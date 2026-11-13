@@ -16,6 +16,7 @@ from traust_core.v1.providers.go_routes import (
     _Checkout,
     _field,
     _params,
+    _receivers,
     _Source,
     _unwrap,
 )
@@ -36,7 +37,8 @@ _PURE = re.compile(
     r"path|filepath|sort|reflect|utf8|unicode|xid|ulid|shortuuid|bson|primitive)\."
 )
 _PURE_PATHS = re.compile(
-    r"(?i)(^strconv$|uuid|/cast$|/xid$|/ulid|/ksuid$|shortid|hashids|sqids|^strings$|^fmt$|"
+    r"(?i)(^strconv$|(^|/)(go\.)?uuid(/v\d+)?$|/cast$|/xid$|/ulid(/v\d+)?$|/ksuid$|shortid$|"
+    r"hashids(/v\d+)?$|sqids(-go)?$|^strings$|^fmt$|"
     r"^errors$|^log$|^log/slog$|^encoding/|^net/url$|/zap$|/logrus$|/zerolog|gofiber/(fiber/v\d+/)?utils)"
 )
 _BUILTINS = {
@@ -89,7 +91,8 @@ class GoOwnership:
 
     def __init__(self, co: _Checkout) -> None:
         self.co = co
-        self.fields = _record_fields(co)
+        self.fields, self.dups = _record_fields(co)
+        self.dead: dict[int, set[int]] = {}
         self.reads_ids: dict[int, bool] = {}
         self.ids_memo: dict[tuple[str, int], bool] = {}
         self.callers_memo: dict[tuple[str, int], bool] = {}
@@ -104,7 +107,12 @@ class GoOwnership:
         if handler is None:
             return None
         ids = self.taint(src, handler, set(), self.id_source, ids=True)
-        if not ids.names and not ids.read:
+        loaders = [
+            (call, found)
+            for call in _calls(handler)
+            if (found := self.checkout_call(src, call)) and self.touches_id(*found)
+        ]  # `n, err := loadNote(r)`: a helper reading the id and loading the record
+        if not ids.names and not ids.read and not loaders:
             return HandlerFacts(ignores_id=True)
         callers = self.taint(src, handler, set(), self.caller(ids.names))
         out = _Facts(callers.first)
@@ -118,10 +126,8 @@ class GoOwnership:
                 continue
             inner = self.hop(*found, node, src, handler, ids.names, callers.names)
             out.merge(inner, self.span(src, node))
-        for call in _calls(handler):  # `n, err := loadNote(r)`: a helper reading id and record
-            if (found := self.checkout_call(src, call)) and self.id_source(src, call, handler):
-                inner = self.load(*found, call, src, handler, callers.names)
-                out.merge(inner, self.span(src, call))
+        for call, found in loaders:
+            out.merge(self.load(*found, call, src, handler, callers.names), self.span(src, call))
         return HandlerFacts(
             lookups=tuple(out.lookups),
             caller=out.caller,
@@ -160,13 +166,13 @@ class GoOwnership:
         For ids, only what still is the id passes on (`strconv.Atoi(id)`, not `store.Get(id)`)."""
         body = fn.child_by_field_name("body") or fn
         out = _Taint(set(seeds))
-        for n in walk(body):
+        for n in self.live(src, body):
             if source(src, n, fn):
                 out.read = True
                 out.first = out.first or self.span(src, n)
         for _ in range(_MAX_PASSES):
             grew = False
-            for n in walk(body):
+            for n in self.live(src, body):
                 if n.type not in (*_ASSIGNS, "range_clause"):
                     if n.type == "call_expression":
                         for name in self.fills(src, n, fn, out.names, source, ids):
@@ -196,7 +202,7 @@ class GoOwnership:
                     if name and not _ERR.match(name) and name not in out.names:
                         out.names.add(name)
                         grew = True
-            for n in walk(body) if ids else ():  # `c.ShouldBindUri(&req)`: it fills `req`
+            for n in self.live(src, body) if ids else ():  # `c.ShouldBindUri(&req)` fills `req`
                 if n.type == "call_expression" and self.binds(src, n, fn):
                     for a in _args(n):
                         inner = _unwrap(a)
@@ -207,6 +213,32 @@ class GoOwnership:
                                 grew = True
             if not grew:
                 break
+        if not ids:
+            out.names -= self.overwritten(src, body, fn, out.names, source)
+        return out
+
+    def overwritten(
+        self, src: _Source, body: Node, fn: Node, callers: set[str], source: _Pred
+    ) -> set[str]:
+        """Caller names assigned something else after they held the caller (`if x { uid = 0 }`):
+        they may not hold it where they are read."""
+        held: dict[str, int] = {}
+        out = set()
+        for n in self.live(src, body):
+            if n.type not in _ASSIGNS[:2]:
+                continue
+            left, right = n.child_by_field_name("left"), n.child_by_field_name("right")
+            if left is None or right is None:
+                continue
+            caller = self.mentions(src, right, callers) or _any(src, right, fn, source)
+            for t in left.named_children:
+                name = src.text(t) if t.type == "identifier" else ""
+                if name not in callers:
+                    continue
+                if caller and self.passes_caller(src, right, fn, callers, source):
+                    held.setdefault(name, n.start_byte)
+                elif name in held:
+                    out.add(name)
         return out
 
     def fills(
@@ -291,7 +323,8 @@ class GoOwnership:
             return True
         operand, _ = _field(src, call)
         alias = src.text(operand) if operand is not None else ""
-        return bool(alias in src.imports and _PURE_PATHS.search(src.imports[alias]))
+        path = src.imports.get(alias, "")
+        return bool(path and _PURE_PATHS.search(path) and self.co.directory(path) is None)
 
     def mentions(self, src: _Source, node: Node, names: set[str]) -> bool:
         return bool(names) and any(
@@ -312,7 +345,7 @@ class GoOwnership:
     def _id_source(self, src: _Source, n: Node) -> bool:
         operand, method = _field(src, n)
         if method in _PARAM_METHODS and operand is not None:
-            return True
+            return self.handed(src, operand)  # `r.PathValue`, `c.Param`, not `cfg.Param("id")`
         if method == "Get" and operand is not None and operand.type == "selector_expression":
             return src.text(operand.child_by_field_name("field")) == "Params"  # gin `c.Params`
         alias = src.text(operand) if operand is not None else ""
@@ -333,13 +366,45 @@ class GoOwnership:
         found = self.checkout_call(src, n)
         return found is not None and self.reads_id(*found)
 
+    def handed(self, src: _Source, value: Node, depth: int = 0) -> bool:
+        """A value rooted in what a function was handed (`r`, `c`, `e.Request`, `ps`), or a
+        local bound to one."""
+        root = _unwrap(value) or value
+        while root.type in ("selector_expression", "call_expression", "index_expression"):
+            nxt = root.child_by_field_name(
+                "function" if root.type == "call_expression" else "operand"
+            )
+            if nxt is None:
+                return False
+            root = _unwrap(nxt) or nxt
+        if root.type != "identifier" or depth > _MAX_PASSES:
+            return False
+        name, fn = src.text(root), _scope_of(root)
+        while fn is not None:
+            if name in {p for p, _ in _params(src, fn)} | _receivers(src, fn):
+                return True
+            bound = self.co.binding(src, root, name, fn)
+            if bound is not None:
+                return self.handed(src, bound.value, depth + 1)
+            fn = _scope_of(fn)
+        return False
+
     def reads_id(self, src: _Source, fn: Node) -> bool:
+        """A checkout helper that returns a path id (`parseID(r)`), not one that only reads it
+        on the way (`log(r.PathValue("id")); return 42`)."""
         key = id(fn)
         if key not in self.reads_ids:
             self.reads_ids[key] = False  # recursion reads as no
-            body = fn.child_by_field_name("body") or fn
-            self.reads_ids[key] = any(self.id_source(src, n, fn) for n in _calls(body))
+            inner = self.taint(src, fn, set(), self.id_source, ids=True)
+            self.reads_ids[key] = any(
+                self.passes_id(src, r, fn, inner.names) for r in self.co.returned(src, fn)
+            )
         return self.reads_ids[key]
+
+    def touches_id(self, src: _Source, fn: Node) -> bool:
+        """A checkout helper that reads a path id itself, whatever it returns (`loadNote(r)`)."""
+        body = fn.child_by_field_name("body") or fn
+        return any(self.id_source(src, n, fn) for n in _calls(body))
 
     def caller(self, ids: set[str]) -> _Pred:
         """A caller source that isn't handed the path id: `store.GetUser(id)` is a record read."""
@@ -380,6 +445,7 @@ class GoOwnership:
                 operand is not None
                 and operand.type == "selector_expression"
                 and src.text(operand.child_by_field_name("field")) in ("Values", "Keys")
+                and self.request_or_session(src, operand.child_by_field_name("operand"), fn)
                 and index is not None
                 and _caller_key(index)
             )
@@ -388,6 +454,8 @@ class GoOwnership:
         if method in _CONTEXT_GETTERS and args:
             if operand is not None and _CLIENT_INPUT.search(src.text(operand)):
                 return False  # `r.URL.Query().Get("user_id")`: what the client sent
+            if operand is None or not self.request_or_session(src, operand, fn):
+                return False  # `cache.Get("user_id")`: no request or session holds it
             asserted = n.parent.child_by_field_name("type") if (
                 n.parent is not None and n.parent.type == "type_assertion_expression"
             ) else None  # fmt: skip
@@ -405,7 +473,42 @@ class GoOwnership:
         if method == "FromContext" and _CALLER_PACKAGE.search(src.imports.get(alias, alias)):
             return True
         name = method or src.text(n.child_by_field_name("function"))
-        return _caller_call(name)
+        if not _caller_call(name):
+            return False
+        # `auth.CurrentUser(r)`, `app.contextGetUser(r)`: a package's or the handler's own;
+        # `note.User()` names a record's owner, not the caller
+        return operand is None or self.handed(src, operand) or not self.local(src, operand)
+
+    def local(self, src: _Source, value: Node) -> bool:
+        """A value rooted in a local the function binds itself (`note` in `note.User()`)."""
+        root = _unwrap(value) or value
+        while root.type in ("selector_expression", "call_expression", "index_expression"):
+            nxt = root.child_by_field_name(
+                "function" if root.type == "call_expression" else "operand"
+            )
+            if nxt is None:
+                return False
+            root = _unwrap(nxt) or nxt
+        if root.type != "identifier":
+            return False
+        fn = _scope_of(root)
+        while fn is not None:
+            if self.co.binding(src, root, src.text(root), fn) is not None:
+                return True
+            fn = _scope_of(fn)
+        return False
+
+    def request_or_session(self, src: _Source, value: Node | None, fn: Node) -> bool:
+        """What a caller key is read from: the request or framework context the handler was
+        handed, its `Context()`, a context or session value (`ctx`, `sess`, `sessionManager`)."""
+        if value is None:
+            return False
+        text = src.text(value)
+        return (
+            self.handed(src, value)
+            or text.endswith("Context()")
+            or bool(re.search(r"(?i)(^|\.)(ctx|context|sess\w*|session\w*|\w*session\w*)$", text))
+        )
 
     def request_value(self, src: _Source, value: Node, fn: Node) -> bool:
         """The request or framework context the handler was given, or a cast of it
@@ -454,7 +557,7 @@ class GoOwnership:
         its chain (`db.Where("id = ?", id).First(&note)`), with the assignment holding it."""
         seen: set[int] = set()
         body = fn.child_by_field_name("body") or fn
-        for n in walk(body):
+        for n in self.live(src, body):
             if n.type == "index_expression":
                 index, operand = n.child_by_field_name("index"), n.child_by_field_name("operand")
                 if (
@@ -570,7 +673,7 @@ class GoOwnership:
     ) -> HandlerFacts | None:
         inner = self.taint(fsrc, fn, seeds, self.id_source, ids=True)
         callers = self.taint(fsrc, fn, caller_seeds, self.caller(inner.names))
-        record = _result_type(fsrc, fn, self.fields)
+        record = self.result_type(fsrc, fn)
         lookups, handoff = [], None
         for n, holder in self.reads(fsrc, fn, inner.names):
             target = self.checkout_call(fsrc, n)
@@ -599,10 +702,47 @@ class GoOwnership:
         scoped = (
             self.mentions(src, node, callers)
             or (fn is not None and _any(src, node, fn, self.caller(ids)))
-            or (held is not None and self.mentions(src, held, callers))
-        )  # `q := db.Where("id = ?", id); q = q.Where("user_id = ?", uid)`
+            or (
+                held is not None
+                and fn is not None
+                and self.scoped_before_run(src, held, fn, callers, ids)
+            )
+        )  # `q := db.Where("id = ?", id); q = q.Where("user_id = ?", uid); q.First(&n)`
         found = self.record(src, node, holder, ids)
         return Lookup(self.span(src, node), scoped=scoped, record_type=found or record)
+
+    def scoped_before_run(
+        self, src: _Source, held: Node, fn: Node, callers: set[str], ids: set[str]
+    ) -> bool:
+        """A query built into a local that the caller narrows before it next runs: the
+        `q = q.Where("user_id = ?", uid)` comes before the `q.First(&n)`."""
+        names = {src.text(t) for t in held.named_children if t.type == "identifier"} & callers
+        if not names:
+            return False
+        body = fn.child_by_field_name("body") or fn
+        scoped_at: list[int] = []
+        runs: list[int] = []
+        for n in self.live(src, body):
+            if n.type == "assignment_statement" and held.start_byte < n.start_byte:
+                left = n.child_by_field_name("left")
+                right = n.child_by_field_name("right")
+                if (
+                    left is not None
+                    and right is not None
+                    and {src.text(t) for t in left.named_children} & names
+                    and self.passes_caller(src, right, fn, callers, self.caller(ids))
+                    and self.mentions(src, right, callers - names)
+                ):
+                    scoped_at.append(n.start_byte)
+            elif n.type == "call_expression" and n.start_byte > held.start_byte:
+                operand, _ = _field(src, n)
+                if operand is not None and src.text(operand) in names:
+                    runs.append(n.start_byte)  # `q.First(&n)`, `q.Where(..)` alike
+        if not scoped_at:
+            return False
+        first_run = min((r for r in runs if r > min(scoped_at)), default=None)
+        early = [r for r in runs if r < min(scoped_at)]
+        return first_run is not None and not early
 
     def record(self, src: _Source, call: Node, holder: Node | None, ids: set[str]) -> str | None:
         """The checkout record type a read loads: what it fills (`&note`, a `new(Note)`), a
@@ -612,11 +752,13 @@ class GoOwnership:
             for n in _walk(call)
             if n.type == "unary_expression" and (inner := _root(_unwrap(n))) is not None
         ]  # `&note`, and `&n.UserID` in a `Scan`
-        bare = [
-            a
-            for a in (_unwrap(x) or x for n in _calls(call, True) for x in _args(n))
-            if a.type == "identifier" and src.text(a) not in ids
-        ]
+        args = [_unwrap(x) or x for n in _calls(call, True) for x in _args(n)]
+        bare = [a for a in args if a.type == "identifier" and src.text(a) not in ids]
+        for a in args:  # `db.First(new(Note), id)`
+            if a.type == "call_expression" and src.text(a.child_by_field_name("function")) == "new":
+                kind = self.named(src, src.text(a.child_by_field_name("arguments")))
+                if kind in self.fields:
+                    return kind
         literals = [n for n in _walk(call) if n.type == "composite_literal"]
         targets = holder.child_by_field_name("left") if holder is not None else None
         held = [
@@ -628,29 +770,78 @@ class GoOwnership:
             if (kind := self.type_name(src, ident)) in self.fields:
                 return kind
         for lit in literals:
-            kind = _last_word(src.text(lit.child_by_field_name("type")))
+            kind = self.named(src, src.text(lit.child_by_field_name("type")))
             if kind in self.fields:
                 return kind
         for ident in held:
             if kind := self.type_name(src, ident):
                 return kind
+        return self.run_fills(src, call, held, ids)
+
+    def run_fills(self, src: _Source, call: Node, held: list[Node], ids: set[str]) -> str | None:
+        """The record a built query fills where it runs: `q := db.Where(..)`, then
+        `q.First(&n)`."""
+        names = {src.text(t) for t in held}
+        fn = _scope_of(call)
+        if not names or fn is None:
+            return None
+        for n in self.live(src, fn.child_by_field_name("body") or fn):
+            operand, _ = _field(src, n) if n.type == "call_expression" else (None, "")
+            if operand is None or src.text(operand) not in names or n.start_byte < call.start_byte:
+                continue
+            for a in _args(n):
+                inner = _root(_unwrap(a)) if a.type == "unary_expression" else None
+                if inner is not None and (kind := self.type_name(src, inner)) in self.fields:
+                    return kind
         return None
 
     def type_name(self, src: _Source, ident: Node) -> str | None:
         kind = self.co.type_of(src, ident)
         if kind:
-            return kind
+            return self.qualify(src, kind, self.co.type_home(src, ident))
         fn = _scope_of(ident)
         for b in self.co.bindings(src, fn).get(src.text(ident), []) if fn is not None else []:
             value = _unwrap(b.value) or b.value
             if value.type == "var_spec":  # `var note Note`
-                return _last_word(src.text(value.child_by_field_name("type"))) or None
+                return self.named(src, src.text(value.child_by_field_name("type")))
             if (
                 value.type == "call_expression"
                 and src.text(value.child_by_field_name("function")) == "new"
             ):  # `n := new(Note)`
-                return _last_word(src.text(value.child_by_field_name("arguments"))) or None
+                return self.named(src, src.text(value.child_by_field_name("arguments")))
         return None
+
+    def named(self, src: _Source, type_text: str) -> str | None:
+        """The record key a type as written names: `Note`, or `models.Note` qualified by its
+        package where several declare one."""
+        text = type_text.strip().strip("()").split(",")[0]
+        kind = _last_word(text)
+        return self.qualify(src, kind, self.co.kind_home(src, text)) if kind else None
+
+    def qualify(self, src: _Source, kind: str, home: str | None = None) -> str:
+        if kind not in self.dups:
+            return kind
+        return f"{home}.{kind}" if home else kind  # unqualified: no fields, owner untold
+
+    def result_type(self, src: _Source, fn: Node) -> str | None:
+        """The checkout record a function says it returns first: `(*Note, error)` is `Note`."""
+        result = fn.child_by_field_name("result")
+        kind = self.named(src, src.text(result)) if result is not None else None
+        return kind if kind in self.fields else None
+
+    def live(self, src: _Source, body: Node) -> Iterator[Node]:
+        """A body's nodes, less those of a closure bound to a local the body never uses
+        (`load := func() { db.First(&n, id) }`, never called): it doesn't run."""
+        if body.id not in self.dead:
+            self.dead[body.id] = _dead_closures(src, body)
+        dead = self.dead[body.id]
+        stack = [body]
+        while stack:
+            n = stack.pop()
+            if n.type == "func_literal" and n.id in dead:
+                continue
+            yield n
+            stack.extend(reversed(n.children))
 
     def span(self, src: _Source, node: Node) -> CodeSpan:
         return CodeSpan(path=RepoPath(src.file.rel), line=src.line(node))
@@ -681,12 +872,17 @@ class _Facts:
         self.handoff = self.handoff or inner.handoff
 
 
-def _record_fields(co: _Checkout) -> dict[str, list[str]]:
+def _record_fields(co: _Checkout) -> tuple[dict[str, list[str]], set[str]]:
     """Each checkout struct type's data fields, an embedded struct's included
-    (`type Doc struct{ Owned; Body string }`)."""
+    (`type Doc struct{ Owned; Body string }`), by name; a name several packages declare is
+    keyed `dir.Name` for each, and listed in the second value."""
+    homes: dict[str, set[str]] = {}
+    for where, kind in co.data_fields:
+        homes.setdefault(kind, set()).add(where)
+    dups = {k for k, v in homes.items() if len(v) > 1}
     fields: dict[str, set[str]] = {}
-    for (_, kind), names in co.data_fields.items():
-        fields.setdefault(kind, set()).update(names)
+    for (where, kind), names in co.data_fields.items():
+        fields.setdefault(f"{where}.{kind}" if kind in dups else kind, set()).update(names)
     embeds: dict[str, set[str]] = {}
     for src in co.sources:
         for spec in walk(src.root):
@@ -705,13 +901,15 @@ def _record_fields(co: _Checkout) -> dict[str, list[str]]:
         grew = False
         for kind, inner in embeds.items():
             for e in inner:
+                if kind in dups or e in dups:
+                    continue  # which package's isn't told here
                 extra = fields.get(e, set()) - fields.get(kind, set())
                 if extra:
                     fields.setdefault(kind, set()).update(extra)
                     grew = True
         if not grew:
             break
-    return {k: sorted(v) for k, v in fields.items()}
+    return {k: sorted(v) for k, v in fields.items()}, dups
 
 
 def _words(text: str) -> list[str]:
@@ -735,6 +933,31 @@ def _root_name(src: _Source, target: Node) -> str:
     while node is not None and node.type in ("selector_expression", "index_expression"):
         node = node.child_by_field_name("operand")
     return src.text(node) if node is not None and node.type == "identifier" else ""
+
+
+def _dead_closures(src: _Source, body: Node) -> set[int]:
+    names: dict[str, int] = {}
+    for n in walk(body):
+        if n.type == "identifier":
+            names[src.text(n)] = names.get(src.text(n), 0) + 1
+    dead = set()
+    for n in walk(body):
+        if n.type != "func_literal" or n.parent is None or n.parent.type != "expression_list":
+            continue
+        holder = n.parent.parent
+        if holder is None or holder.type not in _ASSIGNS[:2]:
+            continue
+        values = n.parent.named_children
+        left = holder.child_by_field_name("left")
+        targets = left.named_children if left is not None else []
+        i = values.index(n)
+        if (
+            i < len(targets)
+            and targets[i].type == "identifier"
+            and names.get(src.text(targets[i]), 0) <= 1
+        ):
+            dead.add(n.id)  # bound and never named again: never called, never handed on
+    return dead
 
 
 def _root(node: Node | None) -> Node | None:
@@ -806,15 +1029,6 @@ def _scope_of(node: Node) -> Node | None:
     while parent is not None and parent.type not in _FUNCS:
         parent = parent.parent
     return parent
-
-
-def _result_type(src: _Source, fn: Node, fields: dict[str, list[str]]) -> str | None:
-    """The checkout record a function says it returns first: `(*Note, error)` is `Note`."""
-    result = fn.child_by_field_name("result")
-    if result is None:
-        return None
-    kind = _last_word(src.text(result).strip().strip("()").split(",")[0])
-    return kind if kind in fields else None
 
 
 def _last_word(text: str) -> str:

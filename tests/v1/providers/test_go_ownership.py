@@ -362,3 +362,89 @@ def test_helpers_that_fan_out_stay_fast(tmp_path: Path) -> None:
     rows, _ = _owned(tmp_path, text)
     assert [r["ownership"] for r in rows] == ["caller-blind"]  # read by what the id becomes
     assert time.perf_counter() - start < 30
+
+
+CALLER = " user := r.Context().Value(userKey).(*User)\n _ = user\n"
+ID = ' id := chi.URLParam(r, "id")\n'
+QODO1 = {
+    "a_helper_that_only_logs_the_id": (
+        {
+            "main.go": _chi(" var n Note\n db.First(&n, pick(r))\n")
+            + 'func pick(r *http.Request) int {\n log.Println(r.PathValue("id"))\n return 42\n}\n'
+        },
+        "unknown",
+    ),
+    "a_store_package_named_like_uuid": (
+        {
+            "main.go": _chi(ID + " n, _ := uuidstore.Load(id)\n _ = n\n").replace(
+                '"gorm.io/gorm"\n', '"gorm.io/gorm"\n "github.com/acme/uuidstore"\n'
+            )
+        },
+        "caller-blind",
+    ),
+    "a_cache_key_named_like_the_caller": (
+        {
+            "main.go": _chi(
+                ' uid := cache.Get("user_id")\n _ = uid\n' + ID + " var n Note\n db.First(&n, id)\n"
+            )
+        },
+        "caller-blind",
+    ),
+    "an_ownerless_record_named_like_an_owned_one": (
+        {
+            "main.go": _chi(ID + " var n models.Note\n db.First(&n, id)\n").replace(
+                '"gorm.io/gorm"\n', '"gorm.io/gorm"\n "example.com/app/models"\n'
+            ),
+            "models/note.go": "package models\n\ntype Note struct {\n ID uint\n Body string\n}\n",
+        },
+        "unknown",
+    ),
+    "a_caller_value_overwritten_on_a_branch": (
+        {
+            "main.go": _chi(
+                CALLER
+                + " uid := user.ID\n if dev {\n  uid = 0\n }\n"
+                + ID
+                + ' var n Note\n db.Where("user_id = ?", uid).First(&n, id)\n'
+            )
+            + "var dev bool\n"
+        },
+        "unchecked",
+    ),
+    "a_builder_scoped_after_it_runs": (
+        {
+            "main.go": _chi(
+                CALLER + ID + ' var n Note\n q := db.Where("id = ?", id)\n q.First(&n)\n'
+                ' q = q.Where("user_id = ?", user.ID)\n'
+            )
+        },
+        "unchecked",
+    ),
+    "a_closure_never_called": (
+        {
+            "main.go": _chi(
+                ' load := func() {\n  var n Note\n  db.First(&n, chi.URLParam(r, "id"))\n }\n'
+            )
+        },
+        "unknown",
+    ),
+    "an_unrelated_param_call": (
+        {"main.go": _chi(' var n Note\n db.First(&n, cfg.Param("id"))\n') + "var cfg Config\n"},
+        "unknown",
+    ),
+    "a_relation_named_like_the_caller": (
+        {"main.go": _chi(ID + " var n Note\n db.First(&n, id)\n owner := n.User()\n _ = owner\n")},
+        "caller-blind",
+    ),
+    "an_inline_new_record": (
+        {"main.go": _chi(CALLER + ID + " db.First(new(Note), id)\n")},
+        "unchecked",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", QODO1)
+def test_the_shapes_the_first_qodo_review_found(tmp_path: Path, case: str) -> None:
+    files, expected = QODO1[case]
+    rows, _ = _owned(tmp_path, files.pop("main.go"), files)
+    assert [r["ownership"] for r in rows] == [expected]
