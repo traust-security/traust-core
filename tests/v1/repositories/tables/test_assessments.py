@@ -486,3 +486,57 @@ def test_assessment_lock_returns_the_exact_record_and_refuses_unknown_identity(s
     assert AssessmentLog(seed.uow).lock(assessment.id) == assessment
     with pytest.raises(NotFoundError):
         seed.uow.assessments.get_for_update(UUID(int=999))
+
+
+def test_census_by_ids_carries_the_line_columns(seed: Seed) -> None:
+    """(id, repository_ref_id, baseline_assessment_id) in bounded batches: the census
+    folds decision lines without a model per assessment."""
+    u = seed.uow
+    ref = seed.repository_ref()
+    original = seed.assessment(ref, occurred_at=T0)
+    rewritten = seed.assessment(ref, occurred_at=T0 + timedelta(days=1))
+    baseline = seed.assessment(
+        seed.repository_ref(), occurred_at=T0, baseline_assessment_id=original.id
+    )
+    found = u.assessments.census_by_ids([original.id, rewritten.id, baseline.id, original.id])
+    assert sorted(found) == sorted(
+        [
+            (original.id, ref.id, None),
+            (rewritten.id, ref.id, None),
+            (baseline.id, baseline.repository_ref_id, original.id),
+        ]
+    )
+    assert u.assessments.census_by_ids([]) == []
+
+
+def test_occurrences_carry_the_latest_report_and_the_firsts_time(seed: Seed) -> None:
+    """The census's occurrence reads: each finding's latest report's severity and CVSS in
+    the views' own report order (the assessment's time, then the occurrence's own), and
+    the first report's time the SLA clock reads — reports after `until` left out."""
+    u = seed.uow
+    repo = seed.repository()
+    finding, other = seed.finding(repo), seed.finding(repo)
+    early = seed.assessment(occurred_at=T0)
+    same_time = seed.assessment(occurred_at=T0 + timedelta(days=2))
+    seed.occurrence(finding, early, severity="medium")
+    apart()
+    seed.occurrence(finding, same_time, severity="critical", cvss_score="9.1")
+    apart()
+    # two reports at the same assessment time: the occurrence's own (created_at, id) order
+    # picks the latest, exactly as the views' stable fold does
+    also_same_time = seed.assessment(occurred_at=T0 + timedelta(days=2))
+    newest = seed.occurrence(finding, also_same_time, severity="high", cvss_score="7.5")
+    seed.occurrence(other, early, severity="low")
+    latest = {row[0]: row[1:] for row in u.census_reads.occurrences_for_repositories([repo.id])}
+    assert latest == {
+        finding.id: ("high", newest.cvss_score, T0),
+        other.id: ("low", None, T0),
+    }
+    until = {
+        row[0]: row[1:]
+        for row in u.census_reads.occurrences_for_repositories(
+            [repo.id], until=T0 + timedelta(days=1)
+        )
+    }
+    assert until == {finding.id: ("medium", None, T0), other.id: ("low", None, T0)}
+    assert u.census_reads.occurrences_for_repositories([]) == []

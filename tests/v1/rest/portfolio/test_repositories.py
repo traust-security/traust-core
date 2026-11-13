@@ -15,10 +15,10 @@ from traust_core.v1.models.inventory import RepositoryFilter
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 
 
-def seed(context: Context):
+def seed(context: Context, url: str | None = None):
     with SqlTraustUnitOfWork(context.database) as uow:
         s = Seed(uow)
-        repo = s.repository()
+        repo = s.repository(**({"url": url} if url else {}))
         ref = s.repository_ref(repo)
         uow.commit()
     return repo, ref
@@ -107,6 +107,40 @@ def test_owners_and_products_of_a_repository_match_in_process(
 def test_unknown_repository_and_ref_are_404(context: Context, client: TestClient) -> None:
     assert client.get(f"/v1/repositories/{uuid4()}", headers=bearer(context)).status_code == 404
     assert client.get(f"/v1/refs/{uuid4()}", headers=bearer(context)).status_code == 404
+
+
+# the cross-repository batch refs listing
+def test_the_batch_refs_listing_matches_in_process(context: Context, client: TestClient) -> None:
+    repo, ref = seed(context)
+    other, other_ref = seed(context, "https://github.com/org/other")
+    body = client.get(
+        "/v1/refs/in",
+        params={"repository_ids": [str(repo.id), str(other.id)]},
+        headers=bearer(context),
+    )
+    assert body.status_code == 200
+    expected = context.services().portfolio.inventory.list_refs_of([repo.id, other.id])
+    assert body.json() == [r.model_dump(mode="json") for r in expected]
+    served = {row["id"] for row in body.json()}
+    assert served == {str(ref.id), str(other_ref.id)}
+
+
+def test_the_batch_refs_listing_refuses_no_set_and_oversized_sets(
+    context: Context, client: TestClient
+) -> None:
+    repo, _ = seed(context)
+    assert client.get("/v1/refs/in", headers=bearer(context)).status_code == 422
+    many = [str(repo.id)] * 501
+    assert (
+        client.get(
+            "/v1/refs/in", params={"repository_ids": many}, headers=bearer(context)
+        ).status_code
+        == 422
+    )
+
+
+def test_the_batch_refs_listing_needs_a_token(context: Context, client: TestClient) -> None:
+    assert client.get("/v1/refs/in").status_code == 401
 
 
 def test_reads_need_a_token_and_reject_a_bad_id(context: Context, client: TestClient) -> None:

@@ -8,7 +8,7 @@ from uuid import UUID
 import sqlalchemy as sa
 
 from traust_core.v1.errors import NotFoundError
-from traust_core.v1.models.assessment import Assessment
+from traust_core.v1.models.assessment import Assessment, CensusAssessment
 from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.repositories.tables import (
     TRAUST,
@@ -60,7 +60,11 @@ class AssessmentRepository(RecordRepository[Assessment], Protocol):
         status: str | Collection[str],
     ) -> Assessment | None: ...
     def latest_per_ref(
-        self, repository_ref_ids: Collection[UUID], kinds: Collection[str], status: str
+        self,
+        repository_ref_ids: Collection[UUID],
+        kinds: Collection[str],
+        status: str,
+        as_of: datetime | None = None,
     ) -> list[Assessment]: ...
     def latest_per_ref_and_kind(
         self,
@@ -89,6 +93,11 @@ class AssessmentRepository(RecordRepository[Assessment], Protocol):
     def list_by_ids(
         self, assessment_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
     ) -> list[Assessment]: ...
+    def census_by_ids(self, assessment_ids: Collection[UUID]) -> list[CensusAssessment]:
+        """(id, repository_ref_id, baseline_assessment_id) per assessment, in bounded
+        batches: the census folds decision lines without a model per assessment."""
+        ...
+
     def search(
         self,
         *,
@@ -197,9 +206,14 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
         return None if row is None else self._to_record(row)
 
     def latest_per_ref(
-        self, repository_ref_ids: Collection[UUID], kinds: Collection[str], status: str
+        self,
+        repository_ref_ids: Collection[UUID],
+        kinds: Collection[str],
+        status: str,
+        as_of: datetime | None = None,
     ) -> list[Assessment]:
-        """Each ref's latest assessment of any of `kinds` with `status`, in bounded batches."""
+        """Each ref's latest assessment of any of `kinds` with `status`, in bounded batches;
+        those after `as_of` are left out."""
         c = self.table.c
         newest = (c.occurred_at.desc(), c.created_at.desc(), c.id.desc())
         rank = sa.func.row_number().over(partition_by=c.repository_ref_id, order_by=newest)
@@ -208,7 +222,12 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
             ranked = (
                 self._select()
                 .add_columns(rank.label("rank"))
-                .where(c.repository_ref_id.in_(batch), c.kind.in_(list(kinds)), c.status == status)
+                .where(
+                    c.repository_ref_id.in_(batch),
+                    c.kind.in_(list(kinds)),
+                    c.status == status,
+                    *([] if as_of is None else [c.occurred_at <= as_of]),
+                )
                 .subquery()
             )
             stmt = sa.select(*(ranked.c[col.name] for col in c)).where(ranked.c.rank == 1)
@@ -300,6 +319,18 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
         # batched: a whole scope's occurrences and decisions can reference more assessments
         # than one statement can bind
         return self._many_in("list by id", self.table.c.id, assessment_ids, read_budget=read_budget)
+
+    def census_by_ids(self, assessment_ids: Collection[UUID]) -> list[CensusAssessment]:
+        """(id, repository_ref_id, baseline_assessment_id) per assessment, in bounded
+        batches: the census folds decision lines without a model per assessment."""
+        c = self.table.c
+        columns = (c.id, c.repository_ref_id, c.baseline_assessment_id)
+        found: list[CensusAssessment] = []
+        for batch in self._batches(assessment_ids):
+            stmt = sa.select(*columns).where(c.id.in_(batch))
+            rows = self._execute(f"census {len(assessment_ids)} by id", stmt)
+            found.extend(CensusAssessment(*row) for row in rows)
+        return found
 
     def search(
         self,

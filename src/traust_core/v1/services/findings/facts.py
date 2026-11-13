@@ -82,7 +82,7 @@ class FindingFacts:
         for fl in uow.finding_labels.list_for_findings(ids, read_budget=read_budget) if ids else ():
             labels[fl.finding_id].append(fl)
         return cls(
-            lines=_lines(
+            lines=decision_lines(
                 [d for ds in decisions.values() for d in ds],
                 {a.id: a for a in assessments if a.id},
                 {
@@ -143,7 +143,7 @@ class FindingFacts:
         return Disposition.fold(finding_id, said, self.lines) if said else None
 
 
-def _lines(
+def decision_lines(
     decisions: Sequence[Decision],
     assessments: Mapping[UUID, Assessment],
     baselines: Mapping[UUID, Assessment],

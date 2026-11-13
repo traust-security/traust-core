@@ -24,6 +24,11 @@ router = APIRouter()
 
 Status = Annotated[str | None, Query(max_length=64)]
 
+# A page's worth of repositories per request, the batch routes' own bound (the orders
+# filter's `repository_ids` shape): a set larger than this is a scope decision the
+# route refuses to carry as one expanding statement.
+MAX_REPOSITORY_IDS = 500
+
 
 @router.get("/v1/assessments", responses=PROBLEMS(401, 422))
 def list_assessments(
@@ -38,6 +43,29 @@ def list_assessments(
     """A ref's assessments, newest first; repository_ref_id is required (the indexed scope)."""
     filter = AssessmentFilter(repository_ref_id=repository_ref_id, kind=kind, status=status)
     return assessments.list(filter, PageRequest(limit=limit, cursor=cursor))
+
+
+# Declared before /v1/assessments/{assessment_id}: a literal path must not be captured
+# as an assessment id the UUID parse would refuse.
+@router.get("/v1/assessments/in", responses=PROBLEMS(401, 422))
+def list_assessments_in(
+    assessments: Assessments,
+    _: Caller,
+    repository_ids: Annotated[list[UUID] | None, Query()] = None,
+    kind: AssessmentKind | None = None,
+) -> list[Assessment]:
+    """Several repositories' assessments in one listing — `list_for_repositories` (the
+    batched `list_for_repository`: one query per table over the set, never one per
+    repository), oldest first across every ref of every repository named, optionally of
+    one kind. A page's worth of repository ids per call, like the orders filter; no ids
+    is a refusal, never a firehose of every assessment."""
+    if not repository_ids:
+        raise ValidationError("list assessments for named repositories; the set is required")
+    if len(repository_ids) > MAX_REPOSITORY_IDS:
+        raise ValidationError(
+            f"list assessments for at most {MAX_REPOSITORY_IDS} repositories per request"
+        )
+    return assessments.list_for_repositories(repository_ids, kind)
 
 
 @router.get("/v1/assessments/{assessment_id}", responses=PROBLEMS(401, 404))

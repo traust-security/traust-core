@@ -6,7 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, Query
 from pydantic import Field
 
-from traust_core.v1.errors import NotFoundError
+from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.common import Cursor, Page, PageRequest
 from traust_core.v1.models.inventory import (
@@ -28,6 +28,11 @@ from traust_core.v1.rest.portfolio.service import Portfolio
 router = APIRouter()
 
 Sha = Annotated[str, Field(pattern=r"^[0-9a-f]{40}([0-9a-f]{24})?$")]
+
+# A page's worth of repositories per request, the batch routes' own bound (the orders
+# filter's `repository_ids` shape): a set larger than this is a scope decision the
+# route refuses to carry as one expanding statement.
+MAX_REPOSITORY_IDS = 500
 
 
 class RefRegistration(Model):
@@ -98,6 +103,26 @@ def set_owners(repository_id: UUID, body: Owners, portfolio: Portfolio, _: Calle
 @router.get("/v1/repositories/{repository_id}/products", responses=PROBLEMS(401, 404))
 def list_products_of(repository_id: UUID, portfolio: Portfolio, _: Caller) -> list[Product]:
     return portfolio.list_products_of(repository_id)
+
+
+# Declared before /v1/refs/{repository_ref_id}: a literal path must not be captured as
+# a ref id the UUID parse would refuse.
+@router.get("/v1/refs/in", responses=PROBLEMS(401, 422))
+def list_refs_in(
+    portfolio: Portfolio, _: Caller, repository_ids: Annotated[list[UUID] | None, Query()] = None
+) -> list[RepositoryRef]:
+    """Every recorded ref of several repositories in one listing — the batched
+    `list_refs`, read in bounded batches — so a consumer resolving each repository's
+    refs (a scanned ref's SHA, a default line) reads one call per bounded set instead
+    of one listing per repository. A page's worth of repository ids per call, like the
+    orders filter; no ids is a refusal, never a firehose of every ref."""
+    if not repository_ids:
+        raise ValidationError("list refs for named repositories; the set is required")
+    if len(repository_ids) > MAX_REPOSITORY_IDS:
+        raise ValidationError(
+            f"list refs for at most {MAX_REPOSITORY_IDS} repositories per request"
+        )
+    return portfolio.inventory.list_refs_of(repository_ids)
 
 
 @router.get("/v1/refs/{repository_ref_id}", responses=PROBLEMS(401, 404))

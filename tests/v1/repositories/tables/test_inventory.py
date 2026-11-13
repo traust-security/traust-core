@@ -180,3 +180,20 @@ def test_repository_get_for_update_finds_the_row_or_raises(seed: Seed) -> None:
     assert seed.uow.repositories.get_for_update(repository.id) == repository
     with pytest.raises(NotFoundError, match="repository"):
         seed.uow.repositories.get_for_update(uuid4())
+
+
+def test_ref_census_columns_read_the_repositories_in_batches(seed: Seed) -> None:
+    """(id, repository_id, name, kind, sha, is_default) in (created_at, id) order: the
+    census folds default lines without a model per ref."""
+    u = seed.uow
+    repo, out = seed.repository(), seed.repository()
+    head = seed.repository_ref(repo, name="main", kind="branch", is_default=True)
+    apart()
+    bare = seed.repository_ref(repo, name=None, kind=None, is_default=False)
+    seed.repository_ref(out)
+    found = u.repository_refs.census_for_repositories([repo.id, repo.id])
+    assert found == [
+        (head.id, repo.id, "main", "branch", head.sha, True),
+        (bare.id, repo.id, None, None, bare.sha, False),
+    ]
+    assert u.repository_refs.census_for_repositories([]) == []

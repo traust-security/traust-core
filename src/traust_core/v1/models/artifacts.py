@@ -373,6 +373,9 @@ class OrgParametersArtifact(ArtifactDocument, name="org-parameters", schema="org
 class SlaPolicyArtifact(ArtifactDocument, name="sla-policy", schema="sla-policy"): ...
 
 
+class InsightBuildsArtifact(ArtifactDocument, name="insight-builds", schema="insight-builds"): ...
+
+
 class ProductDefinitionsMapArtifact(
     ArtifactDocument, name="product-definitions-map", schema="product-definitions-map"
 ): ...
@@ -472,6 +475,7 @@ ARTIFACT_TYPES: tuple[type[ArtifactDocument], ...] = (
     AdrRegistryArtifact,
     OrgParametersArtifact,
     SlaPolicyArtifact,
+    InsightBuildsArtifact,
     ProductDefinitionsMapArtifact,
     BenchmarkTargetArtifact,
     BelowRangePacketsArtifact,
