@@ -345,7 +345,7 @@ def test_decisions_since_are_paged_in_time_order(seed: Seed) -> None:
     assert seed.uow.decisions.list_since(T0 + timedelta(days=3), limit=10) == []
 
 
-def test_newest_person_statement_reads_only_human_actors(seed: Seed) -> None:
+def test_newest_person_statement_excludes_machine_actors(seed: Seed) -> None:
     seed.decision(occurred_at=T0, actor="machine:scanner")
     seed.decision(occurred_at=T0 + timedelta(days=1), actor="user:analyst")
     latest = seed.decision(occurred_at=T0 + timedelta(days=2), actor="human:countersigner")
@@ -362,6 +362,16 @@ def test_newest_person_statement_is_none_without_a_human_judgement(seed: Seed) -
     seed.decision(occurred_at=T0, actor=None, assessment_id=seed.assessment().id)
     seed.decision(occurred_at=T0 + timedelta(days=1), actor="machine:scanner")
     assert seed.uow.decisions.newest_person_statement() is None
+
+
+@pytest.mark.parametrize("actor", ["user:analyst", "analyst@example.test", "Machine:legacy"])
+def test_legacy_actor_statements_advance_the_freshness_watermark(seed: Seed, actor: str) -> None:
+    seed.decision(actor="human:countersigner")
+    apart()
+    latest = seed.decision(actor=actor, occurred_at=T0 - timedelta(days=30))
+    apart()
+    seed.decision(actor="machine:scanner")
+    assert seed.uow.decisions.newest_person_statement() == latest.created_at
 
 
 def test_review_queue_holds_only_pending_items_oldest_first(seed: Seed) -> None:

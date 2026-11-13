@@ -383,21 +383,11 @@ class InsightService:
         return ServedInsight(model=self.build(view, filter))
 
     def record_builds(self) -> PublishResult:
-        """Fold the census views once and publish them as the newest stored build; the
-        dashboards cadence calls this, and unscoped reads serve it until the next build.
-
-        The person-judgement watermark is read BEFORE the fold: a decision landing after it is
-        unverifiable in the build (the fold may or may not have seen it commit), so serving
-        refuses the build until the next one folds. The publication row is the build's moment —
-        the database owns time; the document carries no copy, so an unchanged census republishes
-        as the same digest and the same row."""
+        """Publish a new cadence observation; decision freshness uses the pre-fold watermark,
+        while serving age uses the publication row's database timestamp."""
         if self._builds is None:
             raise ConfigError("insight builds have no artifact store wired")
-        # NEED(artifacts: cadence retention): every build publishes a new row and new bytes —
-        # the coverage and trend models stamp their fold moment, so even an unchanged census
-        # yields a new digest — and nothing prunes old builds of any cadence-published kind.
-        # Growth is roughly one census-sized artifact per cadence period (about 144/day at
-        # 10 minutes).
+        # NEED(artifacts: cadence retention): bound the history of full census observations.
         folded_after = (
             None if self._decisions is None else self._decisions.newest_person_statement()
         )
@@ -405,6 +395,7 @@ class InsightService:
         return self._builds.publish_artifact(
             InsightBuildsArtifact.from_document(
                 {
+                    "built_at": self._clock.now().isoformat(),
                     "folded_after": None if folded_after is None else folded_after.isoformat(),
                     "views": {n.value: m.model_dump(mode="json") for n, m in models.items()},
                 }
@@ -425,10 +416,7 @@ class InsightService:
         return None if parsed is None else (row, parsed)
 
     def _superseded(self, folded_after: datetime | None) -> bool:
-        """A person's judgement recorded at or after the fold's watermark supersedes the build:
-        the fold cannot prove it saw the decision (it may have committed mid-fold, after the
-        fold's own reads), so the read folds with the moved counts and the next cadence build
-        re-arms serving. Both values are the decision table's recording time — one clock."""
+        """Invalidate when the maximum qualifying recording time advances past the watermark."""
         if self._decisions is None:
             return False
         newest = self._decisions.newest_person_statement()
