@@ -257,6 +257,8 @@ The remaining correctness changes are:
 - `ViewName.REMEDIATION_INDEX` is validated by
   `contracts.validate_view("remediation-index", document)` before `build` returns; an unforked
   or unreported work item's fork and fix branch render as `—`.
+- `ViewName.PQC_PORTFOLIO` is validated by `contracts.validate_view("pqc-portfolio", document)`
+  before `build` returns; the executive summary embeds the validated view.
 - `ViewName.COMPLIANCE_PRECISION` wraps the existing
   `DetectionQualityService.calibrate_compliance` result under `calibration`. Its packaged
   view schema reuses the canonical compliance-assessment framework vocabulary through
