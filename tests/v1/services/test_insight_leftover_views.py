@@ -4,7 +4,7 @@ reads, built on demand."""
 from __future__ import annotations
 
 import json
-from collections.abc import Collection, Iterator
+from collections.abc import Collection, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -39,7 +39,7 @@ from traust_core.v1.models.findings import (
     ReviewCaseKind,
     ReviewItem,
 )
-from traust_core.v1.models.insight import ViewFilter, ViewName
+from traust_core.v1.models.insight import QuickWin, RankedThreat, ViewFilter, ViewName
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.vocabulary import ReviewReason, SourceType
 from traust_core.v1.providers.clock import FixedClock
@@ -1071,7 +1071,7 @@ def test_a_register_outside_its_contract_is_refused_by_the_build(
 ) -> None:
     real = insight_module._quick_wins
 
-    def drifted(threats: Any) -> Any:
+    def drifted(threats: Sequence[RankedThreat]) -> tuple[QuickWin, ...]:
         return tuple(w.model_copy(update={"effort": "m"}) for w in real(threats))
 
     monkeypatch.setattr(insight_module, "_quick_wins", drifted)
