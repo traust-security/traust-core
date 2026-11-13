@@ -1278,8 +1278,15 @@ class _Walk:
             return self.derived(given, depth + 1)
         callee = unwrap(call.child_by_field_name("function"))
         handed_args = [unwrap(a) or a for a in args(call)]
-        given_text = [self.src.text(a) for a in handed_args]
-        if self.req not in given_text:
+        # where this handler's own request is handed, never a nearer `req` (`{ const req = x }`)
+        mine = [
+            i
+            for i, a in enumerate(handed_args)
+            if a.type == "identifier"
+            and self.src.text(a) == self.req
+            and _bindings(self.src, a, self.req) == [(_Kind.PARAM, self.fn)]
+        ]
+        if not mine:
             return False
         declared, helper = _helper(self.src, call, self.o.memo)
         src, rel = self.src, self.rel
@@ -1292,9 +1299,6 @@ class _Walk:
             rel = found[0].rel
             src, helper = self.code.files[rel].src, found[0].fn
         params = _param_names(src, helper)
-        index = given_text.index(self.req)
-        if index >= len(params):
-            return False
         here = self.trust()
 
         def handed(param: str, whole: bool, service: _Service) -> bool:
@@ -1318,7 +1322,10 @@ class _Walk:
             )
 
         inner = _Trust(self.trust(rel).local, helper, handed, self.o.memo)
-        return _returns_caller(src, helper, params[index], inner)
+        return any(
+            i < len(params) and params[i] and _returns_caller(src, helper, params[i], inner)
+            for i in mine
+        )
 
     def _bind(self) -> None:
         """The id names (`const { id } = req.params`), the caller locals (`const me =
@@ -2027,8 +2034,9 @@ class _Walk:
         )
         if passes and self.credentials(call):
             return  # Backstage's credentials service reads the request's token, nothing more
-        if _user_info(src, call, self.trust()) is not None:
-            return  # Backstage's user-info service reads the credentials, no record
+        given_info = _user_info(src, call, self.trust())
+        if given_info is not None and self.derived(given_info):
+            return  # Backstage's user-info service reads the caller's credentials, no record
         if passes and not used and name not in ("next",) and root_of(src, fn) != self.res:
             targets = self.code.functions(self.rel, fn, self.cls, self.instance)
             if targets is None or (targets and self.depth >= 1):
@@ -2845,12 +2853,14 @@ def _service(src: Parsed, node: Node | None, service: _Service, trust: _Trust) -
             and _parameter(src, obj, holder, None, service, trust)
             and _only_read(src, holder, service, held[0], trust.memo)
         )
-    found = _bindings(src, node, service) if node.type == "identifier" else []
+    if node.type != "identifier":
+        return False
+    local = src.text(node)  # `httpAuth`, or a name bound from it (`{ httpAuth: auth }`)
+    found = _bindings(src, node, local)
     return (
         len(found) == 1
-        and src.text(node) == service
-        and _parameter(src, node, service, service, service, trust)
-        and _only_called(src, service, service, found[0], trust.memo)
+        and _parameter(src, node, local, service, service, trust)
+        and _only_called(src, local, service, found[0], trust.memo)
     )
 
 
@@ -2906,7 +2916,8 @@ def _binds(
     if pattern is None:
         return False
     if pattern.type == "identifier":
-        return plain and src.text(pattern) == name
+        # a plain parameter is the service only under its own name (`(httpAuth) =>`)
+        return plain and src.text(pattern) == name and (key is None or key == name)
     if pattern.type != "object_pattern" or key is None:
         return False
     for c in pattern.named_children:
@@ -3119,7 +3130,7 @@ def _handed_on(
     src: Parsed, value: Node, name: str, service: _Service, memo: Memo, depth: int
 ) -> bool:
     """A service handed as an argument to a helper this file declares once, as a function,
-    under a parameter of the same name that the helper uses only as `_only_called` allows."""
+    under a plain parameter that the helper uses only as `_only_called` allows."""
     p = value.parent
     if p is None or p.type != "arguments" or p.parent is None or p.parent.type != "call_expression":
         return False
@@ -3130,8 +3141,8 @@ def _handed_on(
     params = _param_names(src, helper)
     return (
         position < len(params)
-        and params[position] == name
-        and _only_called(src, name, service, (_Kind.PARAM, helper), memo, depth + 1)
+        and bool(params[position])
+        and _only_called(src, params[position], service, (_Kind.PARAM, helper), memo, depth + 1)
     )
 
 
@@ -3402,8 +3413,10 @@ def _returns_caller(src: Parsed, fn: Node, param: str, trust: _Trust, depth: int
         returns = [body]
     returned = [n for r in returns if r is not None for n in walk(r)]
     # the helper's own `const` locals it uses nowhere but in what it returns, by declarator
-    # by declarator: its value, and for `const { principal } = ..` the field each name reads
-    trusted: list[tuple[Node, Node | None, dict[str, str] | None]] = []
+    # by declarator: its value, and for `const { principal } = ..` the field each name reads.
+    # A const is trusted when every use of it is in what the helper returns, or in the value of
+    # another trusted const (`const user = await userInfo.getUserInfo(credentials)`).
+    candidates: list[tuple[Node, Node | None, dict[str, str] | None, list[str]]] = []
     for n in own(fn):
         if n.type != "variable_declarator":
             continue
@@ -3420,15 +3433,28 @@ def _returns_caller(src: Parsed, fn: Node, param: str, trust: _Trust, depth: int
         if pattern.type != "identifier" and fields is None:
             continue  # a default, a rest, a nested or computed pattern
         names = [src.text(pattern)] if fields is None else list(fields)
-        if any(
-            m.type in ("identifier", "shorthand_property_identifier")
-            and src.text(m) in names
-            and m not in returned
-            and not _declaring(m)
-            for m in walk(body)
-        ):
-            continue  # a use outside the returns may alias or rewrite it
-        trusted.append((n, n.child_by_field_name("value"), fields))
+        candidates.append((n, n.child_by_field_name("value"), fields, names))
+    region = {(m.start_byte, m.end_byte) for m in returned}
+    trusted: list[tuple[Node, Node | None, dict[str, str] | None]] = []
+    changed = True
+    while changed:
+        changed = False
+        for cand in list(candidates):
+            n, value, fields, names = cand
+            uses = [
+                m
+                for m in walk(body)
+                if m.type in ("identifier", "shorthand_property_identifier")
+                and src.text(m) in names
+                and not _declaring(m)
+            ]
+            # an unused const proves nothing: its value (`mutate(c)`) still runs unchecked
+            if uses and all((m.start_byte, m.end_byte) in region for m in uses):
+                trusted.append((n, value, fields))
+                candidates.remove(cand)
+                if value is not None:
+                    region |= {(m.start_byte, m.end_byte) for m in walk(value)}
+                changed = True
 
     def local_value(ident: Node) -> Node | None:
         """The value of the helper-local const a returned name binds to, if trusted; for a

@@ -1959,3 +1959,155 @@ def test_backstage_round_six_helpers(tmp_path: Path, helpers: str, ownership: st
         {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
     )
     assert _row(result, "GET", "/notes/:id")["ownership"] == ownership
+
+
+@pytest.mark.parametrize(
+    ("factory", "before", "owner", "ownership"),
+    [
+        # a renamed service is still the service
+        (
+            "{ httpAuth: auth }",
+            "",
+            "(await auth.credentials(req, { allow: ['user'] })).principal.userEntityRef",
+            "scoped",
+        ),
+        (
+            "options",
+            "const { httpAuth: auth } = options;",
+            "(await auth.credentials(req, { allow: ['user'] })).principal.userEntityRef",
+            "scoped",
+        ),
+        # but a plain parameter under another name is not
+        (
+            "auth",
+            "",
+            "(await auth.credentials(req, { allow: ['user'] })).principal.userEntityRef",
+            "caller-blind",
+        ),
+        (
+            "{ httpAuth: auth }",
+            "auth.credentials = fake;",
+            "(await auth.credentials(req, { allow: ['user'] })).principal.userEntityRef",
+            "caller-blind",
+        ),
+    ],
+)
+def test_backstage_renamed_services(
+    tmp_path: Path, factory: str, before: str, owner: str, ownership: str
+) -> None:
+    router = _backstage_route(factory, before, owner)
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == ownership
+
+
+@pytest.mark.parametrize(
+    ("helper", "call", "ownership"),
+    [
+        # a nearer `req` handed to the helper is another request
+        (
+            _HELPER,
+            "await (async () => { const req = forged; return getUserEntityRef(req); })()",
+            "not scoped",
+        ),
+        (
+            _HELPER,
+            "await (() => { { const req = forged; return getUserEntityRef(req); } })()",
+            "not scoped",
+        ),
+        # the request handed twice: the position the helper reads counts
+        (
+            f"const getOwner = async (other, req) => (await {_CREDS}).principal.userEntityRef;",
+            "await getOwner(req, req)",
+            "not judged",
+        ),
+        # credentials, then user info, then its field, across consts
+        (
+            "async function getUserEntityRef(req) {\n"
+            f"    const credentials = await {_CREDS};\n"
+            "    const user = await userInfo.getUserInfo(credentials);\n"
+            "    return user.userEntityRef;\n  }",
+            "await getUserEntityRef(req)",
+            "scoped",
+        ),
+        # an unused const still runs: its use of the credentials is unchecked
+        (
+            "async function getUserEntityRef(req) {\n"
+            f"    const credentials = await {_CREDS};\n"
+            "    const spoiled = mutate(credentials);\n"
+            "    return credentials.principal.userEntityRef;\n  }",
+            "await getUserEntityRef(req)",
+            "not scoped",
+        ),
+    ],
+)
+def test_backstage_round_seven_helpers(
+    tmp_path: Path, helper: str, call: str, ownership: str
+) -> None:
+    router = _backstage_route("{ httpAuth, userInfo }", helper, call)
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    got = _row(result, "GET", "/notes/:id")["ownership"]
+    if ownership == "not scoped":
+        assert got != "scoped"
+    elif ownership == "not judged":
+        assert got not in ("caller-blind", "unchecked")
+    else:
+        assert got == ownership
+
+
+@pytest.mark.parametrize(
+    ("handed", "ownership"),
+    [
+        # handed the request, it may load by `req.params`: a hand-off, never `n/a`
+        ("req", "unknown"),
+    ],
+)
+def test_user_info_handed_the_request_is_a_hand_off(
+    tmp_path: Path, handed: str, ownership: str
+) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        "export async function createRouter({ httpAuth, userInfo }) {\n"
+        "  const router = Router();\n"
+        "  router.get('/notes/:id', async (req, res) => {\n"
+        f"    await userInfo.getUserInfo({handed});\n"
+        "    res.json({ ok: true });\n"
+        "  });\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == ownership
+
+
+def test_a_block_shadowing_the_request_hands_the_helper_another(tmp_path: Path) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        'import { Post } from "./models";\n'
+        "export async function createRouter({ httpAuth }) {\n"
+        "  const router = Router();\n"
+        f"  {_HELPER}\n"
+        "  router.get('/notes/:id', async (req, res) => {\n"
+        "    const id = req.params.id;\n"
+        "    {\n"
+        "      const req = { headers: { authorization: forgedToken } };\n"
+        "      const owner = await getUserEntityRef(req);\n"
+        "      res.json(await Post.findOne({ _id: id, user: owner }).orFail());\n"
+        "    }\n"
+        "  });\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] != "scoped"
