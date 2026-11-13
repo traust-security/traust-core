@@ -1572,6 +1572,24 @@ class _Matrix:
             ) is not None
         return False
 
+    def sole_value(self, src: _Source, node: Node) -> _Binding | None:
+        """The one value a name surely holds where it is read; None for several, and for a
+        parameter assigned only where it may not run (`if dev { mw = auth() }`): it may still
+        hold what the caller passed."""
+        fn = _enclosing(node)
+        name = src.text(node)
+        values = self.co.values(src, node, name, fn) if fn is not None else []
+        if len(values) != 1:
+            return None
+        scope = fn
+        while scope is not None:
+            if self.co.binding(src, node, name, scope) is not None:
+                return values[0]
+            if name in {p for p, _ in _params(src, scope)} | _receivers(src, scope):
+                return None
+            scope = _enclosing(scope)
+        return values[0]
+
     def credited(self, src: _Source, node: Node, depth: int = 0) -> list[str]:
         """The names a middleware value may be credited by (D42): a library's, an unseen
         function's, or a checkout middleware that surely does its work; a local bound once to
@@ -1594,13 +1612,12 @@ class _Matrix:
                 ok = found[1].type != "func_literal" and self.middleware_value(found[0], found[1])
                 return [_name(src, node)] if ok else []
             if node.type == "identifier":
-                fn = _enclosing(node)
-                values = self.co.values(src, node, src.text(node), fn) if fn is not None else []
+                sole = self.sole_value(src, node)
                 if (
-                    len(values) == 1
-                    and (_unwrap(values[0].value) or values[0].value).type == "call_expression"
+                    sole is not None
+                    and (_unwrap(sole.value) or sole.value).type == "call_expression"
                 ):
-                    return self.credited(src, values[0].value, depth + 1)
+                    return self.credited(src, sole.value, depth + 1)
             return [_name(src, node)] if self.unseen(src, node) else []
         return []
 
@@ -1699,11 +1716,10 @@ class _Matrix:
         names: list[str] = []
         for _ in range(_MAX_DEPTH):
             if node.type == "identifier":
-                fn = _enclosing(node)
-                values = self.co.values(src, node, src.text(node), fn) if fn is not None else []
-                if len(values) != 1:
+                sole = self.sole_value(src, node)
+                if sole is None:
                     break  # several values (`if dev { h = plain }`): which wraps it isn't told
-                value = _unwrap(values[0].value)
+                value = _unwrap(sole.value)
                 if value is not None and value.type == "call_expression" and self.wraps(src, value):
                     node = value
                     continue
@@ -3104,8 +3120,11 @@ def go_rows(files: list[TreeFile]) -> GoRoutes:
             (
                 f.rel
                 for f in shaped
-                if _REGISTERS.search(code[f.rel])
-                and (f.path.parent in routed or _PATH_REGISTERS.search(code[f.rel]))
+                if (
+                    _REGISTERS.search(code[f.rel])
+                    and (f.path.parent in routed or _PATH_REGISTERS.search(code[f.rel]))
+                )
+                or (_DOT_HTTP.search(code[f.rel]) and _BARE_REGISTERS.search(code[f.rel]))
             ),
             None,
         )

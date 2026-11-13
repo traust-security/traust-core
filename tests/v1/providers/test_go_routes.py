@@ -2166,3 +2166,43 @@ def test_a_commented_out_route_claims_no_parser_gap(
     )
     result = route_guards(tree_files(tmp_path)).model_dump(mode="json")
     assert [g for g in result["coverage_gaps"] if g["system"] == "go-http"] == []
+
+
+def test_a_parameter_assigned_in_a_branch_earns_no_credit(tmp_path: Path) -> None:
+    rows = _rows_all(
+        tmp_path,
+        {
+            "main.go": CHI_HTTP + "var dev bool\n\n"
+            "func setup(r chi.Router, mw func(http.Handler) http.Handler) {\n"
+            " if dev {\n  mw = RequireAuth()\n }\n r.Use(mw)\n"
+            ' r.Get("/notes/{id}", h)\n}\n\nfunc main() {\n r := chi.NewRouter()\n'
+            ' setup(r, noop)\n http.ListenAndServe(":8080", r)\n}\n'
+        },
+    )
+    assert [_guarded(r) for r in rows] == [[]]
+
+
+def test_a_parameter_assigned_before_use_keeps_its_credit(tmp_path: Path) -> None:
+    rows = _rows_all(
+        tmp_path,
+        {
+            "main.go": CHI_HTTP + "func setup(r chi.Router, mw func(http.Handler) http.Handler) {\n"
+            " mw = RequireAuth()\n r.Use(mw)\n"
+            ' r.Get("/notes/{id}", h)\n}\n\nfunc main() {\n r := chi.NewRouter()\n'
+            ' setup(r, noop)\n http.ListenAndServe(":8080", r)\n}\n'
+        },
+    )
+    assert [_guarded(r) for r in rows] == [["RequireAuth"]]
+
+
+def test_a_dot_imported_route_keeps_its_parser_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traust_core.v1.providers import go_routes
+
+    monkeypatch.setattr(go_routes, "parser", lambda: None)
+    (tmp_path / "main.go").write_text(
+        DOT_HTTP + 'func main() {\n HandleFunc("/health", health)\n ListenAndServe(":1", nil)\n}\n'
+    )
+    result = route_guards(tree_files(tmp_path)).model_dump(mode="json")
+    assert [g["system"] for g in result["coverage_gaps"] if g["system"] == "go-http"] == ["go-http"]
