@@ -4950,7 +4950,11 @@ class CensusView:
         views_of = self._findings.all_in(in_scope, as_of=filter.as_of)
         refs_of = {r.id: r.repository_id for r in listed_refs if r.id}
         held_of: defaultdict[UUID, dict[UUID, Assessment]] = defaultdict(dict)
-        for a in self._assessment.list_for_repositories(in_scope):
+        # The whole held history, cursor page by cursor page (the collection
+        # listing's own discipline; the fold assembles across pages).
+        for a in every_item(
+            lambda page: self._assessment.list_for_repositories(in_scope, None, page)
+        ):
             if a.occurred_at <= as_of and a.id is not None:
                 held_of[refs_of[a.repository_ref_id]][a.id] = a  # type: ignore[index]
         ids = [v.finding.id for found in views_of.values() for v in found]  # type: ignore[union-attr]
