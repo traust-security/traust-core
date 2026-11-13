@@ -4,6 +4,7 @@ Query plans at production volume, on Postgres. Continuous ops issues these queri
 
 ```bash
 make db-up && make perf     # first run seeds ~20s; reruns reuse the database
+PERF_SCALE=2 make perf     # the estate at twice the volume (its own database; shape constants hold)
 ```
 
 `.perf/report.md` lists each statement's plan key line and execution time, ready for the PR (quality checklist item 8).

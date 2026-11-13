@@ -35,8 +35,8 @@ SUMMARY = HERE.parent.parent / ".perf" / "api-summary.json"
 BREAKPOINT_SUMMARY = HERE.parent.parent / ".perf" / "api-breakpoint.json"
 API_DATABASE = "traust_perf_api"
 REGRESSION = 1.20  # a run more than 20% slower, or more than 20% lower throughput, fails
-LATENCY_KEYS = ("claim_p95_ms", "list_p95_ms", "feed_p95_ms", "insight_p95_ms")
-RATE_KEYS = ("claim_rps", "list_rps", "feed_rps", "insight_rps", "http_reqs_rate")
+LATENCY_KEYS = ("claim_p95_ms", "list_p95_ms", "feed_p95_ms", "insight_p95_ms", "consumer_p95_ms")
+RATE_KEYS = ("claim_rps", "list_rps", "feed_rps", "insight_rps", "consumer_rps", "http_reqs_rate")
 GATE_KEYS = LATENCY_KEYS + RATE_KEYS
 QUEUE_DEPTH = 70_000  # the breakpoint ramp must claim against a queue, not an empty pool
 

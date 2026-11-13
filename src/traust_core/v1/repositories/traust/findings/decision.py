@@ -76,8 +76,7 @@ class DecisionRepository(RecordRepository[Decision], Protocol):
     def list_since(self, since: datetime, limit: int) -> list[Decision]: ...
 
     def newest_person_statement(self) -> datetime | None:
-        """When a person last judged, by recording time (a backdated statement still counts);
-        None when no person has."""
+        """Latest recording time of a non-machine actor statement, including legacy spellings."""
         ...
 
     def list_finding_ids_with_claims(self) -> list[UUID]: ...
@@ -175,12 +174,14 @@ class SqlDecisionRepository(SqlAppendOnlyRepository[Decision]):
         return [self._to_record(r) for r in self._execute(f"since {since}", stmt).mappings()]
 
     def newest_person_statement(self) -> datetime | None:
-        # The partial index over people's rows keeps this an index head read however sparse
-        # people are among the machines, and empty when no person has judged at all.
+        # Keep the predicate literal so prepared statements can use the partial index.
         c = self.table.c
         stmt = (
             sa.select(c.created_at)
-            .where(c.actor.startswith(f"{ActorKind.HUMAN}:"))
+            .where(
+                c.actor.is_not(None),
+                sa.text("substr(actor, 1, 8) <> 'machine:'"),
+            )
             .order_by(c.created_at.desc())
             .limit(1)
         )

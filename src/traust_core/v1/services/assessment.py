@@ -935,6 +935,22 @@ class AssessmentService:
             )
             return None if found is None else self._read(found)
 
+    def latest_completed_for_refs(
+        self,
+        repository_ref_ids: Collection[UUID],
+        kind: AssessmentKind,
+        as_of: datetime | None = None,
+    ) -> list[Assessment]:
+        """Each ref's latest completed assessment of `kind`, oldest first; a ref with none is
+        absent. The batched `latest` for a scope."""
+        if as_of is not None and as_of.utcoffset() is None:
+            raise ValidationError("as_of must be timezone-aware")
+        with self._uow as uow:
+            rows = uow.assessments.latest_per_ref(
+                repository_ref_ids, self._kind_spellings(kind), ASSESSMENT_COMPLETED, as_of
+            )
+        return [self._read(row) for row in rows]
+
     @staticmethod
     def _kind_spellings(kind: str) -> list[str]:
         target = contracts.normalize_enum("assessment_kind", kind)
@@ -1009,14 +1025,29 @@ class AssessmentService:
         return sorted(rows, key=lambda a: (a.occurred_at, a.id))
 
     def list_for_repositories(
-        self, repository_ids: Collection[UUID], kind: AssessmentKind | None = None
-    ) -> list[Assessment]:
-        """The assessments across every ref of these repositories, oldest first: the batched
-        `list_for_repository` — one query per table over the set, never one per repository."""
+        self,
+        repository_ids: Collection[UUID],
+        kind: AssessmentKind | None,
+        page: PageRequest,
+    ) -> Page[Assessment]:
+        """The assessments across every ref of these repositories, newest first and
+        cursor-paged under the collection listing's own discipline: the batched
+        `list` — one query per table over the set, never one per repository. A
+        consumer that wants the whole history follows the cursor (the SDK's
+        paged iterators do)."""
+        after = page.position()
         refs = [r.id for r in self._inventory.list_refs_of(repository_ids) if r.id]
         kinds = self._kind_spellings(kind) if kind is not None else [None]
-        rows = [self._read(row) for spelling in kinds for row in self._log.list_of(spelling, refs)]
-        return sorted(rows, key=lambda a: (a.occurred_at, a.id))
+        with self._uow as uow:
+            rows = [
+                self._read(row)
+                for spelling in kinds
+                for row in uow.assessments.search(
+                    repository_ref_ids=refs, kind=spelling, limit=page.limit + 1, after=after
+                )
+            ]
+        rows.sort(key=lambda a: (a.occurred_at, a.id), reverse=True)
+        return Page.of(rows, page.limit, lambda a: (a.occurred_at, a.id))
 
     def population(
         self, as_of: datetime, filter: AssessmentFilter, repository_ids: Collection[UUID]

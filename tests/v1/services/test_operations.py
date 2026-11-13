@@ -225,6 +225,95 @@ def test_claim_of_no_assets_claims_nothing(engine: Engine) -> None:
     assert stored(engine, queued).state == OrderState.QUEUED
 
 
+def test_mirror_affinity_skips_a_repository_another_worker_holds(engine: Engine) -> None:
+    held = seeded_repository(engine)
+    free = seeded_repository(engine)
+    running = seeded(engine, asset="diff_scan", repository_id=held, **in_state("leased"))
+    waiting = seeded(engine, asset="repo_state", repository_id=held, priority=1)
+    later = seeded(engine, asset="repo_state", repository_id=free, priority=9)
+    service = ops(engine)
+
+    assert service.claim(W2, LEASE, mirror_affinity=True).id == later.id
+    assert stored(engine, running).lease_holder == W1
+    assert stored(engine, waiting).state == OrderState.QUEUED
+
+
+def test_mirror_affinity_takes_the_holders_own_next_order_on_its_repository(
+    engine: Engine,
+) -> None:
+    repository_id = seeded_repository(engine)
+    running = seeded(engine, asset="diff_scan", repository_id=repository_id, **in_state("leased"))
+    waiting = seeded(engine, asset="repo_state", repository_id=repository_id)
+
+    assert ops(engine).claim(W1, LEASE, mirror_affinity=True).id == waiting.id
+    assert stored(engine, running).lease_holder == W1
+
+
+def test_mirror_affinity_leases_the_head_when_nothing_is_held(engine: Engine) -> None:
+    repository_id = seeded_repository(engine)
+    head = seeded(engine, asset="repo_state", repository_id=repository_id, priority=1)
+    tail = seeded(engine, asset="repo_state", priority=9)
+
+    assert ops(engine).claim(W2, LEASE, mirror_affinity=True).id == head.id
+    assert stored(engine, tail).state == OrderState.QUEUED
+
+
+def test_claim_without_affinity_leases_a_held_repositorys_order(engine: Engine) -> None:
+    held = seeded_repository(engine)
+    running = seeded(engine, asset="diff_scan", repository_id=held, **in_state("leased"))
+    waiting = seeded(engine, asset="repo_state", repository_id=held, priority=1)
+
+    assert ops(engine).claim(W2, LEASE).id == waiting.id
+    assert stored(engine, running).lease_holder == W1
+
+
+def test_mirror_affinity_skips_a_pair_an_open_order_occupies(engine: Engine) -> None:
+    repository_id = seeded_repository(engine)
+    # Two open orders of one (asset, repository) subject can only exist through
+    # submit beside plan; the claim's busy rule keeps the queued sibling waiting.
+    gated = seeded(engine, asset="repo_state", repository_id=repository_id, state="planned")
+    waiting = seeded(engine, asset="repo_state", repository_id=repository_id)
+
+    assert ops(engine).claim(W2, LEASE, mirror_affinity=True) is None
+    assert stored(engine, gated).state == OrderState.PLANNED
+    assert stored(engine, waiting).state == OrderState.QUEUED
+
+
+def test_a_named_order_is_claimed_as_asked_despite_affinity(engine: Engine) -> None:
+    held = seeded_repository(engine)
+    running = seeded(engine, asset="diff_scan", repository_id=held, **in_state("leased"))
+    waiting = seeded(engine, asset="repo_state", repository_id=held, priority=1)
+    assert waiting.id is not None
+
+    assert ops(engine).claim(W2, LEASE, order_id=waiting.id, mirror_affinity=True).id == (
+        waiting.id
+    )
+    assert stored(engine, running).lease_holder == W1
+
+
+def test_mirror_affinity_takes_a_fleet_wide_order_past_the_workers_own_lease(
+    engine: Engine,
+) -> None:
+    # A leased sibling is no gate: a runner whose fleet-wide order's completion
+    # left it leased (a refusal the order keeps) can take the asset's next
+    # queued order — its own lease never blocks it.
+    running = seeded(engine, asset="feeds_cache", **in_state("leased"))
+    waiting = seeded(engine, asset="feeds_cache", priority=9)
+
+    assert ops(engine).claim(W1, LEASE, ["feeds_cache"], mirror_affinity=True).id == waiting.id
+    assert stored(engine, running).lease_holder == W1
+
+
+def test_mirror_affinity_never_blocks_a_fleet_wide_order(engine: Engine) -> None:
+    running = seeded(engine, asset="diff_scan", repository_id=seeded_repository(engine))
+    fleet = seeded(engine, asset="repo_state", priority=9)  # no repository: fleet-wide
+    service = ops(engine)
+    first = service.claim(W1, LEASE, ["diff_scan", "repo_state"])
+    assert first is not None and first.id == running.id
+
+    assert service.claim(W2, LEASE, ["repo_state"], mirror_affinity=True).id == fleet.id
+
+
 def test_start_stores_a_run_already_underway_leased_to_its_runner(engine: Engine) -> None:
     repository_id = seeded_repository(engine)
     request = OrderRequest(asset="repo_state", priority=20, repository_id=repository_id)

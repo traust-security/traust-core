@@ -10,6 +10,8 @@ from tests.v1.rest.findings.conftest import ANALYST
 from traust_core.v1.context import Context
 from traust_core.v1.models.common import PageRequest
 from traust_core.v1.models.findings import (
+    FindingDimension,
+    FindingFilter,
     FindingSetFilter,
     FindingSort,
     SortDirection,
@@ -196,3 +198,47 @@ def test_the_count_route_is_not_a_finding_id(context: Context, client: TestClien
 
 def test_the_count_needs_a_token(context: Context, client: TestClient) -> None:
     assert client.get("/v1/findings/count").status_code == 401
+
+
+# the cross-repository batch summaries
+def test_the_batch_summaries_match_each_repositorys_own(
+    context: Context, client: TestClient
+) -> None:
+    findings = seed_reported(context, count=3)
+    in_set = [str(f.repository_id) for f in findings[:2]]
+    body = client.get(
+        "/v1/findings/summaries",
+        params={"repository_ids": in_set},
+        headers=bearer(context, ANALYST),
+    )
+    assert body.status_code == 200
+    svc = context.services().findings
+    expected = svc.summary_in([f.repository_id for f in findings[:2]])
+    assert body.json() == [r.model_dump(mode="json") for r in expected]
+    own = [
+        row
+        for finding in findings[:2]
+        for row in svc.summary(
+            FindingFilter(repository_id=finding.repository_id),
+            FindingDimension.REPOSITORY,
+        )
+    ]
+    assert sorted(body.json(), key=lambda r: r["key"] or "") == sorted(
+        (r.model_dump(mode="json") for r in own), key=lambda r: r["key"] or ""
+    )
+
+
+def test_the_batch_summaries_refuse_no_set_and_oversized_sets(
+    context: Context, client: TestClient
+) -> None:
+    findings = seed_reported(context, count=1)
+    assert client.get("/v1/findings/summaries", headers=bearer(context, ANALYST)).status_code == 422
+    many = [str(findings[0].repository_id)] * 501
+    bad = client.get(
+        "/v1/findings/summaries", params={"repository_ids": many}, headers=bearer(context, ANALYST)
+    )
+    assert bad.status_code == 422
+
+
+def test_the_batch_summaries_needs_a_token(context: Context, client: TestClient) -> None:
+    assert client.get("/v1/findings/summaries").status_code == 401

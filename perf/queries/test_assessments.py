@@ -44,6 +44,19 @@ def test_search_by_ref_and_kind_uses_the_covering_index(
     fast(statement, "idx_assessment_ref_kind_occurred", 5)
 
 
+def test_search_by_ref_set_uses_the_covering_index(engine: sa.Engine, explained: Profile) -> None:
+    # The batch listings' set scope (GET /v1/assessments?repository_ids=): one
+    # query over a page's worth of refs, never one per repository.
+    with SqlTraustUnitOfWork(engine) as unit:
+        table = unit.assessments.table
+        rows = unit.connection.execute(
+            sa.select(table.c.repository_ref_id).distinct().limit(100)
+        ).all()
+    refs = [row.repository_ref_id for row in rows]
+    (statement,) = explained(lambda uow: uow.assessments.search(repository_ref_ids=refs, limit=101))
+    fast(statement, "idx_assessment_ref_kind_occurred", 100)
+
+
 def test_bounded_version_scan_does_not_charge_other_versions(explained: Profile) -> None:
     def read(uow: SqlTraustUnitOfWork) -> None:
         budget = RecordBudget(1, "selected audits")
