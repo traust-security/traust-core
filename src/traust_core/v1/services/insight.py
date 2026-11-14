@@ -138,7 +138,9 @@ from traust_core.v1.models.insight import (
     RefreshResult,
     RemediationIndex,
     RemediationRow,
+    RenderedReport,
     RenderedView,
+    ReportFormat,
     RepositoryLoc,
     RepositoryRollup,
     ReviewCard,
@@ -449,6 +451,23 @@ class InsightService:
             csv=None if export is None else csv_table(export(model)),
         )
 
+    def render(self, view: ViewName, filter: ViewFilter, format: ReportFormat) -> RenderedReport:
+        """The view built now and rendered in the one format asked for (no other format is
+        rendered); csv is refused before the view is built when it has no export table."""
+        found = self._view(view, filter)
+        export = getattr(found, "export", None)
+        if format is ReportFormat.CSV and export is None:
+            raise ValidationError(f"{view.value} has no export table; ask for markdown or html")
+        model = found.build(filter)
+        report = found.report(model, filter.as_of or self._clock.now())
+        if format is ReportFormat.CSV:
+            body = csv_table(export(model))  # type: ignore[misc]
+        elif format is ReportFormat.HTML:
+            body = HtmlRenderer().render(report).decode()
+        else:
+            body = MarkdownRenderer().render(report).decode()
+        return RenderedReport(view=view, format=format, stem=_stem(report.title), body=body)
+
     def record_sla_policy(self, doc: SlaPolicyArtifact, provenance: Provenance) -> PublishResult:
         """Record the deployment's SLA policy: the SLA view's from now on, over the shipped
         default, unless a run sets its own."""
@@ -531,6 +550,8 @@ class InsightService:
             )
         if filter is not None and filter.window is not None and not _accepts_window(found):
             raise ValidationError(f"{name.value} does not support a window")
+        if filter is not None and filter.executive_panels and name != ViewName.EXECUTIVE_SUMMARY:
+            raise ValidationError("executive_panels are supported only by executive-summary")
         return found
 
 
@@ -1363,7 +1384,8 @@ class FindingsRollupView:
             Section(
                 heading=f"Attack scenarios: {urls[a.repository_id]} {a.label}"
                 + (f", {inline(a.threat)}" if a.threat else ""),
-                body="\n\n".join(f"> {inline(step)}" for step in a.steps)
+                # steps are imported threat-model text: data, so no link or HTML survives
+                body="\n\n".join(f"> {markdown_text(step)}" for step in a.steps)
                 + f"\n\n_From the repository's latest threat model ({a.label})._",
             )
             for a in model.attack_scenarios

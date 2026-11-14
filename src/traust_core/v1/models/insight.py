@@ -134,6 +134,23 @@ class CompliancePrecision(ViewModel):
     calibration: ComplianceCalibration
 
 
+class ReportFormat(StrEnum):
+    """A rendered report's format: markdown and html for every insight, csv for one with an
+    export table. Each format carries its media type and file suffix."""
+
+    MARKDOWN = "markdown"
+    HTML = "html"
+    CSV = "csv"
+
+    @property
+    def media_type(self) -> str:
+        return {"markdown": "text/markdown", "html": "text/html", "csv": "text/csv"}[self.value]
+
+    @property
+    def suffix(self) -> str:
+        return {"markdown": "md", "html": "html", "csv": "csv"}[self.value]
+
+
 class ExecutivePanel(StrEnum):
     ATTACK = "attack"
     PQC = "pqc"
@@ -1008,6 +1025,19 @@ class SlaDashboard(ViewModel):
     clock_start: SlaClockStart
     as_of: datetime
     profiles: tuple[SlaProfileView, ...]
+
+
+class RenderedReport(Model):
+    """A view built and rendered in one format, on demand; nothing is stored."""
+
+    view: ViewName
+    format: ReportFormat
+    stem: str
+    body: str
+
+    @property
+    def filename(self) -> str:
+        return f"{self.stem}.{self.format.suffix}"
 
 
 class RenderedView(Model):

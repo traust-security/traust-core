@@ -5,13 +5,15 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+import pytest
 from fastapi.testclient import TestClient
 
 from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.rest.conftest import bearer
 from traust_core.v1.context import Context
-from traust_core.v1.models.insight import ExecutivePanel, ViewFilter, ViewName
+from traust_core.v1.models.insight import ExecutivePanel, ReportFormat, ViewFilter, ViewName
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services import insight as insight_module
 
 AS_OF = (T0 + timedelta(days=1)).isoformat()
 HOSTILE = "<script>alert(1)</script> leaked key"
@@ -88,3 +90,47 @@ def test_the_summary_panels_are_asked_for_over_rest(context: Context, client: Te
     assert report.status_code == 200 and "## Tenant-isolation posture" in report.text
     unknown = client.get(url, params={"executive_panel": "nonsense"}, headers=headers)
     assert unknown.status_code == 422
+
+
+def test_panels_belong_to_the_executive_summary_only(context: Context, client: TestClient) -> None:
+    params, headers = {"executive_panel": ExecutivePanel.ATTACK}, bearer(context)
+    for url in ("/v1/insights/findings-rollup", "/v1/insights/scoreboard/report"):
+        refused = client.get(url, params=params, headers=headers)
+        assert refused.status_code == 422 and "only by executive-summary" in refused.text
+
+
+def test_csv_is_refused_before_the_view_is_built(
+    context: Context, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def never(*_: object) -> None:
+        raise AssertionError("the view was built for a format it cannot serve")
+
+    monkeypatch.setattr(insight_module.ExecutiveSummaryView, "build", never)
+    refused = client.get(
+        "/v1/insights/executive-summary/report", params={"format": "csv"}, headers=bearer(context)
+    )
+    assert refused.status_code == 422 and "no export table" in refused.text
+
+
+@pytest.mark.parametrize("asked", list(ReportFormat))
+def test_only_the_format_asked_for_is_rendered(
+    context: Context, client: TestClient, monkeypatch: pytest.MonkeyPatch, asked: ReportFormat
+) -> None:
+    def refuse(name: str) -> object:
+        def render(*_: object) -> bytes:
+            raise AssertionError(f"{name} was rendered for a {asked} report")
+
+        return render
+
+    if asked is not ReportFormat.MARKDOWN:
+        monkeypatch.setattr(insight_module.MarkdownRenderer, "render", refuse("markdown"))
+    if asked is not ReportFormat.HTML:
+        monkeypatch.setattr(insight_module.HtmlRenderer, "render", refuse("html"))
+    if asked is not ReportFormat.CSV:
+        monkeypatch.setattr(insight_module, "csv_table", refuse("csv"))
+    response = client.get(
+        "/v1/insights/privileges/report", params={"format": asked.value}, headers=bearer(context)
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"] == f"{asked.media_type}; charset=utf-8"
+    assert response.headers["content-disposition"].endswith(f'.{asked.suffix}"')

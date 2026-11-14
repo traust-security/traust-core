@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Response
@@ -8,7 +8,13 @@ from pydantic import SerializeAsAny
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.common import TimeBucket, TimeWindow
-from traust_core.v1.models.insight import ExecutivePanel, ViewFilter, ViewModel, ViewName
+from traust_core.v1.models.insight import (
+    ExecutivePanel,
+    ReportFormat,
+    ViewFilter,
+    ViewModel,
+    ViewName,
+)
 from traust_core.v1.models.vocabulary import ComplianceFramework
 from traust_core.v1.rest.common.aware_datetime import UtcDatetime
 from traust_core.v1.rest.common.deps import Caller
@@ -21,7 +27,7 @@ Ids = Annotated[list[UUID] | None, Query()]
 Labels = Annotated[list[str] | None, Query()]
 Panels = Annotated[
     list[ExecutivePanel] | None,
-    Query(description="The executive summary's optional panels to build (repeatable)."),
+    Query(description="executive-summary only: its optional panels (repeatable)."),
 ]
 
 
@@ -95,9 +101,6 @@ def get_insight(
     return served.model
 
 
-ReportFormat = Literal["markdown", "html", "csv"]
-_MEDIA = {"markdown": "text/markdown", "html": "text/html", "csv": "text/csv"}
-_SUFFIX = {"markdown": "md", "html": "html", "csv": "csv"}
 _TEXT = {"type": "string"}
 
 
@@ -106,7 +109,7 @@ _TEXT = {"type": "string"}
     response_class=Response,
     responses={
         **PROBLEMS(401, 404, 422),
-        200: {"content": {media: {"schema": _TEXT} for media in _MEDIA.values()}},
+        200: {"content": {f.media_type: {"schema": _TEXT} for f in ReportFormat}},
     },
 )
 def get_insight_report(
@@ -117,20 +120,16 @@ def get_insight_report(
     format: Annotated[
         ReportFormat,
         Query(description="markdown or html for every insight; csv for one with an export table."),
-    ] = "markdown",
+    ] = ReportFormat.MARKDOWN,
 ) -> Response:
     """The insight rendered as a report on demand: the same view, scope and contract check
-    as `GET /v1/insights/{name}`, built now (never a stored census build) and returned as one
-    file, named by `Content-Disposition`. Nothing is stored. Titles, URLs and other recorded
-    text are escaped in HTML and kept as data in Markdown and CSV."""
-    rendered = insight.publish(name, filter)
-    body = {"markdown": rendered.markdown, "html": rendered.html, "csv": rendered.csv}[format]
-    if body is None:
-        raise ValidationError(f"{name.value} has no export table; ask for markdown or html")
+    as `GET /v1/insights/{name}`, built now (never a stored census build) and rendered only in
+    the format asked for, returned as one file named by `Content-Disposition`. Nothing is
+    stored. Recorded text (titles, URLs, imported threat-model steps) stays data: escaped in
+    HTML, unable to form links or HTML in Markdown."""
+    rendered = insight.render(name, filter, format)
     return Response(
-        content=body.encode(),
-        media_type=f"{_MEDIA[format]}; charset=utf-8",
-        headers={
-            "Content-Disposition": f'attachment; filename="{rendered.stem}.{_SUFFIX[format]}"'
-        },
+        content=rendered.body.encode(),
+        media_type=f"{format.media_type}; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{rendered.filename}"'},
     )
