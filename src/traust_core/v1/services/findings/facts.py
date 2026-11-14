@@ -47,8 +47,10 @@ class FindingFacts:
         *,
         read_budget: RecordBudget | None = None,
         objects: ObjectStore | None = None,
+        census: bool = False,
     ) -> FindingFacts:
-        """Decisions made after `until` are left out; every occurrence is kept."""
+        """Decisions made after `until` are left out; every occurrence is kept. A census
+        load leaves the cwes unread — counting views never read them."""
         ids = [f.id for f in findings if f.id is not None]
         decisions: defaultdict[UUID, list[Decision]] = defaultdict(list)
         for d in uow.decisions.list_for_findings(ids, until=until, read_budget=read_budget):
@@ -67,19 +69,20 @@ class FindingFacts:
         reported: defaultdict[UUID, list[Occurrence]] = defaultdict(list)
         for o in sorted(occurrences, key=lambda o: at[o.assessment_id]):
             reported[o.finding_id].append(o)
-        links = uow.finding_cwes.list_for_findings(ids, read_budget=read_budget) if ids else []
-        names = {
-            c.id: c.identifier
-            for c in uow.cwes.list_by_ids({fc.cwe_id for fc in links}, read_budget=read_budget)
-        }
         cwes: defaultdict[UUID, list[str]] = defaultdict(list)
-        for fc in links:
-            cwes[fc.finding_id].append(names[fc.cwe_id])
+        if not census:
+            links = uow.finding_cwes.list_for_findings(ids, read_budget=read_budget) if ids else []
+            names = {
+                c.id: c.identifier
+                for c in uow.cwes.list_by_ids({fc.cwe_id for fc in links}, read_budget=read_budget)
+            }
+            for fc in links:
+                cwes[fc.finding_id].append(names[fc.cwe_id])
         labels: defaultdict[UUID, list[FindingLabel]] = defaultdict(list)
         for fl in uow.finding_labels.list_for_findings(ids, read_budget=read_budget) if ids else ():
             labels[fl.finding_id].append(fl)
         return cls(
-            lines=_lines(
+            lines=decision_lines(
                 [d for ds in decisions.values() for d in ds],
                 {a.id: a for a in assessments if a.id},
                 {
@@ -140,7 +143,7 @@ class FindingFacts:
         return Disposition.fold(finding_id, said, self.lines) if said else None
 
 
-def _lines(
+def decision_lines(
     decisions: Sequence[Decision],
     assessments: Mapping[UUID, Assessment],
     baselines: Mapping[UUID, Assessment],

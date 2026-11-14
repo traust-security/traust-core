@@ -44,6 +44,19 @@ def test_search_by_ref_and_kind_uses_the_covering_index(
     fast(statement, "idx_assessment_ref_kind_occurred", 5)
 
 
+def test_search_by_ref_set_uses_the_covering_index(engine: sa.Engine, explained: Profile) -> None:
+    # The batch listings' set scope (GET /v1/assessments?repository_ids=): one
+    # query over a page's worth of refs, never one per repository.
+    with SqlTraustUnitOfWork(engine) as unit:
+        table = unit.assessments.table
+        rows = unit.connection.execute(
+            sa.select(table.c.repository_ref_id).distinct().limit(100)
+        ).all()
+    refs = [row.repository_ref_id for row in rows]
+    (statement,) = explained(lambda uow: uow.assessments.search(repository_ref_ids=refs, limit=101))
+    fast(statement, "idx_assessment_ref_kind_occurred", 100)
+
+
 def test_bounded_version_scan_does_not_charge_other_versions(explained: Profile) -> None:
     def read(uow: SqlTraustUnitOfWork) -> None:
         budget = RecordBudget(1, "selected audits")
@@ -187,3 +200,59 @@ def test_original_audit_lock_uses_primary_key(engine: sa.Engine, explained: Prof
         assessment_id = unit.connection.scalar(sa.select(unit.assessments.table.c.id).limit(1))
     (statement,) = explained(lambda unit: unit.assessments.get_for_update(assessment_id))
     fast(statement, "assessment_pkey", 5)
+
+
+def test_the_census_latest_per_ref_and_kind_groups_by_index(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    """The coverage fold's window: each (ref, kind)'s newest under the filters, one row per
+    group — never the assessments below the newest."""
+    with SqlTraustUnitOfWork(engine) as unit:
+        table = unit.assessments.table
+        row = unit.connection.execute(
+            sa.select(
+                table.c.repository_ref_id, table.c.kind, table.c.status, table.c.occurred_at
+            ).limit(1)
+        ).one()
+        ref_ids = list(
+            unit.connection.scalars(
+                sa.select(table.c.repository_ref_id)
+                .where(table.c.kind == row.kind, table.c.status == row.status)
+                .limit(2_500)
+            )
+        )
+        distinct = len(set(ref_ids))
+
+    def read(uow: SqlTraustUnitOfWork) -> None:
+        found = uow.assessments.latest_per_ref_and_kind(
+            ref_ids, [row.kind], row.status, until=row.occurred_at
+        )
+        assert 0 < len(found) <= distinct
+
+    # one statement per 500-ref batch, each the same grouped window
+    for statement in explained(read):
+        fast(statement, "idx_assessment_ref_kind_occurred", 50)
+
+
+def test_the_census_counts_group_by_index(engine: sa.Engine, explained: Profile) -> None:
+    """The population fold's counts: narrow (ref, kind, runs) rows, never the assessments."""
+    with SqlTraustUnitOfWork(engine) as unit:
+        table = unit.assessments.table
+        row = unit.connection.execute(
+            sa.select(table.c.repository_ref_id, table.c.kind, table.c.status).limit(1)
+        ).one()
+        ref_ids = list(
+            unit.connection.scalars(
+                sa.select(table.c.repository_ref_id)
+                .where(table.c.kind == row.kind, table.c.status == row.status)
+                .limit(2_500)
+            )
+        )
+
+    def read(uow: SqlTraustUnitOfWork) -> None:
+        found = uow.assessments.counts_for_refs(ref_ids, [row.kind], row.status)
+        assert found and all(count >= 1 for _, _, count in found)
+
+    # one statement per 500-ref batch, each the same grouped count
+    for statement in explained(read):
+        fast(statement, "idx_assessment_ref_kind_occurred", 50)

@@ -389,6 +389,13 @@ def test_get_and_list_filter_the_scheduled_efforts(
     assert list(service.list(PageRequest(), repository_id=repository_id).items) == [first, second]
     assert list(service.list(PageRequest(), finding_id=finding_ids[0]).items) == [first]
     assert list(service.list(PageRequest(), repository_id=other_repository).items) == [third]
+    # the batch shape: one read over several repositories, like the orders filter's set
+    assert list(
+        service.list(PageRequest(), repository_ids=(repository_id, other_repository)).items
+    ) == [first, second, third]
+    assert list(service.list(PageRequest(), repository_ids=(other_repository,)).items) == [third]
+    with pytest.raises(ValidationError):
+        service.list(PageRequest(), repository_id=repository_id, repository_ids=(repository_id,))
     assert list(service.list(PageRequest(), status=RemediationStatus("candidate")).items) == [
         first,
         second,

@@ -45,6 +45,7 @@ from traust_core.v1.services.findings import (
     TaxonomyPolicy,
 )
 from traust_core.v1.services.findings.rating import RatingConfig
+from traust_core.v1.services.findings.windows import WindowMemo
 from traust_core.v1.services.lint import Lint
 
 T0 = datetime(2026, 10, 1, tzinfo=UTC)
@@ -63,7 +64,7 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
         yield eng
 
 
-def service(engine: Engine) -> FindingService:
+def service(engine: Engine, *, windows: WindowMemo | None = None) -> FindingService:
     uow = SqlTraustUnitOfWork(engine)
     precedents = FindingPrecedents(uow)
     decisions = FindingDecisions(
@@ -85,6 +86,7 @@ def service(engine: Engine) -> FindingService:
         precedents,
         rating,
         InMemoryObjectStore(),
+        windows=windows,
     )
 
 

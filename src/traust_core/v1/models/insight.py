@@ -999,3 +999,21 @@ class RefreshResult(Model):
 
     rendered: Mapping[ViewName, RenderedView] = Field(default_factory=dict)
     failed: Mapping[ViewName, str] = Field(default_factory=dict)
+
+
+class InsightBuilds(Model):
+    """One stored build of the census views: the GLOBAL census as the dashboards cadence last
+    folded it. One build serves every scope; the caller's authorization filters it. The
+    publication row is the build's moment; folded_after is the person-judgement watermark the
+    fold read before it started."""
+
+    folded_after: datetime | None
+    views: Mapping[ViewName, SerializeAsAny[ViewModel]] = Field(default_factory=dict)
+
+
+class ServedInsight(Model):
+    """One insight as served: its model, and when the stored census it came from was built
+    (None: folded on demand for this request)."""
+
+    model: SerializeAsAny[ViewModel]
+    built_at: datetime | None = None

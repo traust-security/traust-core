@@ -396,6 +396,26 @@ def test_list_pages_a_repositorys_work_items_oldest_first(
         service.list(repository, PageRequest(limit=0))
 
 
+def test_items_in_reads_the_sets_work_items_one_walk_not_one_per_repository(
+    service: RemediationService, engine: Engine
+) -> None:
+    one, one_found = seeded(engine, findings=2)
+    two, two_found = seeded(engine)
+    three, _ = seeded(engine)  # a repository with no work item yet
+    assert service.items_in([]) == {}
+    for ref, found in ((one, one_found), (two, two_found)):
+        for f in ids(found):
+            service.open([f], ref.id)  # type: ignore[list-item, arg-type]
+    items = service.items_in([one.repository_id, two.repository_id, three.repository_id])  # type: ignore[list-item]
+    assert set(items) == {one.repository_id, two.repository_id}
+    assert [i.work_item_id for i in items[one.repository_id]] == [  # type: ignore[index]
+        i.work_item_id
+        for i in service.items_of(one.repository_id)  # type: ignore[arg-type]
+    ]
+    assert items[two.repository_id] == service.items_of(two.repository_id)  # type: ignore[index,arg-type]
+    assert items[one.repository_id] == service.items_of(one.repository_id)  # type: ignore[index,arg-type]
+
+
 def test_resolve_fork_prefers_the_inventory_mirror(
     service: RemediationService, engine: Engine
 ) -> None:
@@ -1056,9 +1076,12 @@ def test_pull_request_tracker_and_progress_roll_back_together(
 
 
 @pytest.mark.parametrize("kind,verified", [(ActorKind.MACHINE, True), (ActorKind.HUMAN, False)])
-def test_pull_request_recording_requires_a_verified_person(
+def test_pull_request_recording_refuses_a_caller_the_config_never_granted(
     service: RemediationService, engine: Engine, kind: ActorKind, verified: bool
 ) -> None:
+    """Without a grant nothing changes: an ungranted ServiceAccount (or an unverified
+    anyone) is refused before the item is read — the two-door shape the outcome door
+    set."""
     ref, found = seeded(engine)
     item = service.open(ids(found), ref.id)
     principal = PERSON.model_copy(
@@ -1071,6 +1094,77 @@ def test_pull_request_recording_requires_a_verified_person(
             principal,
         )
     assert service.get(item.work_item_id) == item
+
+
+def test_pull_request_recording_is_a_person_s_or_a_granted_serviceaccount_s_word(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """The authorization matrix: a verified person records any attempt's PR; a
+    ServiceAccount only inside a `recording.start` grant for `remediate_finding` on the
+    item's repository — the filing loop's identity, releasing its own PRs through the
+    door."""
+    ref, found = seeded(engine)
+    tracker = Principal(
+        identity="filing-loop",
+        kind=ActorKind.MACHINE,
+        display="PR filer",
+        verified_by=IdentitySource.OIDC,
+    )
+    ungranted = Context(Config(home=tmp_path, remediation=PRIVATE, process=GIT))
+    ungranted.__dict__["database"] = engine
+    service = ungranted.services().remediation
+    item = service.open(ids(found), ref.id)
+    external = ExternalRef(system="github", ref="https://github.com/example/svc/pull/101")
+    with pytest.raises(ForbiddenError, match="requires a verified person"):
+        service.record_pull_request(item.work_item_id, external, tracker)
+    assert service.get(item.work_item_id).status == "candidate"
+
+    off_repository = Context(
+        Config(
+            home=tmp_path,
+            remediation=PRIVATE,
+            process=GIT,
+            recording=RecordingConfig(
+                start=(
+                    RecordingStartScope(
+                        principal=tracker.ref,
+                        assets=("remediate_finding",),
+                        repository_ids=(uuid4(),),  # another repository's scope
+                    ),
+                )
+            ),
+        )
+    )
+    off_repository.__dict__["database"] = engine
+    with pytest.raises(ForbiddenError, match="requires a verified person"):
+        off_repository.services().remediation.record_pull_request(
+            item.work_item_id, external, tracker
+        )
+
+    scoped = Context(
+        Config(
+            home=tmp_path,
+            remediation=PRIVATE,
+            process=GIT,
+            recording=RecordingConfig(
+                start=(
+                    RecordingStartScope(
+                        principal=tracker.ref,
+                        assets=("remediate_finding",),
+                        repository_ids=(ref.repository_id,),
+                    ),
+                )
+            ),
+        )
+    )
+    scoped.__dict__["database"] = engine
+    service = scoped.services().remediation
+    attached = service.record_pull_request(item.work_item_id, external, tracker)
+    assert attached.status == "pr_opened" and attached.tracker == external
+    said = decisions(engine, found[0])[-1]
+    assert (said.assessment_id, said.reason) == (item.work_item_id, "pr_opened")
+    # the person's word still lands on the same door
+    assert service.record_pull_request(item.work_item_id, external, PERSON) == attached
 
 
 def merged(merge_sha: str, actor: str | None = None) -> ProgressReport:

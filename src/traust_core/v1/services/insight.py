@@ -1,25 +1,32 @@
 from __future__ import annotations
 
+import contextlib
+import copy
 import json
 import logging
 import re
+import threading
 from collections import Counter, defaultdict
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
-from functools import partial
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, TypeVar
 from uuid import UUID
+
+from pydantic import ValidationError as ModelValidationError
 
 from traust_core.v1 import contracts
 from traust_core.v1.errors import ConfigError, NotFoundError, TraustError, ValidationError
 from traust_core.v1.models.artifacts import (
     CloudConfigAuditArtifact,
+    InsightBuildsArtifact,
     ReportArtifact,
     SlaPolicyArtifact,
     TriageArtifact,
 )
 from traust_core.v1.models.assessment import (
+    Artifact,
     AssessmentFilter,
     AssessmentKind,
     AttackCatalog,
@@ -96,6 +103,7 @@ from traust_core.v1.models.insight import (
     InsecurePattern,
     InsecurePatternCut,
     InsecurePatterns,
+    InsightBuilds,
     InventoryExport,
     IsolationReviewRow,
     IsolationSummary,
@@ -135,6 +143,7 @@ from traust_core.v1.models.insight import (
     ReviewCards,
     SarifLog,
     Scoreboard,
+    ServedInsight,
     SeverityCounts,
     SlaCounts,
     SlaDashboard,
@@ -175,7 +184,7 @@ from traust_core.v1.models.pqc import (
     PqcSiteKind,
     PqcVendorClaim,
 )
-from traust_core.v1.models.remediation import WorkItem, WorkItemFilter
+from traust_core.v1.models.remediation import WorkItem
 from traust_core.v1.models.validation import ValidationDimension, ValidationFilter
 from traust_core.v1.models.vocabulary import (
     DispositionAssurance,
@@ -204,6 +213,7 @@ from traust_core.v1.rendering import (
     inline,
     markdown_text,
 )
+from traust_core.v1.services.findings.census import FindingCensusRow
 from traust_core.v1.services.findings.intake import CATEGORY
 from traust_core.v1.services.findings.rating import CvssFloor, RatingConfig, RatingPolicy, SlaConfig
 from traust_core.v1.services.provider_catalog import core_version
@@ -224,6 +234,8 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+M = TypeVar("M", bound=ViewModel)
+
 
 class View(Protocol):
     name: ViewName
@@ -237,8 +249,100 @@ def _accepts_window(view: View) -> bool:
     return bool(getattr(view, "accepts_window", getattr(view, "windowed", False)))
 
 
+class LatestStatement(Protocol):
+    """When a person last judged a finding: the stored census builds' freshness bound."""
+
+    def newest_person_statement(self) -> datetime | None: ...
+
+
+# The census views the dashboards cadence stores: the dashboard's whole-scope folds, one GLOBAL
+# build serving every scope (the caller's authorization filters the served model per request).
+# A build serves while the cadence's promise holds: the dashboards lane's fast asset runs at a
+# 5-15 minute cadence, so a build older than this missed its cycles and the read folds (today's
+# behaviour) until the asset runs again.
+SERVE_STALE_AFTER = timedelta(minutes=30)
+CENSUS_VIEWS: Mapping[ViewName, type[ViewModel]] = {
+    ViewName.FINDINGS_ROLLUP: FindingsRollup,
+    ViewName.COVERAGE: CoverageDashboard,
+    ViewName.REMEDIATION_INDEX: RemediationIndex,
+    ViewName.FINDINGS_TREND: FindingsTrend,
+}
+
+
+def _revalidate(model: type[M], document: Any) -> M:
+    """The stored document as the view's model. A model's computed fields dump as output the
+    strict models refuse as input, so exactly the rejected paths are dropped and validation
+    retried; anything else a stored build fails to validate stays a failure."""
+    for _ in range(3):
+        try:
+            return model.model_validate(document)
+        except ModelValidationError as rejected:
+            extra = [e["loc"] for e in rejected.errors() if e["type"] == "extra_forbidden"]
+            if not extra:
+                raise
+            document = _without(document, extra)
+    return model.model_validate(document)
+
+
+def _without(document: Any, paths: Iterable[tuple[object, ...]]) -> Any:
+    pruned = copy.deepcopy(document)
+    for path in paths:
+        node: Any = pruned
+        for step in path[:-1]:
+            node = node[step]
+        with contextlib.suppress(KeyError, IndexError, TypeError):
+            del node[path[-1]]  # a path another rejection already removed
+    return pruned
+
+
+def _parse_builds(document: Any) -> InsightBuilds:
+    """A stored build's document as the census models, each view re-validated as that view's; a
+    view this core cannot name or validate is dropped (that view folds, the rest serve)."""
+    views: dict[ViewName, ViewModel] = {}
+    for name, model in document["views"].items():
+        try:
+            view = ViewName(name)
+            model_type = CENSUS_VIEWS[view]
+        except (ValueError, KeyError):
+            log.warning("stored insight build carries view %s this core does not store", name)
+            continue
+        try:
+            views[view] = _revalidate(model_type, model)
+        except ValueError:
+            log.warning("stored insight build view %s no longer validates", name)
+    return InsightBuilds(folded_after=document["folded_after"], views=views)
+
+
+class ParsedBuilds:
+    """The parsed stored census, once per publication: a service is wired per request, the cache
+    is owned by the Context and outlives them, so a process parses a build when it is published —
+    never per request. A build that cannot be read or parsed is remembered as unreadable (the
+    reads fold) until a newer publication replaces it."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._by_row: tuple[UUID, InsightBuilds | None] | None = None
+
+    def parse(self, row_id: UUID, read: Callable[[], Any]) -> InsightBuilds | None:
+        with self._lock:
+            if self._by_row is not None and self._by_row[0] == row_id:
+                return self._by_row[1]
+            try:
+                parsed: InsightBuilds | None = _parse_builds(read())
+            except (TraustError, ValueError, KeyError) as e:
+                log.warning(
+                    "stored insight build %s is unreadable (%s); folding until the next one",
+                    row_id,
+                    type(e).__name__,
+                )
+                parsed = None
+            self._by_row = (row_id, parsed)
+            return parsed
+
+
 class InsightService:
-    """Dashboards are derived views: built on demand and rendered, never stored."""
+    """Dashboards are derived views: built on demand and rendered; the census views are also
+    stored as rebuilt builds the route serves instead of folding per request."""
 
     def __init__(
         self,
@@ -246,13 +350,81 @@ class InsightService:
         clock: Clock,
         *,
         sla_policies: ArtifactPublisher | None = None,
+        builds: ArtifactPublisher | None = None,
+        decisions: LatestStatement | None = None,
+        parsed: ParsedBuilds | None = None,
     ) -> None:
         self._views = {v.name: v for v in views}
         self._clock = clock
         self._sla_policies = sla_policies
+        self._builds = builds
+        self._decisions = decisions
+        self._parsed = parsed or ParsedBuilds()
 
     def build(self, view: ViewName, filter: ViewFilter) -> ViewModel:
         return self._view(view, filter).build(filter)
+
+    def serve(self, view: ViewName, filter: ViewFilter, *, refresh: bool = False) -> ServedInsight:
+        """The route's read: the newest stored census build, else the on-demand fold.
+
+        The stored build is the GLOBAL census, so only an unscoped request reads it; a scoped
+        filter, `refresh`, a view the census does not carry, a build a person's judgement was
+        recorded at or after the fold's watermark of, a build past the serving bound, and the
+        first request before any build all fold on demand (the current behaviour)."""
+        if not refresh and view in CENSUS_VIEWS and filter == ViewFilter():
+            newest = self._newest()
+            if newest is not None:
+                row, build = newest
+                if not self._superseded(build.folded_after) and not self._expired(row.created_at):
+                    model = build.views.get(view)
+                    if model is not None:
+                        return ServedInsight(model=model, built_at=row.created_at)
+        return ServedInsight(model=self.build(view, filter))
+
+    def record_builds(self) -> PublishResult:
+        """Publish a new cadence observation; decision freshness uses the pre-fold watermark,
+        while serving age uses the publication row's database timestamp."""
+        if self._builds is None:
+            raise ConfigError("insight builds have no artifact store wired")
+        # NEED(artifacts: cadence retention): bound the history of full census observations.
+        folded_after = (
+            None if self._decisions is None else self._decisions.newest_person_statement()
+        )
+        models = {name: self.build(name, ViewFilter()) for name in CENSUS_VIEWS}
+        return self._builds.publish_artifact(
+            InsightBuildsArtifact.from_document(
+                {
+                    "built_at": self._clock.now().isoformat(),
+                    "folded_after": None if folded_after is None else folded_after.isoformat(),
+                    "views": {n.value: m.model_dump(mode="json") for n, m in models.items()},
+                }
+            )
+        )
+
+    def _newest(self) -> tuple[Artifact, InsightBuilds] | None:
+        """The newest stored census build with its publication row; the parse is cached per
+        publication and shared by every request (services are wired per request — the cache
+        outlives them). An unreadable build folds, once, until the next publication."""
+        if self._builds is None:
+            return None
+        rows = self._builds.history(InsightBuildsArtifact, 1)
+        if not rows or rows[0].id is None or rows[0].created_at is None:
+            return None
+        row = rows[0]
+        parsed = self._parsed.parse(row.id, lambda: json.loads(self._builds.get(row.id).payload))
+        return None if parsed is None else (row, parsed)
+
+    def _superseded(self, folded_after: datetime | None) -> bool:
+        """Invalidate when the maximum qualifying recording time advances past the watermark."""
+        if self._decisions is None:
+            return False
+        newest = self._decisions.newest_person_statement()
+        return newest is not None and (folded_after is None or newest > folded_after)
+
+    def _expired(self, built_at: datetime) -> bool:
+        """A build older than the cadence's promise no longer serves: the dashboards lane's
+        fast asset missed its cycles, so the read folds until it runs again."""
+        return built_at < self._clock.now() - SERVE_STALE_AFTER
 
     def report(self, view: ViewName, filter: ViewFilter) -> Report:
         """The view as a report for a person (markdown, html)."""
@@ -1039,10 +1211,17 @@ class FindingsRollupView:
         self._assessment = assessment
 
     def build(self, filter: ViewFilter) -> FindingsRollup:
-        scoped = _scoped_findings(self._findings, self._portfolio, filter)
-        rollup = _rollup(filter.as_of, *scoped).model_copy(
-            update={"categories": _by_category(scoped[3])}
+        products, shipped, repositories = _scope(self._portfolio, filter)
+        # the census: the tallies read states, severities and labels off narrow rows —
+        # never a view materialized — and each batch is counted and released, never held
+        # for the whole scope
+        counted = _Counted(filter, products, shipped, repositories)
+        self._findings.census(
+            [r.id for r in repositories],
+            counted.census,
+            filter.as_of,  # type: ignore[misc,arg-type]
         )
+        rollup = counted.rollup()
         if not (filter.product_ids or filter.team_ids):
             return rollup
         scenarios = self._assessment.attack_scenarios(
@@ -1341,25 +1520,6 @@ def _example(e: PatternExample) -> str:
     return inline(" · ".join(parts))
 
 
-def _by_category(views: Mapping[UUID, Sequence[FindingView]]) -> tuple[FindingRollup, ...]:
-    """Every scoped finding counted per `category` label, largest first; findings without
-    one land in the unlabeled group."""
-    # imported here: findings.decisions imports this module's TriageView, so a module-level
-    # import of the findings service would cycle
-    from traust_core.v1.services.findings.service import finding_rollup
-
-    grouped: defaultdict[str | None, list[FindingView]] = defaultdict(list)
-    for vs in views.values():
-        for v in vs:
-            grouped[v.label(CATEGORY)].append(v)
-    return tuple(
-        sorted(
-            (finding_rollup(key, group) for key, group in grouped.items()),
-            key=lambda r: (-r.findings, r.key is None, r.key or ""),
-        )
-    )
-
-
 def _scoped_findings(
     findings: FindingService, portfolio: PortfolioService, filter: ViewFilter
 ) -> tuple[list[Product], dict[Any, set[UUID]], list[Repository], dict[UUID, list[FindingView]]]:
@@ -1374,50 +1534,163 @@ def _scoped_findings(
     return products, shipped, repositories, views  # type: ignore[return-value]
 
 
-def _rollup(
-    as_of: datetime | None,
-    products: list[Product],
-    shipped: dict[Any, set[UUID]],
-    repositories: list[Repository],
-    views: dict[UUID, list[FindingView]],
-) -> FindingsRollup:
-    urls = {r.id: r.url for r in repositories}
-    everything = [v for found in views.values() for v in found]
-    return FindingsRollup(
-        as_of=as_of,
-        total=_tally(everything),
-        products=tuple(
-            ProductRollup(
-                product_id=p.id,  # type: ignore[arg-type]
-                slug=p.slug,
-                name=p.name,
-                repositories=len(shipped[p.id]),
-                tally=_tally(v for r in shipped[p.id] for v in views[r]),
-            )
-            for p in sorted(products, key=lambda p: p.slug)
-        ),
-        repositories=tuple(
-            RepositoryRollup(
-                repository_id=r.id,  # type: ignore[arg-type]
-                repository_url=r.url,
-                tally=_tally(views[r.id]),
-                hardening_categories=dict(
-                    sorted(Counter(_category(v) for v in views[r.id] if _is(v, _HARDENING)).items())
-                ),
-            )
-            for r in repositories
-        ),
-        top=tuple(
-            sorted(
-                (
-                    _top(v, urls[v.finding.repository_id])
-                    for v in everything
-                    if _is(v, _OPEN) and str(v.effective_severity) in _TOP
-                ),
-                key=lambda t: (_severity_rank(t.severity), -(t.cvss_score or -1), t.repository_url),
-            )
-        ),
+@dataclass
+class _Counting:
+    """One group's counts under construction: census rows count in one at a time."""
+
+    states: Counter[FindingState] = field(default_factory=Counter)
+    opened: Counter[Severity | None] = field(default_factory=Counter)
+    remediated: Counter[Severity | None] = field(default_factory=Counter)
+    proven: int = 0
+    unverified: int = 0
+    decided: int = 0
+
+    def add(self, row: FindingCensusRow) -> None:
+        bucket = row.state
+        self.states[bucket] += 1
+        self.decided += row.decided
+        if bucket == FindingState.RESOLVED:
+            # the open branch guards a missing severity; the resolved branch must too —
+            # an unrated finding resolved without a severity statement is the common
+            # cloud-config case, never a crash
+            self.remediated[row.severity] += 1
+        if bucket == _OPEN:
+            self.opened[row.severity] += 1
+            self.proven += row.proven
+            self.unverified += row.unverified
+
+    def severities(self, counts: Counter[Severity | None]) -> SeverityCounts:
+        return SeverityCounts(
+            **{
+                str(ScannerSeverity.UNRATED if severity is None else severity): n
+                for severity, n in counts.items()
+            }
+        )
+
+    def tally(self) -> FindingTally:
+        return FindingTally(
+            open=self.severities(self.opened),
+            hardening=self.states[_HARDENING],
+            resolved=self.states[FindingState.RESOLVED],
+            risk_accepted=self.states[FindingState.ACCEPTED],
+            false_positive=self.states[FindingState.FALSE_POSITIVE],
+            execution_proven=self.proven,
+            unverified=self.unverified,
+            decided=self.decided,
+            remediated=self.severities(self.remediated),
+        )
+
+
+@dataclass
+class _Counted:
+    """The rollup's tallies, accumulated one census batch at a time: each batch's views are
+    counted and released, never held for the whole scope."""
+
+    filter: ViewFilter
+    products: Sequence[Product]
+    shipped: Mapping[Any, set[UUID]]
+    repositories: Sequence[Repository]
+    total: _Counting = field(default_factory=_Counting)
+    by_product: dict[Any, _Counting] = field(default_factory=dict)
+    by_repository: dict[UUID, _Counting] = field(default_factory=dict)
+    hardening: dict[UUID, Counter[str]] = field(default_factory=dict)
+    categories: defaultdict[str | None, _Counting] = field(
+        default_factory=lambda: defaultdict(_Counting)
     )
+    top: list[TopFinding] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self._urls = {r.id: r.url for r in self.repositories}
+        self._wanted = set(self.filter.categories) or None
+        self.by_product = {p.id: _Counting() for p in self.products}
+        self.by_repository = {r.id: _Counting() for r in self.repositories}  # type: ignore[misc]
+        self.hardening = {r.id: Counter() for r in self.repositories}  # type: ignore[misc]
+
+    def census(self, rows: Iterable[FindingCensusRow]) -> None:
+        """Count one census batch; a category scope keeps only findings carrying one of those
+        labels."""
+        for row in rows:
+            if self._wanted is not None and row.category not in self._wanted:
+                continue
+            self.total.add(row)
+            self.by_repository[row.repository_id].add(row)  # type: ignore[index]
+            if row.state is _HARDENING:
+                self.hardening[row.repository_id][row.category or "uncategorized"] += 1  # type: ignore[index]
+            for product_id, shipped in self.shipped.items():
+                if row.repository_id in shipped:
+                    self.by_product[product_id].add(row)
+            self.categories[row.category].add(row)
+            if row.state is _OPEN and str(row.severity) in _TOP:
+                self.top.append(
+                    TopFinding(
+                        finding_id=row.finding_id,
+                        repository_url=self._urls[row.repository_id],
+                        title=row.title,
+                        severity=row.severity,
+                        cvss_score=row.cvss_score,
+                        execution_proven=row.proven,
+                        sla_due=row.sla_due,
+                    )
+                )
+
+    def rollup(self) -> FindingsRollup:
+        # imported here: findings.decisions imports this module's TriageView, so a
+        # module-level import of the findings service would cycle
+        from traust_core.v1.services.findings.service import _by_severity
+
+        return FindingsRollup(
+            as_of=self.filter.as_of,
+            total=self.total.tally(),
+            products=tuple(
+                ProductRollup(
+                    product_id=p.id,  # type: ignore[arg-type]
+                    slug=p.slug,
+                    name=p.name,
+                    repositories=len(self.shipped[p.id]),
+                    tally=self.by_product[p.id].tally(),
+                )
+                for p in sorted(self.products, key=lambda p: p.slug)
+            ),
+            repositories=tuple(
+                RepositoryRollup(
+                    repository_id=r.id,  # type: ignore[arg-type]
+                    repository_url=r.url,
+                    tally=self.by_repository[r.id].tally(),  # type: ignore[index]
+                    hardening_categories=dict(
+                        sorted(self.hardening[r.id].items())  # type: ignore[index]
+                    ),
+                )
+                for r in self.repositories
+            ),
+            top=tuple(
+                sorted(
+                    self.top,
+                    key=lambda t: (
+                        _severity_rank(t.severity),
+                        -(t.cvss_score or -1),
+                        t.repository_url,
+                    ),
+                )
+            ),
+            categories=tuple(
+                sorted(
+                    (
+                        FindingRollup(
+                            key=key,
+                            findings=sum(counting.states.values()),
+                            open=counting.states[FindingState.OPEN],
+                            hardening=counting.states[_HARDENING],
+                            accepted=counting.states[FindingState.ACCEPTED],
+                            resolved=counting.states[FindingState.RESOLVED],
+                            false_positives=counting.states[FindingState.FALSE_POSITIVE],
+                            open_by_severity=_by_severity(counting.opened),
+                        )
+                        for key, counting in self.categories.items()
+                    ),
+                    key=lambda r: (-r.findings, r.key is None, r.key or ""),
+                )
+            ),
+        )
 
 
 def _scope(
@@ -1481,49 +1754,31 @@ def _proven(view: FindingView) -> bool:
     )
 
 
-def _tally(views: Iterable[FindingView]) -> FindingTally:
-    buckets: Counter[FindingState] = Counter()
-    severities: Counter[str] = Counter()
-    remediated: Counter[str] = Counter()
-    proven = unverified = decided = 0
-    for v in views:
-        bucket = v.state()
-        buckets[bucket] += 1
-        decided += v.disposition is not None
-        if bucket == FindingState.RESOLVED:
-            # the open branch guards a missing severity; the resolved branch must too —
-            # an unrated finding resolved without a severity statement is the common
-            # cloud-config case, never a crash
-            remediated[
-                str(
-                    ScannerSeverity.UNRATED
-                    if v.effective_severity is None
-                    else v.effective_severity
-                )
-            ] += 1
-        if bucket == _OPEN:
-            severities[
-                str(
-                    ScannerSeverity.UNRATED
-                    if v.effective_severity is None
-                    else v.effective_severity
-                )
-            ] += 1
-            proven += _proven(v)
-            unverified += v.disposition is None or (
-                v.disposition.assurance == DispositionAssurance.CLAIMED
-            )
-    return FindingTally(
-        open=SeverityCounts(**severities),
-        hardening=buckets[_HARDENING],
-        resolved=buckets[FindingState.RESOLVED],
-        risk_accepted=buckets[FindingState.ACCEPTED],
-        false_positive=buckets[FindingState.FALSE_POSITIVE],
-        execution_proven=proven,
-        unverified=unverified,
-        decided=decided,
-        remediated=SeverityCounts(**remediated),
+def _census_row(view: FindingView) -> FindingCensusRow:
+    """A view as its counted facts — the adapter a tally over held views folds with, the
+    same shape the SQL census yields; the identity between the two is the rollup's own
+    contract (the census-fold test)."""
+    return FindingCensusRow(
+        finding_id=view.finding.id,  # type: ignore[arg-type]
+        repository_id=view.finding.repository_id,
+        state=view.state(),
+        severity=view.effective_severity,
+        category=view.label(CATEGORY),
+        decided=view.disposition is not None,
+        proven=_proven(view),
+        unverified=view.disposition is None
+        or view.disposition.assurance == DispositionAssurance.CLAIMED,
+        title=view.finding.title,
+        cvss_score=view.occurrence.cvss_score if view.occurrence else None,
+        sla_due=view.sla_due,
     )
+
+
+def _tally(views: Iterable[FindingView]) -> FindingTally:
+    counted = _Counting()
+    for v in views:
+        counted.add(_census_row(v))
+    return counted.tally()
 
 
 def _counts(c: SeverityCounts, *, unrated: bool = False) -> tuple[str, ...]:
@@ -2179,10 +2434,9 @@ class RemediationIndexView:
             raise ValidationError("the remediation index reads work items as they stand; no as_of")
         products, shipped, repositories = _scope(self._portfolio, filter)
         urls = {r.id: r.url for r in repositories}
-        items = {
-            r: list(every_item(partial(self._remediation.list, WorkItemFilter(repository_id=r))))
-            for r in urls
-        }
+        # one batched read over the whole scope — an index joined a repository per row would
+        # walk one listing per repository (thousands of statements at an estate's scale)
+        items = self._remediation.items_in(list(urls))
         groups = (
             [(p.slug, sorted(shipped[p.id], key=urls.__getitem__)) for p in products]
             if products
@@ -2192,7 +2446,7 @@ class RemediationIndexView:
             _remediation_row(slug, urls[r], item)
             for slug, repository_ids in groups
             for r in repository_ids
-            for item in items[r]  # type: ignore[index]
+            for item in items.get(r, ())
         )
         return RemediationIndex(rows=rows, by_status=dict(Counter(r.status for r in rows)))
 
@@ -3882,8 +4136,10 @@ class ExecutiveSummaryView:
                 findings=census.cloud_config,
                 targets=tuple(sorted(targets, key=lambda r: (-r.unsuppressed, r.repository))),
             )
+        counted = _Counted(filter, products, shipped, repositories)
+        counted.census(_census_row(v) for vs in views.values() for v in vs)
         return ExecutiveSummary(
-            rollup=_rollup(filter.as_of, products, shipped, repositories, views),
+            rollup=counted.rollup(),
             credential_leaks=tuple(
                 sorted(
                     (_top(v, urls[v.finding.repository_id]) for v in opened if _credential(v)),

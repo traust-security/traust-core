@@ -522,9 +522,21 @@ class OpsService:
         assets: Collection[AssetName] | None = None,
         *,
         order_id: UUID | None = None,
+        mirror_affinity: bool = False,
     ) -> RunOrder | None:
         """Lease the next queued order, or only the selected queued ID; an empty `assets`
-        claims nothing."""
+        claims nothing.
+
+        `mirror_affinity` bounds the next-order selection to what the claiming worker
+        can take right now: a queued order whose repository another worker's live
+        lease holds (its node already fetched the repository's mirror) is skipped for
+        a later free one, and so is one whose (asset, repository) pair an open order
+        still gates (planned or awaiting approval: a pair at its budget gate keeps
+        its queued sibling waiting). A leased sibling is no gate — the holder's own
+        lease never blocks it. That rule is what the engine's runner once read every
+        open order to apply — the pre-walk that materialized ~10⁸ rows a day on
+        production — now answered inside the claim. A named `order_id` is claimed as
+        asked, affinity or not: the caller picked it."""
         if assets is not None and not assets:
             return None
         with self._uow as uow:
@@ -533,7 +545,12 @@ class OpsService:
             # needs no separate reaper loop for a dead runner's orders.
             expired = uow.run_orders.requeue_expired(self._clock.now())
             order = uow.run_orders.claim(
-                worker, self._clock.now(), lease_for, assets, order_id=order_id
+                worker,
+                self._clock.now(),
+                lease_for,
+                assets,
+                order_id=order_id,
+                mirror_affinity=mirror_affinity,
             )
             uow.commit()
         if expired:
@@ -666,7 +683,7 @@ class OpsService:
         return any(
             scope.principal == principal.ref
             and asset in scope.assets
-            and repository_id in scope.repository_ids
+            and (scope.all_repositories or repository_id in scope.repository_ids)
             for scope in self._recording_starts
         )
 
@@ -840,11 +857,36 @@ class OpsService:
         return {**manifest, "degraded": {**degraded, **gaps}}
 
     def approve(self, order_id: UUID, principal: Principal) -> RunOrder:
-        """Queue an order awaiting approval; only a verified person approves, never a machine."""
-        if not principal.is_verified_human():
+        """Queue an order awaiting approval. A verified person approves anything; a verified
+        ServiceAccount approves what a `recording.start` grant of its covers — the same
+        scope its recording authority names, so the service identity trusted to run an
+        asset's work on a repository may also release that asset's held order on it. The
+        approval record carries the principal's ref — a person's or the ServiceAccount's —
+        so the release is always attributable."""
+        # before the read: a caller refused here learns nothing about whether the order exists
+        if not principal.is_verified_human() and not (
+            principal.is_verified_machine()
+            and any(scope.principal == principal.ref for scope in self._recording_starts)
+        ):
             raise ForbiddenError(
-                f"order {order_id}: approval needs a verified human, not {principal.ref}"
+                f"order {order_id}: approval needs a verified person, or a ServiceAccount"
+                " granted it in recording.start"
             )
+        if principal.is_verified_machine():
+            order = self.get(order_id)
+            # a repository grant covers registered repositories only: a fleet-wide order
+            # (repository_id None) is a person's release, all_repositories or not
+            if not any(
+                scope.principal == principal.ref
+                and order.asset in scope.assets
+                and order.repository_id is not None
+                and (scope.all_repositories or order.repository_id in scope.repository_ids)
+                for scope in self._recording_starts
+            ):
+                raise ForbiddenError(
+                    f"order {order_id}: approval needs a verified person, or a ServiceAccount"
+                    f" granted {order.asset} on this repository in recording.start"
+                )
         approval = {"approver": principal.ref, "approved_at": self._clock.now().isoformat()}
         saved = self._move(
             order_id,
@@ -983,13 +1025,16 @@ class OpsService:
         repository_id: UUID | None,
         after: tuple[datetime, UUID] | None,
         limit: int,
+        repository_ids: Collection[UUID] = (),
     ) -> list[RunOrder]:
-        """One bounded batch of `asset`'s orders, optionally one repository's, oldest first after
-        a (created_at, id) position."""
+        """One bounded batch of `asset`'s orders, one repository's or several repositories'
+        (`repository_ids`, one indexed query over the set), oldest first after a
+        (created_at, id) position."""
         with self._uow as uow:
             return uow.run_orders.search(
                 asset=str(asset),
                 repository_id=repository_id,
+                repository_ids=repository_ids,
                 work_item=True,
                 limit=limit,
                 after=after,

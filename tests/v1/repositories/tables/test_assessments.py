@@ -172,6 +172,52 @@ def test_latest_per_ref_reads_past_one_batch(seed: Seed) -> None:
     assert same_rows(found, latest)
 
 
+def test_latest_per_ref_and_kind_keeps_each_kinds_newest(seed: Seed) -> None:
+    u = seed.uow
+    a, b, quiet = seed.repository_ref(), seed.repository_ref(), seed.repository_ref()
+    assert u.assessments.latest_per_ref_and_kind([]) == []
+    seed.assessment(a, occurred_at=T0)
+    newest_completed = seed.assessment(a, occurred_at=T0 + timedelta(days=2))
+    degraded = seed.assessment(a, occurred_at=T0 + timedelta(days=3), status="degraded")
+    newest_threat = seed.assessment(a, kind="threat_model", occurred_at=T0 + timedelta(days=4))
+    tied = [seed.assessment(b, occurred_at=T0) for _ in range(2)]
+    quiet_threat = seed.assessment(quiet, kind="threat_model")
+    found = u.assessments.latest_per_ref_and_kind([a.id, b.id, quiet.id, a.id, uuid4()])
+    assert same_rows(
+        found,
+        [
+            degraded,
+            newest_threat,
+            max(tied, key=lambda x: (x.created_at, x.id)),
+            quiet_threat,
+        ],
+    )
+    scoped = u.assessments.latest_per_ref_and_kind(
+        [a.id, b.id, quiet.id], ["audit"], "completed", until=T0 + timedelta(days=2)
+    )
+    assert same_rows(scoped, [newest_completed, max(tied, key=lambda x: (x.created_at, x.id))])
+
+
+def test_counts_for_refs_count_each_ref_and_kind_under_the_filters(seed: Seed) -> None:
+    u = seed.uow
+    a, b = seed.repository_ref(), seed.repository_ref()
+    assert u.assessments.counts_for_refs([]) == []
+    seed.assessment(a, occurred_at=T0)
+    seed.assessment(a, occurred_at=T0 + timedelta(days=1))
+    seed.assessment(a, kind="threat_model", occurred_at=T0 + timedelta(days=2))
+    seed.assessment(a, occurred_at=T0 + timedelta(days=3), status="degraded")
+    seed.assessment(b, occurred_at=T0 + timedelta(days=4))
+    assert sorted(u.assessments.counts_for_refs([a.id, b.id, a.id, uuid4()])) == sorted(
+        [(a.id, "audit", 3), (a.id, "threat_model", 1), (b.id, "audit", 1)]
+    )
+    assert sorted(
+        u.assessments.counts_for_refs([a.id, b.id], until=T0 + timedelta(days=2))
+    ) == sorted([(a.id, "audit", 2), (a.id, "threat_model", 1)])
+    assert sorted(u.assessments.counts_for_refs([a.id, b.id], ["audit"], "degraded")) == [
+        (a.id, "audit", 1)
+    ]
+
+
 def test_assessments_produced_by_a_run_order(seed: Seed) -> None:
     order = seed.run_order()
     produced = seed.assessment(run_order_id=order.id)
@@ -440,3 +486,57 @@ def test_assessment_lock_returns_the_exact_record_and_refuses_unknown_identity(s
     assert AssessmentLog(seed.uow).lock(assessment.id) == assessment
     with pytest.raises(NotFoundError):
         seed.uow.assessments.get_for_update(UUID(int=999))
+
+
+def test_census_by_ids_carries_the_line_columns(seed: Seed) -> None:
+    """(id, repository_ref_id, baseline_assessment_id) in bounded batches: the census
+    folds decision lines without a model per assessment."""
+    u = seed.uow
+    ref = seed.repository_ref()
+    original = seed.assessment(ref, occurred_at=T0)
+    rewritten = seed.assessment(ref, occurred_at=T0 + timedelta(days=1))
+    baseline = seed.assessment(
+        seed.repository_ref(), occurred_at=T0, baseline_assessment_id=original.id
+    )
+    found = u.assessments.census_by_ids([original.id, rewritten.id, baseline.id, original.id])
+    assert sorted(found) == sorted(
+        [
+            (original.id, ref.id, None),
+            (rewritten.id, ref.id, None),
+            (baseline.id, baseline.repository_ref_id, original.id),
+        ]
+    )
+    assert u.assessments.census_by_ids([]) == []
+
+
+def test_occurrences_carry_the_latest_report_and_the_firsts_time(seed: Seed) -> None:
+    """The census's occurrence reads: each finding's latest report's severity and CVSS in
+    the views' own report order (the assessment's time, then the occurrence's own), and
+    the first report's time the SLA clock reads — reports after `until` left out."""
+    u = seed.uow
+    repo = seed.repository()
+    finding, other = seed.finding(repo), seed.finding(repo)
+    early = seed.assessment(occurred_at=T0)
+    same_time = seed.assessment(occurred_at=T0 + timedelta(days=2))
+    seed.occurrence(finding, early, severity="medium")
+    apart()
+    seed.occurrence(finding, same_time, severity="critical", cvss_score="9.1")
+    apart()
+    # two reports at the same assessment time: the occurrence's own (created_at, id) order
+    # picks the latest, exactly as the views' stable fold does
+    also_same_time = seed.assessment(occurred_at=T0 + timedelta(days=2))
+    newest = seed.occurrence(finding, also_same_time, severity="high", cvss_score="7.5")
+    seed.occurrence(other, early, severity="low")
+    latest = {row[0]: row[1:] for row in u.census_reads.occurrences_for_repositories([repo.id])}
+    assert latest == {
+        finding.id: ("high", newest.cvss_score, T0),
+        other.id: ("low", None, T0),
+    }
+    until = {
+        row[0]: row[1:]
+        for row in u.census_reads.occurrences_for_repositories(
+            [repo.id], until=T0 + timedelta(days=1)
+        )
+    }
+    assert until == {finding.id: ("medium", None, T0), other.id: ("low", None, T0)}
+    assert u.census_reads.occurrences_for_repositories([]) == []

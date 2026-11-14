@@ -74,6 +74,11 @@ class DecisionRepository(RecordRepository[Decision], Protocol):
         ...
 
     def list_since(self, since: datetime, limit: int) -> list[Decision]: ...
+
+    def newest_person_statement(self) -> datetime | None:
+        """Latest recording time of a non-machine actor statement, including legacy spellings."""
+        ...
+
     def list_finding_ids_with_claims(self) -> list[UUID]: ...
 
     def list_finding_ids_with_validity(self, validity: Validity) -> list[UUID]:
@@ -143,8 +148,8 @@ class SqlDecisionRepository(SqlAppendOnlyRepository[Decision]):
         *,
         read_budget: RecordBudget | None = None,
     ) -> list[Decision]:
-        """Decisions on these findings, those made after `until` left out, in judgement order;
-        read in bounded batches so a whole scope's ids cannot exceed the bind limit."""
+        """Decisions on these findings, those made after `until` left out; read in bounded
+        batches so a whole scope's ids cannot exceed the bind limit."""
         c = self.table.c
         pages = (
             self._many(
@@ -167,6 +172,20 @@ class SqlDecisionRepository(SqlAppendOnlyRepository[Decision]):
             .limit(limit)
         )
         return [self._to_record(r) for r in self._execute(f"since {since}", stmt).mappings()]
+
+    def newest_person_statement(self) -> datetime | None:
+        # Keep the predicate literal so prepared statements can use the partial index.
+        c = self.table.c
+        stmt = (
+            sa.select(c.created_at)
+            .where(
+                c.actor.is_not(None),
+                sa.text("substr(actor, 1, 8) <> 'machine:'"),
+            )
+            .order_by(c.created_at.desc())
+            .limit(1)
+        )
+        return self._execute("newest person statement", stmt).scalars().first()
 
     def list_finding_ids_with_validity(self, validity: Validity) -> list[UUID]:
         c = self.table.c

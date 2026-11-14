@@ -88,6 +88,30 @@ def test_recording_start_capabilities_parse_machine_assets_and_native_repositori
     assert Config().recording.start == ()
 
 
+def test_an_estate_wide_recording_start_scope_loads_from_deployment_yaml(
+    tmp_path: Path,
+) -> None:
+    """The estate-wide flag must reach an operator's traust.yaml, not only the model: the
+    schema-checked `from_file` path (contracts#149 adds the key to the schema; core's pin
+    follows its merge)."""
+    repository_id = "271e3796-e1ac-4f25-bf81-6bac8c85e33a"
+    config = Config.from_file(
+        _write(
+            tmp_path,
+            "recording:\n"
+            "  verification: [verify]\n"
+            "  start:\n"
+            "    - principal: machine:runner\n"
+            "      assets: [verify]\n"
+            f"      repository_ids: [{repository_id}]\n"
+            "      all_repositories: true\n",
+        )
+    )
+    (scope,) = config.recording.start
+    assert scope.all_repositories is True
+    assert tuple(map(str, scope.repository_ids)) == (repository_id,)
+
+
 @pytest.mark.parametrize(
     "scope",
     [

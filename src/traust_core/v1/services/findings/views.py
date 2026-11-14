@@ -21,6 +21,7 @@ from traust_core.v1.models.findings import (
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectStore
 from traust_core.v1.services.artifact_publishing import AssessmentLog
+from traust_core.v1.services.findings.claims import claim_fold
 from traust_core.v1.services.findings.facts import FindingFacts
 from traust_core.v1.services.findings.rating import RatingPolicy
 
@@ -40,15 +41,21 @@ class FindingViewQuery:
         *,
         facts: FindingFacts | None = None,
         read_budget: RecordBudget | None = None,
+        census: bool = False,
     ) -> list[FindingView]:
         facts = (
             facts
             if facts is not None
             else FindingFacts.load(
-                uow, findings, until=as_of, read_budget=read_budget, objects=self._objects
+                uow,
+                findings,
+                until=as_of,
+                read_budget=read_budget,
+                objects=self._objects,
+                census=census,
             )
         )
-        return self._views(uow, findings, as_of, facts, read_budget=read_budget)
+        return self._views(uow, findings, as_of, facts, read_budget=read_budget, census=census)
 
     def _views(
         self,
@@ -58,19 +65,24 @@ class FindingViewQuery:
         facts: FindingFacts,
         *,
         read_budget: RecordBudget | None = None,
+        census: bool = False,
     ) -> list[FindingView]:
-        latest_ids = [
-            seen[-1].id
-            for finding in findings
-            if finding.id and (seen := facts.reported_by(finding.id, as_of)) and seen[-1].id
-        ]
-        places: defaultdict[UUID, list[Location]] = defaultdict(list)
-        for location in (
-            uow.locations.list_for_occurrences(latest_ids, read_budget=read_budget)
-            if latest_ids
-            else ()
-        ):
-            places[location.occurrence_id].append(location)
+        places: Mapping[UUID, Sequence[Location]] = {}
+        if not census:
+            # a census counts: the locations a tally never reads stay unread
+            latest_ids = [
+                seen[-1].id
+                for finding in findings
+                if finding.id and (seen := facts.reported_by(finding.id, as_of)) and seen[-1].id
+            ]
+            held: defaultdict[UUID, list[Location]] = defaultdict(list)
+            for location in (
+                uow.locations.list_for_occurrences(latest_ids, read_budget=read_budget)
+                if latest_ids
+                else ()
+            ):
+                held[location.occurrence_id].append(location)
+            places = held
         return [
             view
             for finding in findings
@@ -173,26 +185,13 @@ class FindingViewQuery:
         if as_of is not None and not reported:
             return None
         finding = normalize_finding(finding, facts.decided_by(finding.id, as_of))
-        claims = facts.claims.get(finding.id, ())
-        current = [
-            claim for claim in claims if as_of is None or claim.decision.occurred_at <= as_of
-        ]
-        claim = current[-1].claim if current else None
-        if claim is not None:
+        folded = claim_fold(facts.claims.get(finding.id, ()), as_of)
+        if folded is not None:
             finding = finding.model_copy(
                 update={
-                    "title": claim.title,
-                    "fingerprint_algo": claim.fingerprint_algo,
-                    "fingerprint": claim.fingerprint,
-                }
-            )
-        elif claims:
-            base = claims[0].base
-            finding = finding.model_copy(
-                update={
-                    "title": base.title,
-                    "fingerprint_algo": base.fingerprint_algo,
-                    "fingerprint": base.fingerprint,
+                    "title": folded.title,
+                    "fingerprint_algo": folded.fingerprint_algo,
+                    "fingerprint": folded.fingerprint,
                 }
             )
         latest = reported[-1] if reported else None
@@ -202,6 +201,7 @@ class FindingViewQuery:
         if latest is not None and (disposition is None or disposition.is_open()):
             opened = facts.at[reported[0].assessment_id]
             due = self._rating.sla_due(severity, opened, latest.cvss_score)
+        claim = folded.claim if folded is not None else None
         return FindingView(
             finding=finding,
             occurrence=latest,

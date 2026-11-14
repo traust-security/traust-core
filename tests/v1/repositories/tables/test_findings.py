@@ -345,6 +345,35 @@ def test_decisions_since_are_paged_in_time_order(seed: Seed) -> None:
     assert seed.uow.decisions.list_since(T0 + timedelta(days=3), limit=10) == []
 
 
+def test_newest_person_statement_excludes_machine_actors(seed: Seed) -> None:
+    seed.decision(occurred_at=T0, actor="machine:scanner")
+    seed.decision(occurred_at=T0 + timedelta(days=1), actor="user:analyst")
+    latest = seed.decision(occurred_at=T0 + timedelta(days=2), actor="human:countersigner")
+    assert seed.uow.decisions.newest_person_statement() == latest.created_at
+
+
+def test_newest_person_statement_is_the_recording_time_not_the_claimed_moment(seed: Seed) -> None:
+    # a backdated statement (a forge comment imported today) still flips the freshness bound
+    backdated = seed.decision(occurred_at=T0 - timedelta(days=30), actor="human:countersigner")
+    assert seed.uow.decisions.newest_person_statement() == backdated.created_at
+
+
+def test_newest_person_statement_is_none_without_a_human_judgement(seed: Seed) -> None:
+    seed.decision(occurred_at=T0, actor=None, assessment_id=seed.assessment().id)
+    seed.decision(occurred_at=T0 + timedelta(days=1), actor="machine:scanner")
+    assert seed.uow.decisions.newest_person_statement() is None
+
+
+@pytest.mark.parametrize("actor", ["user:analyst", "analyst@example.test", "Machine:legacy"])
+def test_legacy_actor_statements_advance_the_freshness_watermark(seed: Seed, actor: str) -> None:
+    seed.decision(actor="human:countersigner")
+    apart()
+    latest = seed.decision(actor=actor, occurred_at=T0 - timedelta(days=30))
+    apart()
+    seed.decision(actor="machine:scanner")
+    assert seed.uow.decisions.newest_person_statement() == latest.created_at
+
+
 def test_review_queue_holds_only_pending_items_oldest_first(seed: Seed) -> None:
     u = seed.uow
     finding = seed.finding()
@@ -556,3 +585,101 @@ def test_claim_candidate_query_is_distinct_and_requires_retained_artifact(seed: 
     seed.decision(second, reason="baseline_rewrite")
     seed.decision(second, artifact_id=artifact.id)
     assert seed.uow.decisions.list_finding_ids_with_claims() == [first.id]
+
+
+def test_external_refs_of_many_findings_read_in_bounded_batches(seed: Seed) -> None:
+    """A whole scope's finding ids in one call (the remediation index's batched walk): the
+    read stays under the bind limit and keeps its global (created_at, id) order."""
+    u = seed.uow
+    findings = [seed.finding() for _ in range(501)]
+    wanted = [
+        seed.finding_external_ref(f, system="jira", ref=f"SEC-{n}") for n, f in enumerate(findings)
+    ]
+    found = u.finding_external_refs.list_for_findings([f.id for f in findings], "jira")
+    assert same_rows(found, wanted)
+    assert found == sorted(found, key=lambda r: (r.created_at, r.id))
+    assert u.finding_external_refs.list_for_findings([uuid4()], "jira") == []
+
+
+def test_finding_census_columns_read_the_repositories_in_batches(seed: Seed) -> None:
+    """(id, repository_id, kind, title, created_at), newest first: the census counts a
+    scope's findings without a model per row, in the order the views' own fold counts."""
+    u = seed.uow
+    repo, other, out = seed.repository(), seed.repository(), seed.repository()
+    first = seed.finding(repo, kind="vulnerability", title="SQLi")
+    apart()
+    second = seed.finding(repo, title="XSS")
+    apart()
+    mine = [seed.finding(other, title="SSRF")]
+    seed.finding(out)  # a repository the batch does not name
+    found = u.findings.census_for_repositories([repo.id, other.id, repo.id])
+    assert [(row[0], row[1], row[2], row[3]) for row in found] == [
+        (mine[0].id, other.id, None, "SSRF"),
+        (second.id, repo.id, None, "XSS"),
+        (first.id, repo.id, "vulnerability", "SQLi"),
+    ]  # newest first across the batch
+    assert [row[4] for row in found] == sorted((row[4] for row in found), reverse=True)
+    assert u.findings.census_for_repositories([]) == []
+
+
+def test_decision_census_columns_carry_the_fold_in_judgement_order(seed: Seed) -> None:
+    """The columns `Disposition.fold` reads — the judgement order and `until` cut of
+    `list_for_findings`, without a decision model per row."""
+    u = seed.uow
+    repo = seed.repository()
+    finding, other = seed.finding(repo), seed.finding(repo)
+    later = seed.decision(
+        finding, occurred_at=T0 + timedelta(days=2), resolution="resolved", evidence_grade="E0"
+    )
+    first = seed.decision(finding, occurred_at=T0, validity="confirmed", actor="user:me")
+    seed.decision(other, occurred_at=T0 + timedelta(days=3), severity="high")
+    found = u.census_reads.decisions_for_repositories([repo.id])
+    assert [(row.id, row.finding_id, row.validity, row.resolution) for row in found] == [
+        (first.id, finding.id, "confirmed", None),
+        (later.id, finding.id, "true_positive", "resolved"),
+        (found[2].id, other.id, "true_positive", None),
+    ]
+    assert found[2].severity == "high" and found[2].actor == "user:analyst"
+    assert found[0].auto_accept_tier is False
+    until = u.census_reads.decisions_for_repositories([repo.id], until=T0 + timedelta(days=1))
+    assert [row.id for row in until] == [first.id]
+    assert u.census_reads.decisions_for_repositories([]) == []
+
+
+def test_label_census_columns_read_first_category_in_recorded_order(seed: Seed) -> None:
+    """(finding_id, label) of the `category` taxonomy only, (created_at, id) order: the
+    census reads the one label it counts — the first of the taxonomy, as the views' own
+    order picks it — and no other taxonomy's rows cross the wire."""
+    u = seed.uow
+    repo = seed.repository()
+    finding, other = seed.finding(repo), seed.finding(repo)
+    first = seed.finding_label(finding, taxonomy="category", label="xss")
+    apart()
+    seed.finding_label(finding, taxonomy="category", label="ssrf")
+    apart()
+    seed.finding_label(finding, taxonomy="attack", label="T1190")
+    apart()
+    seed.finding_label(other, taxonomy="category", label="authz")
+    found = u.census_reads.labels_for_repositories([repo.id])
+    assert found == [
+        (finding.id, "xss"),
+        (finding.id, "ssrf"),
+        (other.id, "authz"),
+    ]  # the attack taxonomy never crosses; recorded order kept
+    assert first.label == "xss"
+    assert u.census_reads.labels_for_repositories([]) == []
+
+
+def test_finding_census_counts_group_per_repository(seed: Seed) -> None:
+    """One narrow (repository_id, findings) row per repository: what bounds a census
+    batch by findings, never by repository count alone."""
+    u = seed.uow
+    repo, other, out = seed.repository(), seed.repository(), seed.repository()
+    seed.finding(repo)
+    seed.finding(repo)
+    seed.finding(repo)
+    seed.finding(other)
+    seed.finding(out)  # a repository the batch does not name
+    found = u.findings.census_counts_for_repositories([repo.id, other.id, repo.id])
+    assert sorted(found) == sorted([(other.id, 1), (repo.id, 3)])
+    assert u.findings.census_counts_for_repositories([]) == []
