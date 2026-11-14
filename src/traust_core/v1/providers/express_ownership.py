@@ -2835,7 +2835,14 @@ def _only_tested(src: Parsed, node: Node) -> bool:
             return _only_tested(src, p)
         return op is not None  # any other operator yields a primitive (`req.headers + ''`)
     if p.type == "template_substitution":
-        return True  # `${req.headers}` yields a string
+        # `${req.headers}` yields a string, but a tagged template (tag`${req.headers}`) hands
+        # the object itself to its tag, which may rewrite it
+        template = p.parent
+        return template is not None and (
+            template.parent is None
+            or template.parent.type != "call_expression"
+            or template.parent.child_by_field_name("arguments") != template
+        )
     if p.type == "ternary_expression":
         if p.child_by_field_name("condition") in (top, node):
             return True

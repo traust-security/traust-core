@@ -2426,3 +2426,41 @@ def test_loop_and_switch_tests_keep_the_request(tmp_path: Path, guard: str) -> N
         {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
     )
     assert _row(result, "GET", "/notes/:id")["ownership"] == "scoped"
+
+
+@pytest.mark.parametrize(
+    ("guard", "ownership"),
+    [
+        # a tagged template hands the object to its tag, which may rewrite it
+        (
+            "const tag = (s, h) => { h.authorization = req.query.token; };\n"
+            "    tag`${req.headers}`;",
+            "not scoped",
+        ),
+        # an untagged template only makes a string of it
+        ("void `${req.headers}`;", "scoped"),
+    ],
+)
+def test_a_tagged_template_hands_request_state_on(
+    tmp_path: Path, guard: str, ownership: str
+) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        'import { Post } from "./models";\n'
+        "export async function createRouter({ httpAuth }) {\n"
+        "  const router = Router();\n"
+        "  router.get('/notes/:id', async (req, res) => {\n"
+        "    const id = req.params.id;\n"
+        f"    {guard}\n"
+        f"    const owner = (await {_CREDS}).principal.userEntityRef;\n"
+        "    res.json(await Post.findOne({ _id: id, user: owner }).orFail());\n"
+        "  });\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    got = _row(result, "GET", "/notes/:id")["ownership"]
+    assert got != "scoped" if ownership == "not scoped" else got == ownership
