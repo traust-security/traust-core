@@ -2829,6 +2829,10 @@ def _only_tested(src: Parsed, node: Node) -> bool:
         return not src.text(p).startswith("delete")
     if p.type == "binary_expression":
         op = p.child_by_field_name("operator")
+        if op is not None and src.text(op) in ("&&", "||", "??"):
+            # a logical yields an operand: safe only where the whole is itself only tested
+            # (`if (req.headers && ok())`), not kept (`const h = req.headers || {}`)
+            return _only_tested(src, p)
         return op is not None and src.text(op) in _TESTS
     if p.type in ("ternary_expression", "if_statement", "while_statement", "do_statement"):
         return p.child_by_field_name("condition") in (top, node)
