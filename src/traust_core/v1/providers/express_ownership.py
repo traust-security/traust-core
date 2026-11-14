@@ -2843,6 +2843,15 @@ def _only_tested(src: Parsed, node: Node) -> bool:
         return _only_tested(src, p)
     if p.type in ("if_statement", "while_statement", "do_statement"):
         return p.child_by_field_name("condition") in (top, node)
+    if p.type == "for_statement":
+        # `for (; req.headers && ok; )`: the test between the semicolons
+        return any(
+            p.field_name_for_child(i) == "condition" and c in (top, node)
+            for i, c in enumerate(p.children)
+        )
+    if p.type in ("switch_statement", "switch_case"):
+        # `switch (req.headers)`, `case req.headers:`: compared strictly, never kept
+        return p.child_by_field_name("value") in (top, node)
     return False
 
 

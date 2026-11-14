@@ -2395,3 +2395,34 @@ def test_request_state_coerced_or_tested_keeps_it(
     )
     got = _row(result, "GET", "/notes/:id")["ownership"]
     assert got != "scoped" if ownership == "not scoped" else got == ownership
+
+
+@pytest.mark.parametrize(
+    "guard",
+    [
+        # a loop's test and a switch's value only test what they hold
+        "for (; req.headers && req.query.ok; ) { break; }",
+        "switch (req.session && req.session.user) { default: break; }",
+        "switch (req.query.mode) { case req.headers: break; default: break; }",
+    ],
+)
+def test_loop_and_switch_tests_keep_the_request(tmp_path: Path, guard: str) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        'import { Post } from "./models";\n'
+        "export async function createRouter({ httpAuth }) {\n"
+        "  const router = Router();\n"
+        "  router.get('/notes/:id', async (req, res) => {\n"
+        "    const id = req.params.id;\n"
+        f"    {guard}\n"
+        f"    const owner = (await {_CREDS}).principal.userEntityRef;\n"
+        "    res.json(await Post.findOne({ _id: id, user: owner }).orFail());\n"
+        "  });\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == "scoped"
