@@ -1286,7 +1286,7 @@ class _Walk:
             and self.src.text(a) == self.req
             and _bindings(self.src, a, self.req) == [(_Kind.PARAM, self.fn)]
         ]
-        if not mine:
+        if not mine or not _request_kept(self.src, self.fn, self.req, self.o.memo):
             return False
         declared, helper = _helper(self.src, call, self.o.memo)
         src, rel = self.src, self.rel
@@ -2791,6 +2791,8 @@ def _user_credentials(src: Parsed, call: Node, req: str, fn: Node, trust: _Trust
         return False
     if _bindings(src, unwrap(given[0]) or given[0], req) != [(_Kind.PARAM, fn)]:
         return False  # `{ const req = other; .. credentials(req, ..) }`
+    if not _request_kept(src, fn, req, trust.memo):
+        return False  # `req.headers.authorization = req.query.token`
     opts = unwrap(given[1])
     if opts is None or opts.type != "object":
         return False
@@ -2821,6 +2823,95 @@ def _user_info(src: Parsed, call: Node, trust: _Trust) -> Node | None:
     ):
         return None
     return given[0]
+
+
+# what of a request credentials are read from, as objects that can be rewritten in place
+_REQUEST_STATE = {"headers", "cookies", "signedCookies", "session", "user", "auth"}
+# request methods that only read it
+_REQUEST_READS = {"get", "header", "is", "accepts", "param"}
+# expressions that only read a value they hold
+_READING = (
+    "binary_expression",
+    "parenthesized_expression",
+    "ternary_expression",
+    "if_statement",
+    "while_statement",
+    "expression_statement",
+)
+
+
+def _request_kept(src: Parsed, fn: Node, req: str, memo: Memo, depth: int = 0) -> bool:
+    """Whether `fn` leaves its request parameter as it came in, so credentials read from it are
+    the caller's: nothing writes or deletes through it (`req.headers.authorization = ..`), no
+    writer is handed it (`Object.assign(req.headers, ..)`), and the request itself, or its
+    header, cookie or session object, goes nowhere but to a credentials call, a request read
+    (`req.get('authorization')`) or a same-file helper that keeps it in turn."""
+    key = ("kept", id(src), fn.start_byte, fn.end_byte, req)
+    if key in memo:
+        return bool(memo[key])
+    memo[key] = False  # a helper handing the request back to itself keeps nothing proven
+    ok = depth <= _MAX_DEPTH and not _written(src, fn, req)
+    body = fn.child_by_field_name("body") or fn
+    for n in walk(body) if ok else ():
+        if n.type != "identifier" or src.text(n) != req:
+            continue
+        if _bindings(src, n, req) != [(_Kind.PARAM, fn)]:
+            continue  # another binding of the name
+        top = n
+        while (
+            top.parent is not None
+            and top.parent.type in ("member_expression", "subscript_expression")
+            and top.parent.child_by_field_name("object") == top
+        ):
+            top = top.parent
+        if _assigned(src, top):
+            ok = False
+            break
+        parts = chain_text(src, top).split(".") if chain_text(src, top) else []
+        if top != n and not parts:
+            ok = False  # `req[key]` may be anything on it
+            break
+        state = top == n or (len(parts) == 2 and parts[1] in _REQUEST_STATE)
+        reading = len(parts) == 2 and parts[1] in _REQUEST_READS
+        p = top.parent
+        if p is None:
+            continue
+        if p.type == "call_expression" and unwrap(p.child_by_field_name("function")) == top:
+            if reading:
+                continue  # `req.get('authorization')`
+            ok = False
+            break
+        if not state:
+            continue  # a value read from the request (`req.params.id`, `req.headers.x`)
+        if p.type == "arguments" and p.parent is not None:
+            call = p.parent
+            callee = unwrap(call.child_by_field_name("function"))
+            if _WRITES_FIRST.match(chain_text(src, callee) or ""):
+                ok = False
+                break
+            _, method = _member(src, callee)
+            if top == n and method == _Service.HTTP_AUTH.method:
+                continue  # the credentials call itself, its shape checked where it is read
+            _, helper = _helper(src, call, memo) if top == n else (False, None)
+            if helper is not None:
+                position = [c for c in p.named_children if c.type != "comment"].index(top)
+                params = _param_names(src, helper)
+                if (
+                    position < len(params)
+                    and params[position]
+                    and _request_kept(src, helper, params[position], memo, depth + 1)
+                ):
+                    continue
+            ok = False
+            break
+        if p.type in _READING or (
+            p.type == "unary_expression" and not src.text(p).startswith("delete")
+        ):
+            continue
+        ok = False  # aliased (`const h = req.headers`), returned, or put in an object
+        break
+    memo[key] = ok
+    return ok
 
 
 def _key_node(pair: Node) -> Node:
@@ -3397,7 +3488,7 @@ def _param_names(src: Parsed, fn: Node) -> list[str]:
 def _returns_caller(src: Parsed, fn: Node, param: str, trust: _Trust, depth: int = 0) -> bool:
     """Every value a helper returns is the caller its `param` request carries, and every path
     returns one. Its locals count only as `const`s it uses nowhere but in what it returns."""
-    if _written(src, fn, param) or depth > _MAX_DEPTH:
+    if depth > _MAX_DEPTH or not _request_kept(src, fn, param, trust.memo):
         return False
     body = fn.child_by_field_name("body")
     if body is None:
@@ -3447,6 +3538,7 @@ def _returns_caller(src: Parsed, fn: Node, param: str, trust: _Trust, depth: int
                 if m.type in ("identifier", "shorthand_property_identifier")
                 and src.text(m) in names
                 and not _declaring(m)
+                and _bindings(src, m, src.text(m)) == [(_Kind.CONST, n)]
             ]
             # an unused const proves nothing: its value (`mutate(c)`) still runs unchecked
             if uses and all((m.start_byte, m.end_byte) in region for m in uses):

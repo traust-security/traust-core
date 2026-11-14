@@ -2111,3 +2111,91 @@ def test_a_block_shadowing_the_request_hands_the_helper_another(tmp_path: Path) 
         {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
     )
     assert _row(result, "GET", "/notes/:id")["ownership"] != "scoped"
+
+
+@pytest.mark.parametrize(
+    ("rewrite", "ownership"),
+    [
+        # the route's own request, rewritten before its credentials are read
+        ("req.headers.authorization = `Bearer ${req.query.token}`;", "not scoped"),
+        ("req.headers['authorization'] = req.query.token;", "not scoped"),
+        ("Object.assign(req.headers, { authorization: req.query.token });", "not scoped"),
+        ("const h = req.headers; h.authorization = req.query.token;", "not scoped"),
+        ("delete req.headers.authorization;", "not scoped"),
+        ("rewrite(req);", "not scoped"),
+        # reading the request leaves it as it came
+        ("const token = req.headers.authorization; void req.get('x-request-id');", "scoped"),
+    ],
+)
+def test_a_rewritten_request_carries_no_caller(
+    tmp_path: Path, rewrite: str, ownership: str
+) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        'import { Post } from "./models";\n'
+        "export async function createRouter({ httpAuth }) {\n"
+        "  const router = Router();\n"
+        "  router.get('/notes/:id', async (req, res) => {\n"
+        "    const id = req.params.id;\n"
+        f"    {rewrite}\n"
+        f"    const owner = (await {_CREDS}).principal.userEntityRef;\n"
+        "    res.json(await Post.findOne({ _id: id, user: owner }).orFail());\n"
+        "  });\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    got = _row(result, "GET", "/notes/:id")["ownership"]
+    assert got != "scoped" if ownership == "not scoped" else got == ownership
+
+
+@pytest.mark.parametrize(
+    ("rewrite", "ownership"),
+    [
+        # rewritten in the handler, then handed to the helper
+        ("req.headers.authorization = req.query.token;", "not scoped"),
+        ("", "scoped"),
+    ],
+)
+def test_a_helper_handed_a_rewritten_request_carries_no_caller(
+    tmp_path: Path, rewrite: str, ownership: str
+) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        'import { Post } from "./models";\n'
+        "export async function createRouter({ httpAuth }) {\n"
+        "  const router = Router();\n"
+        f"  {_HELPER}\n"
+        "  router.get('/notes/:id', async (req, res) => {\n"
+        "    const id = req.params.id;\n"
+        f"    {rewrite}\n"
+        "    const owner = await getUserEntityRef(req);\n"
+        "    res.json(await Post.findOne({ _id: id, user: owner }).orFail());\n"
+        "  });\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    got = _row(result, "GET", "/notes/:id")["ownership"]
+    assert got != "scoped" if ownership == "not scoped" else got == ownership
+
+
+def test_an_inner_block_of_the_same_name_leaves_the_const_trusted(tmp_path: Path) -> None:
+    helper = (
+        "async function getUserEntityRef(req) {\n"
+        f"    const credentials = await {_CREDS};\n"
+        "    { const credentials = 1; void credentials; }\n"
+        "    return credentials.principal.userEntityRef;\n  }"
+    )
+    router = _backstage_route("{ httpAuth }", helper, "await getUserEntityRef(req)")
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == "scoped"
