@@ -214,9 +214,23 @@ def view_schema(name: str) -> dict[str, JsonValue]:
 
 
 @cache
+def _view_registry() -> Registry:
+    """The artifact registry plus every view schema by its `$id`: a view composes others (the
+    executive summary its panels) by reference, never by copying their shapes."""
+    resources = []
+    for path in sorted((_root() / "views_schema/v1").glob("*.schema.json")):
+        resource = Resource.from_contents(json.loads(path.read_text()))
+        uri = resource.id()
+        if uri is None:
+            raise ConfigError(f"traust-contracts view schema {path.name} has no $id")
+        resources.append((uri, resource))
+    return _registry().with_resources(resources)
+
+
+@cache
 def _view_validator(name: str) -> Draft202012Validator:
     return Draft202012Validator(
-        view_schema(name), registry=_registry(), format_checker=FormatChecker()
+        view_schema(name), registry=_view_registry(), format_checker=FormatChecker()
     )
 
 

@@ -39,7 +39,13 @@ from traust_core.v1.models.findings import (
     ReviewCaseKind,
     ReviewItem,
 )
-from traust_core.v1.models.insight import QuickWin, RankedThreat, ViewFilter, ViewName
+from traust_core.v1.models.insight import (
+    LeastPrivilege,
+    QuickWin,
+    RankedThreat,
+    ViewFilter,
+    ViewName,
+)
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.vocabulary import ReviewReason, SourceType
 from traust_core.v1.providers.clock import FixedClock
@@ -727,7 +733,8 @@ class FakeExposure:
         assert group_by == ExposureDimension.ADVISORY
         return [
             ExposureRollup(key="CVE-2026-0001", commits=4, exposed=3, affected=2,
-                           by_classification={})
+                           by_classification={"affected": 2, "likely_affected": 1,
+                                              "not_imported": 1})
         ]  # fmt: skip
 
 
@@ -1079,3 +1086,19 @@ def test_a_register_outside_its_contract_is_refused_by_the_build(
     with pytest.raises(DocumentError) as error:
         register(threats).build(ViewFilter())
     assert "quick_wins/0/effort" in {issue.path for issue in error.value.issues}
+
+
+def test_a_summary_outside_its_contract_is_refused_by_the_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = insight_module.LeastPrivilege
+
+    def drifted(**fields: Any) -> LeastPrivilege:
+        return real(**{**fields, "profiles": -1})
+
+    monkeypatch.setattr(insight_module, "LeastPrivilege", drifted)
+    view, _ = executive([])
+    with pytest.raises(DocumentError) as error:
+        view.build(ViewFilter())
+    assert "privileges/profiles" in {issue.path for issue in error.value.issues}
+    assert view.compose(ViewFilter()).privileges.profiles == -1

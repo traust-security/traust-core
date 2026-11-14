@@ -24,6 +24,7 @@ from traust_core.v1.models.insight import (
     AcceptedRisk,
     DependencyReach,
     EcosystemReach,
+    LeastPrivilege,
     PackageReach,
     QuickWin,
     RankedThreat,
@@ -238,3 +239,18 @@ def test_the_scoreboard_survives_register_drift_in_fields_it_never_reads(
         context.services().insight.build(ViewName.THREAT_REGISTER, ViewFilter())
     board = context.services().insight.build(ViewName.SCOREBOARD, ViewFilter())
     assert isinstance(board, Scoreboard) and board.threat_models == 0
+
+
+def test_the_scoreboard_survives_summary_drift_in_fields_it_never_reads(
+    context: Context, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = insight_module.LeastPrivilege
+
+    def drifted(**fields: Any) -> LeastPrivilege:
+        return real(**{**fields, "profiles": -1})
+
+    monkeypatch.setattr(insight_module, "LeastPrivilege", drifted)
+    with pytest.raises(DocumentError):
+        context.services().insight.build(ViewName.EXECUTIVE_SUMMARY, ViewFilter())
+    board = context.services().insight.build(ViewName.SCOREBOARD, ViewFilter())
+    assert isinstance(board, Scoreboard)
