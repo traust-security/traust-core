@@ -2356,3 +2356,42 @@ def test_a_tested_logical_over_request_state_keeps_it(
     )
     got = _row(result, "GET", "/notes/:id")["ownership"]
     assert got != "scoped" if ownership == "not scoped" else got == ownership
+
+
+@pytest.mark.parametrize(
+    ("guard", "ownership"),
+    [
+        # an operator yielding a primitive, or a ternary that is itself only tested
+        ("if (req.headers + '') {}", "scoped"),
+        ("if (`${req.headers}`.length > 0 || req.query.ok) {}", "scoped"),
+        ("if (req.query.flag ? req.session : null) {}", "scoped"),
+        # a ternary branch kept, or nested in a kept logical, still yields the object
+        (
+            "const h = (req.query.a ? req.headers : {}) || {}; h.authorization = req.query.t;",
+            "not scoped",
+        ),
+    ],
+)
+def test_request_state_coerced_or_tested_keeps_it(
+    tmp_path: Path, guard: str, ownership: str
+) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        'import { Post } from "./models";\n'
+        "export async function createRouter({ httpAuth }) {\n"
+        "  const router = Router();\n"
+        "  router.get('/notes/:id', async (req, res) => {\n"
+        "    const id = req.params.id;\n"
+        f"    {guard}\n"
+        f"    const owner = (await {_CREDS}).principal.userEntityRef;\n"
+        "    res.json(await Post.findOne({ _id: id, user: owner }).orFail());\n"
+        "  });\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    got = _row(result, "GET", "/notes/:id")["ownership"]
+    assert got != "scoped" if ownership == "not scoped" else got == ownership

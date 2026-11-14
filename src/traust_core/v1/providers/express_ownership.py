@@ -2809,14 +2809,14 @@ def _user_info(src: Parsed, call: Node, trust: _Trust) -> Node | None:
 _REQUEST_STATE = {"headers", "cookies", "signedCookies", "session", "user", "auth"}
 # request methods that only read it
 _REQUEST_READS = {"get", "header", "is", "accepts", "param"}
-# operators that only test a value, never yield it (`||`, `&&`, `??` yield an operand)
-_TESTS = {"===", "!==", "==", "!=", "<", ">", "<=", ">=", "instanceof", "in"}
 
 
 def _only_tested(src: Parsed, node: Node) -> bool:
     """Whether a value is only tested where it is (`if (req.headers)`, `req.headers === x`,
-    `!req.headers`, `cond(req.headers) ? ..`), never passed on as the result of an expression
-    (`c ? req.headers : {}`, `req.headers || {}`) or kept."""
+    `!req.headers`, `req.headers + ''`, `cond(req.headers) ? ..`), never passed on as the
+    result of an expression that is kept (`const h = c ? req.headers : {}`, `req.headers || {}`).
+    Operators other than `&&`, `||` and `??` yield a primitive; a logical or a ternary branch
+    yields the object itself, so it is safe only where the whole is only tested."""
     top = node
     while top.parent is not None and top.parent.type == "parenthesized_expression":
         top = top.parent
@@ -2833,8 +2833,15 @@ def _only_tested(src: Parsed, node: Node) -> bool:
             # a logical yields an operand: safe only where the whole is itself only tested
             # (`if (req.headers && ok())`), not kept (`const h = req.headers || {}`)
             return _only_tested(src, p)
-        return op is not None and src.text(op) in _TESTS
-    if p.type in ("ternary_expression", "if_statement", "while_statement", "do_statement"):
+        return op is not None  # any other operator yields a primitive (`req.headers + ''`)
+    if p.type == "template_substitution":
+        return True  # `${req.headers}` yields a string
+    if p.type == "ternary_expression":
+        if p.child_by_field_name("condition") in (top, node):
+            return True
+        # a branch is the ternary's value: safe only where the whole is only tested
+        return _only_tested(src, p)
+    if p.type in ("if_statement", "while_statement", "do_statement"):
         return p.child_by_field_name("condition") in (top, node)
     return False
 
