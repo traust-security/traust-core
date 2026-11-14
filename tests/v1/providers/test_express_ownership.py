@@ -2247,3 +2247,76 @@ def test_a_credentials_stand_in_may_rewrite_the_request(
     )
     got = _row(result, "GET", "/notes/:id")["ownership"]
     assert got != "scoped" if ownership == "not scoped" else got == ownership
+
+
+@pytest.mark.parametrize(
+    "rewrite",
+    [
+        # the request's headers yielded by an expression and rewritten through an alias
+        "const h = req.query.use ? req.headers : {}; h.authorization = req.query.token;",
+        "const h = req.headers || {}; h.authorization = req.query.token;",
+        "const h = (req.headers); h.authorization = req.query.token;",
+    ],
+)
+def test_headers_yielded_by_an_expression_are_kept_too(tmp_path: Path, rewrite: str) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        'import { Post } from "./models";\n'
+        "export async function createRouter({ httpAuth }) {\n"
+        "  const router = Router();\n"
+        "  router.get('/notes/:id', async (req, res) => {\n"
+        "    const id = req.params.id;\n"
+        f"    {rewrite}\n"
+        f"    const owner = (await {_CREDS}).principal.userEntityRef;\n"
+        "    res.json(await Post.findOne({ _id: id, user: owner }).orFail());\n"
+        "  });\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] != "scoped"
+
+
+@pytest.mark.parametrize(
+    ("helper", "ownership"),
+    [
+        # an empty return in one branch is `undefined`, no caller
+        (
+            "async function getUserEntityRef(req) {\n"
+            "    if (req.query.skip) return;\n"
+            f"    return (await {_CREDS}).principal.userEntityRef;\n  }}",
+            "caller-blind",
+        ),
+        # a try and its catch both returning the caller
+        (
+            "async function getUserEntityRef(req) {\n"
+            f"    try {{ return (await {_CREDS}).principal.userEntityRef; }}\n"
+            f"    catch (e) {{ return (await {_CREDS}).principal.userEntityRef; }}\n  }}",
+            "scoped",
+        ),
+        # a catch returning something else, or a finally that may override
+        (
+            "async function getUserEntityRef(req) {\n"
+            f"    try {{ return (await {_CREDS}).principal.userEntityRef; }}\n"
+            "    catch (e) { return req.query.as; }\n  }",
+            "caller-blind",
+        ),
+        (
+            "async function getUserEntityRef(req) {\n"
+            f"    try {{ return (await {_CREDS}).principal.userEntityRef; }}\n"
+            f"    catch (e) {{ return (await {_CREDS}).principal.userEntityRef; }}\n"
+            "    finally { cleanup(); }\n  }",
+            "caller-blind",
+        ),
+    ],
+)
+def test_backstage_helper_return_paths(tmp_path: Path, helper: str, ownership: str) -> None:
+    router = _backstage_route("{ httpAuth }", helper, "await getUserEntityRef(req)")
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == ownership
