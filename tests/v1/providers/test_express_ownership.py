@@ -1043,3 +1043,1207 @@ def test_a_destructured_field_is_the_caller_only_when_its_own(
     )
     result = _tree(tmp_path, {"auth.ts": AUTH, "models.ts": MODELS, "app.ts": app})
     assert _row(result, "DELETE", "/a/:id")["ownership"] == ownership
+
+
+_BACKSTAGE_PLUGIN = """
+import { coreServices, createBackendPlugin } from '@backstage/backend-plugin-api';
+import { createRouter } from './router';
+export const notesPlugin = createBackendPlugin({
+  pluginId: 'notes',
+  register(env) {
+    env.registerInit({
+      deps: { httpRouter: coreServices.httpRouter, httpAuth: coreServices.httpAuth },
+      async init({ httpRouter, httpAuth }) {
+        httpRouter.use(await createRouter({ httpAuth }));
+      },
+    });
+  },
+});
+"""
+
+_USER_REF = (
+    "const getUserEntityRef = async (req) => "
+    "(await httpAuth.credentials(req, { allow: ['user'] })).principal.userEntityRef;"
+)
+
+
+@pytest.mark.parametrize(
+    ("helper", "owner", "ownership"),
+    [
+        # a local helper over the user's credentials is the caller
+        (_USER_REF, "await getUserEntityRef(req)", "scoped"),
+        (
+            "async function getUser(req) {\n"
+            "    const credentials = await httpAuth.credentials(req, { allow: ['user'] });\n"
+            "    return credentials.principal.userEntityRef;\n  }",
+            "await getUser(req)",
+            "scoped",
+        ),
+        (
+            "const getUser = async (req) => userInfo.getUserInfo("
+            "await httpAuth.credentials(req, { allow: ['user'] }));",
+            "(await getUser(req)).userEntityRef",
+            "scoped",
+        ),
+        # the credentials inline
+        (
+            "",
+            "(await httpAuth.credentials(req, { allow: ['user'] })).principal.userEntityRef",
+            "scoped",
+        ),
+        # a bare `credentials(req)` or a service allowed may be a service's principal
+        (
+            "const getUserEntityRef = async (req) => "
+            "(await httpAuth.credentials(req)).principal.userEntityRef;",
+            "await getUserEntityRef(req)",
+            "caller-blind",
+        ),
+        (
+            "const getUserEntityRef = async (req) => (await httpAuth.credentials(req, "
+            "{ allow: ['user', 'service'] })).principal.userEntityRef;",
+            "await getUserEntityRef(req)",
+            "caller-blind",
+        ),
+        # rebindable, or returning what the request names
+        (_USER_REF.replace("const ", "let "), "await getUserEntityRef(req)", "caller-blind"),
+        (
+            "const getUserEntityRef = async (req) => req.query.user;",
+            "await getUserEntityRef(req)",
+            "caller-blind",
+        ),
+        (
+            "async function getUser(req) {\n"
+            "    if (req.query.as) return req.query.as;\n"
+            "    return (await httpAuth.credentials(req, { allow: ['user'] })).principal"
+            ".userEntityRef;\n  }",
+            "await getUser(req)",
+            "caller-blind",
+        ),
+        # another user the principal names, or the helper handed something else
+        (
+            "const getUserEntityRef = async (req) => (await httpAuth.credentials(req, "
+            "{ allow: ['user'] })).principal.managerRef;",
+            "await getUserEntityRef(req)",
+            "caller-blind",
+        ),
+        (_USER_REF, "await getUserEntityRef(req.body)", "caller-blind"),
+    ],
+)
+def test_backstage_caller_helpers_are_the_caller(
+    tmp_path: Path, helper: str, owner: str, ownership: str
+) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        'import { Post } from "./models";\n'
+        "export async function createRouter({ httpAuth, userInfo }) {\n"
+        "  const router = Router();\n"
+        f"  {helper}\n"
+        "  router.get('/notes/:id', async (req, res) => {\n"
+        f"    const owner = {owner};\n"
+        "    res.json(await Post.findOne({ _id: req.params.id, user: owner }).orFail());\n"
+        "  });\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == ownership
+
+
+def test_a_shadowed_backstage_helper_is_not_the_caller(tmp_path: Path) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        'import { Post } from "./models";\n'
+        f"{_USER_REF.replace('httpAuth', 'auth')}\n"
+        "export async function createRouter({ httpAuth }) {\n"
+        "  const router = Router();\n"
+        "  const getUserEntityRef = async (req) => req.body.user;\n"
+        "  router.get('/notes/:id', async (req, res) => {\n"
+        "    const owner = await getUserEntityRef(req);\n"
+        "    res.json(await Post.findOne({ _id: req.params.id, user: owner }).orFail());\n"
+        "  });\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == "caller-blind"
+
+
+def test_a_module_backstage_helper_is_the_caller(tmp_path: Path) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        'import { Post } from "./models";\n'
+        "export const getUserEntityRef = async (req, httpAuth) => (await httpAuth.credentials("
+        "req, { allow: ['user'] })).principal.userEntityRef;\n"
+        "export async function createRouter({ httpAuth }) {\n"
+        "  const router = Router();\n"
+        "  router.get('/notes/:id', async (req, res) => {\n"
+        "    const owner = await getUserEntityRef(req, httpAuth);\n"
+        "    res.json(await Post.findOne({ _id: req.params.id, user: owner }).orFail());\n"
+        "  });\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == "scoped"
+
+
+@pytest.mark.parametrize(
+    ("extra", "credentials", "ownership"),
+    [
+        ("", "httpAuth.credentials(req, { allow: ['user'] })", "scoped"),
+        # a spread may replace `allow`
+        ("", "httpAuth.credentials(req, { allow: ['user'], ...opts })", "caller-blind"),
+        # the checkout's own `credentials` method is no credentials service
+        (
+            "const auth = { credentials: async (req, o) => ({ principal: "
+            "{ userEntityRef: req.query.as } }) };\n",
+            "auth.credentials(req, { allow: ['user'] })",
+            "caller-blind",
+        ),
+    ],
+)
+def test_only_backstages_user_credentials_are_the_caller(
+    tmp_path: Path, extra: str, credentials: str, ownership: str
+) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        'import { Post } from "./models";\n'
+        f"{extra}"
+        "export async function createRouter({ httpAuth, opts }) {\n"
+        "  const router = Router();\n"
+        "  router.get('/notes/:id', async (req, res) => {\n"
+        f"    const owner = (await {credentials}).principal.userEntityRef;\n"
+        "    res.json(await Post.findOne({ _id: req.params.id, user: owner }).orFail());\n"
+        "  });\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == ownership
+
+
+def _backstage_route(factory: str, before: str, owner: str, *, header: str = "") -> str:
+    return (
+        "import Router from 'express-promise-router';\n"
+        'import { Post } from "./models";\n'
+        f"{header}"
+        f"export async function createRouter({factory}) {{\n"
+        "  const router = Router();\n"
+        f"  {before}\n"
+        "  router.get('/notes/:id', async (req, res) => {\n"
+        f"    const owner = {owner};\n"
+        "    res.json(await Post.findOne({ _id: req.params.id, user: owner }).orFail());\n"
+        "  });\n"
+        "  return router;\n"
+        "}\n"
+    )
+
+
+_CREDS = "httpAuth.credentials(req, { allow: ['user'] })"
+
+
+@pytest.mark.parametrize(
+    ("router", "ownership"),
+    [
+        # the service from the factory's options, however it is reached
+        (
+            _backstage_route("options", "", f"(await options.{_CREDS}).principal.userEntityRef"),
+            "scoped",
+        ),
+        (
+            _backstage_route(
+                "options",
+                "const { httpAuth } = options;",
+                f"(await {_CREDS}).principal.userEntityRef",
+            ),
+            "scoped",
+        ),
+        # a credentials service the checkout builds or imports is no Backstage service
+        (
+            _backstage_route(
+                "{}",
+                "",
+                f"(await {_CREDS}).principal.userEntityRef",
+                header="import { httpAuth } from './fake-auth';\n",
+            ),
+            "caller-blind",
+        ),
+        (
+            _backstage_route(
+                "{}",
+                "const httpAuth = { credentials: async (req, o) => ({ principal: "
+                "{ userEntityRef: req.query.as } }) };",
+                f"(await {_CREDS}).principal.userEntityRef",
+            ),
+            "caller-blind",
+        ),
+        # the service parameter replaced, or its default standing in for it
+        (
+            _backstage_route(
+                "{ httpAuth }",
+                "httpAuth = makeFake();",
+                f"(await {_CREDS}).principal.userEntityRef",
+            ),
+            "caller-blind",
+        ),
+        (
+            _backstage_route(
+                "{ httpAuth = fake }", "", f"(await {_CREDS}).principal.userEntityRef"
+            ),
+            "caller-blind",
+        ),
+        # a later computed `allow` overrides the user-only one
+        (
+            _backstage_route(
+                "{ httpAuth }",
+                "",
+                "(await httpAuth.credentials(req, { allow: ['user'], ['allow']: ['service'] }))"
+                ".principal.userEntityRef",
+            ),
+            "caller-blind",
+        ),
+        # a `userInfo` the checkout builds returns what it likes
+        (
+            _backstage_route(
+                "{ httpAuth }",
+                "const userInfo = { getUserInfo: async () => ({ userEntityRef: req.query.as }) };",
+                f"(await userInfo.getUserInfo(await {_CREDS})).userEntityRef",
+            ),
+            "caller-blind",
+        ),
+        (
+            _backstage_route(
+                "{ httpAuth, userInfo }",
+                "",
+                f"(await userInfo.getUserInfo(await {_CREDS})).userEntityRef",
+            ),
+            "scoped",
+        ),
+    ],
+)
+def test_backstage_services_are_the_ones_handed_in(
+    tmp_path: Path, router: str, ownership: str
+) -> None:
+    result = _tree(
+        tmp_path,
+        {
+            "plugin.ts": _BACKSTAGE_PLUGIN,
+            "router.ts": router,
+            "models.ts": MODELS,
+            "fake-auth.ts": "export const httpAuth = { credentials: async (req) => "
+            "({ principal: { userEntityRef: req.query.as } }) };\n",
+        },
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == ownership
+
+
+_HELPER = f"const getUserEntityRef = async (req) => (await {_CREDS}).principal.userEntityRef;"
+
+
+@pytest.mark.parametrize(
+    ("before", "handler_local", "ownership"),
+    [
+        # an out-of-scope block declaring the same name doesn't hide the helper, but the hop
+        # into a name the file declares twice is a hand-off: unknown, never judged
+        (_HELPER + "\n  { const getUserEntityRef = () => 'x'; }", "", "unknown"),
+        # a nearer binding in the handler hides it: a declaration, a destructuring
+        (_HELPER, "const getUserEntityRef = async (req) => req.query.as;", "caller-blind"),
+        (_HELPER, "const { getUserEntityRef } = req.app.locals;", "caller-blind"),
+        (_HELPER, "var getUserEntityRef = async (req) => req.query.as;", "caller-blind"),
+        # the helper reassigned
+        (_HELPER.replace("const", "var") + "\n  getUserEntityRef = fake;", "", "caller-blind"),
+        # the helper's credentials rewritten or replaced before they are returned
+        (
+            "async function getUserEntityRef(req) {\n"
+            f"    const credentials = await {_CREDS};\n"
+            "    credentials.principal = { userEntityRef: req.query.as };\n"
+            "    return credentials.principal.userEntityRef;\n  }",
+            "",
+            "unchecked",
+        ),
+        (
+            "async function getUserEntityRef(req) {\n"
+            f"    let owner = (await {_CREDS}).principal.userEntityRef;\n"
+            "    owner = req.query.as;\n"
+            "    return owner;\n  }",
+            "",
+            "caller-blind",
+        ),
+        (
+            "async function getUserEntityRef(req) {\n"
+            f"    const credentials = await {_CREDS};\n"
+            "    Object.assign(credentials, req.body);\n"
+            "    return credentials.principal.userEntityRef;\n  }",
+            "",
+            "caller-blind",
+        ),
+        # a path falling through returns `undefined`
+        (
+            "async function getUserEntityRef(req) {\n"
+            f"    if (req.query.ok) {{ return (await {_CREDS}).principal.userEntityRef; }}\n  }}",
+            "",
+            "caller-blind",
+        ),
+        # the request rewritten inside the helper
+        (
+            "async function getUserEntityRef(req) {\n"
+            "    req = { headers: { authorization: req.query.token } };\n"
+            f"    return (await {_CREDS}).principal.userEntityRef;\n  }}",
+            "",
+            "caller-blind",
+        ),
+        # a checkout `credentials` method, through a helper
+        (
+            "const auth = { credentials: async (req, o) => ({ principal: "
+            "{ userEntityRef: req.query.as } }) };\n  "
+            "const getUserEntityRef = async (req) => "
+            "(await auth.credentials(req, { allow: ['user'] })).principal.userEntityRef;",
+            "",
+            "caller-blind",
+        ),
+    ],
+)
+def test_backstage_helpers_resolve_where_called(
+    tmp_path: Path, before: str, handler_local: str, ownership: str
+) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        'import { Post } from "./models";\n'
+        "export async function createRouter({ httpAuth }) {\n"
+        "  const router = Router();\n"
+        f"  {before}\n"
+        "  router.get('/notes/:id', async (req, res) => {\n"
+        f"    {handler_local}\n"
+        "    const owner = await getUserEntityRef(req);\n"
+        "    res.json(await Post.findOne({ _id: req.params.id, user: owner }).orFail());\n"
+        "  });\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == ownership
+
+
+def test_a_parameter_shadowing_a_backstage_helper_is_not_it(tmp_path: Path) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        'import { Post } from "./models";\n'
+        "export async function createRouter({ httpAuth }) {\n"
+        "  const router = Router();\n"
+        f"  {_HELPER}\n"
+        "  const mount = (getUserEntityRef) => {\n"
+        "    router.get('/notes/:id', async (req, res) => {\n"
+        "      const owner = await getUserEntityRef(req);\n"
+        "      res.json(await Post.findOne({ _id: req.params.id, user: owner }).orFail());\n"
+        "    });\n"
+        "  };\n"
+        "  mount(async (req) => req.query.as);\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == "caller-blind"
+
+
+@pytest.mark.parametrize(
+    ("factory", "before", "owner", "ownership"),
+    [
+        # a plain parameter's default stands in for the service
+        ("{}, httpAuth = fake", "", f"(await {_CREDS}).principal.userEntityRef", "caller-blind"),
+        # the service replaced or mutated anywhere in the file
+        (
+            "{ httpAuth }",
+            "({ httpAuth } = { httpAuth: fake });",
+            f"(await {_CREDS}).principal.userEntityRef",
+            "caller-blind",
+        ),
+        (
+            "{ httpAuth }",
+            "httpAuth.credentials = fake;",
+            f"(await {_CREDS}).principal.userEntityRef",
+            "caller-blind",
+        ),
+        (
+            "{ httpAuth }",
+            "Object.assign(httpAuth, { credentials: fake });",
+            f"(await {_CREDS}).principal.userEntityRef",
+            "caller-blind",
+        ),
+        (
+            "{ httpAuth }",
+            "const alias = httpAuth; alias.credentials = fake;",
+            f"(await {_CREDS}).principal.userEntityRef",
+            "caller-blind",
+        ),
+        (
+            "{ httpAuth }",
+            "setup({ httpAuth });",
+            f"(await {_CREDS}).principal.userEntityRef",
+            "caller-blind",
+        ),
+        # the object holding it written, or handed on whole
+        (
+            "options",
+            "const { httpAuth } = options;\n  options.httpAuth.credentials = fake;",
+            f"(await {_CREDS}).principal.userEntityRef",
+            "caller-blind",
+        ),
+        (
+            "options",
+            "Object.assign(options, { httpAuth: fake });",
+            f"(await options.{_CREDS}).principal.userEntityRef",
+            "caller-blind",
+        ),
+        # reading other options leaves the service alone
+        (
+            "options",
+            "const log = options.logger;",
+            f"(await options.{_CREDS}).principal.userEntityRef",
+            "scoped",
+        ),
+        # `getUserInfo` inline in the filter is no store read
+        (
+            "{ httpAuth, userInfo }",
+            "",
+            f"(await userInfo.getUserInfo(await {_CREDS})).userEntityRef",
+            "scoped",
+        ),
+    ],
+)
+def test_backstage_services_stay_what_they_were_handed(
+    tmp_path: Path, factory: str, before: str, owner: str, ownership: str
+) -> None:
+    router = _backstage_route(factory, before, owner)
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == ownership
+
+
+def test_inline_user_info_in_the_filter_is_the_caller(tmp_path: Path) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        'import { Post } from "./models";\n'
+        "export async function createRouter({ httpAuth, userInfo }) {\n"
+        "  const router = Router();\n"
+        "  router.get('/notes/:id', async (req, res) => {\n"
+        "    res.json(await Post.findOne({ _id: req.params.id, user: (await userInfo"
+        f".getUserInfo(await {_CREDS})).userEntityRef }}).orFail());\n"
+        "  });\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == "scoped"
+
+
+@pytest.mark.parametrize(
+    ("handed", "ownership"),
+    [
+        ("httpAuth", "scoped"),  # the service the factory is handed
+        ("fakeAuth", "caller-blind"),  # a stand-in at the call site
+        ("{ credentials: fake }", "caller-blind"),
+    ],
+)
+def test_a_helpers_service_is_what_its_call_site_hands_it(
+    tmp_path: Path, handed: str, ownership: str
+) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        'import { Post } from "./models";\n'
+        "const fakeAuth = { credentials: async (req) => ({ principal: "
+        "{ userEntityRef: req.query.as } }) };\n"
+        "const getUser = async (req, httpAuth) => "
+        f"(await {_CREDS}).principal.userEntityRef;\n"
+        "export async function createRouter({ httpAuth }) {\n"
+        "  const router = Router();\n"
+        "  router.get('/notes/:id', async (req, res) => {\n"
+        f"    const owner = await getUser(req, {handed});\n"
+        "    res.json(await Post.findOne({ _id: req.params.id, user: owner }).orFail());\n"
+        "  });\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == ownership
+
+
+@pytest.mark.parametrize(
+    ("helper", "ownership"),
+    [
+        # every branch returns the caller
+        (
+            "async function getUserEntityRef(req) {\n"
+            "    if (req.query.fresh) {\n"
+            f"      return (await {_CREDS}).principal.userEntityRef;\n"
+            "    } else {\n"
+            f"      return (await {_CREDS}).principal.userEntityRef;\n"
+            "    }\n  }",
+            "scoped",
+        ),
+        (
+            "async function getUserEntityRef(req) {\n"
+            "    if (!req.headers.authorization) throw new Error('no token');\n"
+            "    else return (await "
+            f"{_CREDS}).principal.userEntityRef;\n  }}",
+            "scoped",
+        ),
+        # an `if` without `else` may fall through
+        (
+            "async function getUserEntityRef(req) {\n"
+            "    if (req.query.fresh) {\n"
+            f"      return (await {_CREDS}).principal.userEntityRef;\n"
+            "    }\n  }",
+            "caller-blind",
+        ),
+        # a nearer `req` in the helper is another request
+        (
+            "async function getUserEntityRef(req) {\n"
+            "    {\n"
+            "      const req = { headers: { authorization: `Bearer ${req.query.token}` } };\n"
+            f"      return (await {_CREDS}).principal.userEntityRef;\n"
+            "    }\n  }",
+            "caller-blind",
+        ),
+    ],
+)
+def test_backstage_helper_paths(tmp_path: Path, helper: str, ownership: str) -> None:
+    router = _backstage_route("{ httpAuth }", helper, "await getUserEntityRef(req)")
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == ownership
+
+
+def test_a_switch_case_declaration_hides_the_helper(tmp_path: Path) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        'import { Post } from "./models";\n'
+        "export async function createRouter({ httpAuth }) {\n"
+        "  const router = Router();\n"
+        f"  {_HELPER}\n"
+        "  router.get('/notes/:id', async (req, res) => {\n"
+        "    switch (req.query.mode) {\n"
+        "      case 'as':\n"
+        "        const getUserEntityRef = async (r) => r.query.as;\n"
+        "      case 'me': {\n"
+        "        const owner = await getUserEntityRef(req);\n"
+        "        res.json(await Post.findOne({ _id: req.params.id, user: owner }).orFail());\n"
+        "      }\n"
+        "    }\n"
+        "  });\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == "caller-blind"
+
+
+def test_a_nearer_request_in_the_handler_is_not_the_caller(tmp_path: Path) -> None:
+    router = _backstage_route(
+        "{ httpAuth }",
+        "",
+        "await (async () => { const req = forged; return (await "
+        f"{_CREDS}).principal.userEntityRef; }})()",
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] != "scoped"
+
+
+def test_a_helpers_returns_resolve_to_their_own_binding(tmp_path: Path) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        'import { Post } from "./models";\n'
+        "export async function createRouter({ httpAuth }) {\n"
+        "  const router = Router();\n"
+        "  router.get('/notes/:id', async (req, res) => {\n"
+        "    const owner = req.query.as;\n"
+        "    const getUserEntityRef = async (req) => {\n"
+        "      if (req.query.me) {\n"
+        f"        const owner = (await {_CREDS}).principal.userEntityRef;\n"
+        "        return owner;\n"
+        "      }\n"
+        "      return owner;\n"
+        "    };\n"
+        "    const who = await getUserEntityRef(req);\n"
+        "    res.json(await Post.findOne({ _id: req.params.id, user: who }).orFail());\n"
+        "  });\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] != "scoped"
+
+
+@pytest.mark.parametrize(
+    ("before", "ownership"),
+    [
+        # another binding of the name, elsewhere, is not the service
+        (
+            "function other(httpAuth) { setup(httpAuth); }\n"
+            "  { const httpAuth = fake; Object.assign(httpAuth, {}); }",
+            "scoped",
+        ),
+        # a loop header that only reads the helper doesn't declare it
+        ("for (const x of [1]) { void getUserEntityRef; }", "scoped"),
+        # a helper the service is handed to must not rewrite it either
+        (
+            "const prime = (httpAuth) => { httpAuth.credentials = fake; };\n  prime(httpAuth);",
+            "caller-blind",
+        ),
+        # `for (name of ..)` without a declaration rewrites the helper
+        (
+            "for (getUserEntityRef of fakes) {}",
+            "caller-blind",
+        ),
+    ],
+)
+def test_backstage_names_resolve_to_their_binding(
+    tmp_path: Path, before: str, ownership: str
+) -> None:
+    helper = _HELPER.replace("const ", "var ") if "for (getUser" in before else _HELPER
+    router = _backstage_route(
+        "{ httpAuth }", f"{helper}\n  {before}", "await getUserEntityRef(req)"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == ownership
+
+
+def test_a_route_in_a_loop_reading_the_helper_keeps_it(tmp_path: Path) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        'import { Post } from "./models";\n'
+        "export async function createRouter({ httpAuth }) {\n"
+        "  const router = Router();\n"
+        f"  {_HELPER}\n"
+        "  for (const resolve of [getUserEntityRef]) {\n"
+        "    router.get('/notes/:id', async (req, res) => {\n"
+        "      const owner = await getUserEntityRef(req);\n"
+        "      res.json(await Post.findOne({ _id: req.params.id, user: owner }).orFail());\n"
+        "    });\n"
+        "  }\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == "scoped"
+
+
+@pytest.mark.parametrize(
+    ("helper", "ownership"),
+    [
+        # a destructured principal is the caller's
+        (
+            "async function getUserEntityRef(req) {\n"
+            f"    const {{ principal }} = await {_CREDS};\n"
+            "    return principal.userEntityRef;\n  }",
+            "scoped",
+        ),
+        (
+            "async function getUserEntityRef(req) {\n"
+            f"    const {{ principal: who }} = await {_CREDS};\n"
+            "    return who.userEntityRef;\n  }",
+            "scoped",
+        ),
+        # another field, a default or a use outside the return is not
+        (
+            "async function getUserEntityRef(req) {\n"
+            f"    const {{ token }} = await {_CREDS};\n"
+            "    return token;\n  }",
+            "caller-blind",
+        ),
+        (
+            "async function getUserEntityRef(req) {\n"
+            f"    const {{ principal = req.body }} = await {_CREDS};\n"
+            "    return principal.userEntityRef;\n  }",
+            "caller-blind",
+        ),
+        (
+            "async function getUserEntityRef(req) {\n"
+            f"    const {{ principal }} = await {_CREDS};\n"
+            "    principal.userEntityRef = req.query.as;\n"
+            "    return principal.userEntityRef;\n  }",
+            "caller-blind",
+        ),
+    ],
+)
+def test_backstage_destructured_credentials(tmp_path: Path, helper: str, ownership: str) -> None:
+    router = _backstage_route("{ httpAuth }", helper, "await getUserEntityRef(req)")
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == ownership
+
+
+@pytest.mark.parametrize(
+    ("header", "factory", "before", "owner", "ownership"),
+    [
+        # a method of the options object may replace the service
+        (
+            "",
+            "options",
+            "options.replaceHttpAuth(fake);",
+            f"(await options.{_CREDS}).principal.userEntityRef",
+            "caller-blind",
+        ),
+        # a write to another binding of the helper's name elsewhere is not a write to it; the
+        # hop into a name the file declares twice is still a hand-off: unknown, never judged
+        (
+            "",
+            "{ httpAuth }",
+            f"{_HELPER}\n  function other() {{ let getUserEntityRef; getUserEntityRef = 1; }}",
+            "await getUserEntityRef(req)",
+            "unknown",
+        ),
+        # an aliased import binds its alias, not the name it imports
+        (
+            "import { getUserEntityRef as remote } from './remote';\n",
+            "{ httpAuth }",
+            _HELPER,
+            "await getUserEntityRef(req)",
+            "scoped",
+        ),
+    ],
+)
+def test_backstage_round_five(
+    tmp_path: Path, header: str, factory: str, before: str, owner: str, ownership: str
+) -> None:
+    router = _backstage_route(factory, before, owner, header=header)
+    result = _tree(
+        tmp_path,
+        {
+            "plugin.ts": _BACKSTAGE_PLUGIN,
+            "router.ts": router,
+            "models.ts": MODELS,
+            "remote.ts": "export const getUserEntityRef = async (req) => req.query.as;\n",
+        },
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == ownership
+
+
+@pytest.mark.parametrize(
+    ("factory", "before", "owner", "ownership"),
+    [
+        # a service destructured under another name and rewritten through it
+        (
+            "options",
+            "const { httpAuth: alias } = options;\n  alias.credentials = fake;",
+            f"(await options.{_CREDS}).principal.userEntityRef",
+            "caller-blind",
+        ),
+        (
+            "options",
+            "const { ...rest } = options;\n  rest.httpAuth.credentials = fake;",
+            f"(await options.{_CREDS}).principal.userEntityRef",
+            "caller-blind",
+        ),
+        # destructured under another name, only called: the service
+        (
+            "options",
+            "const { httpAuth: alias, logger } = options;",
+            f"(await options.{_CREDS}).principal.userEntityRef",
+            "scoped",
+        ),
+        # bracket access to the service and its method
+        (
+            "{ httpAuth }",
+            "",
+            "(await httpAuth['credentials'](req, { allow: ['user'] })).principal.userEntityRef",
+            "scoped",
+        ),
+        (
+            "options",
+            "",
+            "(await options['httpAuth'].credentials(req, { allow: ['user'] }))"
+            ".principal.userEntityRef",
+            "scoped",
+        ),
+        # a computed key on the options may be the service
+        (
+            "options",
+            "options[key] = fake;",
+            f"(await options.{_CREDS}).principal.userEntityRef",
+            "caller-blind",
+        ),
+    ],
+)
+def test_backstage_round_six_services(
+    tmp_path: Path, factory: str, before: str, owner: str, ownership: str
+) -> None:
+    router = _backstage_route(factory, before, owner)
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == ownership
+
+
+@pytest.mark.parametrize(
+    ("helpers", "ownership"),
+    [
+        # a bracket chain to the caller's own fields
+        (
+            "const getUserEntityRef = async (req) => "
+            f"(await {_CREDS})['principal']['userEntityRef'];",
+            "scoped",
+        ),
+        (
+            f"const getUserEntityRef = async (req) => (await {_CREDS})['principal']['managerRef'];",
+            "caller-blind",
+        ),
+        # a helper delegating to another that returns the caller: taken for the caller, but
+        # the route's second hop with the request is a hand-off (D2): unknown, never judged
+        (
+            f"const inner = async (req) => (await {_CREDS}).principal.userEntityRef;\n"
+            "  const getUserEntityRef = async (req) => inner(req);",
+            "unknown",
+        ),
+        (
+            "const inner = async (req) => req.query.as;\n"
+            "  const getUserEntityRef = async (req) => inner(req);",
+            "caller-blind",
+        ),
+        (
+            f"const inner = async (req) => (await {_CREDS}).principal.userEntityRef;\n"
+            "  const getUserEntityRef = async (req) => inner(forged);",
+            "caller-blind",
+        ),
+    ],
+)
+def test_backstage_round_six_helpers(tmp_path: Path, helpers: str, ownership: str) -> None:
+    router = _backstage_route("{ httpAuth }", helpers, "await getUserEntityRef(req)")
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == ownership
+
+
+@pytest.mark.parametrize(
+    ("factory", "before", "owner", "ownership"),
+    [
+        # a renamed service is still the service
+        (
+            "{ httpAuth: auth }",
+            "",
+            "(await auth.credentials(req, { allow: ['user'] })).principal.userEntityRef",
+            "scoped",
+        ),
+        (
+            "options",
+            "const { httpAuth: auth } = options;",
+            "(await auth.credentials(req, { allow: ['user'] })).principal.userEntityRef",
+            "scoped",
+        ),
+        # but a plain parameter under another name is not
+        (
+            "auth",
+            "",
+            "(await auth.credentials(req, { allow: ['user'] })).principal.userEntityRef",
+            "caller-blind",
+        ),
+        (
+            "{ httpAuth: auth }",
+            "auth.credentials = fake;",
+            "(await auth.credentials(req, { allow: ['user'] })).principal.userEntityRef",
+            "caller-blind",
+        ),
+    ],
+)
+def test_backstage_renamed_services(
+    tmp_path: Path, factory: str, before: str, owner: str, ownership: str
+) -> None:
+    router = _backstage_route(factory, before, owner)
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == ownership
+
+
+@pytest.mark.parametrize(
+    ("helper", "call", "ownership"),
+    [
+        # a nearer `req` handed to the helper is another request
+        (
+            _HELPER,
+            "await (async () => { const req = forged; return getUserEntityRef(req); })()",
+            "not scoped",
+        ),
+        (
+            _HELPER,
+            "await (() => { { const req = forged; return getUserEntityRef(req); } })()",
+            "not scoped",
+        ),
+        # the request handed twice: the position the helper reads counts
+        (
+            f"const getOwner = async (other, req) => (await {_CREDS}).principal.userEntityRef;",
+            "await getOwner(req, req)",
+            "not judged",
+        ),
+        # credentials, then user info, then its field, across consts
+        (
+            "async function getUserEntityRef(req) {\n"
+            f"    const credentials = await {_CREDS};\n"
+            "    const user = await userInfo.getUserInfo(credentials);\n"
+            "    return user.userEntityRef;\n  }",
+            "await getUserEntityRef(req)",
+            "scoped",
+        ),
+        # an unused const still runs: its use of the credentials is unchecked
+        (
+            "async function getUserEntityRef(req) {\n"
+            f"    const credentials = await {_CREDS};\n"
+            "    const spoiled = mutate(credentials);\n"
+            "    return credentials.principal.userEntityRef;\n  }",
+            "await getUserEntityRef(req)",
+            "not scoped",
+        ),
+    ],
+)
+def test_backstage_round_seven_helpers(
+    tmp_path: Path, helper: str, call: str, ownership: str
+) -> None:
+    router = _backstage_route("{ httpAuth, userInfo }", helper, call)
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    got = _row(result, "GET", "/notes/:id")["ownership"]
+    if ownership == "not scoped":
+        assert got != "scoped"
+    elif ownership == "not judged":
+        assert got not in ("caller-blind", "unchecked")
+    else:
+        assert got == ownership
+
+
+@pytest.mark.parametrize(
+    ("handed", "ownership"),
+    [
+        # handed the request, it may load by `req.params`: a hand-off, never `n/a`
+        ("req", "unknown"),
+    ],
+)
+def test_user_info_handed_the_request_is_a_hand_off(
+    tmp_path: Path, handed: str, ownership: str
+) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        "export async function createRouter({ httpAuth, userInfo }) {\n"
+        "  const router = Router();\n"
+        "  router.get('/notes/:id', async (req, res) => {\n"
+        f"    await userInfo.getUserInfo({handed});\n"
+        "    res.json({ ok: true });\n"
+        "  });\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == ownership
+
+
+def test_a_block_shadowing_the_request_hands_the_helper_another(tmp_path: Path) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        'import { Post } from "./models";\n'
+        "export async function createRouter({ httpAuth }) {\n"
+        "  const router = Router();\n"
+        f"  {_HELPER}\n"
+        "  router.get('/notes/:id', async (req, res) => {\n"
+        "    const id = req.params.id;\n"
+        "    {\n"
+        "      const req = { headers: { authorization: forgedToken } };\n"
+        "      const owner = await getUserEntityRef(req);\n"
+        "      res.json(await Post.findOne({ _id: id, user: owner }).orFail());\n"
+        "    }\n"
+        "  });\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] != "scoped"
+
+
+@pytest.mark.parametrize(
+    ("rewrite", "ownership"),
+    [
+        # the route's own request, rewritten before its credentials are read
+        ("req.headers.authorization = `Bearer ${req.query.token}`;", "not scoped"),
+        ("req.headers['authorization'] = req.query.token;", "not scoped"),
+        ("Object.assign(req.headers, { authorization: req.query.token });", "not scoped"),
+        ("const h = req.headers; h.authorization = req.query.token;", "not scoped"),
+        ("delete req.headers.authorization;", "not scoped"),
+        ("rewrite(req);", "not scoped"),
+        # reading the request leaves it as it came
+        ("const token = req.headers.authorization; void req.get('x-request-id');", "scoped"),
+    ],
+)
+def test_a_rewritten_request_carries_no_caller(
+    tmp_path: Path, rewrite: str, ownership: str
+) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        'import { Post } from "./models";\n'
+        "export async function createRouter({ httpAuth }) {\n"
+        "  const router = Router();\n"
+        "  router.get('/notes/:id', async (req, res) => {\n"
+        "    const id = req.params.id;\n"
+        f"    {rewrite}\n"
+        f"    const owner = (await {_CREDS}).principal.userEntityRef;\n"
+        "    res.json(await Post.findOne({ _id: id, user: owner }).orFail());\n"
+        "  });\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    got = _row(result, "GET", "/notes/:id")["ownership"]
+    assert got != "scoped" if ownership == "not scoped" else got == ownership
+
+
+@pytest.mark.parametrize(
+    ("rewrite", "ownership"),
+    [
+        # rewritten in the handler, then handed to the helper
+        ("req.headers.authorization = req.query.token;", "not scoped"),
+        ("", "scoped"),
+    ],
+)
+def test_a_helper_handed_a_rewritten_request_carries_no_caller(
+    tmp_path: Path, rewrite: str, ownership: str
+) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        'import { Post } from "./models";\n'
+        "export async function createRouter({ httpAuth }) {\n"
+        "  const router = Router();\n"
+        f"  {_HELPER}\n"
+        "  router.get('/notes/:id', async (req, res) => {\n"
+        "    const id = req.params.id;\n"
+        f"    {rewrite}\n"
+        "    const owner = await getUserEntityRef(req);\n"
+        "    res.json(await Post.findOne({ _id: id, user: owner }).orFail());\n"
+        "  });\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    got = _row(result, "GET", "/notes/:id")["ownership"]
+    assert got != "scoped" if ownership == "not scoped" else got == ownership
+
+
+def test_an_inner_block_of_the_same_name_leaves_the_const_trusted(tmp_path: Path) -> None:
+    helper = (
+        "async function getUserEntityRef(req) {\n"
+        f"    const credentials = await {_CREDS};\n"
+        "    { const credentials = 1; void credentials; }\n"
+        "    return credentials.principal.userEntityRef;\n  }"
+    )
+    router = _backstage_route("{ httpAuth }", helper, "await getUserEntityRef(req)")
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == "scoped"
+
+
+_REWRITER = (
+    "const auth = { credentials: async (req) => { "
+    "req.headers.authorization = `Bearer ${req.query.token}`; } };"
+)
+
+
+@pytest.mark.parametrize(
+    ("before", "first", "ownership"),
+    [
+        # a checkout `credentials` method rewrites the request before the real call
+        (_REWRITER, "await auth.credentials(req);", "not scoped"),
+        # handed to a helper as its service, a stand-in may rewrite the request too
+        (
+            _REWRITER
+            + "\n  const prime = async (req, httpAuth) => { await httpAuth.credentials(req); };",
+            "await prime(req, auth);",
+            "not scoped",
+        ),
+        # the real service read first changes nothing
+        ("", f"await {_CREDS};", "scoped"),
+    ],
+)
+def test_a_credentials_stand_in_may_rewrite_the_request(
+    tmp_path: Path, before: str, first: str, ownership: str
+) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        'import { Post } from "./models";\n'
+        "export async function createRouter({ httpAuth }) {\n"
+        "  const router = Router();\n"
+        f"  {before}\n"
+        "  router.get('/notes/:id', async (req, res) => {\n"
+        "    const id = req.params.id;\n"
+        f"    {first}\n"
+        f"    const owner = (await {_CREDS}).principal.userEntityRef;\n"
+        "    res.json(await Post.findOne({ _id: id, user: owner }).orFail());\n"
+        "  });\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    got = _row(result, "GET", "/notes/:id")["ownership"]
+    assert got != "scoped" if ownership == "not scoped" else got == ownership
