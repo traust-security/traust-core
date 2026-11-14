@@ -11,10 +11,11 @@ from pathlib import Path
 from uuid import UUID
 
 import pytest
+import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
-from tests.v1.repositories.tables.conftest import T0, Seed
+from tests.v1.repositories.tables.conftest import T0, Seed, repository_for
 from traust_core.v1 import contracts
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError, DocumentError, NotFoundError
@@ -30,6 +31,7 @@ POLICY = Path(__file__).parents[2] / "fixtures" / "insight" / "sla-policy.yaml"
 DAY = timedelta(days=1)
 HUMAN = "human:analyst@example.com"
 LATER = T0 + 100 * DAY
+FILED = T0 + 38 * DAY  # before LATER - 60 days: the filed high's clock is overdue at LATER
 
 
 @pytest.fixture(params=SQL_BACKENDS)
@@ -79,8 +81,18 @@ def seed(engine: Engine) -> Fleet:
 
         crit = finding(svc, "Overdue | crit", "critical")
         filed = finding(svc, "Filed high", "high", 50)
+        # filed on a fixed day, never the wall clock: the store stamps created_at itself, and
+        # the view reads at the fixed LATER, so a wall-clock filing turned this finding's
+        # 60-day clock from overdue to in-SLA on 2026-11-14 (the filing day reached LATER - 60)
         ref = s.finding_external_ref(filed)
         s.finding_external_ref(filed, system="forge", ref="mr-1")
+        refs_table = repository_for(uow, "finding_external_ref").table
+        uow.connection.execute(
+            sa.update(refs_table)
+            .where(refs_table.c.finding_id == filed.id)
+            .values(created_at=FILED)
+        )
+        ref = uow.finding_external_refs.get(ref.id)
         finding(api, "In SLA medium", "medium", 50)
         finding(svc, "Low with cvss", "low", 0, Decimal("5.0"))
         finding(api, "Informational", "informational")
