@@ -2809,15 +2809,57 @@ def _user_info(src: Parsed, call: Node, trust: _Trust) -> Node | None:
 _REQUEST_STATE = {"headers", "cookies", "signedCookies", "session", "user", "auth"}
 # request methods that only read it
 _REQUEST_READS = {"get", "header", "is", "accepts", "param"}
-# expressions that only read a value they hold
-_READING = (
-    "binary_expression",
-    "parenthesized_expression",
-    "ternary_expression",
-    "if_statement",
-    "while_statement",
-    "expression_statement",
-)
+
+
+def _only_tested(src: Parsed, node: Node) -> bool:
+    """Whether a value is only tested where it is (`if (req.headers)`, `req.headers === x`,
+    `!req.headers`, `req.headers + ''`, `cond(req.headers) ? ..`), never passed on as the
+    result of an expression that is kept (`const h = c ? req.headers : {}`, `req.headers || {}`).
+    Operators other than `&&`, `||` and `??` yield a primitive; a logical or a ternary branch
+    yields the object itself, so it is safe only where the whole is only tested."""
+    top = node
+    while top.parent is not None and top.parent.type == "parenthesized_expression":
+        top = top.parent
+    p = top.parent
+    if p is None:
+        return False
+    if p.type == "expression_statement":
+        return True  # `req.headers;`
+    if p.type == "unary_expression":
+        return not src.text(p).startswith("delete")
+    if p.type == "binary_expression":
+        op = p.child_by_field_name("operator")
+        if op is not None and src.text(op) in ("&&", "||", "??"):
+            # a logical yields an operand: safe only where the whole is itself only tested
+            # (`if (req.headers && ok())`), not kept (`const h = req.headers || {}`)
+            return _only_tested(src, p)
+        return op is not None  # any other operator yields a primitive (`req.headers + ''`)
+    if p.type == "template_substitution":
+        # `${req.headers}` yields a string, but a tagged template (tag`${req.headers}`) hands
+        # the object itself to its tag, which may rewrite it
+        template = p.parent
+        return template is not None and (
+            template.parent is None
+            or template.parent.type != "call_expression"
+            or template.parent.child_by_field_name("arguments") != template
+        )
+    if p.type == "ternary_expression":
+        if p.child_by_field_name("condition") in (top, node):
+            return True
+        # a branch is the ternary's value: safe only where the whole is only tested
+        return _only_tested(src, p)
+    if p.type in ("if_statement", "while_statement", "do_statement"):
+        return p.child_by_field_name("condition") in (top, node)
+    if p.type == "for_statement":
+        # `for (; req.headers && ok; )`: the test between the semicolons
+        return any(
+            p.field_name_for_child(i) == "condition" and c in (top, node)
+            for i, c in enumerate(p.children)
+        )
+    if p.type in ("switch_statement", "switch_case"):
+        # `switch (req.headers)`, `case req.headers:`: compared strictly, never kept
+        return p.child_by_field_name("value") in (top, node)
+    return False
 
 
 def _request_kept(src: Parsed, fn: Node, req: str, trust: _Trust, depth: int = 0) -> bool:
@@ -2900,11 +2942,9 @@ def _request_kept(src: Parsed, fn: Node, req: str, trust: _Trust, depth: int = 0
                     continue
             ok = False
             break
-        if p.type in _READING or (
-            p.type == "unary_expression" and not src.text(p).startswith("delete")
-        ):
+        if _only_tested(src, top):
             continue
-        ok = False  # aliased (`const h = req.headers`), returned, or put in an object
+        ok = False  # aliased (`const h = c ? req.headers : {}`), returned, or put in an object
         break
     if key is not None:
         memo[key] = ok
@@ -3487,14 +3527,23 @@ def _plain_fields(src: Parsed, pattern: Node) -> dict[str, str] | None:
 
 def _always_returns(stmt: Node | None) -> bool:
     """Whether every path through a statement returns or throws: a `return`, a `throw`, a
-    block with such a statement, or an `if` whose branches all do (`try`, loops and `switch`
-    are taken to fall through)."""
+    block with such a statement, an `if` whose branches all do, or a `try` whose block and
+    `catch` both do with no `finally` (loops and `switch` are taken to fall through)."""
     if stmt is None:
         return False
     if stmt.type in ("return_statement", "throw_statement"):
         return True
     if stmt.type == "statement_block":
         return any(_always_returns(c) for c in stmt.named_children)
+    if stmt.type == "try_statement":
+        # both the block and its `catch` return; a `finally` may override either: falls through
+        handler = stmt.child_by_field_name("handler")
+        return (
+            stmt.child_by_field_name("finalizer") is None
+            and handler is not None
+            and _always_returns(stmt.child_by_field_name("body"))
+            and _always_returns(handler.child_by_field_name("body"))
+        )
     if stmt.type == "if_statement":
         alternative = stmt.child_by_field_name("alternative")
         if alternative is None:
