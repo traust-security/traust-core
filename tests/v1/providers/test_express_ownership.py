@@ -2199,3 +2199,51 @@ def test_an_inner_block_of_the_same_name_leaves_the_const_trusted(tmp_path: Path
         {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
     )
     assert _row(result, "GET", "/notes/:id")["ownership"] == "scoped"
+
+
+_REWRITER = (
+    "const auth = { credentials: async (req) => { "
+    "req.headers.authorization = `Bearer ${req.query.token}`; } };"
+)
+
+
+@pytest.mark.parametrize(
+    ("before", "first", "ownership"),
+    [
+        # a checkout `credentials` method rewrites the request before the real call
+        (_REWRITER, "await auth.credentials(req);", "not scoped"),
+        # handed to a helper as its service, a stand-in may rewrite the request too
+        (
+            _REWRITER
+            + "\n  const prime = async (req, httpAuth) => { await httpAuth.credentials(req); };",
+            "await prime(req, auth);",
+            "not scoped",
+        ),
+        # the real service read first changes nothing
+        ("", f"await {_CREDS};", "scoped"),
+    ],
+)
+def test_a_credentials_stand_in_may_rewrite_the_request(
+    tmp_path: Path, before: str, first: str, ownership: str
+) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        'import { Post } from "./models";\n'
+        "export async function createRouter({ httpAuth }) {\n"
+        "  const router = Router();\n"
+        f"  {before}\n"
+        "  router.get('/notes/:id', async (req, res) => {\n"
+        "    const id = req.params.id;\n"
+        f"    {first}\n"
+        f"    const owner = (await {_CREDS}).principal.userEntityRef;\n"
+        "    res.json(await Post.findOne({ _id: id, user: owner }).orFail());\n"
+        "  });\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    got = _row(result, "GET", "/notes/:id")["ownership"]
+    assert got != "scoped" if ownership == "not scoped" else got == ownership

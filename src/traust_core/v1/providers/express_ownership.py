@@ -1286,7 +1286,7 @@ class _Walk:
             and self.src.text(a) == self.req
             and _bindings(self.src, a, self.req) == [(_Kind.PARAM, self.fn)]
         ]
-        if not mine or not _request_kept(self.src, self.fn, self.req, self.o.memo):
+        if not mine or not _request_kept(self.src, self.fn, self.req, self.trust()):
             return False
         declared, helper = _helper(self.src, call, self.o.memo)
         src, rel = self.src, self.rel
@@ -1300,28 +1300,8 @@ class _Walk:
             src, helper = self.code.files[rel].src, found[0].fn
         params = _param_names(src, helper)
         here = self.trust()
-
-        def handed(param: str, whole: bool, service: _Service) -> bool:
-            """What this call hands the helper's `param`: the service, or the object holding it."""
-            at = params.index(param) if param in params else len(handed_args)
-            arg = handed_args[at] if at < len(handed_args) else None
-            if arg is None:
-                return False
-            if not whole:
-                return _service(self.src, arg, service, here)
-            return (
-                arg.type == "identifier"
-                and _parameter(self.src, arg, self.src.text(arg), None, service, here)
-                and _only_read(
-                    self.src,
-                    self.src.text(arg),
-                    service,
-                    _bindings(self.src, arg, self.src.text(arg))[0],
-                    here.memo,
-                )
-            )
-
-        inner = _Trust(self.trust(rel).local, helper, handed, self.o.memo)
+        inner = _call_trust(self.src, call, src, helper, here)
+        inner = _Trust(self.trust(rel).local, inner.helper, inner.handed, inner.memo)
         return any(
             i < len(params) and params[i] and _returns_caller(src, helper, params[i], inner)
             for i in mine
@@ -2791,7 +2771,7 @@ def _user_credentials(src: Parsed, call: Node, req: str, fn: Node, trust: _Trust
         return False
     if _bindings(src, unwrap(given[0]) or given[0], req) != [(_Kind.PARAM, fn)]:
         return False  # `{ const req = other; .. credentials(req, ..) }`
-    if not _request_kept(src, fn, req, trust.memo):
+    if not _request_kept(src, fn, req, trust):
         return False  # `req.headers.authorization = req.query.token`
     opts = unwrap(given[1])
     if opts is None or opts.type != "object":
@@ -2840,16 +2820,21 @@ _READING = (
 )
 
 
-def _request_kept(src: Parsed, fn: Node, req: str, memo: Memo, depth: int = 0) -> bool:
+def _request_kept(src: Parsed, fn: Node, req: str, trust: _Trust, depth: int = 0) -> bool:
     """Whether `fn` leaves its request parameter as it came in, so credentials read from it are
     the caller's: nothing writes or deletes through it (`req.headers.authorization = ..`), no
     writer is handed it (`Object.assign(req.headers, ..)`), and the request itself, or its
     header, cookie or session object, goes nowhere but to a credentials call, a request read
-    (`req.get('authorization')`) or a same-file helper that keeps it in turn."""
-    key = ("kept", id(src), fn.start_byte, fn.end_byte, req)
-    if key in memo:
+    (`req.get('authorization')`) or a same-file helper that keeps it in turn. A credentials
+    call is exempt only on the Backstage service (`_service`), never a checkout method of that
+    name that might rewrite the request first."""
+    memo = trust.memo
+    # inside a helper the answer depends on what its call site hands it: not kept per file
+    key = ("kept", id(src), fn.start_byte, fn.end_byte, req) if trust.helper is None else None
+    if key is not None and key in memo:
         return bool(memo[key])
-    memo[key] = False  # a helper handing the request back to itself keeps nothing proven
+    if key is not None:
+        memo[key] = False  # a helper handing the request back to itself keeps nothing proven
     ok = depth <= _MAX_DEPTH and not _written(src, fn, req)
     body = fn.child_by_field_name("body") or fn
     for n in walk(body) if ok else ():
@@ -2889,9 +2874,14 @@ def _request_kept(src: Parsed, fn: Node, req: str, memo: Memo, depth: int = 0) -
             if _WRITES_FIRST.match(chain_text(src, callee) or ""):
                 ok = False
                 break
-            _, method = _member(src, callee)
-            if top == n and method == _Service.HTTP_AUTH.method:
-                continue  # the credentials call itself, its shape checked where it is read
+            receiver, method = _member(src, callee)
+            if (
+                top == n
+                and method == _Service.HTTP_AUTH.method
+                and _service(src, receiver, _Service.HTTP_AUTH, trust)
+                and not trust.local(callee)
+            ):
+                continue  # Backstage's credentials service only reads the request
             _, helper = _helper(src, call, memo) if top == n else (False, None)
             if helper is not None:
                 position = [c for c in p.named_children if c.type != "comment"].index(top)
@@ -2899,7 +2889,13 @@ def _request_kept(src: Parsed, fn: Node, req: str, memo: Memo, depth: int = 0) -
                 if (
                     position < len(params)
                     and params[position]
-                    and _request_kept(src, helper, params[position], memo, depth + 1)
+                    and _request_kept(
+                        src,
+                        helper,
+                        params[position],
+                        _call_trust(src, call, src, helper, trust),
+                        depth + 1,
+                    )
                 ):
                     continue
             ok = False
@@ -2910,8 +2906,35 @@ def _request_kept(src: Parsed, fn: Node, req: str, memo: Memo, depth: int = 0) -
             continue
         ok = False  # aliased (`const h = req.headers`), returned, or put in an object
         break
-    memo[key] = ok
+    if key is not None:
+        memo[key] = ok
     return ok
+
+
+def _call_trust(
+    call_src: Parsed, call: Node, helper_src: Parsed, helper: Node, outer: _Trust
+) -> _Trust:
+    """The trust inside a helper a call hands its arguments to: a service parameter of it is
+    the service only when the call site hands it the service (or the object holding it), as
+    `outer` judges the call site."""
+    handed_args = [unwrap(a) or a for a in args(call)]
+    params = _param_names(helper_src, helper)
+
+    def handed(param: str, whole: bool, service: _Service) -> bool:
+        at = params.index(param) if param in params else len(handed_args)
+        arg = handed_args[at] if at < len(handed_args) else None
+        if arg is None:
+            return False
+        if not whole:
+            return _service(call_src, arg, service, outer)
+        held = _bindings(call_src, arg, call_src.text(arg)) if arg.type == "identifier" else []
+        return (
+            len(held) == 1
+            and _parameter(call_src, arg, call_src.text(arg), None, service, outer)
+            and _only_read(call_src, call_src.text(arg), service, held[0], outer.memo)
+        )
+
+    return _Trust(outer.local, helper, handed, outer.memo)
 
 
 def _key_node(pair: Node) -> Node:
@@ -3488,7 +3511,7 @@ def _param_names(src: Parsed, fn: Node) -> list[str]:
 def _returns_caller(src: Parsed, fn: Node, param: str, trust: _Trust, depth: int = 0) -> bool:
     """Every value a helper returns is the caller its `param` request carries, and every path
     returns one. Its locals count only as `const`s it uses nowhere but in what it returns."""
-    if depth > _MAX_DEPTH or not _request_kept(src, fn, param, trust.memo):
+    if depth > _MAX_DEPTH or not _request_kept(src, fn, param, trust):
         return False
     body = fn.child_by_field_name("body")
     if body is None:
@@ -3598,21 +3621,7 @@ def _returns_caller(src: Parsed, fn: Node, param: str, trust: _Trust, depth: int
         if len(mine) != 1 or mine[0] >= len(params) or not params[mine[0]]:
             return False
 
-        def handed(name: str, whole: bool, service: _Service) -> bool:
-            at = params.index(name) if name in params else len(handed_args)
-            arg = handed_args[at] if at < len(handed_args) else None
-            if arg is None:
-                return False
-            if not whole:
-                return _service(src, arg, service, trust)
-            held = _bindings(src, arg, src.text(arg)) if arg.type == "identifier" else []
-            return (
-                len(held) == 1
-                and _parameter(src, arg, src.text(arg), None, service, trust)
-                and _only_read(src, src.text(arg), service, held[0], trust.memo)
-            )
-
-        inner_trust = _Trust(trust.local, inner, handed, trust.memo)
+        inner_trust = _call_trust(src, call, src, inner, trust)
         return _returns_caller(src, inner, params[mine[0]], inner_trust, depth + 1)
 
     return bool(returns) and all(caller(r) for r in returns)
