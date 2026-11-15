@@ -307,6 +307,11 @@ class Probe:
     ecosystem: str | None = None
 
 
+def _origin(url: str) -> tuple[str, int]:
+    parts = urlsplit(url)
+    return (parts.hostname or "").lower(), parts.port or 443
+
+
 class FeedSource:
     """A registered source queried per identifier (NVD, Red Hat CSAF and VEX documents, OSV,
     deps.dev, Scorecard): its documents on demand, and its declared probe for liveness."""
@@ -334,6 +339,8 @@ class FeedSource:
         self._http = http
         self._probe_http = probe_http
         self._clock = clock
+        if api_key is not None and post:
+            raise ConfigError(f"{name}: an API key travels on a GET source only")
         self._api_key = api_key
 
     def _get(self, http: HttpFetcher, url: str) -> bytes:
@@ -360,10 +367,9 @@ class FeedSource:
 
     def _keyed(self, url: str) -> bool:
         """The key goes to the host its per-identifier template names, never another (a probe
-        URL on a different host goes keyless)."""
-        return self.template is not None and (
-            urlsplit(url).netloc == urlsplit(self.template).netloc
-        )
+        URL on a different host goes keyless). Hosts compare case-insensitively, with HTTPS's
+        default port."""
+        return self.template is not None and _origin(url) == _origin(self.template)
 
     def check(self) -> Readiness:
         """Send the probe: an HTTP refusal means the registry and the service disagree, an
@@ -382,10 +388,12 @@ class FeedSource:
             return Readiness(ready=False, detail=f"probe URL could not be built: {e}")
         except ServiceError as e:
             if e.status is not None and 400 <= e.status < 500 and e.status != 429:
-                if self._api_key is not None and self._keyed(self._probe_url(probe)):
+                probed = self._probe_url(probe)
+                if self._api_key is not None and self._keyed(probed):
                     return Readiness(
                         ready=False,
-                        detail=f"{host} refused the probe sent with {self.name}'s API key "
+                        detail=f"{urlsplit(probed).netloc} refused the probe sent with "
+                        f"{self.name}'s API key "
                         f"(HTTP {e.status}): check the key (feeds.api_keys.{self.name}) first, "
                         "then the source's URL in the feeds registry",
                     )

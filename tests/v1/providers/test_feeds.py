@@ -421,3 +421,22 @@ def test_a_refused_keyed_request_names_the_key() -> None:
     assert raised.value.status == 404 and SECRET not in str(raised.value)
     # keyless, a refusal still reads as the registry and the service disagreeing
     assert "correct its URL" in source(http=http).check().detail
+
+
+def test_a_post_source_cannot_hold_a_key() -> None:
+    with pytest.raises(ConfigError, match="GET source only"):
+        source(post=True, api_key=NVD_KEY)
+
+
+@pytest.mark.parametrize("url", ["https://NVD.test/", "https://nvd.test:443/"])
+def test_the_same_host_written_differently_still_gets_the_key(url: str) -> None:
+    http = _Http()
+    assert source(url=url, probe=Probe(None), http=http, api_key=NVD_KEY).check().ready
+    assert http.headers == [{"apiKey": SECRET}]
+
+
+def test_a_keyed_refusal_names_the_host_that_was_probed() -> None:
+    refused = ServiceError("HTTP 403", status=403)
+    http = _Http({"https://nvd.test/cves?cveId=CVE-2021-44228": refused})
+    readiness = source(url="https://status.other.test/", http=http, api_key=NVD_KEY).check()
+    assert readiness.detail.startswith("nvd.test refused the probe sent with nvd's API key")

@@ -371,3 +371,18 @@ def test_a_retry_after_setting_the_key_registers_cleanly(
     monkeypatch.setenv("TEST_NVD_KEY", "k-1")
     ctx.register_feeds(registry)
     assert ctx.feed_sources.get("nvd")._api_key is not None
+
+
+def test_a_malformed_key_fails_before_anything_registers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TEST_NVD_KEY", "bad key")  # a space can't travel in a header
+    registry = tmp_path / "feeds.yaml"
+    registry.write_text(NVD_REGISTRY)
+    ctx = Context(Config.from_home(_home(tmp_path, "feeds: {api_keys: {nvd: TEST_NVD_KEY}}\n")))
+    with pytest.raises(ConfigError, match="no usable header value"):
+        ctx.register_feeds(registry)
+    assert ctx.feed_sources.names() == []
+    monkeypatch.setenv("TEST_NVD_KEY", "good-key")
+    ctx.register_feeds(registry)
+    assert ctx.feed_sources.get("nvd")._api_key is not None

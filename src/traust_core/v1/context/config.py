@@ -262,12 +262,18 @@ class FeedsConfig(_Model):
     ] = pydantic.Field(default_factory=dict)
 
     def api_key_values(self) -> dict[str, str]:
-        """Each named source's API key, read from its variable."""
-        return {
-            source: value
-            for source, name in self.api_keys.items()
-            if (value := _read_env(name, f"feeds.api_keys.{source}"))
-        }
+        """Each named source's API key, read from its variable: set, non-empty and visible ASCII
+        (anything else can't travel in a header), checked before any feed registers."""
+        keys = {}
+        for source, name in self.api_keys.items():
+            value = _read_env(name, f"feeds.api_keys.{source}")
+            if value is None or any(not 0x21 <= ord(c) <= 0x7E for c in value):
+                raise ConfigError(
+                    f"feeds.api_keys.{source}: ${name} holds no usable header value "
+                    "(visible ASCII only)"
+                )
+            keys[source] = value
+        return keys
 
 
 class ComplianceConfig(_Model):
