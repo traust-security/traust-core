@@ -440,3 +440,31 @@ def test_a_keyed_refusal_names_the_host_that_was_probed() -> None:
     http = _Http({"https://nvd.test/cves?cveId=CVE-2021-44228": refused})
     readiness = source(url="https://status.other.test/", http=http, api_key=NVD_KEY).check()
     assert readiness.detail.startswith("nvd.test refused the probe sent with nvd's API key")
+
+
+def test_a_refused_post_probe_reports_not_ready_without_raising() -> None:
+    refused = ServiceError("HTTP 400", status=400)
+    http = _Http({"https://osv.test/v1/query": refused})
+    osv = source(
+        None,
+        url="https://osv.test/v1/query",
+        ident="package",
+        post=True,
+        probe=Probe("lodash", "npm"),
+        http=http,
+    )
+    readiness = osv.check()
+    assert not readiness.ready and "answered HTTP 400" in readiness.detail
+
+
+def test_readiness_never_shows_url_userinfo() -> None:
+    refused = ServiceError("HTTP 403", status=403)
+    template = "https://user:hunter2@nvd.test/cves?cveId={ident_upper}"
+    http = _Http({"https://user:hunter2@nvd.test/cves?cveId=CVE-2021-44228": refused})
+    readiness = source(
+        template, url="https://status.other.test/", http=http, api_key=NVD_KEY
+    ).check()
+    assert (
+        not readiness.ready and "hunter2" not in readiness.detail and "user" not in readiness.detail
+    )
+    assert readiness.detail.startswith("nvd.test refused")

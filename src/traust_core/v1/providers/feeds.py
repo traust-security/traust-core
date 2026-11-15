@@ -307,6 +307,13 @@ class Probe:
     ecosystem: str | None = None
 
 
+def _host(url: str) -> str:
+    """A URL's host (and a non-default port) for a message: never its userinfo."""
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    return f"{host}:{parts.port}" if parts.port and parts.port != 443 else host
+
+
 def _origin(url: str) -> tuple[str, int]:
     parts = urlsplit(url)
     return (parts.hostname or "").lower(), parts.port or 443
@@ -377,22 +384,23 @@ class FeedSource:
         probe = self._probe
         if probe is None:
             return Readiness(ready=True, detail="no probe declared; liveness unchecked")
-        host = urlsplit(self.url).netloc
+        host = _host(self.url)
+        probed: str | None = None  # the GET's URL; a POST probe goes to the source's URL
         try:
             if self._post:
                 body = {"package": {"name": probe.identifier, "ecosystem": probe.ecosystem}}
                 self._probe_http.post_json(self.url, body)
             else:
-                self._get(self._probe_http, self._probe_url(probe))
+                probed = self._probe_url(probe)
+                self._get(self._probe_http, probed)
         except (ConfigError, ValidationError) as e:
             return Readiness(ready=False, detail=f"probe URL could not be built: {e}")
         except ServiceError as e:
             if e.status is not None and 400 <= e.status < 500 and e.status != 429:
-                probed = self._probe_url(probe)
-                if self._api_key is not None and self._keyed(probed):
+                if probed is not None and self._api_key is not None and self._keyed(probed):
                     return Readiness(
                         ready=False,
-                        detail=f"{urlsplit(probed).netloc} refused the probe sent with "
+                        detail=f"{_host(probed)} refused the probe sent with "
                         f"{self.name}'s API key "
                         f"(HTTP {e.status}): check the key (feeds.api_keys.{self.name}) first, "
                         "then the source's URL in the feeds registry",
