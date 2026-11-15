@@ -15,6 +15,8 @@ from traust_core.v1.models.operations import (
     JobResult,
     OrderFilter,
     OrderManifest,
+    OrderQueryPage,
+    OrderQueryRequest,
     OrderRequest,
     OrderState,
     RunOrder,
@@ -116,6 +118,12 @@ def list_orders(
         run_batch_id=run_batch_id,
     )
     return ops.list(filter, PageRequest(limit=limit, cursor=cursor))
+
+
+@router.post("/v1/orders/query", responses=PROBLEMS(401, 422))
+def query_orders(body: OrderQueryRequest, ops: Ops, _: Caller) -> OrderQueryPage:
+    """Search and order all matching orders, with a resumable cursor on every item."""
+    return ops.query(body)
 
 
 @router.get("/v1/orders/{order_id}", responses=PROBLEMS(401, 404))
