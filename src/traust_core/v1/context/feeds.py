@@ -236,7 +236,8 @@ def load_feed_sources(
             raise ConfigError(f"feeds registry {path}: {name} must be reached over https")
         for u in (url, template):
             if u and not _valid_port(u):
-                raise ConfigError(f"feeds registry {path}: {name} has a malformed URL port ({u})")
+                # the source's name only: a URL can carry credentials
+                raise ConfigError(f"feeds registry {path}: {name} has a malformed URL port")
         declared = source.probe
         probe = (
             None

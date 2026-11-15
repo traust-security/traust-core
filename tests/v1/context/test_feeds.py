@@ -495,3 +495,13 @@ def test_a_source_url_with_a_malformed_port_is_a_config_error(tmp_path: Path) ->
     assert text != SOURCES
     with pytest.raises(ConfigError, match="nvd has a malformed URL port"):
         Context(Config()).register_feeds(_registry(tmp_path, text))
+
+
+def test_a_malformed_port_error_never_shows_the_url(tmp_path: Path) -> None:
+    text = SOURCES.replace(
+        "https://nvd.test/cves?cveId={ident_upper}",
+        "https://user:hunter2@nvd.test:abc/cves?cveId={ident_upper}",
+    )
+    with pytest.raises(ConfigError) as raised:
+        Context(Config()).register_feeds(_registry(tmp_path, text))
+    assert "malformed URL port" in str(raised.value) and "hunter2" not in str(raised.value)
