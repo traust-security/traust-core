@@ -469,14 +469,31 @@ def test_availability_comes_from_explicit_metadata_not_missing_flags(
     assert result.acquisition.acquired_at == NOW
 
 
-@pytest.mark.parametrize("http_status", [404, 403, 500, None])
+@pytest.mark.parametrize("http_status", [403, 500, None])
 def test_an_ambiguous_forge_failure_never_proves_a_repository_is_missing(http_status):
+    """The statuses that could mean anything (forbidden, sick, unreachable) never assert
+    liveness: a repository's word about itself must be positive evidence, never an
+    inference from a refusal the repository did not make."""
     provider, _ = source("not found", status=http_status)
 
     with pytest.raises(SourceError) as error:
         provider.info(HttpsRepoUrl("github.com", "o/r"))
 
     assert error.value.liveness_status == LivenessStatus.UNKNOWN
+
+
+def test_a_repository_reads_404_is_the_forge_reports_missing():
+    """The repository read itself answering 404 is the forge's positive word the
+    repository is gone (foundry plan repo-unreachable's gone-class): it counts toward
+    the unreachable disposition, with the two-consecutive guard, the success reset and
+    the person's verify as the ambiguity net - a private repository the token cannot
+    see answers the same way, and the disposition's evidence names the forge's word."""
+    provider, _ = source("not found", status=404)
+
+    with pytest.raises(SourceError) as error:
+        provider.info(HttpsRepoUrl("github.com", "o/r"))
+
+    assert error.value.liveness_status == LivenessStatus.MISSING
 
 
 @pytest.mark.parametrize(

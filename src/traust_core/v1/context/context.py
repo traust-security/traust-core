@@ -758,6 +758,7 @@ class Context:
             _artifact_run_order(engine, upgrade=local)
             _run_order_fork_scheduled(engine, upgrade=local)
             _finding_external_ref_scope(engine)
+            _repository_disposition(engine, upgrade=local)
         return engine
 
     @cached_property
@@ -1309,6 +1310,17 @@ def _run_order_fork_scheduled(engine: Engine, *, upgrade: bool) -> None:
         engine,
         ("traust_ops", "run_order", "fork_scheduled_at"),
         "run_order_fork_scheduled_upgrade",
+        upgrade=upgrade,
+    )
+
+
+def _repository_disposition(engine: Engine, *, upgrade: bool) -> None:
+    """contracts added `repository.disposition` and its evidence columns (foundry plan
+    repo-unreachable)."""
+    _additive_column(
+        engine,
+        ("traust", "repository", "disposition"),
+        "repository_disposition_upgrade",
         upgrade=upgrade,
     )
 

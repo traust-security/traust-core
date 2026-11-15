@@ -57,6 +57,7 @@ from traust_core.v1.models.inventory import (
     ReleaseCommit,
     RepoLiveness,
     Repository,
+    RepositoryDisposition,
     RepositoryFilter,
     RepositoryRef,
     RepoState,
@@ -123,6 +124,11 @@ DORMANT_DAYS = 365
 _RELEASE_VERSION = re.compile(r"v?(\d+)\.(\d+)(?:\.(\d+))?")
 
 P0_MIN_LIVE = 5
+
+#: Two consecutive gone-class observation failures flip the unreachable disposition
+#: (foundry plan repo-unreachable). One is a blip; the count resets on any success, and
+#: the transient classes (timeouts, 5xx, rate limits) never count at all.
+GONE_STREAK_THRESHOLD = 2
 
 
 class PortfolioPolicy:
@@ -379,6 +385,7 @@ class PortfolioService:
             seen=self._seen_head(target.repository_id),
             tools=self._tools,
         )
+        self._count_toward_disposition(target.repository_id, facts)
         if facts.availability_queried:
             unknown = facts.liveness_status == LivenessStatus.UNKNOWN
             self.record_liveness(
@@ -500,6 +507,123 @@ class PortfolioService:
                 *committed,
             )
         )
+
+    def _count_toward_disposition(self, repository_id: UUID, facts: ForgeFacts) -> None:
+        """The gone-class failure counting (foundry plan repo-unreachable), in the
+        observation's result processing — every path that lands an observation counts
+        the same way: the engine's cadence, the operator's record, the verify door.
+
+        Two consecutive gone-class failures flip the repository's disposition to
+        repo_unreachable: it leaves the planner's universe (the subject gate refuses
+        every order for it) until a person's verify succeeds. A successful observation
+        resets the streak and clears the disposition — the only way it clears, because
+        a dispositioned repository is planned nothing and the only observations that
+        can arrive are deliberate acts. The transient classes (timeouts, 5xx, rate
+        limits) never count and never reset: they say nothing about the repository."""
+        with self._uow.write() as uow:
+            repository = uow.repositories.get_for_update(repository_id)
+            update: dict[str, object] = {}
+            if facts.gone_reason is not None:
+                streak = repository.gone_streak + 1
+                update["gone_streak"] = streak
+                if streak >= GONE_STREAK_THRESHOLD or repository.disposition is not None:
+                    # the flip at two consecutive; an already-dispositioned repository
+                    # holds, its evidence refreshed by what this observation saw
+                    update.update(
+                        disposition=RepositoryDisposition.REPO_UNREACHABLE,
+                        disposition_reason=facts.gone_reason,
+                        disposition_evidence=facts.error
+                        or f"forge reports repository {facts.liveness_status.value}",
+                        disposition_at=self._clock.now(),
+                    )
+            elif facts.availability_queried and facts.liveness_status in (
+                LivenessStatus.ACTIVE,
+                LivenessStatus.ARCHIVED,
+            ):
+                update["gone_streak"] = 0
+                if repository.disposition is not None:
+                    update.update(
+                        disposition=None,
+                        disposition_reason=None,
+                        disposition_evidence=None,
+                        disposition_at=None,
+                    )
+            else:
+                return  # a transient or skipped outcome: neutral, the streak stands
+            if any(getattr(repository, field) != value for field, value in update.items()):
+                repository = uow.repositories.update(repository.model_copy(update=update))
+                uow.commit()
+                self._uow.after_commit(
+                    lambda: log.info(
+                        "portfolio repository %s disposition=%s reason=%s gone_streak=%s",
+                        repository_id,
+                        repository.disposition,
+                        repository.disposition_reason,
+                        repository.gone_streak,
+                    )
+                )
+
+    def correct_repository_url(self, repository_id: UUID, url: HttpsRepoUrl) -> Repository:
+        """The URL correction (foundry plan repo-unreachable): the repository moved, and a
+        person names where it went. The row keeps its identity — every finding, occurrence
+        and decision stays attached, so the finding fingerprints survive the move — and the
+        change is recorded as the upstream link the fork resolution reads
+        (`repository.upstream_id`): the vacated URL's row (the one registered there, else a
+        new one) carries upstream_id = this repository, so anything still holding the old
+        URL follows the edge to the repository. The disposition, if any, holds: the verify
+        is the deliberate act that clears it; the streak restarts, because the failures
+        counted against the old URL say nothing about the new one."""
+        require_uuid(repository_id, "repository.id")
+        if not isinstance(url, HttpsRepoUrl):
+            raise ValidationError("repository.url must be an HttpsRepoUrl")
+        new = str(url)
+        with self._uow.write() as uow:
+            repository = uow.repositories.get_for_update(repository_id)
+            if repository.url == new:
+                return repository
+            uow.repositories.lock_url(new)
+            existing = _registered_repository(uow, new, self._hosts)
+            if existing is not None and existing.id != repository.id:
+                raise ConflictError(
+                    f"{new} is already {existing.id}'s URL; correct that registration instead"
+                )
+            case_only = existing is not None  # this repository, spelled differently
+            old = repository.url
+            repository = uow.repositories.update(
+                repository.model_copy(update={"url": new, "gone_streak": 0})
+            )
+            if not case_only:
+                # the vacated URL's row: the move's record, the same edge the fork
+                # resolution reads. Public, so the private-mirror resolution never
+                # mistakes the vacated self for a push target.
+                uow.repositories.lock_url(old)
+                tombstone = uow.repositories.find_by_url(old) or uow.repositories.get_or_add(
+                    Repository(url=old, public=True)
+                )
+                if tombstone.id != repository.id and tombstone.upstream_id != repository.id:
+                    uow.repositories.update(
+                        tombstone.model_copy(update={"upstream_id": repository.id})
+                    )
+            uow.commit()
+        self._uow.after_commit(
+            lambda: log.info(
+                "portfolio repository %s url corrected: %s -> %s", repository_id, old, new
+            )
+        )
+        return repository
+
+    def verify_repository(self, repository_id: UUID) -> ForgeFacts:
+        """The on-demand observation (foundry plan repo-unreachable): the same observation
+        path the repo_state asset runs — the operator's `traust-engine record repo_state
+        --repo ...` and the engine's cadence land in `record_forge_facts` too — exposed as
+        the door the SCI API calls for the console's verify button. On success the
+        disposition clears and the repository re-enters the planner's universe; on a
+        gone-class failure it holds with the new evidence; on a transient failure it holds
+        untouched (the transient classes never count)."""
+        require_uuid(repository_id, "repository.id")
+        with self._uow as uow:
+            uow.repositories.get(repository_id)  # NotFoundError for an unknown id
+        return self.record_forge_facts(repository_id=repository_id)
 
     def forge_facts(self, repository_id: UUID) -> ForgeFacts | None:
         """The latest observation of the default-branch head; NotFoundError when it was measured
@@ -1438,7 +1562,11 @@ class PortfolioService:
             return Page(items=(found,) if found else ())
         after = page.position()
         with self._uow as uow:
-            rows = uow.repositories.search(limit=page.limit + 1, after=after)
+            rows = uow.repositories.search(
+                limit=page.limit + 1,
+                after=after,
+                dispositioned=filter.dispositioned,
+            )
         return Page.of(rows, page.limit, lambda r: (r.created_at, r.id))
 
     def list_owned_repositories(self, team_id: UUID, as_of: datetime | None = None) -> list[UUID]:

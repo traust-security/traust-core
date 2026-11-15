@@ -348,14 +348,27 @@ class OpsService:
     def _subject_issues(self, repository_id: UUID) -> tuple[DenyIssue, ...]:
         """The subject gate, shared by every door that starts a run: the repository must be
         registered and onboarded (an imported default line — registered alone is not a
-        subject, for preflight, submit and recording start alike)."""
+        subject, for preflight, submit and recording start alike), and it must be in the
+        planner's universe — a repository carrying the unreachable disposition (foundry
+        plan repo-unreachable) is planned nothing until a person's verify clears it."""
         if self._inventory is None:
             raise ConfigError("subject checks need the inventory door")
         try:
-            self._inventory.get_repository(repository_id)
+            repository = self._inventory.get_repository(repository_id)
         except NotFoundError:
             return (
                 DenyIssue(code=DenyCode.SUBJECT_UNKNOWN, detail=f"no repository {repository_id}"),
+            )
+        if repository.disposition is not None:
+            return (
+                DenyIssue(
+                    code=DenyCode.SUBJECT_UNREACHABLE,
+                    detail=(
+                        f"repository {repository_id} is {repository.disposition.value}"
+                        f" ({repository.disposition_reason or 'unknown reason'}):"
+                        " verify it to return it to the planner's universe"
+                    ),
+                ),
             )
         if self._inventory.default_line(repository_id) is None:
             return (

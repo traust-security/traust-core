@@ -7,8 +7,9 @@ import pytest
 import sqlalchemy as sa
 
 from perf.harness import Profile
+from perf.seed import REPOSITORIES
 from traust_core.v1.models.common import PageRequest, encode_cursor
-from traust_core.v1.models.inventory import ComponentFilter, ProductSlug
+from traust_core.v1.models.inventory import ComponentFilter, ProductSlug, RepositoryFilter
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService
 
@@ -171,3 +172,37 @@ def test_a_recorded_release_is_indexed_reads(engine: sa.Engine, explained: Profi
     statements = explained(read)
     assert statements and all(not s.seq_scans() for s in statements), [s.plan for s in statements]
     assert all(s.execution_ms < 10 for s in statements), [s.plan for s in statements]
+
+
+def test_the_planners_universe_page_reads_the_disposition_filter_in_budget(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    """The planner's universe (foundry plan repo-unreachable): the engine's tick pages the
+    active repositories every pass, so the disposition filter must stay a bounded read at
+    the estate's volume — one statement, no scan past the budget."""
+    with SqlTraustUnitOfWork(engine) as uow:
+        gone = (
+            uow.connection.execute(
+                sa.select(uow.repositories.table.c.id).order_by(uow.repositories.table.c.created_at)
+            )
+            .mappings()
+            .all()
+        )
+        ids = [row["id"] for row in gone[: REPOSITORIES // 10]]
+        if ids:
+            uow.connection.execute(
+                sa.update(uow.repositories.table)
+                .where(uow.repositories.table.c.id.in_(ids))
+                .values(disposition="repo_unreachable", disposition_reason="gone")
+            )
+
+    def read(uow: SqlTraustUnitOfWork) -> object:
+        page = PortfolioService(uow, PortfolioPolicy()).list_repositories(
+            RepositoryFilter(dispositioned=False), PageRequest(limit=100)
+        )
+        assert len(page.items) == 100 and page.next is not None
+        return page
+
+    (statement,) = explained(read)
+    assert not statement.seq_scans() or statement.execution_ms < 10, statement.plan
+    assert statement.execution_ms < 10, statement.plan

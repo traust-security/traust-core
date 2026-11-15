@@ -15,6 +15,7 @@ from pydantic import AwareDatetime, field_serializer
 
 from traust_core.v1.models.artifacts import RepoStateArtifact
 from traust_core.v1.models.base import Model
+from traust_core.v1.models.inventory import GoneReason
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.models.vocabulary import ComparisonStatus, LivenessStatus
 
@@ -105,6 +106,13 @@ class ForgeFacts(Model):
     availability_queried: bool = False
     liveness_status: LivenessStatus = LivenessStatus.UNKNOWN
     canonical_url: str | None = None
+    # The gone-class signal (foundry plan repo-unreachable): the observation positively
+    # established the repository left — `gone` (the forge's 404/410 word: missing, moved,
+    # disabled), `empty` (the forge answered but the repository has no commits — no default
+    # branch), or `unreachable` (the transport's positive word the endpoint is not there:
+    # NXDOMAIN, refused, TLS). None on every other outcome: the transient classes
+    # (timeouts, 5xx, rate limits) never count toward the disposition.
+    gone_reason: GoneReason | None = None
     pushed_at: str | None = None
     archived: bool | None = None
     default_branch: str | None = None

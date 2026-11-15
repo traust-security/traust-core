@@ -15,6 +15,7 @@ from typing import Any, TypeVar
 from traust_core.v1.errors import ConfigError, IntegrityError, ValidationError
 from traust_core.v1.models.artifacts import AdapterResultArtifact
 from traust_core.v1.models.assessment import ToolName
+from traust_core.v1.models.inventory import GoneReason
 from traust_core.v1.models.observation import (
     SENSITIVE_RX,
     ChangeMetrics,
@@ -229,6 +230,7 @@ def observe_forge_facts(
                 update={
                     "status": ComparisonStatus.ERROR,
                     "error": f"forge reports repository {availability.value}",
+                    "gone_reason": GoneReason.GONE,
                 }
             )
         branch = info.default_branch
@@ -237,9 +239,23 @@ def observe_forge_facts(
             head = seen.head
         elif branch:
             head = str(_fetch(lambda: sources.head(repo, branch), GitSha))
+        if branch is None and availability in (LivenessStatus.ACTIVE, LivenessStatus.ARCHIVED):
+            # The forge answered and the repository is there, but it names no default
+            # branch: a repository with no commits (200, empty). Gone-class with its own
+            # reason — the remediation waits for a push, not a URL correction.
+            facts = facts.model_copy(update={"gone_reason": GoneReason.EMPTY})
     except SourceError as exc:
         if github:
             breaker.record(False)
+        gone: GoneReason | None = None
+        if exc.liveness_status in (
+            LivenessStatus.MOVED,
+            LivenessStatus.MISSING,
+            LivenessStatus.DISABLED,
+        ):
+            gone = GoneReason.GONE
+        elif exc.endpoint_unreachable:
+            gone = GoneReason.UNREACHABLE
         return facts.model_copy(
             update={
                 "status": exc.observation_status,
@@ -248,6 +264,7 @@ def observe_forge_facts(
                 if facts.liveness_status == LivenessStatus.UNKNOWN
                 else facts.liveness_status,
                 "canonical_url": exc.canonical_url or facts.canonical_url,
+                "gone_reason": gone,
             }
         )
     if github:

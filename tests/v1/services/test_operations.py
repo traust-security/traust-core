@@ -29,6 +29,7 @@ from traust_core.v1.errors import (
 from traust_core.v1.models.artifacts import RunManifestArtifact
 from traust_core.v1.models.common import Cursor, PageRequest, TimeWindow
 from traust_core.v1.models.identity import IdentitySource, Principal
+from traust_core.v1.models.inventory import GoneReason, RepositoryDisposition
 from traust_core.v1.models.operations import (
     OPEN_ORDER_STATES,
     AssetName,
@@ -1435,6 +1436,29 @@ def test_an_asset_bound_to_two_kinds_outside_the_config_is_a_config_error(engine
     repo = subject(engine)
     with pytest.raises(ConfigError, match="several record kinds"):
         ambiguous.submit(OrderRequest(asset="audit", priority=1, repository_id=repo), OPERATOR)
+
+
+def test_a_dispositioned_repository_is_not_a_subject(engine: Engine) -> None:
+    """The planner's universe (foundry plan repo-unreachable): a repository carrying the
+    unreachable disposition is refused by every door that starts a run — no asset is
+    planned for it until a person's verify clears the disposition."""
+    with SqlTraustUnitOfWork(engine) as uow:
+        repo = Seed(uow).repository(url=f"https://github.com/example/{uuid4()}")
+        uow.repositories.update(
+            repo.model_copy(
+                update={
+                    "disposition": RepositoryDisposition.REPO_UNREACHABLE,
+                    "disposition_reason": GoneReason.GONE,
+                }
+            )
+        )
+        uow.commit()
+    assert repo.id is not None
+    with pytest.raises(PolicyDenied) as denied:
+        gated(engine).submit(
+            OrderRequest(asset="assessment", priority=1, repository_id=repo.id), OPERATOR
+        )
+    assert denied.value.deny_code == "subject_unreachable"
 
 
 def test_a_registered_repository_without_an_imported_line_is_not_a_subject(engine: Engine) -> None:

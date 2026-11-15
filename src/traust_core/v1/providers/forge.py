@@ -118,13 +118,20 @@ class CommandSourceProvider:
         """A failed REST read as an observation status. The fetcher
         retries 429 and 5xx itself (Retry-After, capped backoff), so what
         arrives here failed fast (4xx) or gave up (status None); ForgeApi's
-        JSON errors chain a ValueError and stay plain errors."""
+        JSON errors chain a ValueError and stay plain errors. A give-up the
+        transport answered positively (NXDOMAIN, refused, TLS) carries that
+        word, so the observation can count it as unreachable-from-here —
+        a timeout or a 5xx said nothing and never counts."""
         if isinstance(exc.__cause__, ValueError):
             return SourceError(str(exc)[:120], ComparisonStatus.ERROR)
         if exc.status == 401:
             return SourceError(str(exc)[:120], ComparisonStatus.NO_CREDENTIALS)
         if exc.status is None:
-            return SourceError(str(exc)[:120], ComparisonStatus.UNREACHABLE)
+            return SourceError(
+                str(exc)[:120],
+                ComparisonStatus.UNREACHABLE,
+                endpoint_unreachable=exc.endpoint_unreachable,
+            )
         return SourceError(str(exc)[:120], ComparisonStatus.ERROR)
 
     def _object(self, host: str, endpoint: str) -> Mapping[str, Any]:
@@ -168,8 +175,29 @@ class CommandSourceProvider:
 
     def info(self, repo: HttpsRepoUrl) -> Result[RepoInfo]:
         kind = self._kind(repo)
+        try:
+            if kind == "github":
+                payload = self._object(repo.host, f"repos/{repo.path}")
+            else:
+                payload = self._object(repo.host, f"projects/{quote(repo.path, safe='')}")
+        except SourceError as exc:
+            # The repository read itself answered 404 - visible on the refused read's
+            # cause, the fetcher's own error, because _refused flattens every fast 4xx
+            # into a plain error: the forge positively reports no such repository, so
+            # liveness is `missing`, the gone-class signal the unreachable disposition
+            # counts (a private repository the token cannot see answers the same way;
+            # the disposition's evidence names the forge's word, and a person's verify
+            # or URL correction settles which it was). Other reads' 404s (a file, a
+            # branch) stay plain errors.
+            cause = exc.__cause__
+            if isinstance(cause, ServiceError) and cause.status == 404:
+                raise SourceError(
+                    f"{repo}: the forge reports no such repository",
+                    ComparisonStatus.ERROR,
+                    liveness_status=LivenessStatus.MISSING,
+                ) from exc
+            raise
         if kind == "github":
-            payload = self._object(repo.host, f"repos/{repo.path}")
             try:
                 parent = (payload.get("parent") or {}).get("full_name")
             except (AttributeError, TypeError) as exc:
@@ -183,7 +211,6 @@ class CommandSourceProvider:
                 "parent": parent,
             }
         else:
-            payload = self._object(repo.host, f"projects/{quote(repo.path, safe='')}")
             try:
                 parent = (payload.get("forked_from_project") or {}).get("path_with_namespace")
             except (AttributeError, TypeError) as exc:

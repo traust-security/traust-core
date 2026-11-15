@@ -138,11 +138,16 @@ class SourceError(ServiceError):
         *,
         liveness_status: LivenessStatus = LivenessStatus.UNKNOWN,
         canonical_url: str | None = None,
+        endpoint_unreachable: bool = False,
     ) -> None:
-        super().__init__(message)
+        super().__init__(message, endpoint_unreachable=endpoint_unreachable)
         self.observation_status = observation_status
         self.liveness_status = liveness_status
         self.canonical_url = canonical_url
+        # The transport's positive word the repository's host is not there (NXDOMAIN,
+        # refused, TLS) — unlike a timeout, gone-class evidence the unreachable
+        # disposition counts with reason `unreachable`, never "gone" (foundry plan
+        # repo-unreachable: unreachable-from-here, not gone).
 
 
 class SourceProvider(Protocol):

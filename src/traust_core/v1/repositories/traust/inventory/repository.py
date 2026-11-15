@@ -16,6 +16,7 @@ from traust_core.v1.repositories.tables import (
     SqlMutableRepository,
     TableSpec,
     text_column,
+    timestamp_column,
     uuid_column,
 )
 
@@ -27,6 +28,12 @@ REPOSITORY = TableSpec(
         text_column("url"),
         sa.Column("public", sa.Boolean, nullable=False),
         sa.Column("archived", sa.Boolean, nullable=True),
+        # The unreachable disposition (foundry plan repo-unreachable); NULL = active.
+        sa.Column("disposition", sa.Text, nullable=True),
+        sa.Column("disposition_reason", sa.Text, nullable=True),
+        sa.Column("disposition_evidence", sa.Text, nullable=True),
+        timestamp_column("disposition_at", nullable=True),
+        sa.Column("gone_streak", sa.Integer, nullable=False, default=0),
     ),
 )
 
@@ -41,7 +48,13 @@ class RepositoryRepository(MutableRecordRepository[Repository], Protocol):
     def find_private_mirror(self, upstream_id: UUID) -> Repository | None: ...
     def list_by_ids(self, repository_ids: Collection[UUID]) -> list[Repository]: ...
     def list_all(self, *, read_budget: RecordBudget | None = None) -> list[Repository]: ...
-    def search(self, *, limit: int, after: tuple[datetime, UUID] | None) -> list[Repository]: ...
+    def search(
+        self,
+        *,
+        limit: int,
+        after: tuple[datetime, UUID] | None,
+        dispositioned: bool | None = None,
+    ) -> list[Repository]: ...
 
 
 class SqlRepositoryRepository(SqlMutableRepository[Repository]):
@@ -105,5 +118,18 @@ class SqlRepositoryRepository(SqlMutableRepository[Repository]):
             read_budget=read_budget,
         )
 
-    def search(self, *, limit: int, after: tuple[datetime, UUID] | None) -> list[Repository]:
-        return self._page("search", limit=limit, after=after)
+    def search(
+        self,
+        *,
+        limit: int,
+        after: tuple[datetime, UUID] | None,
+        dispositioned: bool | None = None,
+    ) -> list[Repository]:
+        """A keyset page of repositories; `dispositioned` narrows the universe the way the
+        filter names it (None: every repository, False: only active, True: only the ones
+        carrying the unreachable disposition)."""
+        where = ()
+        if dispositioned is not None:
+            gone = self.table.c.disposition.is_not(None)
+            where = (gone,) if dispositioned else (~gone,)
+        return self._page("search", *where, limit=limit, after=after)

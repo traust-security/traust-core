@@ -6,6 +6,8 @@ import json
 import logging
 import random
 import re
+import socket
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -27,6 +29,18 @@ log = logging.getLogger(__name__)
 
 def _target_hash(url: str) -> str:
     return hashlib.sha256(url.encode()).hexdigest()[:16]
+
+
+def _positively_unreachable(error: BaseException) -> bool:
+    """Whether the transport positively established the endpoint is not there: name
+    resolution failed (NXDOMAIN), the connection was refused, or TLS failed its handshake.
+    A timeout or a reset said nothing - the endpoint might be there - so those are never
+    gone-class evidence (foundry plan repo-unreachable: the transient classes never count
+    toward the disposition, the DNS/TLS word does)."""
+    reason = getattr(error, "reason", error)  # URLError reports its cause as `reason`
+    if isinstance(reason, urllib.error.URLError):
+        reason = getattr(reason, "reason", reason)
+    return isinstance(reason, (socket.gaierror, ConnectionRefusedError, ssl.SSLError))
 
 
 def _refused(url: str, status: int, operation: str) -> ServiceError:
@@ -157,7 +171,7 @@ class HttpFetcher:
         method = "POST" if data is not None else "GET"
         target_hash = _target_hash(url)
         started = time.perf_counter()
-        last, throttled = "", False
+        last, throttled, unreachable = "", False, False
         headers = {**(headers or {}), "User-Agent": self._user_agent}
         if correlation := current_correlation():
             headers[REQUEST_ID_HEADER] = correlation.request_id
@@ -175,7 +189,7 @@ class HttpFetcher:
                 if e.code != 429 and not 500 <= e.code < 600:
                     _log_http(method, target_hash, "refused", attempt + 1, started, e.code)
                     raise _Refused(e.code, e.read() if e.fp else b"") from e
-                last, throttled = f"HTTP {e.code}", e.code == 429
+                last, throttled, unreachable = f"HTTP {e.code}", e.code == 429, False
                 after = self._retry_after(e.headers.get("Retry-After") if e.headers else None)
                 delay = (
                     self._backoff(attempt) if after is None else min(after, policy.max_wait_seconds)
@@ -187,6 +201,7 @@ class HttpFetcher:
                 http.client.IncompleteRead,
             ) as e:
                 last, throttled = str(e), False
+                unreachable = _positively_unreachable(e)
                 delay = self._backoff(attempt)
             if attempt + 1 < policy.max_attempts:
                 self._sleep(delay)
@@ -196,6 +211,7 @@ class HttpFetcher:
             status=429 if throttled else None,
             operation=f"http.{method.lower()}",
             target_hash=target_hash,
+            endpoint_unreachable=unreachable and not throttled,
         )
 
     def _backoff(self, attempt: int) -> float:
