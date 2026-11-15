@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -142,6 +143,39 @@ def test_accepting_the_same_report_again_adds_nothing(engine: Engine, target: Ta
         ["CWE-89"],
         1,
     )
+
+
+def test_a_reported_cvss_claim_lands_on_the_occurrence(engine: Engine, target: Target) -> None:
+    """The CVSS a report states reaches the occurrence's columns — the columns every
+    CVSS-reading surface reads (the rollup's top cut, the item findings page). The
+    estate's history left them NULL on every row because intake never carried them;
+    a report that states no CVSS still records none."""
+    run = audit(engine, target)
+    result = intake(engine).accept(
+        run,
+        [
+            candidate(
+                target,
+                cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+                cvss_score=Decimal("5.3"),
+            ),
+            candidate(
+                target,
+                "OPERATOR-abcdef0-002",
+                rule="go.crypto.weak",
+                cwes=("CWE-338",),
+            ),
+        ],
+    )
+    got = rows(engine, result.findings[Label("OPERATOR-abcdef0-001")])
+    (occurrence,) = got["occurrences"]
+    assert (occurrence.cvss_vector, occurrence.cvss_score) == (
+        "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+        Decimal("5.3"),
+    )
+    unscored = rows(engine, result.findings[Label("OPERATOR-abcdef0-002")])
+    (plain,) = unscored["occurrences"]
+    assert (plain.cvss_vector, plain.cvss_score) == (None, None)
 
 
 def test_a_later_scan_matches_by_fingerprint_and_adds_its_own_occurrence(
@@ -479,6 +513,27 @@ def test_a_report_finding_carries_its_owasp_llm_categories(target: Target) -> No
     )
     assert found[0].owasp_llm_references == ("LLM01",)
     assert all(f.owasp_llm_references == () for f in found[1:])
+
+
+def test_a_report_finding_carries_its_cvss_claim(target: Target) -> None:
+    """The contracts report's `findings[].cvss` block is the CVSS source the intake
+    writes; `of_report` must not be where it drops off."""
+    from tests.v1.services.reporting.documents import valid_report
+    from traust_core.v1.models.artifacts import ReportArtifact
+
+    doc = valid_report()
+    doc["findings"][0]["cvss"] = {
+        "score": 5.3,
+        "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+    }
+    found = FindingCandidate.of_report(
+        ReportArtifact.from_document(doc).findings, target.repository.id
+    )
+    scored = [f for f in found if f.cvss_score is not None]
+    assert [(f.cvss_score, f.cvss_vector) for f in scored] == [
+        (Decimal("5.3"), "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N")
+    ]
+    assert all(f.cvss_score is None and f.cvss_vector is None for f in found if f not in scored)
 
 
 def test_reaccepting_an_assessment_records_its_new_locations(

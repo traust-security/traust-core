@@ -380,6 +380,8 @@ class FindingIntake:
                     finding_id=finding.id,
                     assessment_id=assessment_id,
                     severity=candidate.reported_severity,
+                    cvss_vector=candidate.cvss_vector,
+                    cvss_score=candidate.cvss_score,
                     rule=candidate.rule,
                 )
             )
