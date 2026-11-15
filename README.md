@@ -292,6 +292,8 @@ The remaining correctness changes are:
   `build` returns.
 - `ViewName.DEPENDENCY_REACH` is validated by
   `contracts.validate_view("dependency-reach", document)` before `build` returns.
+- `ViewName.VALIDATION_FUZZ` is validated by
+  `contracts.validate_view("validation-fuzz", document)` before `build` returns.
 - `ViewName.EXPOSURE` is validated by `contracts.validate_view("exposure", document)` before
   `build` returns, and carries its `as_of` (the filter's, else the clock's, read once for all
   three cuts); the executive summary's exposure panel uses the same row.

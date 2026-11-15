@@ -3360,7 +3360,7 @@ class ValidationFuzzView:
                 )
                 for g in doc.gaps
             ]
-        return ValidationFuzz(
+        model = ValidationFuzz(
             as_of=filter.as_of,
             targets=tuple(sorted(targets, key=lambda t: (-t.crashers, t.repository, t.target))),
             crashers=tuple(
@@ -3392,6 +3392,8 @@ class ValidationFuzzView:
                 )
             ),
         )
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
 
     def report(self, model: ValidationFuzz, generated_at: datetime) -> Report:
         outcomes: Counter[str] = Counter()
