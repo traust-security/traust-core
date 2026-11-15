@@ -79,5 +79,10 @@ class DocumentError(ValidationError):
         self.issues = issues
 
 
+class ViewContractError(DocumentError):
+    """A view Core built fails its own contract: Core's fault (500, logged), never the caller's
+    request; it stays a DocumentError, so a caller catching that still catches it."""
+
+
 class RemovedSecretError(DocumentError):
     """A patch carries high-confidence secrets only outside its added lines."""

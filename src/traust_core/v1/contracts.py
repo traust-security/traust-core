@@ -22,7 +22,7 @@ from traust_contracts.v1.storage import sql as storage_sql
 from traust_contracts.v1.timestamps import TimestampError as TimestampError
 from traust_contracts.v1.timestamps import to_rfc3339 as to_rfc3339
 
-from traust_core.v1.errors import ConfigError, DocumentError, Issue
+from traust_core.v1.errors import ConfigError, DocumentError, Issue, ViewContractError
 
 Dialect = Literal["sqlite", "postgres"]
 Area = Literal["traust", "traust_ops", "traust_ledger"]
@@ -235,7 +235,12 @@ def _view_validator(name: str) -> Draft202012Validator:
 
 
 def validate_view(name: str, document: JsonValue) -> None:
-    _check(name, _view_validator(name), document)
+    """Refuse a view Core built outside its contract: a ViewContractError, a server fault."""
+    errors = _violations(_view_validator(name), document)
+    if errors:
+        raise ViewContractError(
+            name, [Issue("/".join(map(str, e.absolute_path)) or "$", e.message) for e in errors]
+        )
 
 
 def _violations(validator: Draft202012Validator, document: Any) -> list[SchemaViolation]:

@@ -1456,7 +1456,7 @@ class InsecurePatternsView:
                         hit.view.effective_severity
                     ) < _severity_rank(hits[key].view.effective_severity):
                         hits[key] = hit
-        return InsecurePatterns(
+        model = InsecurePatterns(
             as_of=filter.as_of,
             cuts=tuple(
                 InsecurePatternCut(
@@ -1473,6 +1473,8 @@ class InsecurePatternsView:
                 if found.get(o) or without_cwe.get(o)
             ),
         )
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
 
     def report(self, model: InsecurePatterns, generated_at: datetime) -> Report:
         # NEED(classifiers: Q5): code-vs-config; findings are counted unfiltered.
@@ -1541,13 +1543,14 @@ def _insecure_pattern(cwe: str, hits: _Hits) -> InsecurePattern:
 
 
 def _example(e: PatternExample) -> str:
-    """`repo · file:lines · symbol`, the symbol only when recorded; text cleaned for a cell."""
-    lines = (
-        ""
-        if e.line_start is None
-        else f":{e.line_start}"
-        + (f"-{e.line_end}" if e.line_end not in (None, e.line_start) else "")
-    )
+    """`repo · file:lines · symbol`, the symbol only when recorded; text cleaned for a cell. A
+    claim's location may give only its end line: `file:?-end` (start unknown)."""
+    if e.line_start is None:
+        lines = "" if e.line_end is None else f":?-{e.line_end}"
+    else:
+        lines = f":{e.line_start}" + (
+            f"-{e.line_end}" if e.line_end not in (None, e.line_start) else ""
+        )
     parts = (e.repository_url, f"{e.path}{lines}", *((e.symbol,) if e.symbol else ()))
     return inline(" · ".join(parts))
 
