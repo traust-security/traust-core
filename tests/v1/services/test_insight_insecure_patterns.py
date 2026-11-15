@@ -198,7 +198,7 @@ def test_patterns_outside_their_contract_are_refused_by_the_build(
     corpus(context, engine)
     real = insight_module._insecure_pattern
 
-    def drifted(cwe: str, hits: Any) -> InsecurePattern:
+    def drifted(cwe: str, hits: insight_module._Hits) -> InsecurePattern:
         return real(cwe, hits).model_copy(update={"occurrences": 0})
 
     monkeypatch.setattr(insight_module, "_insecure_pattern", drifted)

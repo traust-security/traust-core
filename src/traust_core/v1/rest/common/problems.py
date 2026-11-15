@@ -16,6 +16,7 @@ from traust_core.v1.errors import (
     NotFoundError,
     TraustError,
     ValidationError,
+    ViewContractError,
 )
 from traust_core.v1.models.base import Dto
 from traust_core.v1.models.operations import DenyCode, DenyIssue
@@ -33,6 +34,8 @@ STATUS: tuple[tuple[type[Exception], HTTPStatus], ...] = (
     (NotFoundError, HTTPStatus.NOT_FOUND),
     (ConflictError, HTTPStatus.CONFLICT),
     (IntegrityError, HTTPStatus.CONFLICT),
+    # before ValidationError: a view outside its own contract is Core's fault, not the request's
+    (ViewContractError, HTTPStatus.INTERNAL_SERVER_ERROR),
     (ValidationError, HTTPStatus.UNPROCESSABLE_ENTITY),
     (RequestValidationError, HTTPStatus.UNPROCESSABLE_ENTITY),
 )

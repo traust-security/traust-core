@@ -134,3 +134,31 @@ def test_only_the_format_asked_for_is_rendered(
     assert response.status_code == 200
     assert response.headers["content-type"] == f"{asked.media_type}; charset=utf-8"
     assert response.headers["content-disposition"].endswith(f'.{asked.suffix}"')
+
+
+def test_a_view_outside_its_own_contract_is_a_server_fault(
+    context: Context, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = insight_module.InsecurePatternsView.build
+
+    def drifted(self: object, filter: ViewFilter) -> object:
+        model = real(self, filter)  # type: ignore[arg-type]
+        document = model.model_dump(mode="json") | {"as_of": "not a timestamp"}
+        insight_module.contracts.validate_view("insecure-patterns", document)
+        return model
+
+    monkeypatch.setattr(insight_module.InsecurePatternsView, "build", drifted)
+    for url in ("/v1/insights/insecure-patterns", "/v1/insights/insecure-patterns/report"):
+        response = client.get(url, headers=bearer(context))
+        assert response.status_code == 500, url
+        assert response.headers["content-type"] == "application/problem+json"
+        assert "not a timestamp" not in response.text  # Core's fault: no contract detail leaks
+
+
+def test_a_view_contract_failure_stays_a_document_error() -> None:
+    from traust_core.v1 import contracts
+    from traust_core.v1.errors import DocumentError, ViewContractError
+
+    with pytest.raises(ViewContractError) as error:
+        contracts.validate_view("insecure-patterns", {"as_of": None})
+    assert isinstance(error.value, DocumentError) and error.value.issues
