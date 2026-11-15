@@ -281,8 +281,8 @@ The remaining correctness changes are:
   registry of every view schema by `$id` (on top of the artifact schemas). The scoreboard
   reads only part of the summary and calls `compose`, the summary before its check.
 - `ViewName.COMPLIANCE` is validated by `contracts.validate_view("compliance", document)` before
-  `build` returns; it reads current declarations and assessments (the filter's `as_of` is not
-  applied).
+  `build` returns. It reads posture as it stands (current declarations, newest assessments), so
+  it refuses an `as_of` (422) rather than serve current posture as historical.
 - `ViewName.EXPOSURE` is validated by `contracts.validate_view("exposure", document)` before
   `build` returns, and carries its `as_of` (the filter's, else the clock's, read once for all
   three cuts); the executive summary's exposure panel uses the same row.

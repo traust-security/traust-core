@@ -127,6 +127,12 @@ def test_compliance_posture_per_framework_and_boundary() -> None:
     assert "not_satisfied 1" in text and "satisfied 4" in text
 
 
+def test_the_compliance_view_refuses_an_as_of() -> None:
+    view = ComplianceDashboardView(FakeCompliance())  # type: ignore[arg-type]
+    with pytest.raises(ValidationError, match="no as_of"):
+        view.build(ViewFilter(as_of=T0))
+
+
 def test_a_compliance_view_outside_its_contract_is_refused_by_the_build() -> None:
     class Drifted(FakeCompliance):
         def summary(self, filter: Any, group_by: ComplianceDimension) -> list[ComplianceRollup]:
