@@ -151,6 +151,29 @@ def test_dependency_reach_of_nothing_says_so_and_takes_no_as_of(context: Context
         context.services().insight.build(ViewName.DEPENDENCY_REACH, ViewFilter(as_of=T0))
 
 
+def test_dependency_reach_lists_each_ecosystem_and_package_once(
+    context: Context, engine: Engine
+) -> None:
+    # the contract cannot check a field unique across rows: Core's grouping guarantees it,
+    # even when many repositories hold the same packages in the same ecosystem
+    with SqlTraustUnitOfWork(engine) as uow:
+        s = Seed(uow)
+        packages = [s.package(ecosystem="go", name=f"example.com/m{i}") for i in range(3)]
+        for n in range(4):
+            sbom = s.sbom()
+            for p in packages:
+                s.dependency(sbom, p)
+            repo = s.repository(url=f"https://github.com/example-org/g{n}")
+            ref = s.repository_ref(repo, is_default=True, manifest_sbom_id=sbom.id)
+            s.assessment(ref, kind=AssessmentKind.REPO_STATE, occurred_at=T0)
+        uow.commit()
+    reach = context.services().insight.build(ViewName.DEPENDENCY_REACH, ViewFilter())
+    assert isinstance(reach, DependencyReach)
+    assert [(e.ecosystem, e.repositories, e.packages) for e in reach.ecosystems] == [("go", 4, 3)]
+    identities = [(p.ecosystem, p.name) for p in reach.shared]
+    assert len(identities) == len(set(identities)) == 3
+
+
 def test_dependency_reach_outside_its_contract_is_refused_by_the_build(
     context: Context, monkeypatch: pytest.MonkeyPatch
 ) -> None:
