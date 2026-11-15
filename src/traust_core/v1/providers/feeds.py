@@ -339,9 +339,31 @@ class FeedSource:
     def _get(self, http: HttpFetcher, url: str) -> bytes:
         """A GET carrying the source's API key when the deployment gives one: a secret header,
         sent to this URL only. A keyless source's request is exactly as before."""
-        if self._api_key is None:
+        if self._api_key is None or not self._keyed(url):
             return http.get(url)
-        return http.get(url, secret_headers=self._api_key.headers())
+        try:
+            return http.get(url, secret_headers=self._api_key.headers())
+        except ServiceError as e:
+            if e.status is not None and 400 <= e.status < 500 and e.status != 429:
+                # a revoked, mistyped or wrongly synced key is refused like a bad URL: say so
+                raise ServiceError(
+                    f"{e} (sent with {self.name}'s API key: a wrong or revoked key is refused "
+                    f"this way; check feeds.api_keys.{self.name})",
+                    status=e.status,
+                    operation=e.operation,
+                    target_hash=e.target_hash,
+                ) from e
+            raise
+
+    def _probe_url(self, probe: Probe) -> str:
+        return self.url if probe.identifier is None else self._resolve(probe.identifier)
+
+    def _keyed(self, url: str) -> bool:
+        """The key goes to the host its per-identifier template names, never another (a probe
+        URL on a different host goes keyless)."""
+        return self.template is not None and (
+            urlsplit(url).netloc == urlsplit(self.template).netloc
+        )
 
     def check(self) -> Readiness:
         """Send the probe: an HTTP refusal means the registry and the service disagree, an
@@ -355,12 +377,18 @@ class FeedSource:
                 body = {"package": {"name": probe.identifier, "ecosystem": probe.ecosystem}}
                 self._probe_http.post_json(self.url, body)
             else:
-                url = self.url if probe.identifier is None else self._resolve(probe.identifier)
-                self._get(self._probe_http, url)
+                self._get(self._probe_http, self._probe_url(probe))
         except (ConfigError, ValidationError) as e:
             return Readiness(ready=False, detail=f"probe URL could not be built: {e}")
         except ServiceError as e:
             if e.status is not None and 400 <= e.status < 500 and e.status != 429:
+                if self._api_key is not None and self._keyed(self._probe_url(probe)):
+                    return Readiness(
+                        ready=False,
+                        detail=f"{host} refused the probe sent with {self.name}'s API key "
+                        f"(HTTP {e.status}): check the key (feeds.api_keys.{self.name}) first, "
+                        "then the source's URL in the feeds registry",
+                    )
                 return Readiness(
                     ready=False,
                     detail=f"{host} answered HTTP {e.status} for the declared probe "

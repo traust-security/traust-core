@@ -356,3 +356,18 @@ def test_a_named_key_variable_that_is_unset_is_a_config_error(
 def test_feeds_api_keys_take_registry_names_and_variable_names(tmp_path: Path, text: str) -> None:
     with pytest.raises(ConfigError):
         Config.from_home(_home(tmp_path, text))
+
+
+def test_a_retry_after_setting_the_key_registers_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("TEST_NVD_KEY", raising=False)
+    registry = tmp_path / "feeds.yaml"
+    registry.write_text(NVD_REGISTRY)
+    ctx = Context(Config.from_home(_home(tmp_path, "feeds: {api_keys: {nvd: TEST_NVD_KEY}}\n")))
+    with pytest.raises(ConfigError, match="unset variable"):
+        ctx.register_feeds(registry)
+    assert ctx.feed_sources.names() == []  # nothing half-registered
+    monkeypatch.setenv("TEST_NVD_KEY", "k-1")
+    ctx.register_feeds(registry)
+    assert ctx.feed_sources.get("nvd")._api_key is not None

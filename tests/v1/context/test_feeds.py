@@ -435,9 +435,11 @@ def test_no_deployment_key_is_keyless(tmp_path: Path) -> None:
                 "    probe: {ident: lodash, ecosystem: npm}\n    api_key_header: apiKey\n",
             ),
             {"osv": "k"},
-            "GET sources only",
+            "per-identifier GET source only",
         ),
         (NVD_HEADER, {"nvd": "bad\nkey"}, "no usable header value"),
+        (NVD_HEADER, {"nvd": "clé-unicode"}, "no usable header value"),  # not sendable as a header
+        (NVD_HEADER, {"epss": "k"}, "declares no api_key_header"),  # a whole-file feed
         (
             NVD_HEADER.replace("api_key_header: apiKey", "api_key_header: 'api key'"),
             {},
@@ -456,7 +458,7 @@ def test_a_cached_whole_file_feed_takes_no_key(tmp_path: Path) -> None:
     text = REGISTRY.replace(
         "    max_age_hours: 12\n", "    max_age_hours: 12\n    api_key_header: apiKey\n"
     )
-    with pytest.raises(ConfigError, match="kev fetches whole files"):
+    with pytest.raises(ConfigError, match="per-identifier GET source only"):
         Context(Config()).register_feeds(_registry(tmp_path, text))
 
 

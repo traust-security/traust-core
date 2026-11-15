@@ -106,15 +106,24 @@ feeds:
     nvd: NVD_API_KEY   # the variable's name; set NVD_API_KEY from your secret store
 ```
 
-Core reads each named variable when it registers the feeds (`Context.register_feeds`).
-It refuses a key at load, never at the first request, when:
+Core reads every named variable before it registers any feed (`Context.register_feeds`),
+so a retry after setting a missing one starts clean. It refuses a key at load, never at
+the first request, when:
 - the variable is unset or empty;
 - the source isn't registered, or declares no `api_key_header`;
-- the source is a POST or whole-file feed;
-- the key holds control characters.
+- the key holds anything but visible ASCII.
 
-The key is sent only to the source's own URL, never carried onto a redirect, and never
-appears in a URL, log line, error or `repr`.
+Only a per-identifier GET source (a live `url_template`, or a cached `doc_url_template`)
+may declare `api_key_header`. A whole-file feed or a POST source that declares one is a
+registry error.
+
+The key is sent only to the host its per-identifier template names. A probe on another
+host goes keyless, and the key is never carried onto a redirect. It never appears in a
+URL, log line, error or `repr`.
+
+When the source refuses a request carrying the key (a 4xx other than 429), the readiness
+check and the error say so and point at `feeds.api_keys.<source>` before the registry URL,
+since NVD answers a wrong or revoked key with 404.
 
 The feeds registry refuses any field it doesn't read, so a setting that would do
 nothing fails loudly instead of being ignored.

@@ -395,3 +395,29 @@ def test_the_key_is_in_no_readiness_log_line_or_repr(caplog: pytest.LogCaptureFi
     assert not readiness.ready and SECRET not in readiness.detail
     assert all(SECRET not in r.getMessage() for r in caplog.records)
     assert SECRET not in repr(NVD_KEY)
+
+
+def test_a_probe_on_another_host_goes_keyless() -> None:
+    http = _Http()
+    nvd = source(url="https://status.other.test/", probe=Probe(None), http=http, api_key=NVD_KEY)
+    assert nvd.check().ready
+    nvd.document("CVE-2026-0001")
+    assert http.headers == [None, {"apiKey": SECRET}]  # the probe host isn't the template's
+
+
+def test_a_refused_keyed_request_names_the_key() -> None:
+    refused = ServiceError("https://nvd.test/x: HTTP 404", status=404)
+    http = _Http(
+        {
+            "https://nvd.test/cves?cveId=CVE-2021-44228": refused,
+            "https://nvd.test/cves?cveId=CVE-2026-0001": refused,
+        }
+    )
+    nvd = source(http=http, api_key=NVD_KEY)
+    readiness = nvd.check()
+    assert not readiness.ready and "feeds.api_keys.nvd" in readiness.detail
+    with pytest.raises(ServiceError, match=r"feeds\.api_keys\.nvd") as raised:
+        nvd.document("CVE-2026-0001")
+    assert raised.value.status == 404 and SECRET not in str(raised.value)
+    # keyless, a refusal still reads as the registry and the service disagreeing
+    assert "correct its URL" in source(http=http).check().detail
