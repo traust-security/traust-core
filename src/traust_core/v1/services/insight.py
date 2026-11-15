@@ -4690,7 +4690,7 @@ class PrivilegesView:
             )
             for p in profiles
         )
-        return PrivilegesRollup(
+        model = PrivilegesRollup(
             as_of=filter.as_of,
             rows=tuple(
                 sorted(
@@ -4704,6 +4704,8 @@ class PrivilegesView:
                 )
             ),
         )
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
 
     def report(self, model: PrivilegesRollup, generated_at: datetime) -> Report:
         rows = model.rows
