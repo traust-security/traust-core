@@ -17,8 +17,8 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
-from traust_core.v1.models.common import RecordBudget
-from traust_core.v1.models.findings import Finding, FindingState, RecordDecision
+from traust_core.v1.models.common import PageRequest, RecordBudget
+from traust_core.v1.models.findings import Finding, FindingFilter, FindingState, RecordDecision
 from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.inventory import Repository, RepositoryRef
 from traust_core.v1.models.vocabulary import (
@@ -144,6 +144,38 @@ def test_get_undecided_finding_is_rated_by_its_report_with_a_deadline(engine: En
 def test_get_unknown_finding_is_not_found(engine: Engine) -> None:
     with pytest.raises(NotFoundError):
         service(engine).get(uuid4())
+
+
+def test_a_view_carries_when_the_reports_ran(engine: Engine) -> None:
+    """The view's first/last report times — the occurrence→assessment join the census
+    reads for its SLA `first` — so a listing can show a date per finding (the item
+    findings page's datetime column); an `as_of` before the later report still sees
+    only the earlier one."""
+    a = audited(engine, severity="high")
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        later = seed.assessment(a.ref, occurred_at=T0 + timedelta(days=10))
+        seed.occurrence(a.finding, later, severity="high")
+        uow.commit()
+    view = service(engine).get(a.finding.id)  # type: ignore[arg-type]
+    assert view.first_reported_at == T0
+    assert view.last_reported_at == T0 + timedelta(days=10)
+    cutoff = service(engine).list(
+        FindingFilter(repository_id=a.repository.id, as_of=T0 + timedelta(days=5)), PageRequest()
+    )
+    assert [v.first_reported_at for v in cutoff.items] == [T0]
+    assert [v.last_reported_at for v in cutoff.items] == [T0]
+
+
+def test_a_finding_no_assessment_reported_has_no_report_times(engine: Engine) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repo = seed.repository()
+        seed.repository_ref(repo)
+        finding = seed.finding(repo)
+        uow.commit()
+    view = service(engine).get(finding.id)  # type: ignore[arg-type]
+    assert (view.first_reported_at, view.last_reported_at) == (None, None)
 
 
 @pytest.mark.parametrize("with_algorithm", [False, True])

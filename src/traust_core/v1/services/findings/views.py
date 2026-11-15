@@ -197,9 +197,14 @@ class FindingViewQuery:
         latest = reported[-1] if reported else None
         disposition = facts.disposition(finding.id, as_of)
         severity = self._rating.effective_severity(latest, disposition)
+        # the reporting assessments' own times — the occurrence→assessment
+        # join the census reads for its SLA `first` — computed once here for
+        # the view's date fields (facts.at already holds them for the fold)
+        first_reported = facts.at[reported[0].assessment_id] if reported else None
+        last_reported = facts.at[latest.assessment_id] if latest is not None else None
         due = None
         if latest is not None and (disposition is None or disposition.is_open()):
-            opened = facts.at[reported[0].assessment_id]
+            opened = first_reported
             due = self._rating.sla_due(severity, opened, latest.cvss_score)
         claim = folded.claim if folded is not None else None
         return FindingView(
@@ -208,6 +213,8 @@ class FindingViewQuery:
             disposition=disposition,
             effective_severity=severity,
             sla_due=due,
+            first_reported_at=first_reported,
+            last_reported_at=last_reported,
             locations=(
                 claim.locations
                 if claim is not None
