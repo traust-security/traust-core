@@ -361,3 +361,85 @@ def test_an_air_gapped_osv_source_reads_exported_records_not_the_api(tmp_path: P
     record.write_text(json.dumps({"id": "GHSA-aaaa-bbbb-cccc", "affected": []}))
     ctx.use_exported_advisories([record])
     assert isinstance(ctx.advisories, ExportedAdvisoryLookup)
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "field"),
+    [
+        # a setting nothing would read is refused, never dropped
+        (
+            "    url_template: https://nvd.test/cves?cveId={ident_upper}\n",
+            "    url_template: https://nvd.test/cves?cveId={ident_upper}\n"
+            "    api_key_evn: NVD_API_KEY\n",
+            "api_key_evn",
+        ),
+        (
+            "{ident: lodash, ecosystem: npm}",
+            "{ident: lodash, ecosystem: npm, expect: 200}",
+            "expect",
+        ),
+        (
+            "{page_param: page, per_page: 1000}",
+            "{page_param: page, per_page: 1000, size: 5}",
+            "size",
+        ),
+    ],
+)
+def test_a_field_the_registry_does_not_read_is_a_config_error(
+    tmp_path: Path, old: str, new: str, field: str
+) -> None:
+    assert old in SOURCES
+    with pytest.raises(ConfigError, match=field):
+        Context(Config()).register_feeds(_registry(tmp_path, SOURCES.replace(old, new)))
+
+
+@pytest.mark.parametrize(
+    ("key", "match"),
+    [
+        ("    api_key_env: NVD_API_KEY\n", "set together"),  # a key with no header to travel in
+        ("    api_key_header: apiKey\n", "set together"),
+        (
+            "    api_key_env: nvd-key\n    api_key_header: apiKey\n",
+            "must name an environment variable",
+        ),
+    ],
+)
+def test_an_api_key_names_its_variable_and_its_header(tmp_path: Path, key: str, match: str) -> None:
+    text = SOURCES.rstrip() + "\n" + key
+    with pytest.raises(ConfigError, match=match):
+        Context(Config()).register_feeds(_registry(tmp_path, text))
+
+
+def test_a_probe_expects_only_success(tmp_path: Path) -> None:
+    text = SOURCES.replace("{ident: none, expect_status: 200}", "{ident: none, expect_status: 404}")
+    with pytest.raises(ConfigError, match="only 200 is checked"):
+        Context(Config()).register_feeds(_registry(tmp_path, text))
+
+
+def test_the_nvd_source_carries_its_api_key(tmp_path: Path) -> None:
+    text = SOURCES.rstrip() + "\n    api_key_env: NVD_API_KEY\n    api_key_header: apiKey\n"
+    ctx = Context(Config())
+    ctx.register_feeds(_registry(tmp_path, text))
+    nvd = ctx.feed_sources.get("nvd")
+    assert nvd._api_key is not None
+    assert (nvd._api_key.env, nvd._api_key.header) == ("NVD_API_KEY", "apiKey")
+    assert ctx.feed_sources.get("vex")._api_key is None
+
+
+@pytest.mark.parametrize("field", ["deletions_url", "archive_pointer_url", "doc_cache_dir"])
+def test_a_lazy_source_field_nothing_reads_is_refused(tmp_path: Path, field: str) -> None:
+    text = SOURCES.replace(
+        "    doc_url_template: https://vex.test/{year}/{ident_lower}.json\n",
+        "    doc_url_template: https://vex.test/{year}/{ident_lower}.json\n"
+        f"    {field}: https://vex.test/x\n",
+    )
+    with pytest.raises(ConfigError, match=field):
+        Context(Config()).register_feeds(_registry(tmp_path, text))
+
+
+def test_the_shipped_registry_loads_with_every_field_read() -> None:
+    from traust_core.v1.context.feeds import _load
+
+    shipped = Path(__file__).parents[3] / "src/traust_core/v1/context/shipped/feeds.yaml"
+    nvd = _load(shipped).sources["nvd"]
+    assert (nvd.api_key_env, nvd.api_key_header) == ("NVD_API_KEY", "apiKey")

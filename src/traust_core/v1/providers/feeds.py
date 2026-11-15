@@ -5,6 +5,7 @@ import gzip
 import io
 import json
 import logging
+import os
 import re
 import zlib
 from collections.abc import Callable, Iterator, Sequence
@@ -286,6 +287,19 @@ def fill_template(template: str, identifier: str) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class ApiKey:
+    """Where a source's API key comes from (`env`, an environment variable read per request) and
+    the header it travels in. The key is never in a URL, a log line or an error."""
+
+    env: str
+    header: str
+
+    def headers(self) -> dict[str, str] | None:
+        key = os.environ.get(self.env, "").strip()
+        return {self.header: key} if key else None
+
+
+@dataclass(frozen=True, slots=True)
 class Probe:
     """A known-good request: an identifier (None: the source's URL as published), and for a
     package query its ecosystem."""
@@ -310,6 +324,7 @@ class FeedSource:
         http: HttpFetcher,
         probe_http: HttpFetcher,
         clock: Clock,
+        api_key: ApiKey | None = None,
     ) -> None:
         self.name = name
         self.url = url
@@ -320,11 +335,36 @@ class FeedSource:
         self._http = http
         self._probe_http = probe_http
         self._clock = clock
+        self._api_key = api_key
+
+    def _get(self, http: HttpFetcher, url: str) -> bytes:
+        """A GET carrying the API key's header when there is one; a keyless source's request is
+        exactly as before."""
+        headers = self._headers()
+        return http.get(url, headers=headers) if headers else http.get(url)
+
+    def _headers(self) -> dict[str, str] | None:
+        """The API key's header when its variable is set; unset, the request goes keyless and
+        says so (`check` reports the source not ready)."""
+        if self._api_key is None:
+            return None
+        headers = self._api_key.headers()
+        if headers is None:
+            log.warning(
+                "%s: $%s is not set; requests go without its API key", self.name, self._api_key.env
+            )
+        return headers
 
     def check(self) -> Readiness:
         """Send the probe: an HTTP refusal means the registry and the service disagree, an
         unreachable host means liveness is undetermined."""
         probe = self._probe
+        if self._api_key is not None and self._api_key.headers() is None:
+            return Readiness(
+                ready=False,
+                detail=f"${self._api_key.env} is not set: {self.name} requests would go without "
+                "their API key (rate-limited); set it from the deployment's secret store",
+            )
         if probe is None:
             return Readiness(ready=True, detail="no probe declared; liveness unchecked")
         host = urlsplit(self.url).netloc
@@ -334,7 +374,7 @@ class FeedSource:
                 self._probe_http.post_json(self.url, body)
             else:
                 url = self.url if probe.identifier is None else self._resolve(probe.identifier)
-                self._probe_http.get(url)
+                self._get(self._probe_http, url)
         except (ConfigError, ValidationError) as e:
             return Readiness(ready=False, detail=f"probe URL could not be built: {e}")
         except ServiceError as e:
@@ -354,7 +394,7 @@ class FeedSource:
         """The source's document for one identifier, as it serves it now."""
         url = self._resolve(identifier)
         acquisition = Acquisition(provider=self.name, acquired_at=self._clock.now(), source=url)
-        return Result(self._http.get(url), acquisition)
+        return Result(self._get(self._http, url), acquisition)
 
     def _resolve(self, identifier: str) -> str:
         if self.template is None:

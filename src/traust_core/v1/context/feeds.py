@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+import re
+from datetime import date, timedelta
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
@@ -12,6 +13,7 @@ import yaml
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.feeds import (
+    ApiKey,
     FeedProvider,
     FeedSource,
     HttpFileFeed,
@@ -43,23 +45,53 @@ class ObjectCache:
         self._store.put(ObjectKey.parse(f"{self._prefix}/{key}"), data)
 
 
-class _Paginate(pydantic.BaseModel):
+class _Strict(pydantic.BaseModel):
+    """A registry block: a field the loader doesn't know is a config error, never dropped, so a
+    setting nothing reads (an API key, a status a probe should expect) can't pass silently."""
+
+    model_config = pydantic.ConfigDict(extra="forbid")
+
+
+class _Paginate(_Strict):
     page_param: str
     per_page: pydantic.PositiveInt
 
 
-class _Incremental(pydantic.BaseModel):
+class _Incremental(_Strict):
     since_param: str
     watermark_field: str
     backfill_from: str
 
 
-class _Probe(pydantic.BaseModel):
+class _Probe(_Strict):
     ident: str
     ecosystem: str | None = None
+    # what the probe must answer; a successful (2xx) response is the only answer modeled
+    expect_status: int = 200
+
+    @pydantic.field_validator("expect_status")
+    @classmethod
+    def _only_success(cls, value: int) -> int:
+        if value != 200:
+            raise ValueError(f"expect_status {value}: only 200 is checked by the probe")
+        return value
 
 
-class _Source(pydantic.BaseModel):
+class _License(_Strict):
+    """Documentation for adopters; the loader keeps it, nothing acts on it."""
+
+    id: str
+    terms: str | None = None
+    attribution: str | None = None
+    url: str | None = None
+    verified: date | str | None = None
+
+
+# The environment variable an API key is read from: never the key itself.
+_ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]*")
+
+
+class _Source(_Strict):
     tier: str
     mode: str | None = None
     url: str | None = None
@@ -79,9 +111,26 @@ class _Source(pydantic.BaseModel):
     access: str = "api"
     extra_hosts: tuple[str, ...] = ()
     redirect_hosts: tuple[str, ...] = ()
+    # an API key: the variable it is read from and the header it travels in
+    api_key_env: str | None = None
+    api_key_header: str | None = None
+    # documentation the registry carries for adopters; nothing acts on it
+    summary: str | None = None
+    consumers: tuple[str, ...] = ()
+    license: _License | None = None
+    cadence: str | None = None
+
+    @pydantic.model_validator(mode="after")
+    def _key_travels_in_a_header(self) -> _Source:
+        if self.api_key_env is not None and not _ENV_NAME.fullmatch(self.api_key_env):
+            raise ValueError(f"api_key_env {self.api_key_env!r} must name an environment variable")
+        if (self.api_key_env is None) != (self.api_key_header is None):
+            raise ValueError("api_key_env and api_key_header are set together")
+        return self
 
 
-class _Registry(pydantic.BaseModel):
+class _Registry(_Strict):
+    version: int | None = None
     sources: dict[str, _Source]
 
 
@@ -179,6 +228,11 @@ def load_feed_sources(
                 ident=source.ident,
                 post=post,
                 probe=probe,
+                api_key=(
+                    None
+                    if source.api_key_env is None or source.api_key_header is None
+                    else ApiKey(source.api_key_env, source.api_key_header)
+                ),
                 http=http,
                 probe_http=probe_http,
                 clock=clock,

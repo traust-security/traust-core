@@ -9,6 +9,7 @@ from traust_core.v1.errors import ConfigError, ServiceError, ValidationError
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.feeds import (
     MAX_PAGES,
+    ApiKey,
     FeedSource,
     HttpFileFeed,
     PagedJsonFeed,
@@ -222,6 +223,7 @@ class _Http:
     def __init__(self, answers: dict[str, bytes | Exception] | None = None) -> None:
         self.answers = answers or {}
         self.sent: list[tuple[str, object]] = []
+        self.headers: list[dict[str, str] | None] = []
 
     def _answer(self, url: str, body: object) -> bytes:
         self.sent.append((url, body))
@@ -230,7 +232,8 @@ class _Http:
             raise answer
         return answer
 
-    def get(self, url: str) -> bytes:
+    def get(self, url: str, headers: dict[str, str] | None = None) -> bytes:
+        self.headers.append(headers)
         return self._answer(url, None)
 
     def post_json(self, url: str, doc: object) -> bytes:
@@ -249,6 +252,7 @@ def source(
     post: bool = False,
     probe: Probe | None = LOG4SHELL,
     http: _Http | None = None,
+    api_key: ApiKey | None = None,
 ) -> FeedSource:
     fetcher = http or _Http()
     return FeedSource(
@@ -261,6 +265,7 @@ def source(
         http=fetcher,  # type: ignore[arg-type]
         probe_http=fetcher,  # type: ignore[arg-type]
         clock=FixedClock(AT),
+        api_key=api_key,
     )
 
 
@@ -348,3 +353,52 @@ def test_a_probe_that_cannot_be_built_is_not_ready() -> None:
 def test_a_source_without_a_probe_is_ready_and_says_liveness_is_unchecked() -> None:
     readiness = source(probe=None).check()
     assert readiness.ready and readiness.detail == "no probe declared; liveness unchecked"
+
+
+NVD_KEY = ApiKey("NVD_API_KEY", "apiKey")
+SECRET = "test-only-nvd-key"
+
+
+def test_the_api_key_travels_in_its_header_on_documents_and_probes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NVD_API_KEY", SECRET)
+    http = _Http()
+    nvd = source(http=http, api_key=NVD_KEY)
+    nvd.document("CVE-2026-0001")
+    assert nvd.check().ready
+    assert http.headers == [{"apiKey": SECRET}, {"apiKey": SECRET}]
+    assert SECRET not in nvd.document("CVE-2026-0001").acquisition.source  # never in the URL
+
+
+def test_an_unset_key_is_not_ready_and_requests_go_keyless_aloud(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.delenv("NVD_API_KEY", raising=False)
+    http = _Http()
+    nvd = source(http=http, api_key=NVD_KEY)
+    readiness = nvd.check()
+    assert not readiness.ready and "$NVD_API_KEY is not set" in readiness.detail
+    with caplog.at_level("WARNING"):
+        nvd.document("CVE-2026-0001")
+    assert http.headers == [None]  # the probe isn't sent; the document goes keyless
+    assert any("$NVD_API_KEY is not set" in r.getMessage() for r in caplog.records)
+
+
+def test_the_key_is_in_no_readiness_or_log_line(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("NVD_API_KEY", SECRET)
+    refused = ServiceError("nvd answered 403", status=403)
+    http = _Http({"https://nvd.test/cves?cveId=CVE-2021-44228": refused})
+    nvd = source(http=http, api_key=NVD_KEY)
+    with caplog.at_level("DEBUG"):
+        readiness = nvd.check()
+    assert not readiness.ready and SECRET not in readiness.detail
+    assert all(SECRET not in r.getMessage() for r in caplog.records)
+
+
+def test_a_source_without_a_key_sends_no_header() -> None:
+    http = _Http()
+    source(http=http).document("CVE-2026-0001")
+    assert http.headers == [None]
