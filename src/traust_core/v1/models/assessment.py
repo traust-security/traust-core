@@ -522,6 +522,8 @@ class PrivilegeProfile(Model):
     rbac_rules: int
     wildcard_rules: int | None = None
     scc_requests: tuple[str, ...] = ()
+    # the profile's own flag: "asked for no SCC" is not "could not tell"; None when unstated
+    no_scc_request_recorded: bool | None = None
     flags: dict[str, int] = Field(default_factory=dict)  # a pattern is present only if it matched
     containers: int | None = None  # None when the profile lists no workloads
     privileged_containers: int | None = None
@@ -588,6 +590,7 @@ class PrivilegeProfile(Model):
             rbac_rules=summary["rbac_rules"],
             wildcard_rules=summary.get("wildcard_rules"),
             scc_requests=tuple(summary.get("scc_requests") or ()),
+            no_scc_request_recorded=summary.get("no_scc_request_recorded"),
             flags={k: len(v) for k, v in (profile.get("rbac_flags") or {}).items() if v},
             namespaces=tuple(profile.get("namespaces") or ()),
             install_modes=tuple(k for k, v in (profile.get("install_modes") or {}).items() if v),

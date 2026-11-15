@@ -15,6 +15,7 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0
 from tests.v1.services.test_insight import FakePortfolio
 from traust_core.v1.context import Config, Context
+from traust_core.v1.errors import ViewContractError
 from traust_core.v1.models.assessment import Permission, PrivilegeProfile
 from traust_core.v1.models.insight import PrivilegesRollup, ViewFilter, ViewName
 from traust_core.v1.providers.clock import FixedClock
@@ -156,3 +157,19 @@ def test_an_empty_fleet_renders_through_context(engine: Engine, tmp_path: Path) 
     assert rendered.csv is not None and len(rendered.csv.splitlines()) == 1
     other = ctx.services().insight.publish(ViewName.FINDINGS_ROLLUP, ViewFilter())
     assert other.csv is None
+
+
+def test_a_rollup_outside_its_contract_is_refused_by_the_build() -> None:
+    portfolio, _, ids = fleet()
+    # container posture without its containers: a profile Core never projects
+    drifted = FakeAssessment(profile(ids["a"], privileged_containers=1))
+    with pytest.raises(ViewContractError) as error:
+        PrivilegesView(drifted, portfolio).build(ViewFilter())  # type: ignore[arg-type]
+    assert "rows/0/privileged_containers" in {issue.path for issue in error.value.issues}
+
+
+def test_a_row_keeps_the_profiles_no_scc_recorded_flag() -> None:
+    portfolio, _, ids = fleet()
+    stated = FakeAssessment(profile(ids["a"], no_scc_request_recorded=True))
+    (row,) = PrivilegesView(stated, portfolio).build(ViewFilter()).rows  # type: ignore[arg-type]
+    assert (row.scc_requests, row.no_scc_request_recorded) == ((), True)

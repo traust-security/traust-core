@@ -288,6 +288,8 @@ The remaining correctness changes are:
 - A view Core built outside its own contract raises `ViewContractError` (a `DocumentError`):
   over REST it is a 500, logged with its source, with a generic detail; a caller's invalid
   request stays a 422.
+- `ViewName.PRIVILEGES` is validated by `contracts.validate_view("privileges", document)` before
+  `build` returns.
 - `ViewName.EXPOSURE` is validated by `contracts.validate_view("exposure", document)` before
   `build` returns, and carries its `as_of` (the filter's, else the clock's, read once for all
   three cuts); the executive summary's exposure panel uses the same row.
