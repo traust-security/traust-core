@@ -166,3 +166,10 @@ def test_a_rollup_outside_its_contract_is_refused_by_the_build() -> None:
     with pytest.raises(ViewContractError) as error:
         PrivilegesView(drifted, portfolio).build(ViewFilter())  # type: ignore[arg-type]
     assert "rows/0/privileged_containers" in {issue.path for issue in error.value.issues}
+
+
+def test_a_row_keeps_the_profiles_no_scc_recorded_flag() -> None:
+    portfolio, _, ids = fleet()
+    stated = FakeAssessment(profile(ids["a"], no_scc_request_recorded=True))
+    (row,) = PrivilegesView(stated, portfolio).build(ViewFilter()).rows  # type: ignore[arg-type]
+    assert (row.scc_requests, row.no_scc_request_recorded) == ((), True)

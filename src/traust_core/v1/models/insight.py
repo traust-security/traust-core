@@ -540,6 +540,7 @@ class PrivilegeRow(Model):
     rbac_rules: int
     wildcard_rules: int | None = None
     scc_requests: tuple[str, ...] = ()
+    no_scc_request_recorded: bool | None = None
     flags: Mapping[str, int] = Field(default_factory=dict)
     containers: int | None = None
     privileged_containers: int | None = None

@@ -102,6 +102,7 @@ def test_a_profile_states_its_grants_posture_and_flags(profiles: Profiles) -> No
         privileged_workloads=0,
         rbac_rules=1,
         wildcard_rules=0,
+        no_scc_request_recorded=True,
         flags={"secrets_access": 1, "escalate_bind_impersonate": 1},
         containers=1,
         privileged_containers=0,
@@ -318,3 +319,22 @@ def test_distinct_triples_count_grants_once_whatever_their_scope(
     (found,) = profiles.service.privileges(AssessmentFilter(), ids(repo))
     assert (found.distinct_rule_triples, found.distinct_cluster_triples) == triples
     assert found.model_dump()["distinct_rule_triples"] == triples[0]
+
+
+@pytest.mark.parametrize(
+    ("stated", "expected"),
+    [
+        ({"no_scc_request_recorded": True}, True),
+        ({"no_scc_request_recorded": False}, False),
+        ({}, None),
+    ],
+)
+def test_an_empty_scc_list_keeps_whether_none_was_recorded(
+    profiles: Profiles, stated: dict[str, Any], expected: bool | None
+) -> None:
+    # "asked for no SCC" and "could not tell" must not read the same: the profile's own flag
+    repo, main, _ = profiles.repo()
+    summary = {"workloads": 0, "rbac_rules": 0, "scc_requests": [], **stated}
+    profiles.record(main, 1, {"repo": "scc-operator", "summary": summary})
+    (found,) = profiles.service.privileges(AssessmentFilter(), ids(repo))
+    assert (found.scc_requests, found.no_scc_request_recorded) == ((), expected)
