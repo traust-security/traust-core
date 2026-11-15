@@ -307,16 +307,22 @@ class Probe:
     ecosystem: str | None = None
 
 
+def _port(url: str) -> int | None:
+    try:
+        return urlsplit(url).port
+    except ValueError:  # malformed: the registry refuses it, but never crash a message on it
+        return None
+
+
 def _host(url: str) -> str:
     """A URL's host (and a non-default port) for a message: never its userinfo."""
-    parts = urlsplit(url)
-    host = parts.hostname or ""
-    return f"{host}:{parts.port}" if parts.port and parts.port != 443 else host
+    host = urlsplit(url).hostname or ""
+    port = _port(url)
+    return f"{host}:{port}" if port and port != 443 else host
 
 
 def _origin(url: str) -> tuple[str, int]:
-    parts = urlsplit(url)
-    return (parts.hostname or "").lower(), parts.port or 443
+    return (urlsplit(url).hostname or "").lower(), _port(url) or 443
 
 
 class FeedSource:
@@ -361,8 +367,9 @@ class FeedSource:
             if e.status is not None and 400 <= e.status < 500 and e.status != 429:
                 # a revoked, mistyped or wrongly synced key is refused like a bad URL: say so
                 raise ServiceError(
-                    f"{e} (sent with {self.name}'s API key: a wrong or revoked key is refused "
-                    f"this way; check feeds.api_keys.{self.name})",
+                    f"{e} (the request carried {self.name}'s API key, which a redirect drops: "
+                    f"a wrong or revoked key is refused this way, so check "
+                    f"feeds.api_keys.{self.name}, then the source's URL)",
                     status=e.status,
                     operation=e.operation,
                     target_hash=e.target_hash,
@@ -400,10 +407,10 @@ class FeedSource:
                 if probed is not None and self._api_key is not None and self._keyed(probed):
                     return Readiness(
                         ready=False,
-                        detail=f"{_host(probed)} refused the probe sent with "
-                        f"{self.name}'s API key "
-                        f"(HTTP {e.status}): check the key (feeds.api_keys.{self.name}) first, "
-                        "then the source's URL in the feeds registry",
+                        detail=f"{_host(probed)} refused the probe (HTTP {e.status}), which "
+                        f"carried {self.name}'s API key unless a redirect dropped it: check the "
+                        f"key (feeds.api_keys.{self.name}) first, then the source's URL in the "
+                        "feeds registry",
                     )
                 return Readiness(
                     ready=False,

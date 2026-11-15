@@ -486,3 +486,12 @@ def test_the_shipped_registry_loads_with_every_field_read() -> None:
 
     shipped = Path(__file__).parents[3] / "src/traust_core/v1/context/shipped/feeds.yaml"
     assert _load(shipped).sources["nvd"].api_key_header == "apiKey"
+
+
+def test_a_source_url_with_a_malformed_port_is_a_config_error(tmp_path: Path) -> None:
+    text = SOURCES.replace(
+        "https://nvd.test/cves?cveId={ident_upper}", "https://nvd.test:abc/cves?cveId={ident_upper}"
+    )
+    assert text != SOURCES
+    with pytest.raises(ConfigError, match="nvd has a malformed URL port"):
+        Context(Config()).register_feeds(_registry(tmp_path, text))

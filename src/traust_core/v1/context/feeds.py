@@ -234,6 +234,9 @@ def load_feed_sources(
             raise ConfigError(f"feeds registry {path}: {name} has a probe but no URL")
         if any(not u.startswith("https://") for u in (url, template) if u):
             raise ConfigError(f"feeds registry {path}: {name} must be reached over https")
+        for u in (url, template):
+            if u and not _valid_port(u):
+                raise ConfigError(f"feeds registry {path}: {name} has a malformed URL port ({u})")
         declared = source.probe
         probe = (
             None
@@ -257,6 +260,15 @@ def load_feed_sources(
             )
         )
     return tuple(found)
+
+
+def _valid_port(url: str) -> bool:
+    """Whether a URL's port, if any, parses: a non-numeric or out-of-range one doesn't."""
+    try:
+        _ = urlsplit(url).port  # raises on a malformed port
+    except ValueError:
+        return False
+    return True
 
 
 def _api_key(

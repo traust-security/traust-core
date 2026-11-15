@@ -439,7 +439,8 @@ def test_a_keyed_refusal_names_the_host_that_was_probed() -> None:
     refused = ServiceError("HTTP 403", status=403)
     http = _Http({"https://nvd.test/cves?cveId=CVE-2021-44228": refused})
     readiness = source(url="https://status.other.test/", http=http, api_key=NVD_KEY).check()
-    assert readiness.detail.startswith("nvd.test refused the probe sent with nvd's API key")
+    assert readiness.detail.startswith("nvd.test refused the probe (HTTP 403)")
+    assert "feeds.api_keys.nvd" in readiness.detail
 
 
 def test_a_refused_post_probe_reports_not_ready_without_raising() -> None:
@@ -467,4 +468,11 @@ def test_readiness_never_shows_url_userinfo() -> None:
     assert (
         not readiness.ready and "hunter2" not in readiness.detail and "user" not in readiness.detail
     )
-    assert readiness.detail.startswith("nvd.test refused")
+    assert readiness.detail.startswith("nvd.test refused")  # host only
+
+
+@pytest.mark.parametrize("url", ["https://nvd.test:abc/", "https://nvd.test:99999/"])
+def test_a_malformed_port_never_crashes_a_message(url: str) -> None:
+    from traust_core.v1.providers.feeds import _host, _origin
+
+    assert _host(url) == "nvd.test" and _origin(url) == ("nvd.test", 443)
