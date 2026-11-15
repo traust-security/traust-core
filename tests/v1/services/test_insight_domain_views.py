@@ -127,6 +127,20 @@ def test_compliance_posture_per_framework_and_boundary() -> None:
     assert "not_satisfied 1" in text and "satisfied 4" in text
 
 
+def test_a_boundary_declared_with_an_empty_name_builds() -> None:
+    # the compliance-scope contract lets a declaration name a boundary "", and the
+    # summary keys its row by that name: the view's contract accepts it
+    class Unnamed(FakeCompliance):
+        def summary(self, filter: Any, group_by: ComplianceDimension) -> list[ComplianceRollup]:
+            rows = super().summary(filter, group_by)
+            if group_by == ComplianceDimension.SCOPE:
+                return [r.model_copy(update={"key": ""}) for r in rows]
+            return rows
+
+    model = ComplianceDashboardView(Unnamed()).build(ViewFilter())  # type: ignore[arg-type]
+    assert [r.key for r in model.by_scope] == [""]
+
+
 def test_the_compliance_view_refuses_an_as_of() -> None:
     view = ComplianceDashboardView(FakeCompliance())  # type: ignore[arg-type]
     with pytest.raises(ValidationError, match="no as_of"):
