@@ -4008,11 +4008,16 @@ class ComplianceDashboardView:
 
     def build(self, filter: ViewFilter) -> ComplianceDashboard:
         _fleet_only(self.name, filter)
+        if filter.as_of is not None:
+            # never current posture served as if it were historical
+            raise ValidationError("the compliance view reads posture as it stands; no as_of")
         every = ComplianceFilter()
-        return ComplianceDashboard(
+        model = ComplianceDashboard(
             by_framework=tuple(self._compliance.summary(every, ComplianceDimension.FRAMEWORK)),
             by_scope=tuple(self._compliance.summary(every, ComplianceDimension.SCOPE)),
         )
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
 
     def report(self, model: ComplianceDashboard, generated_at: datetime) -> Report:
         def rows(rollups: Sequence[ComplianceRollup]) -> list[tuple[str, ...]]:

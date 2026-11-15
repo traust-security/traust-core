@@ -24,7 +24,7 @@ from traust_core.v1.models.assessment import (
     Population,
     PopulationRow,
 )
-from traust_core.v1.models.compliance import ComplianceDimension, ComplianceRollup
+from traust_core.v1.models.compliance import COVERAGE_KEYS, ComplianceDimension, ComplianceRollup
 from traust_core.v1.models.dependencies import ExposureDimension, ExposureFilter, ExposureRollup
 from traust_core.v1.models.insight import ViewFilter, ViewName
 from traust_core.v1.models.pqc import PqcDimension, PqcRollup
@@ -106,16 +106,55 @@ def test_pqc_rolls_up_each_named_product_else_every_commit(products: tuple[UUID,
 
 @dataclass
 class FakeCompliance:
+    """Rows as Core counts them: a registered framework, the assessment's full coverage block,
+    and a framework row keyed by its framework."""
+
     def summary(self, filter: Any, group_by: ComplianceDimension) -> list[ComplianceRollup]:
-        coverage = {"nist-800-53": {"pass": 4, "fail": 1}}
-        return [ComplianceRollup(key=str(group_by), pairs=2, assessed=1, coverage=coverage)]
+        counts = dict.fromkeys(COVERAGE_KEYS, 0) | {"satisfied": 4, "not_satisfied": 1}
+        key = "nist-800-53-rev5" if group_by == ComplianceDimension.FRAMEWORK else "tenant-plane"
+        coverage = {"nist-800-53-rev5": counts}
+        return [ComplianceRollup(key=key, pairs=2, assessed=1, coverage=coverage)]
 
 
 def test_compliance_posture_per_framework_and_boundary() -> None:
     model = ComplianceDashboardView(FakeCompliance()).build(ViewFilter())  # type: ignore[arg-type]
-    assert [r.key for r in (*model.by_framework, *model.by_scope)] == ["framework", "scope"]
+    assert [r.key for r in (*model.by_framework, *model.by_scope)] == [
+        "nist-800-53-rev5",
+        "tenant-plane",
+    ]
     text = md(ComplianceDashboardView(FakeCompliance()))  # type: ignore[arg-type]
-    assert "| framework | 2 | 1 | nist-800-53: fail 1, pass 4 |" in text
+    assert "| tenant-plane | 2 | 1 | nist-800-53-rev5: " in text
+    assert "not_satisfied 1" in text and "satisfied 4" in text
+
+
+def test_a_boundary_declared_with_an_empty_name_builds() -> None:
+    # the compliance-scope contract lets a declaration name a boundary "", and the
+    # summary keys its row by that name: the view's contract accepts it
+    class Unnamed(FakeCompliance):
+        def summary(self, filter: Any, group_by: ComplianceDimension) -> list[ComplianceRollup]:
+            rows = super().summary(filter, group_by)
+            if group_by == ComplianceDimension.SCOPE:
+                return [r.model_copy(update={"key": ""}) for r in rows]
+            return rows
+
+    model = ComplianceDashboardView(Unnamed()).build(ViewFilter())  # type: ignore[arg-type]
+    assert [r.key for r in model.by_scope] == [""]
+
+
+def test_the_compliance_view_refuses_an_as_of() -> None:
+    view = ComplianceDashboardView(FakeCompliance())  # type: ignore[arg-type]
+    with pytest.raises(ValidationError, match="no as_of"):
+        view.build(ViewFilter(as_of=T0))
+
+
+def test_a_compliance_view_outside_its_contract_is_refused_by_the_build() -> None:
+    class Drifted(FakeCompliance):
+        def summary(self, filter: Any, group_by: ComplianceDimension) -> list[ComplianceRollup]:
+            return [r.model_copy(update={"pairs": 0}) for r in super().summary(filter, group_by)]
+
+    with pytest.raises(DocumentError) as error:
+        ComplianceDashboardView(Drifted()).build(ViewFilter())  # type: ignore[arg-type]
+    assert "by_framework/0/pairs" in {issue.path for issue in error.value.issues}
 
 
 @pytest.mark.parametrize(
