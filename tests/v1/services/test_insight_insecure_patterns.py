@@ -205,3 +205,21 @@ def test_patterns_outside_their_contract_are_refused_by_the_build(
     with pytest.raises(DocumentError) as error:
         patterns(context)
     assert "cuts/0/patterns/0/occurrences" in {issue.path for issue in error.value.issues}
+
+
+def test_a_claim_location_with_one_line_builds(
+    context: Context, engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a finding claim's location may give line_end without line_start; Core serves it as is
+    corpus(context, engine)
+    real = insight_module._insecure_pattern
+
+    def claimed(cwe: str, hits: insight_module._Hits) -> InsecurePattern:
+        pattern = real(cwe, hits)
+        examples = tuple(e.model_copy(update={"line_start": None}) for e in pattern.examples)
+        return pattern.model_copy(update={"examples": examples})
+
+    monkeypatch.setattr(insight_module, "_insecure_pattern", claimed)
+    owned = patterns(context).cuts[0]
+    assert owned.patterns[0].examples[0].line_start is None
+    assert owned.patterns[0].examples[0].line_end == 3
