@@ -79,8 +79,43 @@ identity:                                 # absent: no caller can be verified (R
 | Key | Effect |
 |---|---|
 | `feeds.osv_access` | `api` (default) queries the OSV API; `air-gapped` reads exported OSV records only (`Context.use_exported_advisories`). The feeds registry no longer carries this switch |
+| `feeds.api_keys` | feed source -> the environment variable holding its API key (`{nvd: NVD_API_KEY}`). Optional: a source not named goes keyless at its lower rate limit, with no warnings; a named variable that is unset is a config error. See [Feed API keys](#feed-api-keys) |
 | `execution.sandbox` | `none` (default) or `podman`: how lanes run a target's own build and test code |
 | `campaign.tracking_reference`, `campaign.display_name` | the tracking key and title reports cite |
 | `remediation.fork_org`, `remediation.patch_prefix`, `remediation.private_forge_hosts` | where fixes are pushed: the mirror org, the patch-repository name prefix the convention computes (`patch-` by default; a deployment running SCI's provisioner sets `sci-patch-`), and the deployment's own forge hosts |
 | `forge_tokens` | forge host -> the environment variable holding its API token, beside `forge_hosts` |
 | `overrides.rule_pack_allowlist` | enables supplemental rule packs; absent: none. The only override: tool pins, safe-exec profiles and the feeds registry are the project's and ship in `context/shipped/` (`Context.register_toolchain()` / `register_feeds()` read them) |
+
+## Feed API keys
+
+Some feed sources accept an API key for a higher rate limit. NVD answers about 5
+requests per 30 seconds without one and about 50 with one. A key is optional:
+without it, the source is queried keyless and nothing warns.
+
+- **Which sources take a key** is the feeds registry's (`context/shipped/feeds.yaml`):
+  a source declares `api_key_header`, the header its key travels in (NVD: `apiKey`).
+  Only per-identifier GET sources can declare one.
+- **Which variable holds the key** is the deployment's: name it under
+  `feeds.api_keys` in `traust.yaml`. The key itself never goes in either file; it comes
+  from the environment, for example a secret store synced into the worker's
+  environment.
+
+```yaml
+feeds:
+  api_keys:
+    nvd: NVD_API_KEY   # the variable's name; set NVD_API_KEY from your secret store
+```
+
+Core reads each named variable when it registers the feeds (`Context.register_feeds`).
+It refuses a key at load, never at the first request, when:
+- the variable is unset or empty;
+- the source isn't registered, or declares no `api_key_header`;
+- the source is a POST or whole-file feed;
+- the key holds control characters.
+
+The key is sent only to the source's own URL, never carried onto a redirect, and never
+appears in a URL, log line, error or `repr`.
+
+The feeds registry refuses any field it doesn't read, so a setting that would do
+nothing fails loudly instead of being ignored.
+

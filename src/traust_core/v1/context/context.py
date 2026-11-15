@@ -497,7 +497,11 @@ class Context:
             self.feeds.register(feed.name, lambda feed=feed: feed)
         probe_http = HttpFetcher("traust-core", PROBE_POLICY, clock=self.clock)
         for source in load_feed_sources(
-            registry, http=self.http, probe_http=probe_http, clock=self.clock
+            registry,
+            http=self.http,
+            probe_http=probe_http,
+            clock=self.clock,
+            api_keys=self.config.feeds.api_key_values(),
         ):
             self.feed_sources.register(source.name, lambda source=source: source)
         self.package_sources = load_package_sources(

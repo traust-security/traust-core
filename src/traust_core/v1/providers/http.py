@@ -92,9 +92,17 @@ class HttpFetcher:
         self._clock = clock or SystemClock()
         self._sleep = sleep
 
-    def get(self, url: str, headers: Mapping[str, str] | None = None) -> bytes:
+    def get(
+        self,
+        url: str,
+        headers: Mapping[str, str] | None = None,
+        *,
+        secret_headers: Mapping[str, str] | None = None,
+    ) -> bytes:
+        """`secret_headers` (an API key) go to `url` only: never onto a redirected request, so a
+        redirect to another host can't carry them."""
         try:
-            return self._send(url, None, headers=headers)
+            return self._send(url, None, headers=headers, secret_headers=secret_headers)
         except _Refused as e:
             raise _refused(url, e.status, "http.get") from e
 
@@ -152,6 +160,7 @@ class HttpFetcher:
         *,
         read: Callable[[Any], Any] = lambda r: r.read(),
         headers: Mapping[str, str] | None = None,
+        secret_headers: Mapping[str, str] | None = None,
     ) -> Any:
         policy = self._policy
         method = "POST" if data is not None else "GET"
@@ -165,6 +174,9 @@ class HttpFetcher:
             headers["Content-Type"] = content_type
         for attempt in range(policy.max_attempts):
             req = urllib.request.Request(url, data, headers=headers)
+            for name, value in (secret_headers or {}).items():
+                # urllib copies a request's headers onto a redirect, but not unredirected ones
+                req.add_unredirected_header(name, value)
             try:
                 with urllib.request.urlopen(req, timeout=policy.timeout_seconds) as r:
                     result = read(r)

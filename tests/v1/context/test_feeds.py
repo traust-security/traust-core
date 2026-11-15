@@ -1,5 +1,5 @@
 import json
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -179,7 +179,7 @@ sources:
     file: rh_cve.json
     paginate: {page_param: page, per_page: 1000}
     incremental: {since_param: after, watermark_field: public_date, backfill_from: '2026-05-01'}
-    probe: {ident: none, expect_status: 200}
+    probe: {ident: none}
   vex:
     tier: cached
     mode: indexed-lazy
@@ -393,46 +393,88 @@ def test_a_field_the_registry_does_not_read_is_a_config_error(
         Context(Config()).register_feeds(_registry(tmp_path, SOURCES.replace(old, new)))
 
 
+NVD_HEADER = SOURCES.rstrip() + "\n    api_key_header: apiKey\n"
+
+
+def _sources(tmp_path: Path, text: str, api_keys: dict[str, str]) -> dict:
+    from traust_core.v1.context.feeds import load_feed_sources
+    from traust_core.v1.providers.clock import FixedClock
+    from traust_core.v1.providers.http import HttpFetcher
+
+    http = HttpFetcher("test")
+    found = load_feed_sources(
+        _registry(tmp_path, text),
+        http=http,
+        probe_http=http,
+        clock=FixedClock(datetime(2026, 1, 1, tzinfo=UTC)),
+        api_keys=api_keys,
+    )
+    return {s.name: s for s in found}
+
+
+def test_a_deployment_key_goes_to_the_source_declaring_its_header(tmp_path: Path) -> None:
+    sources = _sources(tmp_path, NVD_HEADER, {"nvd": "k-1"})
+    assert sources["nvd"]._api_key is not None
+    assert sources["nvd"]._api_key.headers() == {"apiKey": "k-1"}
+    assert sources["vex"]._api_key is None
+
+
+def test_no_deployment_key_is_keyless(tmp_path: Path) -> None:
+    assert _sources(tmp_path, NVD_HEADER, {})["nvd"]._api_key is None
+
+
 @pytest.mark.parametrize(
-    ("key", "match"),
+    ("text", "keys", "match"),
     [
-        ("    api_key_env: NVD_API_KEY\n", "set together"),  # a key with no header to travel in
-        ("    api_key_header: apiKey\n", "set together"),
+        (NVD_HEADER, {"nvdd": "k"}, "not a registered feed source"),
+        (SOURCES, {"nvd": "k"}, "declares no api_key_header"),  # nowhere for it to travel
+        (NVD_HEADER, {"osv": "k"}, "declares no api_key_header"),
         (
-            "    api_key_env: nvd-key\n    api_key_header: apiKey\n",
-            "must name an environment variable",
+            SOURCES.replace(
+                "    probe: {ident: lodash, ecosystem: npm}\n",
+                "    probe: {ident: lodash, ecosystem: npm}\n    api_key_header: apiKey\n",
+            ),
+            {"osv": "k"},
+            "GET sources only",
+        ),
+        (NVD_HEADER, {"nvd": "bad\nkey"}, "no usable header value"),
+        (
+            NVD_HEADER.replace("api_key_header: apiKey", "api_key_header: 'api key'"),
+            {},
+            "not an HTTP header name",
         ),
     ],
 )
-def test_an_api_key_names_its_variable_and_its_header(tmp_path: Path, key: str, match: str) -> None:
-    text = SOURCES.rstrip() + "\n" + key
+def test_a_key_that_cannot_be_sent_fails_at_load(
+    tmp_path: Path, text: str, keys: dict[str, str], match: str
+) -> None:
     with pytest.raises(ConfigError, match=match):
-        Context(Config()).register_feeds(_registry(tmp_path, text))
+        _sources(tmp_path, text, keys)
 
 
-def test_a_probe_expects_only_success(tmp_path: Path) -> None:
-    text = SOURCES.replace("{ident: none, expect_status: 200}", "{ident: none, expect_status: 404}")
-    with pytest.raises(ConfigError, match="only 200 is checked"):
-        Context(Config()).register_feeds(_registry(tmp_path, text))
-
-
-def test_the_nvd_source_carries_its_api_key(tmp_path: Path) -> None:
-    text = SOURCES.rstrip() + "\n    api_key_env: NVD_API_KEY\n    api_key_header: apiKey\n"
-    ctx = Context(Config())
-    ctx.register_feeds(_registry(tmp_path, text))
-    nvd = ctx.feed_sources.get("nvd")
-    assert nvd._api_key is not None
-    assert (nvd._api_key.env, nvd._api_key.header) == ("NVD_API_KEY", "apiKey")
-    assert ctx.feed_sources.get("vex")._api_key is None
-
-
-@pytest.mark.parametrize("field", ["deletions_url", "archive_pointer_url", "doc_cache_dir"])
-def test_a_lazy_source_field_nothing_reads_is_refused(tmp_path: Path, field: str) -> None:
-    text = SOURCES.replace(
-        "    doc_url_template: https://vex.test/{year}/{ident_lower}.json\n",
-        "    doc_url_template: https://vex.test/{year}/{ident_lower}.json\n"
-        f"    {field}: https://vex.test/x\n",
+def test_a_cached_whole_file_feed_takes_no_key(tmp_path: Path) -> None:
+    text = REGISTRY.replace(
+        "    max_age_hours: 12\n", "    max_age_hours: 12\n    api_key_header: apiKey\n"
     )
+    with pytest.raises(ConfigError, match="kev fetches whole files"):
+        Context(Config()).register_feeds(_registry(tmp_path, text))
+
+
+@pytest.mark.parametrize(
+    "field", ["deletions_url", "archive_pointer_url", "doc_cache_dir", "expect_status"]
+)
+def test_a_field_nothing_reads_is_refused(tmp_path: Path, field: str) -> None:
+    if field == "expect_status":
+        text = SOURCES.replace(
+            "    probe: {ident: none}\n", "    probe: {ident: none, expect_status: 200}\n"
+        )
+    else:
+        text = SOURCES.replace(
+            "    doc_url_template: https://vex.test/{year}/{ident_lower}.json\n",
+            "    doc_url_template: https://vex.test/{year}/{ident_lower}.json\n"
+            f"    {field}: https://vex.test/x\n",
+        )
+    assert text != SOURCES
     with pytest.raises(ConfigError, match=field):
         Context(Config()).register_feeds(_registry(tmp_path, text))
 
@@ -441,5 +483,4 @@ def test_the_shipped_registry_loads_with_every_field_read() -> None:
     from traust_core.v1.context.feeds import _load
 
     shipped = Path(__file__).parents[3] / "src/traust_core/v1/context/shipped/feeds.yaml"
-    nvd = _load(shipped).sources["nvd"]
-    assert (nvd.api_key_env, nvd.api_key_header) == ("NVD_API_KEY", "apiKey")
+    assert _load(shipped).sources["nvd"].api_key_header == "apiKey"

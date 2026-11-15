@@ -328,3 +328,26 @@ def test_a_refused_page_is_a_typed_error(monkeypatch: pytest.MonkeyPatch) -> Non
     with pytest.raises(ServiceError) as raised:
         list(_fetcher([]).pages("https://forge.test/items"))
     assert raised.value.status == 401
+
+
+def test_secret_headers_go_to_the_url_only_never_onto_a_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sent: list[urllib.request.Request] = []
+
+    def _open(req: urllib.request.Request, timeout: float) -> _Resp:
+        sent.append(req)
+        return _Resp(b"ok")
+
+    monkeypatch.setattr(http.urllib.request, "urlopen", _open)
+    fetcher = http.HttpFetcher("t", http.RetryPolicy(max_attempts=1))
+    fetcher.get("https://nvd.test/a", headers={"X-Plain": "p"}, secret_headers={"apiKey": "k"})
+    [req] = sent
+    assert req.get_header("Apikey") == "k" and req.get_header("X-plain") == "p"
+    # urllib's redirect handler copies `headers`, never `unredirected_hdrs`
+    assert "Apikey" in req.unredirected_hdrs and "Apikey" not in req.headers
+    redirected = urllib.request.HTTPRedirectHandler().redirect_request(
+        req, None, 302, "Found", {}, "https://elsewhere.test/b"
+    )
+    assert redirected is not None
+    assert redirected.get_header("Apikey") is None and redirected.get_header("X-plain") == "p"

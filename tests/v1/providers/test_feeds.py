@@ -232,8 +232,14 @@ class _Http:
             raise answer
         return answer
 
-    def get(self, url: str, headers: dict[str, str] | None = None) -> bytes:
-        self.headers.append(headers)
+    def get(
+        self,
+        url: str,
+        headers: dict[str, str] | None = None,
+        *,
+        secret_headers: dict[str, str] | None = None,
+    ) -> bytes:
+        self.headers.append(secret_headers)
         return self._answer(url, None)
 
     def post_json(self, url: str, doc: object) -> bytes:
@@ -355,14 +361,11 @@ def test_a_source_without_a_probe_is_ready_and_says_liveness_is_unchecked() -> N
     assert readiness.ready and readiness.detail == "no probe declared; liveness unchecked"
 
 
-NVD_KEY = ApiKey("NVD_API_KEY", "apiKey")
 SECRET = "test-only-nvd-key"
+NVD_KEY = ApiKey("apiKey", SECRET)
 
 
-def test_the_api_key_travels_in_its_header_on_documents_and_probes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("NVD_API_KEY", SECRET)
+def test_the_api_key_travels_as_a_secret_header_on_documents_and_probes() -> None:
     http = _Http()
     nvd = source(http=http, api_key=NVD_KEY)
     nvd.document("CVE-2026-0001")
@@ -371,24 +374,19 @@ def test_the_api_key_travels_in_its_header_on_documents_and_probes(
     assert SECRET not in nvd.document("CVE-2026-0001").acquisition.source  # never in the URL
 
 
-def test_an_unset_key_is_not_ready_and_requests_go_keyless_aloud(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+def test_a_source_without_a_key_sends_none_and_says_nothing(
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    monkeypatch.delenv("NVD_API_KEY", raising=False)
     http = _Http()
-    nvd = source(http=http, api_key=NVD_KEY)
-    readiness = nvd.check()
-    assert not readiness.ready and "$NVD_API_KEY is not set" in readiness.detail
-    with caplog.at_level("WARNING"):
+    nvd = source(http=http)
+    with caplog.at_level("DEBUG"):
+        readiness = nvd.check()
         nvd.document("CVE-2026-0001")
-    assert http.headers == [None]  # the probe isn't sent; the document goes keyless
-    assert any("$NVD_API_KEY is not set" in r.getMessage() for r in caplog.records)
+    assert readiness.ready and http.headers == [None, None]
+    assert not [r for r in caplog.records if r.levelname in ("WARNING", "ERROR")]
 
 
-def test_the_key_is_in_no_readiness_or_log_line(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    monkeypatch.setenv("NVD_API_KEY", SECRET)
+def test_the_key_is_in_no_readiness_log_line_or_repr(caplog: pytest.LogCaptureFixture) -> None:
     refused = ServiceError("nvd answered 403", status=403)
     http = _Http({"https://nvd.test/cves?cveId=CVE-2021-44228": refused})
     nvd = source(http=http, api_key=NVD_KEY)
@@ -396,9 +394,4 @@ def test_the_key_is_in_no_readiness_or_log_line(
         readiness = nvd.check()
     assert not readiness.ready and SECRET not in readiness.detail
     assert all(SECRET not in r.getMessage() for r in caplog.records)
-
-
-def test_a_source_without_a_key_sends_no_header() -> None:
-    http = _Http()
-    source(http=http).document("CVE-2026-0001")
-    assert http.headers == [None]
+    assert SECRET not in repr(NVD_KEY)

@@ -5,11 +5,10 @@ import gzip
 import io
 import json
 import logging
-import os
 import re
 import zlib
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import PurePosixPath
 from typing import Any, Protocol
@@ -288,15 +287,15 @@ def fill_template(template: str, identifier: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class ApiKey:
-    """Where a source's API key comes from (`env`, an environment variable read per request) and
-    the header it travels in. The key is never in a URL, a log line or an error."""
+    """A source's API key and the header it travels in, from the deployment's config (traust.yaml
+    `feeds.api_keys`). Sent only to the source's own URL, never onto a redirect; never in a URL,
+    a log line, an error or a repr."""
 
-    env: str
     header: str
+    value: str = field(repr=False)
 
-    def headers(self) -> dict[str, str] | None:
-        key = os.environ.get(self.env, "").strip()
-        return {self.header: key} if key else None
+    def headers(self) -> dict[str, str]:
+        return {self.header: self.value}
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,33 +337,16 @@ class FeedSource:
         self._api_key = api_key
 
     def _get(self, http: HttpFetcher, url: str) -> bytes:
-        """A GET carrying the API key's header when there is one; a keyless source's request is
-        exactly as before."""
-        headers = self._headers()
-        return http.get(url, headers=headers) if headers else http.get(url)
-
-    def _headers(self) -> dict[str, str] | None:
-        """The API key's header when its variable is set; unset, the request goes keyless and
-        says so (`check` reports the source not ready)."""
+        """A GET carrying the source's API key when the deployment gives one: a secret header,
+        sent to this URL only. A keyless source's request is exactly as before."""
         if self._api_key is None:
-            return None
-        headers = self._api_key.headers()
-        if headers is None:
-            log.warning(
-                "%s: $%s is not set; requests go without its API key", self.name, self._api_key.env
-            )
-        return headers
+            return http.get(url)
+        return http.get(url, secret_headers=self._api_key.headers())
 
     def check(self) -> Readiness:
         """Send the probe: an HTTP refusal means the registry and the service disagree, an
         unreachable host means liveness is undetermined."""
         probe = self._probe
-        if self._api_key is not None and self._api_key.headers() is None:
-            return Readiness(
-                ready=False,
-                detail=f"${self._api_key.env} is not set: {self.name} requests would go without "
-                "their API key (rate-limited); set it from the deployment's secret store",
-            )
         if probe is None:
             return Readiness(ready=True, detail="no probe declared; liveness unchecked")
         host = urlsplit(self.url).netloc

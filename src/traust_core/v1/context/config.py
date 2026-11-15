@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -254,6 +254,20 @@ class Locations(_Model):
 
 class FeedsConfig(_Model):
     osv_access: Literal["api", "air-gapped"] = "api"  # air-gapped: exported OSV records only
+    # source -> the environment variable holding its API key (`nvd: NVD_API_KEY`). Optional:
+    # a source not named here goes keyless; a named variable that is unset is a config error.
+    api_keys: dict[
+        Annotated[str, pydantic.StringConstraints(pattern=r"^[a-z0-9][a-z0-9_-]*$")],
+        Annotated[str, pydantic.StringConstraints(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")],
+    ] = pydantic.Field(default_factory=dict)
+
+    def api_key_values(self) -> dict[str, str]:
+        """Each named source's API key, read from its variable."""
+        return {
+            source: value
+            for source, name in self.api_keys.items()
+            if (value := _read_env(name, f"feeds.api_keys.{source}"))
+        }
 
 
 class ComplianceConfig(_Model):

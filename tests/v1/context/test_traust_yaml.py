@@ -302,3 +302,57 @@ def test_a_registry_naming_osv_access_itself_is_refused(tmp_path: Path) -> None:
     registry.write_text(LIVE_OSV + "    access: air-gapped\n")
     with pytest.raises(ConfigError, match=r"feeds\.osv_access"):
         Context(Config()).register_feeds(registry)
+
+
+NVD_REGISTRY = """\
+version: 1
+sources:
+  nvd:
+    tier: live
+    url_template: https://nvd.test/cves?cveId={ident_upper}
+    ident: cve
+    api_key_header: apiKey
+"""
+
+
+def test_feeds_api_keys_give_a_source_the_key_its_variable_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TEST_NVD_KEY", "k-1")
+    registry = tmp_path / "feeds.yaml"
+    registry.write_text(NVD_REGISTRY)
+    config = Config.from_home(_home(tmp_path, "feeds: {api_keys: {nvd: TEST_NVD_KEY}}\n"))
+    assert config.feeds.api_keys == {"nvd": "TEST_NVD_KEY"}
+    ctx = Context(config)
+    ctx.register_feeds(registry)
+    key = ctx.feed_sources.get("nvd")._api_key
+    assert key is not None and key.headers() == {"apiKey": "k-1"}
+
+
+def test_no_api_keys_is_keyless(tmp_path: Path) -> None:
+    registry = tmp_path / "feeds.yaml"
+    registry.write_text(NVD_REGISTRY)
+    ctx = Context(Config.from_home(_home(tmp_path, "feeds: {osv_access: api}\n")))
+    ctx.register_feeds(registry)
+    assert ctx.feed_sources.get("nvd")._api_key is None
+
+
+def test_a_named_key_variable_that_is_unset_is_a_config_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("TEST_NVD_KEY", raising=False)
+    registry = tmp_path / "feeds.yaml"
+    registry.write_text(NVD_REGISTRY)
+    ctx = Context(Config.from_home(_home(tmp_path, "feeds: {api_keys: {nvd: TEST_NVD_KEY}}\n")))
+    with pytest.raises(
+        ConfigError, match=r"feeds\.api_keys\.nvd names unset variable TEST_NVD_KEY"
+    ):
+        ctx.register_feeds(registry)
+
+
+@pytest.mark.parametrize(
+    "text", ["feeds: {api_keys: {nvd: nvd-key}}\n", "feeds: {api_keys: {NVD: K}}\n"]
+)
+def test_feeds_api_keys_take_registry_names_and_variable_names(tmp_path: Path, text: str) -> None:
+    with pytest.raises(ConfigError):
+        Config.from_home(_home(tmp_path, text))
