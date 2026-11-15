@@ -28,6 +28,7 @@ from traust_core.v1.models.insight import (
 from traust_core.v1.models.values import ProductSlug
 from traust_core.v1.models.vocabulary import OwnershipClass
 from traust_core.v1.providers.clock import FixedClock
+from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services import insight as insight_module
 
@@ -220,6 +221,11 @@ def test_a_claim_location_with_one_line_builds(
         return pattern.model_copy(update={"examples": examples})
 
     monkeypatch.setattr(insight_module, "_insecure_pattern", claimed)
-    owned = patterns(context).cuts[0]
+    model = patterns(context)
+    owned = model.cuts[0]
     assert owned.patterns[0].examples[0].line_start is None
     assert owned.patterns[0].examples[0].line_end == 3
+    # the report keeps the end line it was given: start unknown, not "no lines"
+    view = context.services().insight._view(ViewName.INSECURE_PATTERNS)
+    text = MarkdownRenderer().render(view.report(model, T0)).decode()
+    assert f"{API} · q.go:?-3 · handler" in text
