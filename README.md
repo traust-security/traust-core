@@ -202,6 +202,15 @@ The remaining correctness changes are:
   or indexing, individual row/file byte size, or database query-planning work.
   Building and publishing do not fetch feeds, scan, write SQL rows or write object bytes.
   CSV uses the shared one-line, formula-neutralizing renderer; JSON retains original text.
+- **Reports on demand:** `GET /v1/insights/{name}/report?format=markdown|html|csv` renders
+  any insight with the same scope query and contract check as `GET /v1/insights/{name}`
+  (`InsightService.render`), built now (never a stored census build), rendered only in the
+  format asked for (`ReportFormat`) and returned as one file named by `Content-Disposition`;
+  nothing is stored. `csv` is for an insight with an export table (`inventory-export`,
+  `privileges`); others refuse it with a 422 before the view is built. Both routes take
+  `executive_panel` (repeatable: `attack`, `pqc`, `isolation`, `iac`) for the executive
+  summary's optional panels; any other view refuses it (422), so a panel never silently
+  bypasses the stored census.
 - The census insight views (`findings-rollup`, `coverage`, `remediation-index`,
   `findings-trend`) are now also **stored builds** (performance-lane wave (d),
   foundry#56): `InsightService.record_builds()` folds the four once at the GLOBAL scope

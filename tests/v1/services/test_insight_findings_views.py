@@ -244,6 +244,28 @@ def test_the_team_report_lifts_attack_scenarios_verbatim_for_a_scope() -> None:
     assert "_From the repository's latest threat model (T3)._" in md
 
 
+def test_imported_scenario_steps_cannot_form_links_or_html() -> None:
+    repo, product = uuid4(), uuid4()
+    portfolio = FakePortfolio(
+        repositories={repo: "https://github.com/example-org/svc"},
+        products={product: ("alpha", {repo})},
+    )
+    scenario = AttackScenario(
+        assessment_id=uuid4(),
+        repository_id=repo,
+        label="T4",
+        threat=None,
+        steps=("Open [click](https://attacker.example) then <img src=x onerror=alert(1)>.",),
+    )
+    rollup_view = FindingsRollupView(
+        FakeFindings([view(repository_id=repo)]), portfolio, ThreatModels(scenario)
+    )  # type: ignore[arg-type]
+    model = rollup_view.build(ViewFilter(product_ids=(product,)))
+    md = MarkdownRenderer().render(rollup_view.report(model, T0)).decode()
+    assert "[click](" not in md and "<img" not in md
+    assert r"\[click\]\(https://attacker.example\)" in md and "&lt;img" in md
+
+
 def test_the_fleet_rollup_reads_no_threat_models() -> None:
     repo = uuid4()
     assessment = ThreatModels()
