@@ -17,7 +17,7 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.services.test_insight_domain_views import FakeExposure
 from traust_core.v1.context import Config, Context
-from traust_core.v1.errors import DocumentError, ValidationError
+from traust_core.v1.errors import DocumentError, ValidationError, ViewContractError
 from traust_core.v1.models.assessment import AssessmentKind
 from traust_core.v1.models.dependencies import ExposureDimension, ExposureRollup, malicious_id
 from traust_core.v1.models.insight import (
@@ -149,6 +149,41 @@ def test_dependency_reach_of_nothing_says_so_and_takes_no_as_of(context: Context
     assert "_No manifests recorded._" in md
     with pytest.raises(ValidationError, match="no as_of"):
         context.services().insight.build(ViewName.DEPENDENCY_REACH, ViewFilter(as_of=T0))
+
+
+def test_dependency_reach_lists_each_ecosystem_and_package_once(
+    context: Context, engine: Engine
+) -> None:
+    # the contract cannot check a field unique across rows: Core's grouping guarantees it,
+    # even when many repositories hold the same packages in the same ecosystem
+    with SqlTraustUnitOfWork(engine) as uow:
+        s = Seed(uow)
+        packages = [s.package(ecosystem="go", name=f"example.com/m{i}") for i in range(3)]
+        for n in range(4):
+            sbom = s.sbom()
+            for p in packages:
+                s.dependency(sbom, p)
+            repo = s.repository(url=f"https://github.com/example-org/g{n}")
+            ref = s.repository_ref(repo, is_default=True, manifest_sbom_id=sbom.id)
+            s.assessment(ref, kind=AssessmentKind.REPO_STATE, occurred_at=T0)
+        uow.commit()
+    reach = context.services().insight.build(ViewName.DEPENDENCY_REACH, ViewFilter())
+    assert isinstance(reach, DependencyReach)
+    assert [(e.ecosystem, e.repositories, e.packages) for e in reach.ecosystems] == [("go", 4, 3)]
+    identities = [(p.ecosystem, p.name) for p in reach.shared]
+    assert len(identities) == len(set(identities)) == 3
+
+
+def test_dependency_reach_outside_its_contract_is_refused_by_the_build(
+    context: Context, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def drifted(*args: object) -> tuple[dict[tuple[str, str], set[object]], int]:
+        return {}, -1
+
+    monkeypatch.setattr(insight_module, "_manifest_holders", drifted)
+    with pytest.raises(ViewContractError) as error:
+        context.services().insight.build(ViewName.DEPENDENCY_REACH, ViewFilter())
+    assert "unmeasured" in {issue.path for issue in error.value.issues}
 
 
 @pytest.mark.parametrize(
