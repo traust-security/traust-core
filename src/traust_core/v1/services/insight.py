@@ -1456,7 +1456,7 @@ class InsecurePatternsView:
                         hit.view.effective_severity
                     ) < _severity_rank(hits[key].view.effective_severity):
                         hits[key] = hit
-        return InsecurePatterns(
+        model = InsecurePatterns(
             as_of=filter.as_of,
             cuts=tuple(
                 InsecurePatternCut(
@@ -1473,6 +1473,8 @@ class InsecurePatternsView:
                 if found.get(o) or without_cwe.get(o)
             ),
         )
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
 
     def report(self, model: InsecurePatterns, generated_at: datetime) -> Report:
         # NEED(classifiers: Q5): code-vs-config; findings are counted unfiltered.

@@ -283,6 +283,8 @@ The remaining correctness changes are:
 - `ViewName.COMPLIANCE` is validated by `contracts.validate_view("compliance", document)` before
   `build` returns. It reads posture as it stands (current declarations, newest assessments), so
   it refuses an `as_of` (422) rather than serve current posture as historical.
+- `ViewName.INSECURE_PATTERNS` is validated by
+  `contracts.validate_view("insecure-patterns", document)` before `build` returns.
 - `ViewName.EXPOSURE` is validated by `contracts.validate_view("exposure", document)` before
   `build` returns, and carries its `as_of` (the filter's, else the clock's, read once for all
   three cuts); the executive summary's exposure panel uses the same row.
