@@ -18,7 +18,13 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
 from traust_core.v1.models.common import PageRequest, RecordBudget
-from traust_core.v1.models.findings import Finding, FindingFilter, FindingState, RecordDecision
+from traust_core.v1.models.findings import (
+    Finding,
+    FindingFilter,
+    FindingSetFilter,
+    FindingState,
+    RecordDecision,
+)
 from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.inventory import Repository, RepositoryRef
 from traust_core.v1.models.vocabulary import (
@@ -146,36 +152,65 @@ def test_get_unknown_finding_is_not_found(engine: Engine) -> None:
         service(engine).get(uuid4())
 
 
-def test_a_view_carries_when_the_reports_ran(engine: Engine) -> None:
+@pytest.mark.parametrize("closed", [False, True])
+def test_report_times_follow_assessments_not_insertion_or_decision_times(
+    engine: Engine, closed: bool
+) -> None:
     """The view's first/last report times — the occurrence→assessment join the census
     reads for its SLA `first` — so a listing can show a date per finding (the item
     findings page's datetime column); an `as_of` before the later report still sees
-    only the earlier one."""
-    a = audited(engine, severity="high")
+    only the earlier one, on the single-repository listing and on the set listing."""
+    a = audited(engine)
+    earlier = T0 - timedelta(days=5)
+    later = T0 + timedelta(days=10)
     with SqlTraustUnitOfWork(engine) as uow:
         seed = Seed(uow)
-        later = seed.assessment(a.ref, occurred_at=T0 + timedelta(days=10))
-        seed.occurrence(a.finding, later, severity="high")
+        for at in (later, earlier, T0 + timedelta(days=2)):
+            seed.occurrence(a.finding, seed.assessment(a.ref, occurred_at=at), severity="high")
         uow.commit()
-    view = service(engine).get(a.finding.id)  # type: ignore[arg-type]
-    assert view.first_reported_at == T0
-    assert view.last_reported_at == T0 + timedelta(days=10)
-    cutoff = service(engine).list(
-        FindingFilter(repository_id=a.repository.id, as_of=T0 + timedelta(days=5)), PageRequest()
-    )
-    assert [v.first_reported_at for v in cutoff.items] == [T0]
-    assert [v.last_reported_at for v in cutoff.items] == [T0]
+    findings = service(engine)
+    if closed:
+        findings.decisions.decide(said(a.finding, 20, validity="false_positive"), ALICE)
+    view = findings.get(a.finding.id)
+    assert (view.first_reported_at, view.last_reported_at) == (earlier, later)
+    assert a.finding.created_at not in (earlier, later)
+    for cutoff, expected in (
+        (None, (earlier, later)),
+        (earlier, (earlier, earlier)),
+        (T0 + timedelta(days=5), (earlier, T0 + timedelta(days=2))),
+        (later, (earlier, later)),
+    ):
+        pages = (
+            findings.list(
+                FindingFilter(repository_id=a.repository.id, as_of=cutoff), PageRequest()
+            ),
+            findings.list_in(
+                FindingSetFilter(repository_ids=(a.repository.id,), as_of=cutoff), PageRequest()
+            ),
+        )
+        for page in pages:
+            assert len(page.items) == 1
+            listed = page.items[0]
+            assert (listed.first_reported_at, listed.last_reported_at) == expected
+    before = FindingFilter(repository_id=a.repository.id, as_of=earlier - timedelta(seconds=1))
+    assert findings.list(before, PageRequest()).items == ()
 
 
-def test_a_finding_no_assessment_reported_has_no_report_times(engine: Engine) -> None:
+def test_a_finding_without_reports_has_no_report_times(engine: Engine) -> None:
     with SqlTraustUnitOfWork(engine) as uow:
         seed = Seed(uow)
         repo = seed.repository()
         seed.repository_ref(repo)
         finding = seed.finding(repo)
         uow.commit()
-    view = service(engine).get(finding.id)  # type: ignore[arg-type]
-    assert (view.first_reported_at, view.last_reported_at) == (None, None)
+    findings = service(engine)
+    views = [
+        findings.get(finding.id),
+        *findings.list(FindingFilter(repository_id=repo.id), PageRequest()).items,
+        *findings.list_in(FindingSetFilter(repository_ids=(repo.id,)), PageRequest()).items,
+    ]
+    assert len(views) == 3
+    assert all((v.first_reported_at, v.last_reported_at) == (None, None) for v in views)
 
 
 @pytest.mark.parametrize("with_algorithm", [False, True])

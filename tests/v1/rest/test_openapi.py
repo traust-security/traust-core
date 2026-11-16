@@ -32,3 +32,13 @@ def test_operation_ids_are_the_route_names_without_path_or_method(client: TestCl
     ids = [operation["operationId"] for path in paths for operation in path.values()]
     assert len(ids) == len(set(ids))
     assert [i for i in ids if not re.fullmatch(r"[a-z]+(_[a-z]+)*", i)] == []
+
+
+def test_finding_report_times_remain_nullable_datetimes_in_the_sdk_contract(
+    client: TestClient,
+) -> None:
+    spec = client.get("/openapi.json").json()
+    properties = spec["components"]["schemas"]["FindingView"]["properties"]
+    for name in ("first_reported_at", "last_reported_at"):
+        assert {"type": "string", "format": "date-time"} in properties[name]["anyOf"]
+        assert {"type": "null"} in properties[name]["anyOf"]

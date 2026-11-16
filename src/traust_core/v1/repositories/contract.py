@@ -297,7 +297,9 @@ class OrderReads(SqlRepository):
         c = orders.c
         collation = "C" if self._connection.dialect.name == "postgresql" else "BINARY"
         reference = sa.func.coalesce(
-            repositories.c.url, sa.cast(c.repository_id, sa.Text), sa.cast(c.id, sa.Text)
+            sa.func.nullif(repositories.c.url, ""),
+            sa.cast(c.repository_id, sa.Text),
+            sa.cast(c.id, sa.Text),
         )
         if query.sort_by is OrderSortBy.IDS:
             value = sa.case(
@@ -333,10 +335,15 @@ class OrderReads(SqlRepository):
         if query.q:
             escaped = query.q.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             pattern = f"%{escaped}%"
+            lower = (
+                sa.func.lower
+                if self._connection.dialect.name == "postgresql"
+                else sa.func.unicode_lower
+            )
             stmt = stmt.where(
                 sa.or_(
                     *(
-                        sa.func.lower(column).like(pattern, escape="\\")
+                        lower(column).like(pattern, escape="\\")
                         for column in (reference, c.asset, c.state)
                     )
                 )
@@ -344,33 +351,43 @@ class OrderReads(SqlRepository):
         descending = (
             query.sort_order is OrderSortOrder.DESC and query.sort_by is not OrderSortBy.IDS
         )
-        if after is not None:
-            position = after.value
-            if (
-                query.sort_by
-                in {
-                    OrderSortBy.CREATED_AT,
-                    OrderSortBy.STARTED_AT,
-                    OrderSortBy.FINISHED_AT,
-                }
-                and position is not None
-            ):
-                position = datetime.fromisoformat(position)
-            elif query.sort_by is OrderSortBy.ID and position is not None:
-                position = UUID(position)
-            id_after = c.id < after.order_id if descending else c.id > after.order_id
-            if position is None:
-                stmt = stmt.where(value.is_(None), id_after)
-            else:
-                beyond = value < position if descending else value > position
-                stmt = stmt.where(
-                    sa.or_(value.is_(None), beyond, sa.and_(value == position, id_after))
-                )
         direction = sa.desc if descending else sa.asc
-        stmt = stmt.order_by(value.is_(None), direction(value), direction(c.id)).limit(
-            query.limit + 1
-        )
-        rows = self._execute("query orders", stmt).mappings()
+        nullable = query.sort_by in {
+            OrderSortBy.STARTED_AT,
+            OrderSortBy.FINISHED_AT,
+            OrderSortBy.REASON,
+        }
+        position = after.value if after is not None else None
+        if position is not None:
+            if query.sort_by in {
+                OrderSortBy.CREATED_AT,
+                OrderSortBy.STARTED_AT,
+                OrderSortBy.FINISHED_AT,
+            }:
+                position = datetime.fromisoformat(position)
+            elif query.sort_by is OrderSortBy.ID:
+                position = UUID(position)
+        target = query.limit + 1
+        rows = []
+        if after is None or position is not None:
+            nonnull = stmt.where(value.is_not(None)) if nullable else stmt
+            if after is not None:
+                if query.sort_by is OrderSortBy.ID:
+                    seek = c.id < after.order_id if descending else c.id > after.order_id
+                else:
+                    key = sa.tuple_(value, c.id)
+                    cursor = (position, after.order_id)
+                    seek = key < cursor if descending else key > cursor
+                nonnull = nonnull.where(seek)
+            keys = (c.id,) if query.sort_by is OrderSortBy.ID else (value, c.id)
+            nonnull = nonnull.order_by(*(direction(key) for key in keys)).limit(target)
+            rows = list(self._execute("query orders", nonnull).mappings())
+        if nullable and len(rows) < target:
+            nulls = stmt.where(value.is_(None))
+            if after is not None and position is None:
+                nulls = nulls.where(c.id < after.order_id if descending else c.id > after.order_id)
+            nulls = nulls.order_by(direction(c.id)).limit(target - len(rows))
+            rows.extend(self._execute("query orders without sort value", nulls).mappings())
         return [
             (
                 RunOrder.model_validate({column.name: row[column.name] for column in orders.c}),

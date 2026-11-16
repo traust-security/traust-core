@@ -8,15 +8,17 @@ from uuid import UUID
 import pytest
 
 from perf.harness import Explained, Profile
-from perf.seed import TYPICAL_REPOSITORY
+from perf.seed import RUN_ORDERS, TYPICAL_REPOSITORY
 from traust_core.v1.models.common import TimeWindow
 from traust_core.v1.models.operations import (
     FEED_ORDER_STATES,
     FINISHED_ORDER_STATES,
     OPEN_ORDER_STATES,
     LaneName,
+    OrderQueryPosition,
     OrderQueryRequest,
     OrderSortBy,
+    OrderSortOrder,
     OrderState,
     SpendDimension,
     SpendFilter,
@@ -226,13 +228,10 @@ def test_lane_costs_read_settled_orders_in_the_window_by_index(explained: Profil
 
 
 @pytest.mark.parametrize("sort_by", [OrderSortBy.CREATED_AT, OrderSortBy.STARTED_AT])
-@pytest.mark.parametrize(
-    "search", ["", TYPICAL_REPOSITORY], ids=["first-page", "repository-search"]
-)
-def test_order_query_bounds_the_first_page_at_volume(
-    explained: Profile, search: str, sort_by: OrderSortBy
+def test_order_query_substring_search_has_a_bounded_result_and_scan_budget(
+    explained: Profile, sort_by: OrderSortBy
 ) -> None:
-    query = OrderQueryRequest(q=search, sort_by=sort_by, limit=100)
+    query = OrderQueryRequest(q=TYPICAL_REPOSITORY, sort_by=sort_by, limit=100)
 
     def read(uow: SqlTraustUnitOfWork) -> object:
         rows = uow.order_reads.query(query, query.position())
@@ -243,3 +242,60 @@ def test_order_query_bounds_the_first_page_at_volume(
     assert "LIMIT" in page.sql.upper(), page.sql
     assert any("Limit" in line for line in page.plan), page.plan
     assert page.execution_ms < 2000, page.plan
+
+
+@pytest.mark.parametrize("sort_order", list(OrderSortOrder))
+@pytest.mark.parametrize("deep", [False, True], ids=["first-page", "deep-page"])
+@pytest.mark.parametrize(
+    ("sort_by", "index"),
+    [
+        (OrderSortBy.CREATED_AT, "idx_ops_run_order_created"),
+        (OrderSortBy.STARTED_AT, "idx_ops_run_order_started"),
+        (OrderSortBy.ID, "run_order_pkey"),
+    ],
+)
+def test_common_empty_search_order_pages_seek_indexes(
+    explained: Profile, sort_by: OrderSortBy, index: str, deep: bool, sort_order: OrderSortOrder
+) -> None:
+    query = OrderQueryRequest(sort_by=sort_by, sort_order=sort_order, limit=100)
+    middle_id = UUID(int=1 << 127)
+    value = (
+        str(middle_id)
+        if sort_by is OrderSortBy.ID
+        else (NOW - timedelta(seconds=RUN_ORDERS * 15 // 2)).isoformat()
+    )
+    position = (
+        OrderQueryPosition(fingerprint=query.fingerprint(), value=value, order_id=middle_id)
+        if deep
+        else None
+    )
+
+    def read(uow: SqlTraustUnitOfWork) -> object:
+        rows = uow.order_reads.query(query, position)
+        assert len(rows) == query.limit + 1
+        return rows
+
+    (page,) = explained(read)
+    fast(page, index, 50)
+    assert "OFFSET" not in page.sql.upper(), page.sql
+    assert not any("Sort" in line for line in page.plan), page.plan
+
+
+@pytest.mark.parametrize("sort_order", list(OrderSortOrder))
+def test_deep_null_started_segment_seeks_its_partial_index(
+    explained: Profile, sort_order: OrderSortOrder
+) -> None:
+    query = OrderQueryRequest(sort_by=OrderSortBy.STARTED_AT, sort_order=sort_order, limit=100)
+    position = OrderQueryPosition(
+        fingerprint=query.fingerprint(), value=None, order_id=UUID(int=1 << 127)
+    )
+
+    def read(uow: SqlTraustUnitOfWork) -> object:
+        rows = uow.order_reads.query(query, position)
+        assert len(rows) == query.limit + 1
+        assert all(value is None for _, _, value in rows)
+        return rows
+
+    (page,) = explained(read)
+    fast(page, "idx_ops_run_order_unstarted", 50)
+    assert not any("Sort" in line for line in page.plan), page.plan

@@ -969,7 +969,7 @@ Services own their domain's use cases and declare the section unit of work they 
 | Findings: what's wrong and every decision on it | `services.findings` · `FindingService` + `intake`, `decisions`, `review`, `precedents`; `FindingViewQuery` shares rich views/history; `IdentityPolicy`, `RatingPolicy` | `TraustUnitOfWork` (finding, cwe, finding_cwe, finding_label, finding_external_ref, decision, decision_approver, review_item); `Disposition.fold` interprets historical classifiers and explicit evidence strength |
 | Attestation: human sign-off | `services.attestation` · `AttestationService` | `FindingsUnitOfWork` — a human answer is a `decision` that resolves a `review_item` |
 | Identity: who is acting | `services.identity` · `IdentityService`; `models.identity` (`Principal`, `Role`) | none: principals come from `providers.identity` (OIDC, local user, directory) |
-| Operations: orders, leases, spend | `services.operations` · `OpsService`, `SpendService`, `SpendViews` (`ctx.spend_views.usage_summary(source, window, group_by)`: a source's usage per day, skill and model at list prices, unrecorded; it never opens the record store, and `SpendService.usage_summary` is the same answer); `FeedQuery` (the ops feed: orders that stopped or finished, new assessments and recorded releases after a `(timestamp, id)` cursor, oldest first; composes `OpsService`, `AssessmentService` and `PortfolioService`, whose `recorded_release` gives the router a release's repositories and change) | `OpsUnitOfWork` (run_batch, run_order, spend_event, feed_snapshot, assessment_input) |
+| Operations: orders, leases, spend | `services.operations` · `OpsService`, `SpendService`, `SpendViews` (`ctx.spend_views.usage_summary(source, window, group_by)`: a source's usage per day, skill and model at list prices, unrecorded; it never opens the record store, and `SpendService.usage_summary` is the same answer); `FeedQuery` (the ops feed: orders that stopped or finished, new assessments and recorded releases after a `(timestamp, id)` cursor, oldest first; composes `OpsService`, `AssessmentService` and `PortfolioService`, whose `recorded_release` gives the router a release's repositories and change) | `OpsUnitOfWork` (run_batch, run_order, spend_event, feed_snapshot, assessment_input; composed `OrderQueryReader` for history) |
 | Ledger: proof of decisions | `services.ledger` · `LedgerService`: an append grows the layer's tree from its stored frontier (O(log n), never rereads events); `decide` / `restate` sign their append, `record` seals once per triage; `verify` / `checkpoint` recompute from events; `audit` verifies every layer, for the scheduled `ledger_audit` asset | `LedgerUnitOfWork` (layers, events) |
 | PQC, code facts, compliance, detection quality | `services.pqc`, `services.code_facts`, `services.compliance`, `services.detection_quality` | `AssessmentsUnitOfWork` — content is read from the assessment's artifacts, never tables |
 | Validation: supplied machine reports | `services.validation` · `ValidationService.record`, `evidence` | `TraustUnitOfWork` — source/baseline assessments, artifacts, findings decisions and evidence external refs; no live execution |
@@ -1010,6 +1010,13 @@ Unrated or unreported findings have `effective_severity=None`; only a reported o
 rating supplies a severity. `review_surfaces(repository_id, as_of=None)` merges the latest
 audit with later scans and keeps a surface open until its findings are affirmatively closed.
 Closing one review item does not bypass the finding's evidence-strength or independent-review gates.
+
+Every `FindingView`, including REST detail and repository/batch listings, carries
+`first_reported_at` and `last_reported_at`: the earliest and latest reporting
+assessments' `occurred_at`, not row creation or decision times. Both are `None` when
+no assessment has reported the finding. An `as_of` listing uses only reports at or
+before its cutoff and omits findings not yet reported, reusing the fold's loaded facts
+without another query.
 
 `FindingService.get_by_fingerprint(repository_id, fingerprint, fingerprint_algo=None)` resolves
 opaque fingerprints exactly, without trimming, recomputing identity or matching titles.
@@ -1126,6 +1133,8 @@ changing filters or ordering requires a new query without a cursor (otherwise 42
 
 Filters compose: `states`, `repository_id`, `repository_ids`, `run_batch_id`, `asset`,
 `ids` (null means unrestricted, an empty array means no matches), and `exclude_ids`.
+Each `ids`, `exclude_ids`, or `repository_ids` selector is limited to 500 entries;
+oversized selectors are rejected, not truncated. `states` is bounded by its vocabulary.
 `q` matches a literal, case-insensitive substring of the displayed repository reference
 (URL, else repository UUID, else order UUID), asset, or verbatim state before paging.
 `sort_by` accepts `created_at`, `started_at`, `finished_at`, `asset`, `state`,
@@ -1133,8 +1142,17 @@ Filters compose: `states`, `repository_id`, `repository_ids`, `run_batch_id`, `a
 `created_at` descending). Nulls always follow present values, text uses bytewise
 ordering, and ties use the order UUID in the requested direction. `sort_by=ids`
 requires distinct `ids` and follows their supplied sequence, independent of direction.
-The query composes inventory and operations in one SQL read, returning at most
-`limit + 1` rows internally; callers never enumerate history to search or sort.
+`OrderReads` is a cross-domain composite query, like `RepoStateQuery` and `CensusReads`,
+not a second operations table repository. The ops unit of work exposes its narrow
+`OrderQueryReader` capability without depending on the concrete SQL composer.
+Nullable sorts may read the non-null and null segments separately; combined
+materialization is bounded to `limit + 1`. Common created/started history pages use
+the corresponding contract-owned indexes; arbitrary sorts and substring searches
+can still inspect a larger matching population.
+
+Cursors enumerate current data, not a transactional snapshot. Lifecycle changes
+can move rows under mutable sorts; prefer immutable creation-time or ID ordering
+for historical walks and refresh to incorporate changes to filters or live values.
 Existing indexed `GET /v1/orders` filters and its cursor contract remain unchanged.
 
 ### Operational classifiers

@@ -503,12 +503,13 @@ def test_query_rejects_cursors_from_a_different_query(
     assert "cursor" in response.json()["detail"]
 
 
+@pytest.mark.parametrize("body", [{}, {"ids": None}])
 def test_query_accepts_unfiltered_and_empty_id_reads_without_changing_get(
-    context: Context, client: TestClient
+    context: Context, client: TestClient, body: dict[str, object]
 ) -> None:
     order = seed_orders(context)
     headers = bearer(context)
-    queried = client.post("/v1/orders/query", json={}, headers=headers)
+    queried = client.post("/v1/orders/query", json=body, headers=headers)
     assert queried.status_code == 200
     assert [item["order"]["id"] for item in queried.json()["items"]] == [str(order.id)]
     empty = client.post("/v1/orders/query", json={"sort_by": "ids", "ids": []}, headers=headers)
@@ -517,3 +518,35 @@ def test_query_accepts_unfiltered_and_empty_id_reads_without_changing_get(
     listed = client.get("/v1/orders", params={"states": "queued"}, headers=headers)
     assert listed.status_code == 200
     assert listed.json()["items"][0]["id"] == str(order.id)
+
+
+@pytest.mark.parametrize("field", ["ids", "exclude_ids", "repository_ids", "states"])
+@pytest.mark.parametrize("oversized", [False, True])
+def test_query_selector_bounds_are_enforced_at_the_rest_boundary(
+    context: Context, client: TestClient, field: str, oversized: bool
+) -> None:
+    with SqlTraustUnitOfWork(context.database) as uow:
+        seed = Seed(uow)
+        repository = seed.repository()
+        order = seed.run_order(repository_id=repository.id)
+        uow.commit()
+    maximum = len(OrderState) if field == "states" else 500
+    count = maximum + int(oversized)
+    if field == "states":
+        values = [OrderState.QUEUED.value] * count
+    else:
+        last = repository.id if field == "repository_ids" else order.id
+        values = [*(str(uuid4()) for _ in range(count - 1)), str(last)]
+    body: dict[str, object] = {field: values, "limit": 1}
+    if field == "ids":
+        body["sort_by"] = "ids"
+    response = client.post("/v1/orders/query", json=body, headers=bearer(context))
+    if oversized:
+        assert response.status_code == 422
+        assert response.headers["content-type"] == "application/problem+json"
+        assert field in response.text
+    else:
+        assert response.status_code == 200
+        expected = [] if field == "exclude_ids" else [str(order.id)]
+        assert [item["order"]["id"] for item in response.json()["items"]] == expected
+        assert response.json()["next"] is None

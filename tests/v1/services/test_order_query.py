@@ -8,11 +8,12 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import UUID, uuid4
 
+import pydantic
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
-from tests.v1.conftest import contract_db
+from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed, saved_id
 from tests.v1.services.test_operations import ops
 from traust_core.v1.errors import ValidationError
@@ -23,14 +24,15 @@ from traust_core.v1.models.operations import (
     OrderReason,
     OrderSortBy,
     OrderSortOrder,
+    OrderState,
     RunOrder,
 )
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 
 
-@pytest.fixture
-def engine(tmp_path: Path) -> Iterator[Engine]:
-    with contract_db("sqlite", tmp_path) as database:
+@pytest.fixture(params=SQL_BACKENDS)
+def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
+    with contract_db(request.param, tmp_path) as database:
         yield database
 
 
@@ -208,6 +210,28 @@ def test_search_is_a_literal_case_insensitive_substring(
     assert page.next is None
 
 
+@pytest.mark.parametrize("field", ["repository", "asset"])
+@pytest.mark.parametrize(
+    ("stored", "search"),
+    [("ÉCOLE", "école"), ("école", "ÉCOLE"), ("CAFÉ_%", "café_%"), ("café_%", "CAFÉ_%")],
+)
+def test_search_folds_unicode_and_preserves_literal_wildcards(
+    engine: Engine, seed: Seed, field: str, stored: str, search: str
+) -> None:
+    if field == "repository":
+        wanted_repo = seed.repository(url=f"https://forge.example/{stored}")
+        other_repo = seed.repository(url="https://forge.example/caféXX")
+        wanted = seed.run_order(repository_id=wanted_repo.id)
+        seed.run_order(repository_id=other_repo.id)
+    else:
+        wanted = seed.run_order(asset=f"prefix{stored}suffix")
+        seed.run_order(asset="prefixcaféXXsuffix")
+    seed.uow.commit()
+    assert [item.order.id for item in ops(engine).query(OrderQueryRequest(q=search)).items] == [
+        wanted.id
+    ]
+
+
 @pytest.mark.parametrize(("search", "expected"), [("REPO_STATE", 0), ("PLAN", 1)])
 def test_search_includes_asset_and_state(
     engine: Engine, seed: Seed, search: str, expected: int
@@ -221,24 +245,43 @@ def test_search_includes_asset_and_state(
 
 def test_repository_display_search_and_sort_fall_back_to_ids(engine: Engine, seed: Seed) -> None:
     repository = seed.repository(url="https://forge.example/visible")
+    empty_repository = seed.repository(url="https://forge.example/legacy-empty")
+    empty_url = seed.run_order(repository_id=empty_repository.id)
     displayed = seed.run_order(repository_id=repository.id)
     fleet = seed.run_order()
     orphan = seed.run_order(repository_id=repository.id)
     seed.uow.commit()
     missing_id = uuid4()
     with engine.connect() as connection:
-        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        sqlite = connection.dialect.name == "sqlite"
+        if sqlite:
+            connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            connection.exec_driver_sql("PRAGMA ignore_check_constraints=ON")
+        else:
+            connection.exec_driver_sql("SET LOCAL session_replication_role = replica")
+            connection.exec_driver_sql(
+                "ALTER TABLE traust.repository DROP CONSTRAINT repository_url_check"
+            )
         table = seed.uow.run_orders.table
         connection.execute(
             sa.update(table).where(table.c.id == orphan.id).values(repository_id=missing_id)
         )
+        repository_table = seed.uow.repositories.table
+        connection.execute(
+            sa.update(repository_table)
+            .where(repository_table.c.id == empty_repository.id)
+            .values(url="")
+        )
         connection.commit()
-        connection.exec_driver_sql("PRAGMA foreign_keys=ON")
-        connection.commit()
+        if sqlite:
+            connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+            connection.exec_driver_sql("PRAGMA ignore_check_constraints=OFF")
+            connection.commit()
     expected = {
         saved_id(displayed): repository.url,
         saved_id(fleet): str(fleet.id),
         saved_id(orphan): str(missing_id),
+        saved_id(empty_url): str(empty_repository.id),
     }
     for sort_order in OrderSortOrder:
         assert traverse(
@@ -249,10 +292,14 @@ def test_repository_display_search_and_sort_fall_back_to_ids(engine: Engine, see
             key=lambda order_id: (expected[order_id], order_id),
             reverse=sort_order is OrderSortOrder.DESC,
         )
-    for order, search in ((fleet, str(fleet.id)), (orphan, str(missing_id))):
+    for order, search in (
+        (fleet, str(fleet.id)),
+        (orphan, str(missing_id)),
+        (empty_url, str(empty_repository.id)),
+    ):
         page = ops(engine).query(OrderQueryRequest(q=search.upper()))
         assert [item.order.id for item in page.items] == [order.id]
-        assert page.items[0].repository_url is None
+        assert page.items[0].repository_url == ("" if order is empty_url else None)
     assert ops(engine).query(OrderQueryRequest(q=str(repository.id))).items == []
 
 
@@ -344,6 +391,81 @@ def test_each_item_resumes_without_consuming_the_rest_of_its_page(
     assert ops(engine).query(query.model_copy(update={"cursor": last.items[-1].cursor})).items == []
 
 
+@pytest.mark.parametrize(
+    "sort_by",
+    [
+        OrderSortBy.CREATED_AT,
+        OrderSortBy.ID,
+        OrderSortBy.ASSET,
+        OrderSortBy.STATE,
+        OrderSortBy.REPOSITORY,
+        OrderSortBy.IDS,
+    ],
+)
+def test_nonnullable_sorts_seek_without_null_ordering_or_disjunctions(
+    engine: Engine, seed: Seed, sort_by: OrderSortBy
+) -> None:
+    rows = [seed.run_order() for _ in range(4)]
+    seed.uow.commit()
+    statements: list[str] = []
+
+    def record(
+        connection: sa.Connection,
+        clause: sa.sql.Executable,
+        multiparams: object,
+        params: object,
+        options: object,
+    ) -> None:
+        if isinstance(clause, sa.sql.Select):
+            statements.append(str(clause.compile(engine)))
+
+    query = OrderQueryRequest(sort_by=sort_by, ids=tuple(saved_id(row) for row in rows), limit=1)
+    sa.event.listen(engine, "before_execute", record)
+    try:
+        first = ops(engine).query(query)
+        second = ops(engine).query(query.model_copy(update={"cursor": first.next}))
+    finally:
+        sa.event.remove(engine, "before_execute", record)
+    assert first.next is not None and second.items[0].order.id != first.items[0].order.id
+    assert len(statements) == 2
+    for statement in statements:
+        assert " IS NULL" not in statement and " IS NOT NULL" not in statement
+        assert " OR " not in statement
+    if sort_by is not OrderSortBy.ID:
+        comparison = ") > (" if sort_by is OrderSortBy.IDS else ") < ("
+        assert comparison in statements[1]
+
+
+@pytest.mark.parametrize("sort_order", list(OrderSortOrder))
+@pytest.mark.parametrize(
+    "sort_by", [OrderSortBy.STARTED_AT, OrderSortBy.FINISHED_AT, OrderSortBy.REASON]
+)
+def test_each_cursor_resumes_across_nullable_segments_without_overfetching(
+    engine: Engine, seed: Seed, sort_by: OrderSortBy, sort_order: OrderSortOrder
+) -> None:
+    reason = next(iter(OrderReason))
+    for index in range(7):
+        values = {
+            "started_at": T0 + timedelta(hours=index // 2),
+            "finished_at": T0 + timedelta(days=index // 2 + 1),
+            "reason": reason,
+        }
+        seed.run_order(**{sort_by.value: values[sort_by.value] if index < 2 else None})
+    seed.uow.commit()
+    query = OrderQueryRequest(sort_by=sort_by, sort_order=sort_order, limit=4)
+    expected = traverse(engine, query)
+    assert len(expected) == 7 and len(set(expected)) == 7
+    first = ops(engine).query(query)
+    assert len(first.items) == 4 and first.next == first.items[-1].cursor
+    for index, item in enumerate(first.items):
+        resumed = query.model_copy(update={"cursor": item.cursor, "limit": 2})
+        with patch.object(RunOrder, "model_validate", wraps=RunOrder.model_validate) as materialize:
+            page = ops(engine).query(resumed)
+        assert materialize.call_count <= 3
+        assert [saved_id(item.order) for item in page.items] == expected[index + 1 : index + 3]
+        assert traverse(engine, resumed) == expected[index + 1 :]
+
+
 def test_old_history_beyond_a_thousand_orders_is_completely_traversable(
     engine: Engine, seed: Seed
 ) -> None:
@@ -404,3 +526,76 @@ def test_multiple_states_are_unioned_before_paging(engine: Engine, seed: Seed) -
         {"states": ["queued", "planned"], "sort_by": "id", "limit": 1}
     )
     assert traverse(engine, query) == sorted((saved_id(row) for row in wanted), reverse=True)
+
+
+@pytest.mark.parametrize("field", ["ids", "exclude_ids", "repository_ids", "states"])
+def test_selector_bounds_reject_oversized_models_and_in_process_copies_before_sql(
+    engine: Engine, field: str
+) -> None:
+    values = (
+        (OrderState.QUEUED,) * (len(OrderState) + 1)
+        if field == "states"
+        else tuple(uuid4() for _ in range(501))
+    )
+    with pytest.raises(pydantic.ValidationError, match=field):
+        OrderQueryRequest.model_validate({field: values})
+
+    # Copy updates are intentionally unvalidated by Pydantic, but still must not
+    # reach SQL through the public in-process query owner.
+    query = OrderQueryRequest().model_copy(update={field: values})
+    statements: list[str] = []
+
+    def record(
+        connection: sa.Connection,
+        cursor: object,
+        statement: str,
+        parameters: object,
+        context: object,
+        executemany: bool,
+    ) -> None:
+        statements.append(statement)
+
+    sa.event.listen(engine, "before_cursor_execute", record)
+    try:
+        with pytest.raises(ValidationError, match=field):
+            ops(engine).query(query)
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", record)
+    assert statements == []
+
+
+@pytest.mark.parametrize("field", ["ids", "exclude_ids", "repository_ids", "states"])
+def test_exact_selector_bound_keeps_the_last_entry_and_pages_all_matches(
+    engine: Engine, seed: Seed, field: str
+) -> None:
+    repository = seed.repository()
+    rows = [seed.run_order(repository_id=repository.id) for _ in range(3)]
+    seed.uow.commit()
+    ids = [saved_id(row) for row in rows]
+    arguments: dict[str, object] = {"sort_by": "id", "sort_order": "asc", "limit": 1}
+    expected = sorted(ids)
+    if field == "ids":
+        arguments.update(
+            ids=[*(uuid4() for _ in range(497)), *ids],
+            sort_by="ids",
+        )
+        expected = ids
+    elif field == "exclude_ids":
+        arguments[field] = [*(uuid4() for _ in range(499)), ids[-1]]
+        expected = sorted(ids[:-1])
+    elif field == "repository_ids":
+        arguments[field] = [*(uuid4() for _ in range(499)), repository.id]
+    else:
+        arguments[field] = list(OrderState)
+    assert traverse(engine, OrderQueryRequest.model_validate(arguments)) == expected
+
+
+@pytest.mark.parametrize("ids", [None, ()])
+def test_empty_selectors_preserve_unrestricted_and_empty_id_semantics(
+    engine: Engine, seed: Seed, ids: tuple[UUID, ...] | None
+) -> None:
+    order = seed.run_order()
+    seed.uow.commit()
+    query = OrderQueryRequest(ids=ids, exclude_ids=(), repository_ids=(), states=(), limit=1)
+    assert query.ids == ids
+    assert traverse(engine, query) == ([saved_id(order)] if ids is None else [])

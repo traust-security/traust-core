@@ -45,6 +45,12 @@ def create_database_engine(url: str | sa.URL) -> Engine:
         dbapi_conn.execute("PRAGMA foreign_keys = ON")
         # Contracts' uuid(): ext/misc/uuid.c in other drivers, registered here.
         dbapi_conn.create_function("uuid", 0, lambda: str(uuid4()))
+        dbapi_conn.create_function(
+            "unicode_lower",
+            1,
+            lambda value: value.lower() if value is not None else None,
+            deterministic=True,
+        )
 
     return engine
 

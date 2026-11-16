@@ -369,17 +369,24 @@ class OrderQueryPosition(Model):
         return base64.urlsafe_b64encode(self.model_dump_json().encode()).decode()
 
 
+# Match the REST set-filter convention; each selector expands SQL binds (and ids sorting
+# also expands CASE branches). This bounds a request's scope, never the order history.
+MAX_ORDER_QUERY_IDS = 500
+
+
 class OrderQueryRequest(Model):
-    states: tuple[OrderState, ...] = ()
+    """Page all matching history; explicit ID selectors carry at most 500 entries each."""
+
+    states: tuple[OrderState, ...] = Field(default=(), max_length=len(OrderState))
     repository_id: UUID | None = None
-    repository_ids: tuple[UUID, ...] = ()
+    repository_ids: tuple[UUID, ...] = Field(default=(), max_length=MAX_ORDER_QUERY_IDS)
     run_batch_id: UUID | None = None
     asset: AssetName | None = None
     q: str = ""
     sort_by: OrderSortBy = OrderSortBy.CREATED_AT
     sort_order: OrderSortOrder = OrderSortOrder.DESC
-    ids: tuple[UUID, ...] | None = None
-    exclude_ids: tuple[UUID, ...] = ()
+    ids: tuple[UUID, ...] | None = Field(default=None, max_length=MAX_ORDER_QUERY_IDS)
+    exclude_ids: tuple[UUID, ...] = Field(default=(), max_length=MAX_ORDER_QUERY_IDS)
     limit: int = Field(default=100, ge=1, le=1000)
     cursor: str | None = None
 
@@ -388,6 +395,17 @@ class OrderQueryRequest(Model):
         return hashlib.sha256(json.dumps(document, sort_keys=True).encode()).hexdigest()
 
     def position(self) -> OrderQueryPosition | None:
+        # model_copy/model_construct deliberately bypass Pydantic validation. Refuse those
+        # oversized in-process requests here too, before the query owner opens its UoW.
+        for name, maximum in (
+            ("states", len(OrderState)),
+            ("repository_ids", MAX_ORDER_QUERY_IDS),
+            ("ids", MAX_ORDER_QUERY_IDS),
+            ("exclude_ids", MAX_ORDER_QUERY_IDS),
+        ):
+            values = getattr(self, name)
+            if values is not None and len(values) > maximum:
+                raise ValidationError(f"{name} must contain at most {maximum} entries")
         if self.sort_by is OrderSortBy.IDS:
             if self.ids is None:
                 raise ValidationError("sort_by=ids requires ids")
