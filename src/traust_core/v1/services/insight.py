@@ -3763,7 +3763,7 @@ class PqcVendorsView:
                 r.claim.id,
             ),
         )
-        return PqcVendorRoadmap(
+        model = PqcVendorRoadmap(
             claims_artifact_id=claims.artifact_id,
             version=claims.version,
             updated=claims.updated,
@@ -3772,6 +3772,9 @@ class PqcVendorsView:
             unmeasured=unmeasured,
             blocked_external=self._blocked_external({r.id: r.url for r in repositories if r.id}),
         )
+        # By alias: the wire shape REST serves, where a claim's vendor_class is "class".
+        contracts.validate_view(self.name, model.model_dump(mode="json", by_alias=True))
+        return model
 
     def _blocked_external(self, urls: dict[UUID, str]) -> tuple[str, ...]:
         """The repositories whose newest-assessed commit reads blocked-external."""
