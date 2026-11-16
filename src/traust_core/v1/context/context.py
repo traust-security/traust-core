@@ -29,6 +29,7 @@ from traust_core.v1.context.feeds import (
     DEPS_DEV,
     DEPS_DEV_CACHE,
     ObjectCache,
+    check_api_key_sources,
     load_advisory_lookup,
     load_feed_sources,
     load_feeds,
@@ -496,6 +497,8 @@ class Context:
         # load and check everything (the deployment's API keys, every source) before touching
         # the registries, so a config error leaves this context as it was and a retry after
         # fixing it starts clean
+        # the names first, so no error about a variable can echo an unregistered name
+        check_api_key_sources(registry, self.config.feeds.api_keys)
         api_keys = self.config.feeds.api_key_values()
         feeds = load_feeds(registry, http=self.http, clock=self.clock)
         sources = load_feed_sources(
