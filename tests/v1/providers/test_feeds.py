@@ -428,11 +428,16 @@ def test_a_post_source_cannot_hold_a_key() -> None:
         source(post=True, api_key=NVD_KEY)
 
 
-@pytest.mark.parametrize("url", ["https://NVD.test/", "https://nvd.test:443/"])
-def test_the_same_host_written_differently_still_gets_the_key(url: str) -> None:
+@pytest.mark.parametrize(
+    "url", ["https://nvd.test/feed.json.gz", "https://NVD.test/", "https://nvd.test:0/"]
+)
+def test_a_probe_of_the_published_url_goes_keyless_even_on_the_templates_host(url: str) -> None:
+    # `ident: none` probes the source's URL, which may be another endpoint (a whole-file feed)
     http = _Http()
-    assert source(url=url, probe=Probe(None), http=http, api_key=NVD_KEY).check().ready
-    assert http.headers == [{"apiKey": SECRET}]
+    nvd = source(url=url, probe=Probe(None), http=http, api_key=NVD_KEY)
+    assert nvd.check().ready
+    nvd.document("CVE-2026-0001")
+    assert http.headers == [None, {"apiKey": SECRET}]  # only the template-built request
 
 
 def test_a_keyed_refusal_names_the_host_that_was_probed() -> None:
@@ -473,6 +478,36 @@ def test_readiness_never_shows_url_userinfo() -> None:
 
 @pytest.mark.parametrize("url", ["https://nvd.test:abc/", "https://nvd.test:99999/"])
 def test_a_malformed_port_never_crashes_a_message(url: str) -> None:
-    from traust_core.v1.providers.feeds import _host, _origin
+    from traust_core.v1.providers.feeds import _host
 
-    assert _host(url) == "nvd.test" and _origin(url) == ("nvd.test", 443)
+    assert _host(url) == "nvd.test"
+
+
+def test_a_port_zero_url_shows_its_port() -> None:
+    from traust_core.v1.providers.feeds import _host
+
+    assert _host("https://nvd.test:0/") == "nvd.test:0"
+
+
+@pytest.mark.parametrize(
+    ("header", "value", "match"),
+    [
+        ("api key", SECRET, "not an HTTP header name"),
+        ("", SECRET, "not an HTTP header name"),
+        ("apiKey", "", "no usable header value"),
+        ("apiKey", f"{SECRET}\n", "no usable header value"),
+        ("apiKey", f"{SECRET} x", "no usable header value"),
+        ("apiKey", f"{SECRET}é", "no usable header value"),
+    ],
+)
+@pytest.mark.parametrize("build", [ApiKey, ApiKey.parse], ids=["direct", "parse"])
+def test_a_key_checks_its_own_header_and_value(
+    build: object, header: str, value: str, match: str
+) -> None:
+    with pytest.raises(ConfigError, match=match) as raised:
+        build(header, value)  # type: ignore[operator]
+    assert SECRET not in str(raised.value)  # never the value, even a malformed one
+
+
+def test_parse_gives_a_key_that_sends_its_header() -> None:
+    assert ApiKey.parse("apiKey", SECRET).headers() == {"apiKey": SECRET}

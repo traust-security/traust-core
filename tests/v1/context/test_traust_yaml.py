@@ -386,3 +386,23 @@ def test_a_malformed_key_fails_before_anything_registers(
     monkeypatch.setenv("TEST_NVD_KEY", "good-key")
     ctx.register_feeds(registry)
     assert ctx.feed_sources.get("nvd")._api_key is not None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "feeds:\n  api_keys:\n    nvd: nvd-7f3a91c2b4d8e6f0\n",  # a key, not a variable's name
+        "feeds:\n  api_keys:\n    nvd: *nvd-7f3a91c2b4d8e6f0\n",  # as a YAML alias
+        "feeds:\n  osv_access: !nvd-7f3a91c2b4d8e6f0 api\n",  # as a YAML tag
+    ],
+    ids=["as-a-value", "as-an-alias", "as-a-tag"],
+)
+def test_a_pasted_key_stays_out_of_the_startup_error(tmp_path: Path, text: str) -> None:
+    import traceback
+
+    path = tmp_path / "traust.yaml"
+    path.write_text(text)
+    with pytest.raises(ConfigError) as raised:
+        Config.from_file(path)
+    assert raised.value.__cause__ is not None
+    assert "7f3a91c2b4d8e6f0" not in "".join(traceback.format_exception(raised.value))

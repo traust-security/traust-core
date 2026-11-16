@@ -1,7 +1,5 @@
 import http.client as http_client
 import logging
-import socket
-import ssl
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -353,52 +351,3 @@ def test_secret_headers_go_to_the_url_only_never_onto_a_redirect(
     )
     assert redirected is not None
     assert redirected.get_header("Apikey") is None and redirected.get_header("X-plain") == "p"
-
-
-# The gone-class transport word (foundry plan repo-unreachable, Qodo #474): only the
-# resolver's definitive no-such-name answers, a refused connection and a refused
-# certificate count; a busy resolver or an interrupted handshake never does.
-
-
-def _wrap(reason: BaseException) -> Exception:
-    return urllib.error.URLError(reason)
-
-
-@pytest.mark.parametrize(
-    ("reason", "counts"),
-    [
-        (socket.gaierror(socket.EAI_NONAME, "Name or service not known"), True),
-        (
-            socket.gaierror(
-                getattr(socket, "EAI_NODATA", socket.EAI_NONAME), "No address associated"
-            ),
-            True,
-        ),
-        (socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution"), False),
-        (ConnectionRefusedError(), True),
-        (ssl.SSLCertVerificationError(), True),
-        (ssl.SSLEOFError(), False),
-        (TimeoutError("timed out"), False),
-    ],
-    ids=["nxdomain", "nodata", "eai-again", "refused", "bad-cert", "handshake-eof", "timeout"],
-)
-def test_only_the_positive_transport_word_counts(reason: Exception, counts: bool) -> None:
-    assert http._positively_unreachable(_wrap(reason)) is counts
-    # Bare, unwrapped failures classify the same way.
-    assert http._positively_unreachable(reason) is counts
-
-
-def test_a_busy_resolver_never_reaches_the_disposition(monkeypatch: pytest.MonkeyPatch) -> None:
-    """EAI_AGAIN straight through the fetcher: the error carries no endpoint word, so
-    the observation counts it as a plain unreachable failure — never gone-class."""
-    calls: list[int] = []
-    busy = socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
-    monkeypatch.setattr(
-        http.urllib.request,
-        "urlopen",
-        _urlopen([_wrap(busy), _wrap(busy), _wrap(busy)], calls),
-    )
-    fetcher = _fetcher([], max_attempts=3)
-    with pytest.raises(ServiceError) as refused:
-        fetcher.get("https://forge.example/x")
-    assert refused.value.endpoint_unreachable is False

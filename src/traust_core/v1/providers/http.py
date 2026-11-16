@@ -27,6 +27,21 @@ _NEXT = re.compile(r'<([^>]+)>\s*;\s*rel="?next"?')
 log = logging.getLogger(__name__)
 
 
+# An HTTP header name: an RFC 9110 token.
+_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+
+
+def is_header_name(name: str) -> bool:
+    """Whether `name` can be sent as an HTTP header name."""
+    return _HEADER_NAME.fullmatch(name) is not None
+
+
+def is_header_value(value: str) -> bool:
+    """Whether `value` can travel as a secret header (an API key): non-empty and visible ASCII
+    only, since a control, a space or a non-ASCII character can't be sent as-is."""
+    return bool(value) and all(0x21 <= ord(c) <= 0x7E for c in value)
+
+
 def _target_hash(url: str) -> str:
     return hashlib.sha256(url.encode()).hexdigest()[:16]
 

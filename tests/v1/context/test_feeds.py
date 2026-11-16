@@ -1,4 +1,5 @@
 import json
+import traceback
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -389,8 +390,23 @@ def test_a_field_the_registry_does_not_read_is_a_config_error(
     tmp_path: Path, old: str, new: str, field: str
 ) -> None:
     assert old in SOURCES
-    with pytest.raises(ConfigError, match=field):
-        Context(Config()).register_feeds(_registry(tmp_path, SOURCES.replace(old, new)))
+    text = SOURCES.replace(old, new)
+    with pytest.raises(ConfigError) as raised:
+        Context(Config()).register_feeds(_registry(tmp_path, text))
+    _names_the_line_not_the_field(str(raised.value), text, field)
+
+
+def _line_of(text: str, needle: str) -> int:
+    return next(i for i, line in enumerate(text.splitlines(), 1) if needle in line)
+
+
+def _names_the_line_not_the_field(message: str, text: str, field: str) -> None:
+    """An unknown field is located by its line; its name isn't echoed (it could be a pasted
+    key)."""
+    line = _line_of(text, field)
+    assert f"line {line}: " in message
+    assert f"<key at line {line}>: Extra inputs are not permitted" in message
+    assert field not in message
 
 
 NVD_HEADER = SOURCES.rstrip() + "\n    api_key_header: apiKey\n"
@@ -477,8 +493,9 @@ def test_a_field_nothing_reads_is_refused(tmp_path: Path, field: str) -> None:
             f"    {field}: https://vex.test/x\n",
         )
     assert text != SOURCES
-    with pytest.raises(ConfigError, match=field):
+    with pytest.raises(ConfigError) as raised:
         Context(Config()).register_feeds(_registry(tmp_path, text))
+    _names_the_line_not_the_field(str(raised.value), text, field)
 
 
 def test_the_shipped_registry_loads_with_every_field_read() -> None:
@@ -505,3 +522,141 @@ def test_a_malformed_port_error_never_shows_the_url(tmp_path: Path) -> None:
     with pytest.raises(ConfigError) as raised:
         Context(Config()).register_feeds(_registry(tmp_path, text))
     assert "malformed URL port" in str(raised.value) and "hunter2" not in str(raised.value)
+
+
+def test_a_rejected_key_setting_leaves_the_context_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TEST_NVD_KEY", "k-1")
+    ctx = Context(Config(feeds=FeedsConfig(api_keys={"nvd": "TEST_NVD_KEY"})))
+    with pytest.raises(ConfigError, match="declares no api_key_header"):
+        ctx.register_feeds(_registry(tmp_path, SOURCES))  # epss is cached and loads first
+    assert ctx.feeds.names() == [] and ctx.feed_sources.names() == []
+    ctx.register_feeds(_registry(tmp_path, NVD_HEADER))  # corrected: starts clean
+    assert "epss" in ctx.feeds.names()
+    assert ctx.feed_sources.get("nvd")._api_key.headers() == {"apiKey": "k-1"}
+
+
+SECRET = "test-only-mistyped-secret"
+
+
+_LAST = len(SOURCES.splitlines()) + 1  # the line a test appends
+
+
+@pytest.mark.parametrize(
+    ("line", "names"),
+    [
+        (
+            f"    api_key: {SECRET}\n",
+            rf"line {_LAST}: sources\.nvd\.<key at line {_LAST}>: Extra inputs",  # a shipped name
+        ),
+        (f"    api_key: '{SECRET}\n", r"invalid YAML at line \d+"),  # an unterminated quote
+        (f"    {SECRET}: x\n", rf"<key at line {_LAST}>: Extra inputs are not permitted"),  # a key
+        (f"    {SECRET}\n", r"invalid YAML at line \d+"),  # a line of its own inside a source
+        (f"  {SECRET}:\n", rf"sources\.<key at line {_LAST}>: Input should be a valid dictionary"),
+        (f"    api_key_header: '{SECRET} x'\n", "api_key_header is not an HTTP header name"),
+        (f"    summary: *{SECRET}\n", r"invalid YAML at line \d+"),  # an undefined alias
+        (f"    summary: !{SECRET} x\n", r"invalid YAML at line \d+"),  # an unknown tag
+        # a pasted key as a source name, on a block with a bad field: located, never named
+        (f"  {SECRET}:\n    tier: live\n    size: 5\n", rf"sources\.<key at line {_LAST}>\.<key"),
+    ],
+    ids=[
+        "unknown-field",
+        "invalid-yaml",
+        "as-a-key",
+        "own-line",
+        "as-a-source",
+        "as-a-header",
+        "as-an-alias",
+        "as-a-tag",
+        "as-a-source-with-a-bad-field",
+    ],
+)
+def test_a_secret_mistyped_into_the_registry_stays_out_of_the_error(
+    tmp_path: Path, line: str, names: str
+) -> None:
+    text = SOURCES.rstrip() + "\n" + line
+    with pytest.raises(ConfigError, match=names) as raised:
+        Context(Config()).register_feeds(_registry(tmp_path, text))
+    assert SECRET not in str(raised.value)
+    # nor in the cause it chains, or anywhere in the traceback
+    assert raised.value.__cause__ is not None
+    assert SECRET not in "".join(traceback.format_exception(raised.value))
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "https://nvd.test/cves",  # one static URL: the key would go to every request
+        "https://nvd.test/{year}/cves",  # a year alone names no identifier
+        "https://nvd.test/cves.json#{ident}",  # a fragment is never sent
+        "https://{ident_lower}.nvd.test/cves",  # in the host: `_resolve` refuses it
+    ],
+)
+def test_a_template_naming_no_identifier_takes_no_key(tmp_path: Path, template: str) -> None:
+    text = NVD_HEADER.replace("https://nvd.test/cves?cveId={ident_upper}", template)
+    assert text != NVD_HEADER
+    with pytest.raises(ConfigError, match="per-identifier GET source only"):
+        Context(Config()).register_feeds(_registry(tmp_path, text))
+
+
+def test_a_source_url_on_port_zero_is_a_config_error(tmp_path: Path) -> None:
+    text = SOURCES.replace("https://nvd.test/cves", "https://nvd.test:0/cves")
+    assert text != SOURCES
+    with pytest.raises(ConfigError, match="nvd has a malformed URL port"):
+        Context(Config()).register_feeds(_registry(tmp_path, text))
+
+
+@pytest.mark.parametrize(
+    "template", ["https://nvd.test/cves/{ident}", "https://nvd.test/c?id={ident}"]
+)
+def test_a_template_sending_its_identifier_takes_a_key(tmp_path: Path, template: str) -> None:
+    text = NVD_HEADER.replace("https://nvd.test/cves?cveId={ident_upper}", template)
+    assert _sources(tmp_path, text, {"nvd": "k-1"})["nvd"]._api_key is not None
+
+
+def test_a_bad_key_names_its_variable_never_its_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TEST_NVD_KEY", "k-1 trailing")
+    ctx = Context(Config(feeds=FeedsConfig(api_keys={"nvd": "TEST_NVD_KEY"})))
+    with pytest.raises(ConfigError) as raised:
+        ctx.register_feeds(_registry(tmp_path, NVD_HEADER))
+    message = str(raised.value)
+    assert "feeds.api_keys.nvd: $TEST_NVD_KEY: " in message and "no usable header value" in message
+    assert "k-1" not in message and "apiKey" not in message
+
+
+def test_a_source_level_error_gives_the_sources_line(tmp_path: Path) -> None:
+    # a shipped source's name shows; any other source's name is located by its line, since a
+    # pasted key can't be told from a custom name
+    text = REGISTRY.replace(
+        "    max_age_hours: 12\n", "    max_age_hours: 12\n    api_key_header: apiKey\n"
+    )
+    line = _line_of(text, "  kev:")
+    with pytest.raises(ConfigError, match=rf"line {line}: sources\.kev: "):
+        Context(Config()).register_feeds(_registry(tmp_path, text))
+    custom = text.replace("  kev:", "  my-feed:")
+    with pytest.raises(ConfigError, match=rf"line {line}: sources\.<key at line {line}>: "):
+        Context(Config()).register_feeds(_registry(tmp_path, custom))
+
+
+NUMERIC = "8675309"  # an unquoted all-digit key parses as an integer
+
+
+@pytest.mark.parametrize(
+    "line",
+    [f"  {NUMERIC}:\n    tier: live\n    size: 5\n", f"    {NUMERIC}: x\n"],
+    ids=["as-a-source", "as-a-field"],
+)
+def test_a_numeric_key_is_located_never_shown(tmp_path: Path, line: str) -> None:
+    text = SOURCES.rstrip() + "\n" + line
+    with pytest.raises(ConfigError, match=rf"<key at line {_LAST}>") as raised:
+        Context(Config()).register_feeds(_registry(tmp_path, text))
+    assert NUMERIC not in "".join(traceback.format_exception(raised.value))
+
+
+def test_a_source_named_like_a_field_is_located_never_shown(tmp_path: Path) -> None:
+    text = SOURCES.rstrip() + "\n  summary:\n    tier: live\n    size: 5\n"
+    with pytest.raises(ConfigError, match=rf"sources\.<key at line {_LAST}>\."):
+        Context(Config()).register_feeds(_registry(tmp_path, text))
