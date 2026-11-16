@@ -1613,16 +1613,29 @@ class ExposureService:
             named = None if filter.advisory_id is None else uow.advisories.get(filter.advisory_id)
             wanted = None if named is None else named.alias_of_id or named.id
             canonical = {}
+            unkept = set()
             for cve in {doc.metadata.cve for _, _, doc in held}:
                 known = uow.advisories.find_by_identifier(cve)
                 if known is None:
-                    raise IntegrityError(f"an impact analysis names {cve}, never kept")
+                    # The partial-seed state: analyses name CVEs the registry has not
+                    # kept yet. Skipping them (with the warning) keeps every other
+                    # analysis readable instead of failing the whole section.
+                    unkept.add(cve)
+                    continue
                 canonical[cve] = (
                     uow.advisories.get(known.alias_of_id) if known.alias_of_id else known
                 )
+        if unkept:
+            log.warning(
+                "impact analyses name %d advisories the registry never kept, skipped: %s",
+                len(unkept),
+                ", ".join(sorted(unkept)),
+            )
         rows = []
         for assessment, artifact, doc in held:
-            advisory = canonical[doc.metadata.cve]
+            advisory = canonical.get(doc.metadata.cve)
+            if advisory is None:
+                continue
             classification = ImpactClassification(doc.repos[0].classification)
             if wanted not in (None, advisory.id) or filter.classification not in (
                 None,

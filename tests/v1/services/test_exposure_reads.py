@@ -3,10 +3,12 @@ record; vex_status until its provider exists."""
 
 from __future__ import annotations
 
+import logging
 from datetime import timedelta
 from uuid import UUID, uuid4
 
 import pytest
+import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from tests.v1.repositories.tables.conftest import Seed
@@ -21,7 +23,7 @@ from tests.v1.services.test_exposure_impact import (
     refs,
     sbom,
 )
-from traust_core.v1.errors import ConfigError, IntegrityError, NotFoundError, ValidationError
+from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
 from traust_core.v1.models.common import Cursor, PageRequest, Provenance, every_item
 from traust_core.v1.models.dependencies import (
     AdvisoryIdentifier,
@@ -140,6 +142,37 @@ def test_no_impacts_recorded(engine: Engine) -> None:
     assert (page.items, page.next) == ((), None)
 
 
+def test_impacts_skip_analyses_naming_an_advisory_the_registry_never_kept(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The partial-seed state: the registry keeps none (or only some) of the CVEs the
+    analyses name — the exposure section skips those analyses with a warning instead
+    of failing the whole read, so a summary renders from whatever the registry keeps
+    (the empty-registry IntegrityError was over-strict before the seed ran)."""
+    exposure = reads(engine)
+    made = refs(engine, 2)
+    ids = [r.id for r in made if r.id is not None]
+    [
+        record(exposure, ref_id, *case, day)
+        for day, (ref_id, case) in enumerate(zip(ids, (IN_RANGE, OUT), strict=True))
+    ]
+    assert len(exposure.impacts(ImpactFilter(), PageRequest()).items) == 2
+    with SqlTraustUnitOfWork(engine) as uow:  # the registry emptied after the fact
+        advisory = uow.advisories.table
+        uow.connection.execute(sa.delete(advisory).where(advisory.c.alias_of_id.is_not(None)))
+        uow.connection.execute(sa.delete(uow.advisory_packages.table))
+        uow.connection.execute(sa.delete(advisory))
+        uow.commit()
+    with caplog.at_level(logging.WARNING, logger="traust_core.v1.services.exposure"):
+        page = exposure.impacts(ImpactFilter(), PageRequest())
+        summary = exposure.summary(ExposureFilter(), ExposureDimension.ADVISORY)
+    assert page.items == ()
+    assert summary == []
+    warnings_ = [record_ for record_ in caplog.records if "never kept" in record_.message]
+    assert warnings_  # every read warned and kept serving, none raised
+    assert all("GHSA-m425-mq94-257g" in w.getMessage() for w in warnings_)
+
+
 @pytest.mark.parametrize(
     "page", [PageRequest(limit=0), PageRequest(cursor=Cursor("nope"))], ids=["zero", "cursor"]
 )
@@ -206,7 +239,13 @@ def test_summary_narrows_by_advisory_and_ecosystem(engine: Engine) -> None:
     assert exposure.summary(ExposureFilter(advisory_id=empty.id), ExposureDimension.ADVISORY) == []
 
 
-def test_an_impact_naming_an_advisory_never_kept_is_an_integrity_error(engine: Engine) -> None:
+def test_an_impact_naming_an_advisory_the_registry_lacks_is_skipped_with_a_warning(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The drifted-registry state: the registry keeps its rows but not under the
+    identifiers the analyses name (renamed, or seeded from another source) — the read
+    skips the orphaned analyses with a warning instead of failing. Before the seed's
+    graceful path this was an IntegrityError on the whole section."""
     exposure, recorded, _ = fleet(engine)
     with SqlTraustUnitOfWork(engine) as uow:
         for alias in uow.advisories.list_aliases(recorded[0].advisory_id):
@@ -214,8 +253,11 @@ def test_an_impact_naming_an_advisory_never_kept_is_an_integrity_error(engine: E
         canonical = uow.advisories.get(recorded[0].advisory_id)
         uow.advisories.update(canonical.model_copy(update={"identifier": "GHSA-gone-0000-0000"}))
         uow.commit()
-    with pytest.raises(IntegrityError, match="never kept"):
-        exposure.impacts(ImpactFilter(), PageRequest())
+    with caplog.at_level(logging.WARNING, logger="traust_core.v1.services.exposure"):
+        page = exposure.impacts(ImpactFilter(), PageRequest())
+    assert page.items == ()
+    [warning] = [record_ for record_ in caplog.records if "never kept" in record_.message]
+    assert "GHSA-m425-mq94-257g" in warning.getMessage()
 
 
 def test_vex_status_needs_a_provider_core_lacks(engine: Engine) -> None:
