@@ -299,6 +299,10 @@ The remaining correctness changes are:
   records are the shared `finding-records` definitions.
 - `ViewName.PQC` is validated by `contracts.validate_view("pqc", document)` before `build`
   returns. It reads readiness as it stands, so it refuses an `as_of` (422), as compliance does.
+- `ViewName.PQC_VENDORS` is validated by `contracts.validate_view("pqc-vendors", document)`
+  before `build` returns, on its by-alias dump (the wire shape, where a claim's class is
+  `class`). It reads the latest claims and manifests, so it refuses an `as_of` and a product
+  or team scope (422).
 - `ViewName.EXPOSURE` is validated by `contracts.validate_view("exposure", document)` before
   `build` returns, and carries its `as_of` (the filter's, else the clock's, read once for all
   three cuts); the executive summary's exposure panel uses the same row.

@@ -9,6 +9,8 @@ from fastapi.testclient import TestClient
 from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.rest.conftest import bearer, same_as_in_process
 from tests.v1.services.test_detection_quality_doors import WINDOW, Campaign, World
+from tests.v1.services.test_pqc import PROVENANCE
+from tests.v1.services.test_pqc_vendors import claims
 from traust_core.v1 import contracts
 from traust_core.v1.context import Context
 from traust_core.v1.models.common import TimeBucket
@@ -257,3 +259,13 @@ def test_the_first_census_read_before_any_build_folds(context: Context, client: 
     assert "X-Traust-View-Built-At" not in response.headers
     expected = context.services().insight.build(ViewName.COVERAGE, ViewFilter())
     same_as_in_process(response.json(), expected)
+
+
+def test_the_pqc_vendors_insight_serves_its_contract_by_alias(
+    context: Context, client: TestClient
+) -> None:
+    """The wire names a claim's class "class" (by alias): the shape the build validates."""
+    context.services().pqc.record_claims(claims(), PROVENANCE)
+    body = client.get("/v1/insights/pqc-vendors", headers=bearer(context)).json()
+    contracts.validate_view(ViewName.PQC_VENDORS, body)
+    assert {"class", "status"} <= set(body["vendors"][0]["claim"])
