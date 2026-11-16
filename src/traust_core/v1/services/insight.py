@@ -2387,7 +2387,7 @@ class LocView:
         )
         tallies = [_tally(found.get(r.id, ())) for r in repositories]  # type: ignore[misc,arg-type]
         code = sum(r.code for r in measured if r.code is not None)
-        return LocDashboard(
+        model = LocDashboard(
             as_of=at,
             comparison=comparison,
             code=code,
@@ -2419,6 +2419,8 @@ class LocView:
                 sorted(measured, key=lambda r: (r.code is None, -(r.code or 0), r.repository_url))
             ),
         )
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
 
     def report(self, model: LocDashboard, generated_at: datetime) -> Report:
         unmeasured = [r for r in model.repositories if r.unmeasured]
