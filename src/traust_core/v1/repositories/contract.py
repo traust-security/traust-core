@@ -21,6 +21,13 @@ from sqlalchemy.engine import Connection
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.assessment import Assessment
 from traust_core.v1.models.findings import CensusDecision, FindingExternalRef
+from traust_core.v1.models.operations import (
+    OrderQueryPosition,
+    OrderQueryRequest,
+    OrderSortBy,
+    OrderSortOrder,
+    RunOrder,
+)
 from traust_core.v1.repositories import traust_ledger, traust_ops
 from traust_core.v1.repositories.sql import SqlRepository
 from traust_core.v1.repositories.tables import (
@@ -39,9 +46,11 @@ from traust_core.v1.repositories.traust.findings.decision import DECISION
 from traust_core.v1.repositories.traust.findings.finding import FINDING
 from traust_core.v1.repositories.traust.findings.finding_label import FINDING_LABEL
 from traust_core.v1.repositories.traust.inventory import InventoryUnitOfWork
+from traust_core.v1.repositories.traust.inventory.repository import REPOSITORY
 from traust_core.v1.repositories.traust.inventory.repository_ref import REPOSITORY_REF
 from traust_core.v1.repositories.traust_ledger import LedgerUnitOfWork
 from traust_core.v1.repositories.traust_ops import OpsUnitOfWork
+from traust_core.v1.repositories.traust_ops.run_order import RUN_ORDER, order_conditions
 
 CONTRACT_TABLES: tuple[TableSpec, ...] = (
     *inventory.TABLES,
@@ -100,6 +109,7 @@ class SqlTraustUnitOfWork(SqlTablesUnitOfWork):
         self.review_items = findings.SqlReviewItemRepository(conn, tables)
         self.run_batches = traust_ops.SqlRunBatchRepository(conn, tables)
         self.run_orders = traust_ops.SqlRunOrderRepository(conn, tables)
+        self.order_reads = OrderReads(conn, tables)
         self.spend_events = traust_ops.SqlSpendEventRepository(conn, tables)
         self.feed_snapshots = traust_ops.SqlFeedSnapshotRepository(conn, tables)
         self.assessment_inputs = traust_ops.SqlAssessmentInputRepository(conn, tables)
@@ -268,3 +278,108 @@ class CensusReads(SqlRepository):
             rows = self._execute(f"census occurrences of {len(batch)} repositories", stmt)
             found.extend((row[0], row[1], row[2], row[3]) for row in rows)
         return found
+
+
+class OrderReads(SqlRepository):
+    """Bounded order reads composed with inventory's displayed repository reference."""
+
+    def __init__(self, connection: Connection, tables: TableFactory) -> None:
+        super().__init__(connection)
+        self._orders = tables.table(RUN_ORDER)
+        self._repositories = tables.table(REPOSITORY)
+
+    def query(
+        self, query: OrderQueryRequest, after: OrderQueryPosition | None
+    ) -> list[tuple[RunOrder, str | None, str | int | None]]:
+        if query.ids == ():
+            return []
+        orders, repositories = self._orders, self._repositories
+        c = orders.c
+        collation = "C" if self._connection.dialect.name == "postgresql" else "BINARY"
+        reference = sa.func.coalesce(
+            repositories.c.url, sa.cast(c.repository_id, sa.Text), sa.cast(c.id, sa.Text)
+        )
+        if query.sort_by is OrderSortBy.IDS:
+            value = sa.case(
+                *((c.id == order_id, index) for index, order_id in enumerate(query.ids or ())),
+                else_=-1,
+            )
+        elif query.sort_by is OrderSortBy.REPOSITORY:
+            value = reference.collate(collation)
+        else:
+            value = c[query.sort_by.value]
+            if query.sort_by in {OrderSortBy.ASSET, OrderSortBy.STATE, OrderSortBy.REASON}:
+                value = value.collate(collation)
+        stmt = sa.select(
+            orders, repositories.c.url.label("repository_url"), value.label("sort_value")
+        )
+        stmt = stmt.select_from(
+            orders.outerjoin(repositories, c.repository_id == repositories.c.id)
+        )
+        stmt = stmt.where(
+            *order_conditions(
+                orders,
+                states=query.states,
+                repository_id=query.repository_id,
+                repository_ids=query.repository_ids,
+                run_batch_id=query.run_batch_id,
+                asset=query.asset,
+            )
+        )
+        if query.ids is not None:
+            stmt = stmt.where(c.id.in_(query.ids))
+        if query.exclude_ids:
+            stmt = stmt.where(c.id.not_in(query.exclude_ids))
+        if query.q:
+            escaped = query.q.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{escaped}%"
+            stmt = stmt.where(
+                sa.or_(
+                    *(
+                        sa.func.lower(column).like(pattern, escape="\\")
+                        for column in (reference, c.asset, c.state)
+                    )
+                )
+            )
+        descending = (
+            query.sort_order is OrderSortOrder.DESC and query.sort_by is not OrderSortBy.IDS
+        )
+        if after is not None:
+            position = after.value
+            if (
+                query.sort_by
+                in {
+                    OrderSortBy.CREATED_AT,
+                    OrderSortBy.STARTED_AT,
+                    OrderSortBy.FINISHED_AT,
+                }
+                and position is not None
+            ):
+                position = datetime.fromisoformat(position)
+            elif query.sort_by is OrderSortBy.ID and position is not None:
+                position = UUID(position)
+            id_after = c.id < after.order_id if descending else c.id > after.order_id
+            if position is None:
+                stmt = stmt.where(value.is_(None), id_after)
+            else:
+                beyond = value < position if descending else value > position
+                stmt = stmt.where(
+                    sa.or_(value.is_(None), beyond, sa.and_(value == position, id_after))
+                )
+        direction = sa.desc if descending else sa.asc
+        stmt = stmt.order_by(value.is_(None), direction(value), direction(c.id)).limit(
+            query.limit + 1
+        )
+        rows = self._execute("query orders", stmt).mappings()
+        return [
+            (
+                RunOrder.model_validate({column.name: row[column.name] for column in orders.c}),
+                row["repository_url"],
+                row["sort_value"].isoformat()
+                if isinstance(row["sort_value"], datetime)
+                else str(row["sort_value"])
+                if isinstance(row["sort_value"], UUID)
+                else row["sort_value"],
+            )
+            for row in rows
+        ]

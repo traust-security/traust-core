@@ -15,6 +15,7 @@ from traust_core.v1.models.operations import (
     FINISHED_ORDER_STATES,
     OPEN_ORDER_STATES,
     LaneName,
+    OrderQueryRequest,
     OrderState,
     SpendDimension,
     SpendFilter,
@@ -217,3 +218,20 @@ def test_the_last_routed_order_is_read_once_per_start(explained: Profile) -> Non
 def test_lane_costs_read_settled_orders_in_the_window_by_index(explained: Profile) -> None:
     (costs,) = explained(lambda uow: uow.spend_events.order_costs(MONTH.start, MONTH.end))
     assert not costs.seq_scans() and costs.execution_ms < 500, costs.plan
+
+
+@pytest.mark.parametrize(
+    "search", ["", TYPICAL_REPOSITORY], ids=["first-page", "repository-search"]
+)
+def test_order_query_bounds_the_first_page_at_volume(explained: Profile, search: str) -> None:
+    query = OrderQueryRequest(q=search, limit=100)
+
+    def read(uow: SqlTraustUnitOfWork) -> object:
+        rows = uow.order_reads.query(query, query.position())
+        assert 0 < len(rows) <= query.limit + 1
+        return rows
+
+    (page,) = explained(read)
+    assert "LIMIT" in page.sql.upper(), page.sql
+    assert any("Limit" in line for line in page.plan), page.plan
+    assert page.execution_ms < 2000, page.plan

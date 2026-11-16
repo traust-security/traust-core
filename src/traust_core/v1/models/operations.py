@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 from collections.abc import Mapping
 from datetime import date, datetime
 from decimal import Decimal
@@ -338,6 +341,100 @@ class OrderFilter(Model):
     repository_ids: tuple[UUID, ...] = ()
     run_batch_id: UUID | None = None
     window: TimeWindow | None = None
+
+
+class OrderSortBy(StrEnum):
+    CREATED_AT = "created_at"
+    STARTED_AT = "started_at"
+    FINISHED_AT = "finished_at"
+    ASSET = "asset"
+    STATE = "state"
+    REPOSITORY = "repository"
+    REASON = "reason"
+    ID = "id"
+    IDS = "ids"
+
+
+class OrderSortOrder(StrEnum):
+    ASC = "asc"
+    DESC = "desc"
+
+
+class OrderQueryPosition(Model):
+    fingerprint: str
+    value: str | pydantic.StrictInt | None
+    order_id: UUID
+
+    def encode(self) -> str:
+        return base64.urlsafe_b64encode(self.model_dump_json().encode()).decode()
+
+
+class OrderQueryRequest(Model):
+    states: tuple[OrderState, ...] = ()
+    repository_id: UUID | None = None
+    repository_ids: tuple[UUID, ...] = ()
+    run_batch_id: UUID | None = None
+    asset: AssetName | None = None
+    q: str = ""
+    sort_by: OrderSortBy = OrderSortBy.CREATED_AT
+    sort_order: OrderSortOrder = OrderSortOrder.DESC
+    ids: tuple[UUID, ...] | None = None
+    exclude_ids: tuple[UUID, ...] = ()
+    limit: int = Field(default=100, ge=1, le=1000)
+    cursor: str | None = None
+
+    def fingerprint(self) -> str:
+        document = self.model_dump(mode="json", exclude={"limit", "cursor"})
+        return hashlib.sha256(json.dumps(document, sort_keys=True).encode()).hexdigest()
+
+    def position(self) -> OrderQueryPosition | None:
+        if self.sort_by is OrderSortBy.IDS:
+            if self.ids is None:
+                raise ValidationError("sort_by=ids requires ids")
+            if len(set(self.ids)) != len(self.ids):
+                raise ValidationError("sort_by=ids requires distinct ids")
+        if self.cursor is None:
+            return None
+        try:
+            raw = base64.b64decode(self.cursor, altchars=b"-_", validate=True)
+            position = OrderQueryPosition.model_validate_json(raw)
+            if position.fingerprint != self.fingerprint():
+                raise ValueError("query mismatch")
+            value = position.value
+            if self.sort_by is OrderSortBy.IDS:
+                if type(value) is not int or not 0 <= value < len(self.ids):
+                    raise ValueError("invalid sequence position")
+                if self.ids[value] != position.order_id:
+                    raise ValueError("invalid sequence id")
+            elif value is not None and not isinstance(value, str):
+                raise ValueError("invalid sort value")
+            elif (
+                self.sort_by
+                in {
+                    OrderSortBy.CREATED_AT,
+                    OrderSortBy.STARTED_AT,
+                    OrderSortBy.FINISHED_AT,
+                }
+                and value is not None
+            ):
+                datetime.fromisoformat(value)
+            elif self.sort_by is OrderSortBy.ID:
+                if value is None or UUID(value) != position.order_id:
+                    raise ValueError("invalid id position")
+            return position
+        except (ValueError, TypeError) as error:
+            raise ValidationError("invalid or mismatched order query cursor") from error
+
+
+class OrderQueryItem(Model):
+    order: RunOrder
+    repository_url: str | None
+    cursor: str
+
+
+class OrderQueryPage(Model):
+    items: list[OrderQueryItem]
+    next: str | None
 
 
 FINISHED_ORDER_STATES = (

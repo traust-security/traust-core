@@ -46,6 +46,10 @@ from traust_core.v1.models.operations import (
     OrderFilter,
     OrderManifest,
     OrderProgress,
+    OrderQueryItem,
+    OrderQueryPage,
+    OrderQueryPosition,
+    OrderQueryRequest,
     OrderReason,
     OrderRequest,
     OrderState,
@@ -1076,6 +1080,25 @@ class OpsService:
         with self._uow as uow:
             rows = uow.run_orders.search(**query, limit=page.limit + 1, after=after)
         return Page.of(rows, page.limit, lambda o: (o.created_at, o.id))
+
+    def query(self, query: OrderQueryRequest) -> OrderQueryPage:
+        after = query.position()
+        with self._uow as uow:
+            rows = uow.order_reads.query(query, after)
+        fingerprint = query.fingerprint()
+        items = [
+            OrderQueryItem(
+                order=order,
+                repository_url=url,
+                cursor=OrderQueryPosition(
+                    fingerprint=fingerprint, value=value, order_id=order.id
+                ).encode(),
+            )
+            for order, url, value in rows[: query.limit]
+        ]
+        return OrderQueryPage(
+            items=items, next=items[-1].cursor if len(rows) > query.limit else None
+        )
 
     def feed_after(self, after: tuple[datetime, UUID] | None, limit: int) -> list[RunOrder]:
         """Orders that reached a `FEED_ORDER_STATES` state after a feed position, oldest change
