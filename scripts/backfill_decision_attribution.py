@@ -56,6 +56,7 @@ import argparse
 import csv
 import io
 import json
+import re
 import shlex
 import subprocess
 import sys
@@ -63,9 +64,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 GRADES = {"E0", "E1", "E2", "E3"}
+# Core's actor spelling (Principal.ref): `<kind>:<identity>`, kind one of the
+# actor-kind registry's human/machine, the identity nonempty.
+ACTOR = re.compile(r"(?:human|machine):.+")
 
 # The append-only guard this backfill must lift for its UPDATE, by name.
 MUTATION_TRIGGER = "decision_reject_mutation"
+
+
+def positive_int(raw: str) -> int:
+    """A batch size the range() loop can step by (zero crashes, negative skips silently)."""
+    value = int(raw)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, not {raw!r}")
+    return value
 
 
 class Psql:
@@ -132,6 +144,7 @@ class Plan:
     ineligible: list[dict] = field(
         default_factory=list
     )  # actors an assessment's decision can't take
+    malformed: list[dict] = field(default_factory=list)  # stated actors outside core's shape
     unparseable: list[dict] = field(default_factory=list)
     unknown_grades: list[dict] = field(default_factory=list)
     no_event: list[str] = field(default_factory=list)
@@ -172,27 +185,41 @@ def parse_payload(raw: str) -> dict | None:
     return loaded if isinstance(loaded, dict) else None
 
 
-def actor_of(payload: dict) -> str | None:
-    """The actor the payload states, in core's `<kind>:<identity>` spelling."""
+def actor_of(payload: dict) -> tuple[str | None, str]:
+    """(the actor the payload states in core's `<kind>:<identity>` spelling, why not).
+
+    A stated actor outside core's shape is returned as (None, why) — it goes to the
+    review list, never onto a decision row.
+    """
     actor = payload.get("actor")
     if isinstance(actor, str) and actor:
-        return actor
+        return (actor, "") if ACTOR.fullmatch(actor) else (None, f"malformed actor: {actor!r}")
     source = payload.get("source")
     if isinstance(source, dict):
         who = source.get("actor")
         if isinstance(who, dict):
             kind, identity = who.get("kind"), who.get("identity")
-            if isinstance(kind, str) and isinstance(identity, str) and kind and identity:
-                return f"{kind}:{identity}"
-        elif isinstance(who, str) and who:
-            return who
-    return None
+            if (
+                isinstance(kind, str)
+                and isinstance(identity, str)
+                and kind in ("human", "machine")
+                and identity
+            ):
+                return f"{kind}:{identity}", ""
+            return None, f"malformed source.actor: {repr(who)[:120]}"
+        if isinstance(who, str) and who:
+            return (who, "") if ACTOR.fullmatch(who) else (None, f"malformed actor: {who!r}")
+    return None, ""
 
 
 def grade_of(payload: dict) -> tuple[str | None, bool]:
-    """(the grade the payload states, whether one was stated but unknown)."""
+    """(the grade the payload states, whether one was stated but unknown).
+
+    A non-string grade (an array or object reach here through parsed JSON) counts
+    as stated-but-unknown, same as a word outside E0-E3 — never a crash.
+    """
     grade = payload.get("evidence_grade")
-    if grade in GRADES:
+    if isinstance(grade, str) and grade in GRADES:
         return grade, False
     return None, grade is not None
 
@@ -212,17 +239,19 @@ def load_plan(core: Psql) -> Plan:
                 plan.no_event.append(waiting.decision_id)
             continue
         plan.counted["with_events"] += 1
-        actor = actor_of(payload)
+        actor, why = actor_of(payload)
         grade, unknown = grade_of(payload)
+        if why:
+            plan.malformed.append({"decision_id": waiting.decision_id, "detail": why})
         if unknown:
             plan.unknown_grades.append(
-                {"decision_id": waiting.decision_id, "grade": repr(payload["evidence_grade"])}
+                {"decision_id": waiting.decision_id, "grade": repr(payload["evidence_grade"])[:120]}
             )
         if actor is not None and waiting.by_assessment:
             # never two who's: an assessment's decision keeps its actor NULL
             plan.ineligible.append({"decision_id": waiting.decision_id, "actor": actor})
             actor = None
-        elif actor is None:
+        elif actor is None and not why:
             plan.no_actor += 1
         if (actor is not None and not waiting.has_actor) or (
             grade is not None and not waiting.has_grade
@@ -307,6 +336,8 @@ def write_review(path: str, plan: Plan) -> None:
         w.writerow(["kind", "decision_id", "detail"])
         for r in plan.ineligible:
             w.writerow(["ineligible-actor", r["decision_id"], r["actor"]])
+        for r in plan.malformed:
+            w.writerow(["malformed-actor", r["decision_id"], r["detail"]])
         for r in plan.unparseable:
             w.writerow(["unparseable-payload", r["decision_id"], ""])
         for r in plan.unknown_grades:
@@ -315,7 +346,7 @@ def write_review(path: str, plan: Plan) -> None:
             w.writerow(["no-event", decision_id, ""])
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument(
         "--psql-core",
@@ -329,11 +360,14 @@ def main() -> int:
         help="record the attributions (default: dry run, report only)",
     )
     ap.add_argument(
-        "--batch-size", type=int, default=2000, help="rows per UPDATE transaction (default 2000)"
+        "--batch-size",
+        type=positive_int,
+        default=2000,
+        help="rows per UPDATE transaction (default 2000)",
     )
     ap.add_argument("--report", help="write the JSON report here")
     ap.add_argument("--review", help="write the review-list CSV here")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     core = Psql(args.psql_core)
     plan = load_plan(core)
@@ -346,7 +380,8 @@ def main() -> int:
     )
     print(
         f"  actors derivable      {actors:>6}  (another {len(plan.ineligible)} name one an "
-        "assessment's decision can't take — the accepted gap)"
+        "assessment's decision can't take — the accepted gap; "
+        f"{len(plan.malformed)} stated one outside core's shape)"
     )
     print(
         f"  evidence grades       {grades:>6}  ({len(plan.unknown_grades)} stated an unknown "
@@ -375,6 +410,7 @@ def main() -> int:
         "payloads_unparseable": len(plan.unparseable),
         "actors_derived": actors,
         "actors_ineligible": len(plan.ineligible),
+        "actors_malformed": len(plan.malformed),
         "events_stating_no_actor": plan.no_actor,
         "evidence_grades_derived": grades,
         "evidence_grades_unknown": len(plan.unknown_grades),
@@ -389,6 +425,7 @@ def main() -> int:
         write_review(args.review, plan)
         entries = (
             len(plan.ineligible)
+            + len(plan.malformed)
             + len(plan.unparseable)
             + len(plan.unknown_grades)
             + len(plan.no_event)

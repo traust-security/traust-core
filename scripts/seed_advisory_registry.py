@@ -71,6 +71,14 @@ from pathlib import Path
 CVE = re.compile(r"(?:CVE|GHSA|MAL|PYSEC|GO|RUSTSEC|OSV)-[A-Za-z0-9][A-Za-z0-9-]{0,63}")
 
 
+def positive_int(raw: str) -> int:
+    """A batch size the range() loop can step by (zero crashes, negative skips silently)."""
+    value = int(raw)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, not {raw!r}")
+    return value
+
+
 class Psql:
     """Runs reads and writes through a caller-supplied psql command prefix."""
 
@@ -229,7 +237,7 @@ def write_review(path: str, rejected: list[dict]) -> None:
             w.writerow([r["artifact_id"], r["uri"], r["why"]])
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument(
         "--psql-core",
@@ -248,11 +256,14 @@ def main() -> int:
         "--apply", action="store_true", help="record the advisories (default: dry run, report only)"
     )
     ap.add_argument(
-        "--batch-size", type=int, default=1000, help="rows per INSERT transaction (default 1000)"
+        "--batch-size",
+        type=positive_int,
+        default=1000,
+        help="rows per INSERT transaction (default 1000)",
     )
     ap.add_argument("--report", help="write the JSON report here")
     ap.add_argument("--review", help="write the review-list CSV here")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     core = Psql(args.psql_core)
     seed, counts = load_seed(core, args.objects_root)

@@ -6,6 +6,7 @@ Run: python3 scripts/test_backfill_decision_attribution.py
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 import sys
@@ -57,15 +58,35 @@ class ParsePayloadTests(unittest.TestCase):
         self.assertIsNone(backfill.parse_payload("\\x5b5d"))  # a JSON array, not an object
 
     def test_legacy_layer_event_actor_folds_to_core_spelling(self):
-        self.assertEqual(backfill.actor_of(LEGACY), "human:a@x.com")
+        self.assertEqual(backfill.actor_of(LEGACY), ("human:a@x.com", ""))
 
     def test_decision_dump_actor_string_passes_through(self):
-        self.assertEqual(backfill.actor_of(DUMP), "human:b@x.com")
+        self.assertEqual(backfill.actor_of(DUMP), ("human:b@x.com", ""))
 
     def test_payloads_without_actors_state_none(self):
-        self.assertIsNone(backfill.actor_of({"evidence_grade": "E1"}))
-        self.assertIsNone(backfill.actor_of({"source": {"actor": {"kind": "human"}}}))
-        self.assertIsNone(backfill.actor_of({}))
+        self.assertEqual(backfill.actor_of({"evidence_grade": "E1"}), (None, ""))
+        self.assertEqual(backfill.actor_of({"source": {}}), (None, ""))
+        self.assertEqual(backfill.actor_of({}), (None, ""))
+
+    def test_stated_actors_outside_cores_shape_are_malformed_not_written(self):
+        for payload in (
+            {"actor": "not-an-actor"},  # no <kind>: prefix
+            {"actor": "human:"},  # empty identity
+            {"source": {"actor": "unprefixed@a@x.com"}},  # a legacy actor string, still unshaped
+            {"source": {"actor": {"kind": "alien", "identity": "a@x.com"}}},
+            {"source": {"actor": {"kind": "human", "identity": ""}}},
+            {"source": {"actor": {"kind": "human"}}},
+        ):
+            actor, why = backfill.actor_of(payload)
+            self.assertIsNone(actor, payload)
+            self.assertTrue(why, payload)
+        # a non-string actor states none (not malformed)
+        self.assertEqual(backfill.actor_of({"actor": 42}), (None, ""))
+        # shaped strings still pass, from both payload spellings
+        self.assertEqual(backfill.actor_of({"actor": "machine:triage"}), ("machine:triage", ""))
+        self.assertEqual(
+            backfill.actor_of({"source": {"actor": "human:a@x.com"}}), ("human:a@x.com", "")
+        )
 
     def test_grades_accept_only_the_known_set(self):
         for grade in ("E0", "E1", "E2", "E3"):
@@ -73,6 +94,10 @@ class ParsePayloadTests(unittest.TestCase):
         self.assertEqual(backfill.grade_of({"evidence_grade": "E4"}), (None, True))
         self.assertEqual(backfill.grade_of({"evidence_grade": None}), (None, False))
         self.assertEqual(backfill.grade_of({}), (None, False))
+
+    def test_unhashable_grades_are_unknown_not_a_crash(self):
+        for grade in (["E1"], {"grade": "E1"}):
+            self.assertEqual(backfill.grade_of({"evidence_grade": grade}), (None, True))
 
 
 class LoadPlanTests(unittest.TestCase):
@@ -144,6 +169,48 @@ class LoadPlanTests(unittest.TestCase):
         self.assertEqual(plan.no_actor, 2)  # the unknown-grade and the bare events
         self.assertEqual(plan.counted["missing"], 4)
         self.assertEqual(plan.counted["with_events"], 2)  # the unparseable one does not count
+
+    def test_malformed_actors_and_unhashable_grades_reach_the_review_list_not_a_crash(self):
+        core = FakePsql(
+            {
+                "FROM traust.decision": [
+                    self.row(D1, "f", {"actor": "not-an-actor"}),
+                    self.row(D2, "f", {"evidence_grade": ["E1"]}),  # an array, not a string
+                    self.row(D3, "f", {"source": {"actor": {"kind": "alien", "identity": "x"}}}),
+                ]
+            }
+        )
+        plan = backfill.load_plan(core)  # would raise TypeError before the fix
+        self.assertEqual(plan.updates, [])
+        self.assertEqual(
+            plan.malformed,
+            [
+                {"decision_id": D1, "detail": "malformed actor: 'not-an-actor'"},
+                {
+                    "decision_id": D3,
+                    "detail": "malformed source.actor: {'identity': 'x', 'kind': 'alien'}",
+                },
+            ],
+        )
+        self.assertEqual(plan.unknown_grades, [{"decision_id": D2, "grade": repr(["E1"])}])
+        self.assertEqual(
+            plan.no_actor, 1
+        )  # the array-grade row states no actor; malformed is its own class
+
+
+class BatchSizeTests(unittest.TestCase):
+    def test_nonpositive_batch_sizes_are_refused_at_parse_time(self):
+        for bad in ("0", "-5"):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                backfill.positive_int(bad)
+        self.assertEqual(backfill.positive_int("1"), 1)
+        self.assertEqual(backfill.positive_int("2000"), 2000)
+
+    def test_main_refuses_a_nonpositive_batch_size_before_any_work(self):
+        for bad in ("0", "-5"):
+            with self.assertRaises(SystemExit) as refused:
+                backfill.main(["--psql-core", "psql", "--apply", "--batch-size", bad])
+            self.assertEqual(refused.exception.code, 2)
 
 
 class ApplyTests(unittest.TestCase):

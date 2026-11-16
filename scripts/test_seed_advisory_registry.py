@@ -6,6 +6,7 @@ Run: python3 scripts/test_seed_advisory_registry.py
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import importlib.util
 import json
@@ -136,6 +137,22 @@ class ApplyTests(unittest.TestCase):
         core = FakePsql({})
         self.assertEqual(seed_script.apply_inserts(core, [], 10), 0)
         self.assertEqual(core.scripts, [])
+
+
+class BatchSizeTests(unittest.TestCase):
+    def test_nonpositive_batch_sizes_are_refused_at_parse_time(self):
+        for bad in ("0", "-5"):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                seed_script.positive_int(bad)
+        self.assertEqual(seed_script.positive_int("1000"), 1000)
+
+    def test_main_refuses_a_nonpositive_batch_size_before_any_work(self):
+        for bad in ("0", "-5"):
+            with self.assertRaises(SystemExit) as refused:
+                seed_script.main(
+                    ["--psql-core", "psql", "--objects-root", "/nowhere", "--batch-size", bad]
+                )
+            self.assertEqual(refused.exception.code, 2)
 
 
 if __name__ == "__main__":
