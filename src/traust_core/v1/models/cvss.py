@@ -177,8 +177,8 @@ def score_of(
 
 
 class _NvdCvssData(Dto):
-    version: StrictStr | None = None
-    vector: StrictStr | None = Field(None, alias="vectorString")
+    version: StrictStr
+    vector: StrictStr = Field(alias="vectorString")
     stated: _Stated = Field(None, alias="baseScore")
 
 
@@ -229,7 +229,7 @@ class _OsvRecord(Dto):
 
 class _RhCvss3(Dto):
     stated: _Stated = Field(None, alias="cvss3_base_score")
-    vector: StrictStr | None = Field(None, alias="cvss3_scoring_vector")
+    vector: StrictStr = Field(alias="cvss3_scoring_vector")
 
 
 class _RhCveRecord(Dto):
@@ -238,8 +238,8 @@ class _RhCveRecord(Dto):
 
 
 class _CsafCvssV3(Dto):
-    version: StrictStr | None = None
-    vector: StrictStr | None = Field(None, alias="vectorString")
+    version: StrictStr
+    vector: StrictStr = Field(alias="vectorString")
     stated: _Stated = Field(None, alias="baseScore")
 
 

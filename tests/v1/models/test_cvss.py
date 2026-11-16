@@ -232,6 +232,37 @@ def test_an_unreviewed_ghsa_and_another_databases_record_rank_nowhere() -> None:
         (parse_rh_cve, {"name": "CVE-2099-1", "cvss3": "x"}),
         (parse_rh_cve, {"cvss3": {}}),
         (parse_csaf, {"vulnerabilities": "x"}),
+        # a score block that's present must carry its vector: a renamed field fails, never drops
+        (
+            parse_nvd,
+            _nvd(
+                "cvssMetricV31",
+                source="nvd@nist.gov",
+                type="Primary",
+                cvssData={"version": "3.1", "baseScore": 8.1},
+            ),
+        ),
+        (
+            parse_nvd,
+            _nvd(
+                "cvssMetricV31",
+                source="nvd@nist.gov",
+                type="Primary",
+                cvssData={"vectorString": V31, "baseScore": 8.1},
+            ),
+        ),
+        (parse_rh_cve, {"name": "CVE-2099-1", "cvss3": {"cvss3_base_score": "8.1"}}),
+        (
+            parse_csaf,
+            {
+                "vulnerabilities": [
+                    {
+                        "cve": "CVE-2021-44228",
+                        "scores": [{"cvss_v3": {"version": "3.1", "baseScore": 8.1}}],
+                    }
+                ]
+            },
+        ),
     ],
 )
 def test_a_document_that_doesnt_fit_its_shape_is_a_validation_error(parse: Any, doc: Any) -> None:
