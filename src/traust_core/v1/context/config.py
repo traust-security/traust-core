@@ -319,8 +319,10 @@ class RecordingConfig(_Model):
         deliberate alias (remediation rides the triage allowlist until contracts grows a
         recording.remediation section) and is legal on triage only — anywhere else it is
         a misbinding whose remediation prerequisite nothing wires."""
-        # errors name list positions, never the asset: a value pasted into a list stays out
-        names: dict[str, str] = {}
+        # errors name list positions, never the asset: a value pasted into a list stays out.
+        # A repeat within one kind's list is harmless (each allowlist is a set downstream);
+        # only the same asset on two kinds is ambiguous.
+        names: dict[str, tuple[RecordKind, str]] = {}
         for kind in (
             RecordKind.TRIAGE,
             RecordKind.ASSESSMENT,
@@ -336,10 +338,11 @@ class RecordingConfig(_Model):
                             "to the triage allowlist"
                         )
                     continue
-                if (first := names.setdefault(asset, at)) != at:
+                first_kind, first_at = names.setdefault(asset, (kind, at))
+                if first_kind is not kind:
                     raise ValueError(
-                        f"{first} and {at} list the same asset: a recording asset belongs to "
-                        "one report kind"
+                        f"{first_at} and {at} list the same asset: a recording asset belongs "
+                        "to one report kind"
                     )
         return self
 
