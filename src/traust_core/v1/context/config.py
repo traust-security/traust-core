@@ -12,6 +12,7 @@ import sqlalchemy as sa
 import yaml
 
 from traust_core.v1 import contracts
+from traust_core.v1.context.redaction import yaml_cause, yaml_where
 from traust_core.v1.errors import ConfigError, DocumentError
 from traust_core.v1.models.compliance import DocsTarget
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
@@ -446,17 +447,25 @@ class Config(_Model):
         """A traust.yaml, schema-checked; relative locations and overrides resolve beside it."""
         try:
             data = yaml.safe_load(path.read_text()) or {}
-        except (OSError, yaml.YAMLError) as e:
+        except OSError as e:
             raise ConfigError(f"cannot read {path}") from e
+        except yaml.YAMLError as e:
+            # never the parser's own text (a pasted key as a tag, an alias or a line)
+            raise ConfigError(f"cannot read {path}: invalid YAML{yaml_where(e)}") from (
+                yaml_cause(e)
+            )
         try:
-            contracts.validate_config("traust", data)
+            contracts.validate_config("traust", data)  # its errors never echo the file
             provided = frozenset(data)
             locations = Locations.model_validate(
                 {k: v for k, v in data.pop("locations", {}).items() if k in Locations.model_fields}
             )
             config = cls.model_validate(data)
-        except (DocumentError, pydantic.ValidationError) as e:
+        except DocumentError as e:
             raise ConfigError(f"{path}: {e}") from e
+        except pydantic.ValidationError as e:
+            error, cause = _redacted(path, data, e)
+            raise error from cause  # the cause is rebuilt without the input, never `e`
         home = path.parent
         overrides = {k: (home / v).resolve() for k, v in config.overrides if v is not None}
         loaded = config.model_copy(
@@ -468,3 +477,24 @@ class Config(_Model):
         loaded._provided = provided
         loaded._config_home = home
         return loaded
+
+
+def _redacted(
+    path: Path, data: object, e: pydantic.ValidationError
+) -> tuple[ConfigError, pydantic.ValidationError]:
+    """A traust.yaml model error that never echoes the file: schema-declared names and the
+    error's kind only (a validator's own message can quote its input), chaining a cause rebuilt
+    the same way with inputs hidden."""
+    names = contracts.config_property_names("traust")
+    issues, line_errors = [], []
+    for err in e.errors(include_input=False, include_url=False):
+        where = contracts.redacted_config_path(data, err["loc"], names)
+        message = "fails a validation rule" if err["type"] == "value_error" else err["msg"]
+        issues.append(f"{where}: {message}")
+        if err["type"] != "value_error":
+            line_errors.append(
+                {"type": err["type"], "loc": tuple(where.split("/")), "input": None}
+                | ({"ctx": err["ctx"]} if "ctx" in err else {})
+            )
+    cause = pydantic.ValidationError.from_exception_data(e.title, line_errors, hide_input=True)
+    return ConfigError(f"{path}: {'; '.join(issues)}"), cause

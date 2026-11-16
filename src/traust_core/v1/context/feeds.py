@@ -5,12 +5,14 @@ from __future__ import annotations
 import string
 from collections.abc import Mapping
 from datetime import date, timedelta
+from functools import cache
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
 import pydantic
 import yaml
 
+from traust_core.v1.context.redaction import yaml_cause, yaml_where
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.feeds import (
@@ -153,12 +155,6 @@ class _Registry(_Strict):
     sources: dict[str, _Source]
 
 
-class _RegistryParseError(Exception):
-    """What a feeds-registry parse failure chains as its cause: the failure's kind and position
-    only. The parser's own exception carries document text (an unknown tag or alias, the
-    offending line) that a pasted credential could be."""
-
-
 def _load(path: Path) -> _Registry:
     """The registry, or a ConfigError that says where it's wrong but never what's there: lines,
     columns and the registry's own field names only, never a value or a key the file chose (a
@@ -171,10 +167,10 @@ def _load(path: Path) -> _Registry:
     try:
         return _Registry.model_validate(yaml.safe_load(text))
     except yaml.YAMLError as e:
-        mark = getattr(e, "problem_mark", None)
-        where = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
-        cause = _RegistryParseError(f"{type(e).__name__}{where}")
-        raise ConfigError(f"cannot read feeds registry {path}: invalid YAML{where}") from cause
+        where = yaml_where(e)
+        raise ConfigError(f"cannot read feeds registry {path}: invalid YAML{where}") from (
+            yaml_cause(e)
+        )
     except pydantic.ValidationError as e:
         root = yaml.compose(text)
         problems, line_errors = [], []
@@ -197,33 +193,44 @@ def _registry_fields() -> frozenset[str]:
     return frozenset(name for model in models for name in model.model_fields)
 
 
-# The only path segments an error shows as written: the registry's own field names.
+# The only path segments an error shows as written: the registry's own field names, at a field's
+# position, and the names of the sources traust-core ships (no pasted key can be one of those).
+# Every other key the file chose is located by its line, never shown.
 _FIELDS = _registry_fields()
+
+
+@cache
+def _shipped_source_names() -> frozenset[str]:
+    shipped = yaml.safe_load((Path(__file__).parent / "shipped" / "feeds.yaml").read_text())
+    return frozenset(str(name) for name in shipped.get("sources", {}))
 
 
 def _where(root: yaml.Node | None, loc: tuple[int | str, ...]) -> tuple[int | None, list[str]]:
     """Where an error's location is in the document: the line of the deepest node it reaches,
-    and its path with every key the file chose (a source's name, an unknown field) shown as the
-    line it's on, never its text."""
+    and its path. A sequence index shows as a number; a mapping key shows only if it's a field
+    name in a field's position, or a shipped source's name in a source's; any other (an unknown
+    field, a custom source, an unquoted number) shows as the line it's on, never its text."""
     node, line, shown = root, None, []
-    for part in loc:
-        if isinstance(part, int):
+    for i, part in enumerate(loc):
+        if isinstance(node, yaml.SequenceNode) and isinstance(part, int):
             shown.append(str(part))
-            if isinstance(node, yaml.SequenceNode) and part < len(node.value):
-                node = node.value[part]
-                line = node.start_mark.line + 1
-            else:
-                node = None
+            node = node.value[part] if part < len(node.value) else None
+            line = node.start_mark.line + 1 if node is not None else line
             continue
         entry = None
         if isinstance(node, yaml.MappingNode):
-            entry = next(((k, v) for k, v in node.value if k.value == part), None)
+            entry = next(((k, v) for k, v in node.value if k.value == str(part)), None)
         if entry is not None:
             line, node = entry[0].start_mark.line + 1, entry[1]
         else:
             node = None
-        if part in _FIELDS:
-            shown.append(part)
+        source_position = i == 1 and loc[0] == "sources"
+        if source_position:
+            known = isinstance(part, str) and part in _shipped_source_names()
+        else:
+            known = isinstance(part, str) and part in _FIELDS
+        if known:
+            shown.append(str(part))
         else:
             shown.append(f"<key at line {line}>" if entry is not None else "<key>")
     return line, shown

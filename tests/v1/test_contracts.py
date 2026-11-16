@@ -31,7 +31,17 @@ def test_config_gate_validates_a_pack_and_reports_paths() -> None:
     contracts.validate_config("pack", {"pack": "p", "assets": {"a": {"trigger": {"every": "1d"}}}})
     with pytest.raises(DocumentError) as err:
         contracts.validate_config("pack", {"pack": "p", "assets": {"a": {"trigger": {"x": 1}}}})
-    assert any(i.path.startswith("assets/a/trigger") for i in err.value.issues)
+    # a key the document chose (the asset's name) is never echoed; schema names are
+    assert any(i.path.startswith("assets/<key>/trigger") for i in err.value.issues)
+
+
+def test_a_config_error_never_echoes_the_document() -> None:
+    secret = "nvd-7f3a91c2b4d8e6f0"  # a key pasted where the variable's name goes
+    with pytest.raises(DocumentError) as err:
+        contracts.validate_config("traust", {"feeds": {"api_keys": {"nvd": secret}}})
+    issue = err.value.issues[0]
+    assert issue.path == "feeds/api_keys/<key>" and "does not match the pattern" in issue.message
+    assert secret not in str(err.value)
 
 
 def test_an_unknown_config_schema_is_a_config_error() -> None:

@@ -548,7 +548,7 @@ _LAST = len(SOURCES.splitlines()) + 1  # the line a test appends
     [
         (
             f"    api_key: {SECRET}\n",
-            rf"line {_LAST}: sources\.<key at line \d+>\.<key at line {_LAST}>: Extra inputs",
+            rf"line {_LAST}: sources\.nvd\.<key at line {_LAST}>: Extra inputs",  # a shipped name
         ),
         (f"    api_key: '{SECRET}\n", r"invalid YAML at line \d+"),  # an unterminated quote
         (f"    {SECRET}: x\n", rf"<key at line {_LAST}>: Extra inputs are not permitted"),  # a key
@@ -628,10 +628,35 @@ def test_a_bad_key_names_its_variable_never_its_value(
 
 
 def test_a_source_level_error_gives_the_sources_line(tmp_path: Path) -> None:
-    # a source's name is never echoed (a pasted key can't be told from one); its line is given
+    # a shipped source's name shows; any other source's name is located by its line, since a
+    # pasted key can't be told from a custom name
     text = REGISTRY.replace(
         "    max_age_hours: 12\n", "    max_age_hours: 12\n    api_key_header: apiKey\n"
     )
     line = _line_of(text, "  kev:")
+    with pytest.raises(ConfigError, match=rf"line {line}: sources\.kev: "):
+        Context(Config()).register_feeds(_registry(tmp_path, text))
+    custom = text.replace("  kev:", "  my-feed:")
     with pytest.raises(ConfigError, match=rf"line {line}: sources\.<key at line {line}>: "):
+        Context(Config()).register_feeds(_registry(tmp_path, custom))
+
+
+NUMERIC = "8675309"  # an unquoted all-digit key parses as an integer
+
+
+@pytest.mark.parametrize(
+    "line",
+    [f"  {NUMERIC}:\n    tier: live\n    size: 5\n", f"    {NUMERIC}: x\n"],
+    ids=["as-a-source", "as-a-field"],
+)
+def test_a_numeric_key_is_located_never_shown(tmp_path: Path, line: str) -> None:
+    text = SOURCES.rstrip() + "\n" + line
+    with pytest.raises(ConfigError, match=rf"<key at line {_LAST}>") as raised:
+        Context(Config()).register_feeds(_registry(tmp_path, text))
+    assert NUMERIC not in "".join(traceback.format_exception(raised.value))
+
+
+def test_a_source_named_like_a_field_is_located_never_shown(tmp_path: Path) -> None:
+    text = SOURCES.rstrip() + "\n  summary:\n    tier: live\n    size: 5\n"
+    with pytest.raises(ConfigError, match=rf"sources\.<key at line {_LAST}>\."):
         Context(Config()).register_feeds(_registry(tmp_path, text))
