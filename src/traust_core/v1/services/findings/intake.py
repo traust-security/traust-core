@@ -265,7 +265,10 @@ class FindingIntake:
         self, repo: Repository, candidates: Sequence[FindingCandidate], examiner: str
     ) -> tuple[list[Fingerprint], dict[Fingerprint, FindingKind]]:
         """Each identity and its agreed kind, checked before anything is written."""
-        keys = [self._fingerprint(repo, c, examiner) for c in candidates]
+        # The move's alias URLs resolve once for the whole batch (Qodo #474:
+        # per-candidate resolution rescans the upstream edge per finding).
+        prior = self._inventory.prior_urls(repo.id) if repo.id is not None else ()
+        keys = [self._fingerprint(repo, c, examiner, prior=prior) for c in candidates]
         placed: dict[Fingerprint, dict[tuple[str, int | None], str]] = {}
         claims: dict[Fingerprint, dict[tuple[str, int | None, str], str]] = {}
         kinds: dict[Fingerprint, FindingKind] = {}
@@ -296,7 +299,12 @@ class FindingIntake:
         return keys, kinds
 
     def _fingerprint(
-        self, repo: Repository, candidate: FindingCandidate, examiner: str
+        self,
+        repo: Repository,
+        candidate: FindingCandidate,
+        examiner: str,
+        *,
+        prior: tuple[str, ...] | None = None,
     ) -> Fingerprint:
         if candidate.repository_id != repo.id:
             raise ValidationError(
@@ -323,7 +331,7 @@ class FindingIntake:
                 )
             return Fingerprint(confirmed.fingerprint_algo, confirmed.fingerprint)
         current = self._identity_key(repo.url, candidate)
-        return self._moved_identity(repo, candidate, current)
+        return self._moved_identity(repo, candidate, current, prior=prior)
 
     def _identity_key(self, url: str, candidate: FindingCandidate) -> Fingerprint:
         """The candidate's identity under one repository URL."""
@@ -348,7 +356,12 @@ class FindingIntake:
         )
 
     def _moved_identity(
-        self, repo: Repository, candidate: FindingCandidate, current: Fingerprint
+        self,
+        repo: Repository,
+        candidate: FindingCandidate,
+        current: Fingerprint,
+        *,
+        prior: tuple[str, ...] | None = None,
     ) -> Fingerprint:
         """The URL correction's identity continuity (foundry plan repo-unreachable,
         resolved decision 4): a repository whose URL was corrected keeps findings
@@ -360,7 +373,7 @@ class FindingIntake:
         URL that was never the repository's simply matches nothing."""
         if repo.id is None:
             return current
-        for url in self._inventory.prior_urls(repo.id):
+        for url in self._inventory.prior_urls(repo.id) if prior is None else prior:
             alias = self._identity_key(url, candidate)
             with self._uow as uow:
                 if uow.findings.find_by_fingerprint(repo.id, alias.algo, alias.value) is not None:

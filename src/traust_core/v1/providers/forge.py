@@ -495,14 +495,16 @@ class CommandSourceProvider:
                 except (AttributeError, TypeError) as exc:
                     raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
         except SourceError as exc:
-            # A repository whose own read answered but whose default branch names no
-            # commit reads 404 (the unborn ref) or 409 ("Git Repository is empty") -
-            # the empty repository's signature, not a transport failure (Qodo #474:
-            # GitHub reports default_branch for a repository with no commits).
+            # A repository whose own read answered but whose branch names no commit
+            # reads 404 (the unborn ref) or 409 ("Git Repository is empty") - the
+            # empty repository's signature when the branch is the default (the only
+            # caller that reads the empty marker; a branch import of a missing name
+            # carries the same error without the marker mattering), never a
+            # transport failure (Qodo #474).
             cause = exc.__cause__
             if isinstance(cause, ServiceError) and cause.status in (404, 409):
                 raise SourceError(
-                    f"{repo}: the default branch {branch} names no commit",
+                    f"{repo}: no commit on branch {branch}",
                     ComparisonStatus.ERROR,
                     empty_repository=True,
                 ) from exc

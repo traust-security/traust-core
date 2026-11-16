@@ -493,3 +493,52 @@ def test_the_tombstone_is_dispositioned_at_creation():
     )
     assert tombstone.disposition_reason == GoneReason.GONE
     assert tombstone.upstream_id == harness.repository_id
+
+
+# The Qodo #474 second round: the undo, and the alias row set.
+
+
+def test_a_mistaken_correction_can_be_undone_by_moving_back():
+    """A correction back to the URL the repository vacated reclaims its own
+    tombstone rather than conflicting with it: the repository returns home (where its
+    findings' stamps match directly again), and the tombstone follows the URL being
+    left — recording the new vacated one."""
+    harness, service, _, _, _sources = observer()
+    home = _repository(service, harness.repository_id).url
+    service.correct_repository_url(harness.repository_id, _url("https://github.com/wrong/typo"))
+    moved = _repository(service, harness.repository_id)
+    assert moved.url == "https://github.com/wrong/typo"
+
+    back = service.correct_repository_url(harness.repository_id, _url(home))
+    assert back.id == harness.repository_id and back.url == home
+    with service._uow as uow:
+        # The tombstone followed the typo'd URL: it is vacated now.
+        tombstone = uow.repositories.find_by_url("https://github.com/wrong/typo")
+        assert tombstone is not None and tombstone.id is not None
+        assert tombstone.upstream_id == harness.repository_id
+        assert tombstone.disposition == RepositoryDisposition.REPO_UNREACHABLE
+        assert home not in {
+            row.url for row in uow.repositories.list_by_upstream(harness.repository_id)
+        }
+        # The undo left exactly one row at the home URL: the repository itself.
+        assert uow.repositories.find_by_url(home).id == harness.repository_id
+
+
+def test_prior_urls_answer_vacated_rows_not_forks():
+    """The alias set is the correction's vacated-URL rows, recognized by the
+    correction's own signature — a fork or mirror sharing the upstream edge is not a
+    place the repository's findings were stamped."""
+    harness, service, _, _, _sources = observer()
+    repository = _repository(service, harness.repository_id)
+    with service._uow.write() as uow:
+        mirror = uow.repositories.get_or_add(
+            Repository(url="https://github.com/example/mirror", public=False)
+        )
+        uow.repositories.update(mirror.model_copy(update={"upstream_id": repository.id}))
+        uow.commit()
+    assert service.inventory.prior_urls(harness.repository_id) == ()
+    service.correct_repository_url(
+        harness.repository_id, _url("https://github.com/moved/relocated")
+    )
+    prior = service.inventory.prior_urls(harness.repository_id)
+    assert prior == (repository.url,)

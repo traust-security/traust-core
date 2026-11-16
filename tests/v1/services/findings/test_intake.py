@@ -26,7 +26,12 @@ from traust_core.v1.models.findings import (
     SuppressionStatus,
 )
 from traust_core.v1.models.integrity import FingerprintInput
-from traust_core.v1.models.inventory import Repository, RepositoryRef
+from traust_core.v1.models.inventory import (
+    GoneReason,
+    Repository,
+    RepositoryDisposition,
+    RepositoryRef,
+)
 from traust_core.v1.models.vocabulary import ReviewReason, Severity
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.findings import FindingIntake, IdentityPolicy, TaxonomyPolicy
@@ -605,14 +610,24 @@ def test_a_moved_repositorys_findings_keep_their_identity(engine: Engine, target
     original = rows(engine, finding_id)["finding"]
 
     # The correction: the row keeps its identity at the new URL, and the vacated
-    # URL's row carries the upstream link — the same edge the fork resolution reads.
+    # URL's row carries the upstream link — the same edge the fork resolution reads —
+    # left in the state the correction door leaves (dispositioned, with its signature).
     with SqlTraustUnitOfWork(engine) as uow:
         repo = uow.repositories.get(target.repository.id)
         assert repo.id is not None
         uow.repositories.update(
             repo.model_copy(update={"url": "https://github.com/example/relocated"})
         )
-        uow.repositories.get_or_add(Repository(url=repo.url, public=True, upstream_id=repo.id))
+        uow.repositories.get_or_add(
+            Repository(
+                url=repo.url,
+                public=True,
+                upstream_id=repo.id,
+                disposition=RepositoryDisposition.REPO_UNREACHABLE,
+                disposition_reason=GoneReason.GONE,
+                disposition_evidence="url corrected to https://github.com/example/relocated",
+            )
+        )
         uow.commit()
 
     second = audit(engine, target)

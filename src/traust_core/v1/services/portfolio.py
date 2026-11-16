@@ -270,18 +270,19 @@ class Inventory:
         return refs[0]
 
     def prior_urls(self, repository_id: UUID) -> tuple[str, ...]:
-        """The URLs this repository previously carried: the vacated-URL rows pointing
-        upstream at it (the URL correction's record — the same edge the fork resolution
-        reads). Findings stamped under those URLs still belong to the repository, so the
-        finding intake matches a candidate against them before taking a new identity
-        (foundry plan repo-unreachable, resolved decision 4: the fingerprints survive
-        the move through the edge). A mirror's URL simply matches nothing."""
+        """The URLs this repository previously carried: its vacated-URL rows — the ones
+        the URL correction left pointing upstream at it, recognized by the correction's
+        own signature (dispositioned gone with the "url corrected to" evidence), not the
+        forks and mirrors that share the edge. Findings stamped under those URLs still
+        belong to the repository, so the finding intake matches a candidate against
+        them before taking a new identity (foundry plan repo-unreachable, resolved
+        decision 4: the fingerprints survive the move through the edge)."""
         require_uuid(repository_id, "repository.id")
         with self._uow as uow:
             return tuple(
                 row.url
                 for row in uow.repositories.list_by_upstream(repository_id)
-                if row.id is not None
+                if row.id is not None and _is_vacated(row)
             )
 
     def private_mirror(self, repository_id: UUID) -> Repository | None:
@@ -609,38 +610,65 @@ class PortfolioService:
                 return repository
             uow.repositories.lock_url(new)
             existing = _registered_repository(uow, new, self._hosts)
-            if existing is not None and existing.id != repository.id:
+            move_back = (
+                existing is not None
+                and existing.id != repository.id
+                and existing.upstream_id == repository.id
+                and _is_vacated(existing)
+            )
+            if existing is not None and existing.id != repository.id and not move_back:
                 raise ConflictError(
                     f"{new} is already {existing.id}'s URL; correct that registration instead"
                 )
-            case_only = existing is not None  # this repository, spelled differently
+            # A move back reclaims the repository's own vacated-URL row: the destination
+            # is the tombstone this repository's earlier correction left, so the
+            # correction is the undo of that one (a typo, a move home) rather than a
+            # conflict. The tombstone follows the URL being left now.
+            case_only = existing is not None and not move_back
             old = repository.url
-            repository = uow.repositories.update(
-                repository.model_copy(update={"url": new, "gone_streak": 0})
-            )
-            if not case_only:
-                # The vacated URL's row: the move's record, the same edge the fork
-                # resolution reads. Public, so the private-mirror resolution never
-                # mistakes the vacated self for a push target; and dispositioned at
-                # creation — the vacated URL is known gone (the person just corrected
-                # away from it), so it never re-enters the planner's universe to burn
-                # two observations proving it (Qodo #474).
-                uow.repositories.lock_url(old)
-                tombstone = uow.repositories.find_by_url(old) or uow.repositories.get_or_add(
-                    Repository(url=old, public=True)
+            tombstone: Repository | None = None
+            if move_back:
+                # A move back is a URL swap: the tombstone holds the destination, the
+                # repository holds the URL being left, and each must take the other's.
+                # A unique URL cannot swap in two statements, so the tombstone steps
+                # aside to a value that never leaves the transaction before the
+                # repository takes the destination (Qodo #474: the undo).
+                assert existing is not None
+                tombstone = existing
+                aside = f"{old}#vacated:{repository_id}"
+                uow.repositories.update(tombstone.model_copy(update={"url": aside}))
+                repository = uow.repositories.update(
+                    repository.model_copy(update={"url": new, "gone_streak": 0})
                 )
-                if tombstone.id != repository.id:
-                    uow.repositories.update(
-                        tombstone.model_copy(
-                            update={
-                                "upstream_id": repository.id,
-                                "disposition": RepositoryDisposition.REPO_UNREACHABLE,
-                                "disposition_reason": GoneReason.GONE,
-                                "disposition_evidence": f"url corrected to {new}",
-                                "disposition_at": self._clock.now(),
-                            }
-                        )
+            else:
+                repository = uow.repositories.update(
+                    repository.model_copy(update={"url": new, "gone_streak": 0})
+                )
+                if not case_only:
+                    # The vacated URL's row: the move's record, the same edge the
+                    # fork resolution reads. Public, so the private-mirror resolution
+                    # never mistakes the vacated self for a push target; and
+                    # dispositioned at creation — the vacated URL is known gone (the
+                    # person just corrected away from it), so it never re-enters the
+                    # planner's universe to burn two observations proving it (Qodo
+                    # #474).
+                    uow.repositories.lock_url(old)
+                    tombstone = uow.repositories.find_by_url(old) or uow.repositories.get_or_add(
+                        Repository(url=old, public=True)
                     )
+            if tombstone is not None and tombstone.id != repository.id:
+                uow.repositories.update(
+                    tombstone.model_copy(
+                        update={
+                            "url": old,
+                            "upstream_id": repository.id,
+                            "disposition": RepositoryDisposition.REPO_UNREACHABLE,
+                            "disposition_reason": GoneReason.GONE,
+                            "disposition_evidence": f"url corrected to {new}",
+                            "disposition_at": self._clock.now(),
+                        }
+                    )
+                )
             uow.commit()
         self._uow.after_commit(
             lambda: log.info(
@@ -1777,6 +1805,15 @@ def _subject_of(
 
 def _owned(subject: CorpusSubject | None) -> tuple[OwnershipClass | None, str | None]:
     return (None, None) if subject is None else (subject.ownership, subject.business_unit)
+
+
+def _is_vacated(row: Repository) -> bool:
+    """Whether the row is a URL correction's vacated-URL record: dispositioned gone by
+    the correction's own hand (the "url corrected to ..." evidence), not a fork or a
+    mirror that merely shares the upstream edge."""
+    return row.disposition == RepositoryDisposition.REPO_UNREACHABLE and (
+        row.disposition_evidence or ""
+    ).startswith("url corrected to")
 
 
 def _registered_repository(
