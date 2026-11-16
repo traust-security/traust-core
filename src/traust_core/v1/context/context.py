@@ -767,12 +767,12 @@ class Context:
         if local and not populated:
             dialect = Dialect.of(engine)
             apply_schema(engine, contracts.database_ddl(dialect))
+            _run_channel(engine, local=True)
             log.info(
-                "store bootstrap fresh dialect=%s: baseline schema, then the whole channel",
+                "store bootstrap fresh dialect=%s: baseline schema and the whole channel applied",
                 dialect,
                 extra={"operation": "store.bootstrap", "outcome": "fresh"},
             )
-            _run_channel(engine, local=True)
         elif populated:
             if _channel_stamped(engine):
                 _run_channel(engine, local=local)
@@ -1268,15 +1268,13 @@ def _store_populated(engine: Engine) -> bool:
     """Any namespace's tables count as a populated store: on postgres they live
     in the traust schemas, not the default one ``get_table_names()`` inspects."""
     inspector = sa.inspect(engine)
-    if inspector.get_table_names():
-        return True
-    if Dialect.of(engine) != Dialect.POSTGRES:
-        return False
-    return any(
-        inspector.get_table_names(schema=schema)
-        for schema in ("traust", "traust_ops", "traust_ledger")
-        if schema in inspector.get_schema_names()
-    )
+    if Dialect.of(engine) == Dialect.POSTGRES:
+        return any(
+            inspector.get_table_names(schema=schema)
+            for schema in ("traust", "traust_ops", "traust_ledger")
+            if schema in inspector.get_schema_names()
+        )
+    return bool(inspector.get_table_names())
 
 
 def _channel_stamped(engine: Engine) -> bool:
@@ -1299,6 +1297,7 @@ def _run_channel(engine: Engine, *, local: bool) -> None:
             engine, lambda dbapi: contracts.pending_db_upgrades(dbapi, dialect)
         )
     except MigrationError as error:
+        log.error("store refused: the db contract's upgrade channel rejected it - %s", error)
         raise ConfigError(
             f"the db contract's upgrade channel refused this store: {error}"
         ) from error

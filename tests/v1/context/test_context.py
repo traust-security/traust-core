@@ -191,6 +191,28 @@ def test_a_populated_postgres_store_is_not_fresh_and_refuses_pending(
             _ = Context(configured).database
 
 
+@pytest.mark.integration
+def test_a_configured_postgres_with_foreign_public_tables_opens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A shared configured postgres with tables in the default schema but no
+    contract schemas is empty to the store, not a version-0 refusal."""
+    from tests.v1.conftest import PG_URL, _fresh_postgres
+    from traust_core.v1.context.config import DatabaseConfig
+
+    if not PG_URL:
+        pytest.skip("TRAUST_TEST_DATABASE_URL not set")
+
+    with _fresh_postgres() as engine:
+        with engine.begin() as connection:
+            connection.exec_driver_sql("CREATE TABLE public.foreign_table (id TEXT)")
+        configured = Config(
+            home=tmp_path / "home",
+            database=DatabaseConfig(url=engine.url.render_as_string(hide_password=False)),
+        )
+        _ = Context(configured).database  # opens: never bootstrapped, never refused
+
+
 def test_a_store_from_before_the_channel_is_refused_with_recreate(tmp_path: Path) -> None:
     engine = Context(Config(home=tmp_path)).database  # a store the channel stamped
     with engine.begin() as connection:
