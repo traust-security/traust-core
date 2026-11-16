@@ -295,7 +295,7 @@ def test_cursors_are_bound_to_every_filter_and_sort(
         (OrderSortBy.STARTED_AT, 4),
         (OrderSortBy.FINISHED_AT, "2026-99-99"),
         (OrderSortBy.ID, None),
-        (OrderSortBy.ID, str(uuid4())),
+        (OrderSortBy.ID, str(UUID(int=1))),
         (OrderSortBy.ASSET, 1),
         (OrderSortBy.IDS, -1),
         (OrderSortBy.IDS, 1),
