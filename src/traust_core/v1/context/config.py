@@ -12,8 +12,8 @@ import sqlalchemy as sa
 import yaml
 
 from traust_core.v1 import contracts
-from traust_core.v1.context.redaction import yaml_cause, yaml_where
-from traust_core.v1.errors import ConfigError, DocumentError
+from traust_core.v1.context.redaction import locate, schema_issue, yaml_cause, yaml_where
+from traust_core.v1.errors import ConfigError, DocumentError, Issue
 from traust_core.v1.models.compliance import DocsTarget
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
 from traust_core.v1.models.operations import (
@@ -446,26 +446,37 @@ class Config(_Model):
     def from_file(cls, path: Path) -> Config:
         """A traust.yaml, schema-checked; relative locations and overrides resolve beside it."""
         try:
-            data = yaml.safe_load(path.read_text()) or {}
+            text = path.read_text()
         except OSError as e:
             raise ConfigError(f"cannot read {path}") from e
+        try:
+            data = yaml.safe_load(text) or {}
         except yaml.YAMLError as e:
             # never the parser's own text (a pasted key as a tag, an alias or a line)
             raise ConfigError(f"cannot read {path}: invalid YAML{yaml_where(e)}") from (
                 yaml_cause(e)
             )
+        # traust.yaml names the deployment's secrets: its errors are located by line and worded
+        # by the schema, never echoing what the file holds
+        if errors := contracts.config_schema_errors("traust", data):
+            names = contracts.config_property_names("traust")
+            root = yaml.compose(text)
+            issues = [schema_issue(root, e, names) for e in errors]
+            cause = DocumentError("traust", [Issue("$", issue) for issue in issues])
+            raise ConfigError(f"{path}: {'; '.join(issues)}") from cause
+        provided = frozenset(data)
         try:
-            contracts.validate_config("traust", data)  # its errors never echo the file
-            provided = frozenset(data)
             locations = Locations.model_validate(
                 {k: v for k, v in data.pop("locations", {}).items() if k in Locations.model_fields}
             )
-            config = cls.model_validate(data)
-        except DocumentError as e:
-            raise ConfigError(f"{path}: {e}") from e
         except pydantic.ValidationError as e:
-            error, cause = _redacted(path, data, e)
+            error, cause = _redacted(path, text, e, under=("locations",))
             raise error from cause  # the cause is rebuilt without the input, never `e`
+        try:
+            config = cls.model_validate(data)
+        except pydantic.ValidationError as e:
+            error, cause = _redacted(path, text, e)
+            raise error from cause
         home = path.parent
         overrides = {k: (home / v).resolve() for k, v in config.overrides if v is not None}
         loaded = config.model_copy(
@@ -480,21 +491,24 @@ class Config(_Model):
 
 
 def _redacted(
-    path: Path, data: object, e: pydantic.ValidationError
+    path: Path, text: str, e: pydantic.ValidationError, *, under: tuple[str, ...] = ()
 ) -> tuple[ConfigError, pydantic.ValidationError]:
-    """A traust.yaml model error that never echoes the file: schema-declared names and the
-    error's kind only (a validator's own message can quote its input), chaining a cause rebuilt
-    the same way with inputs hidden."""
+    """A traust.yaml model error that never echoes the file: located by line, through the
+    schema's own names, with the validators' own messages (code-authored, they say which rule
+    failed). Its cause is rebuilt the same way, with inputs hidden."""
     names = contracts.config_property_names("traust")
+    root = yaml.compose(text)
     issues, line_errors = [], []
     for err in e.errors(include_input=False, include_url=False):
-        where = contracts.redacted_config_path(data, err["loc"], names)
-        message = "fails a validation rule" if err["type"] == "value_error" else err["msg"]
-        issues.append(f"{where}: {message}")
-        if err["type"] != "value_error":
-            line_errors.append(
-                {"type": err["type"], "loc": tuple(where.split("/")), "input": None}
-                | ({"ctx": err["ctx"]} if "ctx" in err else {})
-            )
+        line, where = locate(root, (*under, *err["loc"]), names)
+        at = f"line {line}: " if line else ""
+        issues.append(f"{at}{where}: {err['msg']}")
+        detail = {"type": err["type"], "loc": tuple(where.split("/")), "input": None}
+        if "ctx" in err:
+            ctx = dict(err["ctx"])
+            if err["type"] == "value_error":
+                ctx["error"] = ValueError(str(ctx.get("error", "")))
+            detail["ctx"] = ctx
+        line_errors.append(detail)
     cause = pydantic.ValidationError.from_exception_data(e.title, line_errors, hide_input=True)
     return ConfigError(f"{path}: {'; '.join(issues)}"), cause
