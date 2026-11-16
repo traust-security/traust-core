@@ -19,11 +19,12 @@ from traust_core.v1.models.inventory import (
     Team,
     TeamName,
 )
-from traust_core.v1.models.values import GitSha
+from traust_core.v1.models.observation import ForgeFacts
+from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.models.vocabulary import RefKind
 from traust_core.v1.rest.common.deps import Caller
 from traust_core.v1.rest.common.problems import PROBLEMS
-from traust_core.v1.rest.portfolio.service import Portfolio
+from traust_core.v1.rest.portfolio.service import Person, Portfolio
 
 router = APIRouter()
 
@@ -45,17 +46,36 @@ class Owners(Model):
     teams: tuple[Annotated[TeamName, Field(min_length=1, max_length=256)], ...]
 
 
+class UrlCorrection(Model):
+    url: Annotated[str, Field(min_length=1, max_length=2048)]
+
+
+class RepositoryVerification(Model):
+    """One deliberate observation of a repository and the disposition it left behind: the
+    console's verify button renders the outcome (the facts' status and error) beside the
+    repository's disposition — cleared on success, held with the new evidence on a
+    gone-class failure, untouched on a transient one."""
+
+    facts: ForgeFacts
+    repository: Repository
+
+
 @router.get("/v1/repositories", responses=PROBLEMS(401, 422))
 def list_repositories(
     portfolio: Portfolio,
     _: Caller,
     url: Annotated[str | None, Query(max_length=2048)] = None,
+    dispositioned: Annotated[bool | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=1000)] = 100,
     cursor: Cursor | None = None,
 ) -> Page[Repository]:
-    """Every repository, paged; with `url`, the one registered there (or none)."""
+    """Every repository, paged; with `url`, the one registered there (or none). With
+    `dispositioned`: only the repositories carrying (true) or not carrying (false) the
+    unreachable disposition — false is the planner's universe, true its remediation
+    worklist."""
     return portfolio.list_repositories(
-        RepositoryFilter(url=url), PageRequest(limit=limit, cursor=cursor)
+        RepositoryFilter(url=url, dispositioned=dispositioned),
+        PageRequest(limit=limit, cursor=cursor),
     )
 
 
@@ -103,6 +123,32 @@ def set_owners(repository_id: UUID, body: Owners, portfolio: Portfolio, _: Calle
 @router.get("/v1/repositories/{repository_id}/products", responses=PROBLEMS(401, 404))
 def list_products_of(repository_id: UUID, portfolio: Portfolio, _: Caller) -> list[Product]:
     return portfolio.list_products_of(repository_id)
+
+
+@router.put("/v1/repositories/{repository_id}/url", responses=PROBLEMS(401, 403, 404, 409, 422))
+def correct_repository_url(
+    repository_id: UUID, body: UrlCorrection, portfolio: Portfolio, _: Person
+) -> Repository:
+    """Correct a moved repository's URL (foundry plan repo-unreachable): the row keeps its
+    identity — every finding stays attached, so the fingerprints survive the move — and the
+    change is recorded as the upstream link on the vacated URL's row, the same edge the
+    fork resolution reads. The disposition, if any, holds until the verify succeeds."""
+    return portfolio.correct_repository_url(
+        repository_id, HttpsRepoUrl.parse(body.url, portfolio.inventory.hosts)
+    )
+
+
+@router.post("/v1/repositories/{repository_id}/verify", responses=PROBLEMS(401, 403, 404, 422))
+def verify_repository(
+    repository_id: UUID, portfolio: Portfolio, _: Person
+) -> RepositoryVerification:
+    """The on-demand observation (foundry plan repo-unreachable): the same path the
+    repo_state asset runs, exposed as the door the SCI API calls for the console's verify
+    button. On success the disposition clears and the repository re-enters the planner's
+    universe; on a gone-class failure it holds with the new evidence; a transient failure
+    holds it untouched."""
+    facts = portfolio.verify_repository(repository_id)
+    return RepositoryVerification(facts=facts, repository=portfolio.get_repository(repository_id))
 
 
 # The refs collection: every recorded ref of several repositories in one

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -25,7 +26,12 @@ from traust_core.v1.models.findings import (
     SuppressionStatus,
 )
 from traust_core.v1.models.integrity import FingerprintInput
-from traust_core.v1.models.inventory import Repository, RepositoryRef
+from traust_core.v1.models.inventory import (
+    GoneReason,
+    Repository,
+    RepositoryDisposition,
+    RepositoryRef,
+)
 from traust_core.v1.models.vocabulary import ReviewReason, Severity
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.findings import FindingIntake, IdentityPolicy, TaxonomyPolicy
@@ -142,6 +148,39 @@ def test_accepting_the_same_report_again_adds_nothing(engine: Engine, target: Ta
         ["CWE-89"],
         1,
     )
+
+
+def test_a_reported_cvss_claim_lands_on_the_occurrence(engine: Engine, target: Target) -> None:
+    """The CVSS a report states reaches the occurrence's columns — the columns every
+    CVSS-reading surface reads (the rollup's top cut, the item findings page). The
+    estate's history left them NULL on every row because intake never carried them;
+    a report that states no CVSS still records none."""
+    run = audit(engine, target)
+    result = intake(engine).accept(
+        run,
+        [
+            candidate(
+                target,
+                cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+                cvss_score=Decimal("5.3"),
+            ),
+            candidate(
+                target,
+                "OPERATOR-abcdef0-002",
+                rule="go.crypto.weak",
+                cwes=("CWE-338",),
+            ),
+        ],
+    )
+    got = rows(engine, result.findings[Label("OPERATOR-abcdef0-001")])
+    (occurrence,) = got["occurrences"]
+    assert (occurrence.cvss_vector, occurrence.cvss_score) == (
+        "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+        Decimal("5.3"),
+    )
+    unscored = rows(engine, result.findings[Label("OPERATOR-abcdef0-002")])
+    (plain,) = unscored["occurrences"]
+    assert (plain.cvss_vector, plain.cvss_score) == (None, None)
 
 
 def test_a_later_scan_matches_by_fingerprint_and_adds_its_own_occurrence(
@@ -481,6 +520,27 @@ def test_a_report_finding_carries_its_owasp_llm_categories(target: Target) -> No
     assert all(f.owasp_llm_references == () for f in found[1:])
 
 
+def test_a_report_finding_carries_its_cvss_claim(target: Target) -> None:
+    """The contracts report's `findings[].cvss` block is the CVSS source the intake
+    writes; `of_report` must not be where it drops off."""
+    from tests.v1.services.reporting.documents import valid_report
+    from traust_core.v1.models.artifacts import ReportArtifact
+
+    doc = valid_report()
+    doc["findings"][0]["cvss"] = {
+        "score": 5.3,
+        "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+    }
+    found = FindingCandidate.of_report(
+        ReportArtifact.from_document(doc).findings, target.repository.id
+    )
+    scored = [f for f in found if f.cvss_score is not None]
+    assert [(f.cvss_score, f.cvss_vector) for f in scored] == [
+        (Decimal("5.3"), "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N")
+    ]
+    assert all(f.cvss_score is None and f.cvss_vector is None for f in found if f not in scored)
+
+
 def test_reaccepting_an_assessment_records_its_new_locations(
     engine: Engine, target: Target
 ) -> None:
@@ -535,3 +595,48 @@ def test_a_suppressed_candidate_is_queued_for_review_even_when_another_shares_it
         rules = {f: uow.occurrences.list_for_finding(f)[0].rule for f in queued}
     assert len(findings) == 2
     assert list(rules.values()) == ["go.sql.injection"]
+
+
+def test_a_moved_repositorys_findings_keep_their_identity(engine: Engine, target: Target) -> None:
+    """The URL correction's identity continuity (foundry plan repo-unreachable, Qodo
+    #474): a repository whose URL was corrected keeps findings stamped under the
+    vacated URL — the upstream edge records the move — so the next audit at the new
+    URL attaches its occurrence to the existing finding instead of creating a
+    duplicate under the new URL's stamp. The finding keeps the identity its ledger
+    dispositions were recorded against."""
+    first = audit(engine, target)
+    stamped = intake(engine).accept(first, [candidate(target)])
+    finding_id = stamped.findings[Label("OPERATOR-abcdef0-001")]
+    original = rows(engine, finding_id)["finding"]
+
+    # The correction: the row keeps its identity at the new URL, and the vacated
+    # URL's row carries the upstream link — the same edge the fork resolution reads —
+    # left in the state the correction door leaves (dispositioned, with its signature).
+    with SqlTraustUnitOfWork(engine) as uow:
+        repo = uow.repositories.get(target.repository.id)
+        assert repo.id is not None
+        uow.repositories.update(
+            repo.model_copy(update={"url": "https://github.com/example/relocated"})
+        )
+        uow.repositories.get_or_add(
+            Repository(
+                url=repo.url,
+                public=True,
+                upstream_id=repo.id,
+                disposition=RepositoryDisposition.REPO_UNREACHABLE,
+                disposition_reason=GoneReason.GONE,
+                disposition_evidence="url corrected to https://github.com/example/relocated",
+            )
+        )
+        uow.commit()
+
+    second = audit(engine, target)
+    moved = intake(engine).accept(second, [candidate(target)])
+    assert moved.findings[Label("OPERATOR-abcdef0-001")] == finding_id
+    assert moved.created == ()  # one finding, not a duplicate under the new URL
+    got = rows(engine, finding_id)
+    assert (got["finding"].fingerprint_algo, got["finding"].fingerprint) == (
+        original.fingerprint_algo,
+        original.fingerprint,
+    )
+    assert [o.assessment_id for o in got["occurrences"]] == [first, second]

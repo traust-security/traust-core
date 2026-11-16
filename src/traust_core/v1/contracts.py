@@ -321,6 +321,13 @@ def default_named_at_upgrade(dialect: Dialect) -> list[str]:
     return storage_sql.default_named_at_upgrade(dialect)
 
 
+def repository_disposition_upgrade(dialect: Dialect) -> list[str]:
+    """The additive upgrade for a database whose `repository` predates the unreachable
+    disposition (foundry plan repo-unreachable); apply it only when `disposition` is
+    absent. Existing rows stay active — NULL — with their streak at 0."""
+    return storage_sql.repository_disposition_upgrade(dialect)
+
+
 def database_ddl(dialect: Dialect) -> list[str]:
     """Every namespace, in bootstrap order: the whole db contract."""
     return [s for area in AREAS for s in ddl(area, dialect)]

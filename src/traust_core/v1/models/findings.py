@@ -466,6 +466,11 @@ class FindingCandidate(Model):
     owasp_llm_references: tuple[OwaspLlmCategory, ...] = ()
     locations: tuple[CodeSpan, ...] = ()
     reported_severity: ScannerSeverity | None = None
+    # The report's CVSS claim, carried onto the occurrence it records: an
+    # audit that scored the finding states it (contracts report
+    # `findings[].cvss`); a report that stated none leaves both None.
+    cvss_vector: str | None = None
+    cvss_score: Decimal | None = None
     confidence: Confidence | None = None
     exposure: ExposureKey | None = None
     # A policy check: identity is `rule` on `resources` (every resource the check names, located
@@ -564,6 +569,8 @@ class FindingCandidate(Model):
                     for loc in e.locations
                 ),
                 reported_severity=ScannerSeverity(e.severity),
+                cvss_vector=e.cvss.vector if e.cvss else None,
+                cvss_score=Decimal(str(e.cvss.score)) if e.cvss else None,
             )
             for e in entries
         ]
@@ -1234,6 +1241,11 @@ class FindingView(Model):
     disposition: Disposition | None = None
     effective_severity: Severity | None = None
     sla_due: datetime | None = None
+    # When the reporting assessments ran (the occurrence→assessment join, the
+    # same clock the census reads for its SLA `first`): None only on a finding
+    # no assessment has reported yet.
+    first_reported_at: datetime | None = None
+    last_reported_at: datetime | None = None
     locations: tuple[Location | ClaimLocation, ...] = ()
     cwes: tuple[str, ...] = ()
     labels: tuple[FindingLabel, ...] = ()

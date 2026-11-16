@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from uuid import UUID
 
 from traust_core.v1.errors import ValidationError
@@ -66,7 +67,7 @@ class OnboardingService:
             self._ops.plan(
                 OrderRequest(asset=asset, priority=0, repository_id=repository_id), principal
             )
-            for repository_id in repository_ids
+            for repository_id in self._active(repository_ids)
             for asset in request.baseline
         ]
         assert product.id is not None
@@ -76,6 +77,18 @@ class OnboardingService:
             order_ids=tuple(o.id for o in orders if o.id),
             skipped=tuple(why for _, skipped in onboarded for why in skipped),
         )
+
+    def _active(self, repository_ids: Sequence[UUID]) -> list[UUID]:
+        """The repositories still in the planner's universe: a repository carrying the
+        unreachable disposition (foundry plan repo-unreachable) is planned nothing by
+        onboarding either — the collector re-registering a vacated URL must not
+        re-enter it through the baseline (Qodo #474). Its disposition stays until a
+        person's verify clears it."""
+        active = []
+        for repository in self._portfolio.inventory.list_repositories(repository_ids):
+            if repository.id is not None and repository.disposition is None:
+                active.append(repository.id)
+        return active
 
     def _onboard_repository(self, spec: RepositorySpec) -> tuple[UUID, tuple[str, ...]]:
         """The repository's id, and what its import couldn't refresh."""

@@ -18,7 +18,7 @@ from traust_core.v1.models.artifacts import (
 from traust_core.v1.models.inventory import Repository
 from traust_core.v1.models.observation import ComparisonStatus, ObservationTarget
 from traust_core.v1.models.values import GitSha
-from traust_core.v1.models.vocabulary import Severity
+from traust_core.v1.models.vocabulary import LivenessStatus, Severity
 from traust_core.v1.providers.base import Acquisition, ProviderRegistry, Readiness, Result
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.sources import (
@@ -110,11 +110,29 @@ class FakeSource:
         self.calls.append("info")
         data = {k: v for k, v in self.info_data.items() if k not in ("ok", "head")}
         if not self.info_data["ok"]:
-            raise SourceError(data.get("error") or "source failed", ComparisonStatus(data["kind"]))
+            # The disposition's gone-class doubles: `liveness` names the forge's positive
+            # word (missing/moved/disabled), `endpoint_unreachable` the transport's.
+            liveness = data.pop("liveness", None)
+            unreachable = bool(data.pop("endpoint_unreachable", False))
+            canonical = data.pop("canonical_url", None)
+            raise SourceError(
+                data.get("error") or "source failed",
+                ComparisonStatus(data["kind"]),
+                liveness_status=LivenessStatus(liveness) if liveness else LivenessStatus.UNKNOWN,
+                endpoint_unreachable=unreachable,
+                canonical_url=canonical,
+            )
         return self.result(RepoInfo(repo=repo, **data))
 
     def head(self, repo, branch):
         self.calls.append("head")
+        if self.info_data.get("head_error"):
+            raise SourceError(
+                self.info_data["head_error"],
+                ComparisonStatus(self.info_data.get("head_kind", "unreachable")),
+                endpoint_unreachable=bool(self.info_data.get("head_unreachable", False)),
+                empty_repository=bool(self.info_data.get("head_empty", False)),
+            )
         return self.result(GitSha(self.info_data.get("head", HEAD)))
 
     def compare(self, repo, baseline, branch):

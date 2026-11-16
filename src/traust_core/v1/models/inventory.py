@@ -47,6 +47,36 @@ class Repository(Entity):
     url: str
     public: bool
     archived: bool | None = None
+    # The unreachable disposition (foundry plan repo-unreachable). None = active: the
+    # repository stays in the planner's universe. `repo_unreachable` leaves it - no work is
+    # planned for the repository until a person's verify succeeds - with the gone-class
+    # reason, the last error as evidence and the moment the disposition flipped. The
+    # streak counts consecutive gone-class observation failures (two flip it); any
+    # successful observation resets it, and the transient classes (timeouts, 5xx, rate
+    # limits) never touch it.
+    disposition: RepositoryDisposition | None = None
+    disposition_reason: GoneReason | None = None
+    disposition_evidence: str | None = None
+    disposition_at: datetime | None = None
+    gone_streak: int = 0
+
+
+class RepositoryDisposition(StrEnum):
+    """A repository's standing in the planner's universe. The unreachable disposition is
+    user-removable only: no automatic recovery, ever - the re-verification is a deliberate
+    act (the verify door, the operator's record path)."""
+
+    REPO_UNREACHABLE = "repo_unreachable"
+
+
+class GoneReason(StrEnum):
+    """Why a repository left: the gone-class taxonomy. The remediation differs - update the
+    URL (gone), wait (empty), check the network or token (unreachable) - so the UI carries
+    the reason, not just the disposition."""
+
+    GONE = "gone"
+    EMPTY = "empty"
+    UNREACHABLE = "unreachable"
 
 
 class InventoryExportRow(Model):
@@ -200,9 +230,15 @@ class SyncReport(Model):
 
 
 class RepositoryFilter(Model):
-    """Every repository, or the one registered at `url`."""
+    """Every repository, or the one registered at `url`.
+
+    `dispositioned` narrows the universe: None (the default) answers every repository,
+    False only the active ones (the planner's universe - the engine's tick asks this
+    way, so a dispositioned repository costs no roundtrip), True only the ones carrying
+    the unreachable disposition (a remediation worklist)."""
 
     url: str | None = None
+    dispositioned: bool | None = None
 
 
 # Shapes land with their implementation slice.

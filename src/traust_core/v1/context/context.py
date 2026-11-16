@@ -493,11 +493,18 @@ class Context:
     def register_feeds(self, registry: Path = SHIPPED_FEEDS) -> None:
         """Register a provider for each cached feed, each per-identifier or probed source, and
         the advisory lookup, from the feeds registry traust-core ships (tests pass fixtures)."""
+        # the deployment's API keys first: an unset variable fails before anything registers,
+        # so a retry after setting it starts clean
+        api_keys = self.config.feeds.api_key_values()
         for feed in load_feeds(registry, http=self.http, clock=self.clock):
             self.feeds.register(feed.name, lambda feed=feed: feed)
         probe_http = HttpFetcher("traust-core", PROBE_POLICY, clock=self.clock)
         for source in load_feed_sources(
-            registry, http=self.http, probe_http=probe_http, clock=self.clock
+            registry,
+            http=self.http,
+            probe_http=probe_http,
+            clock=self.clock,
+            api_keys=api_keys,
         ):
             self.feed_sources.register(source.name, lambda source=source: source)
         self.package_sources = load_package_sources(
@@ -758,6 +765,7 @@ class Context:
             _artifact_run_order(engine, upgrade=local)
             _run_order_fork_scheduled(engine, upgrade=local)
             _finding_external_ref_scope(engine)
+            _repository_disposition(engine, upgrade=local)
         return engine
 
     @cached_property
@@ -1309,6 +1317,17 @@ def _run_order_fork_scheduled(engine: Engine, *, upgrade: bool) -> None:
         engine,
         ("traust_ops", "run_order", "fork_scheduled_at"),
         "run_order_fork_scheduled_upgrade",
+        upgrade=upgrade,
+    )
+
+
+def _repository_disposition(engine: Engine, *, upgrade: bool) -> None:
+    """contracts added `repository.disposition` and its evidence columns (foundry plan
+    repo-unreachable)."""
+    _additive_column(
+        engine,
+        ("traust", "repository", "disposition"),
+        "repository_disposition_upgrade",
         upgrade=upgrade,
     )
 

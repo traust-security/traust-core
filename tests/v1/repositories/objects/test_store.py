@@ -1,3 +1,4 @@
+import os
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -65,6 +66,31 @@ def test_bad_keys_are_rejected(raw: str) -> None:
 def test_local_store_leaves_no_temp_files(tmp_path: Path) -> None:
     LocalObjectStore(tmp_path).put(KEY, b"x")
     assert [p.name for p in (tmp_path / "reports/org/repo").iterdir()] == ["scan.json"]
+
+
+def test_local_store_put_honors_the_process_umask(tmp_path: Path) -> None:
+    """The store's volume is shared by core's server, the engine and the claim workers under
+    different uids and one supplemental group, and the deployments wrap each writer in
+    `umask 0002` so the bytes land group-readable. mkstemp forced 0600 whatever the umask
+    said, so every artifact was readable only by the pod that wrote it — a phantom row to
+    every other reader (the census folds answered source_unavailable). The temp must be
+    created where the umask applies, and a stricter umask must stay strict."""
+    store = LocalObjectStore(tmp_path)
+    shared = ObjectKey.parse("artifacts/run-manifest/shared.json")
+    was = os.umask(0o002)
+    try:
+        store.put(shared, b"{}")
+    finally:
+        os.umask(was)
+    assert (tmp_path / "artifacts/run-manifest/shared.json").stat().st_mode & 0o777 == 0o664
+
+    private = ObjectKey.parse("artifacts/run-manifest/private.json")
+    was = os.umask(0o077)
+    try:
+        store.put(private, b"{}")
+    finally:
+        os.umask(was)
+    assert (tmp_path / "artifacts/run-manifest/private.json").stat().st_mode & 0o777 == 0o600
 
 
 def test_local_store_failed_put_with_failing_cleanup_raises_repository_error(

@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.rest.conftest import bearer, same_as_in_process
 from traust_core.v1.context import Context
+from traust_core.v1.errors import ServiceError
 from traust_core.v1.models.assessment import AssessmentKind
 from traust_core.v1.models.common import PageRequest
 from traust_core.v1.models.inventory import RepositoryFilter
@@ -254,3 +255,72 @@ def test_owners_sync_rejects_a_supplied_time_and_an_unknown_repository(
     gone = f"/v1/repositories/{uuid4()}/owners"
     missing = client.put(gone, json={"teams": []}, headers=bearer(context))
     assert missing.status_code == 404
+
+
+# The unreachable disposition's doors (foundry plan repo-unreachable): the URL
+# correction and the verify — a person's, never a machine's.
+
+
+def machine_bearer(context: Context) -> dict[str, str]:
+    token = context.local_issuer.mint("runner", machine=True).token.get_secret_value()
+    return {"Authorization": f"Bearer {token}"}
+
+
+class _RefusingForge:
+    """The forge api double answering 404 to every read: the gone-class word."""
+
+    def get(self, host: str, endpoint: str, headers=None):
+        raise ServiceError(f"{endpoint}: HTTP 404", status=404)
+
+
+def test_the_url_correction_records_the_move_and_holds_identity(
+    context: Context, client: TestClient
+) -> None:
+    repo, _ = seed(context, url=f"https://github.com/example/{uuid4()}")
+    moved = client.put(
+        f"/v1/repositories/{repo.id}/url",
+        json={"url": "https://github.com/example/relocated"},
+        headers=bearer(context),
+    )
+    assert moved.status_code == 200, moved.text
+    body = moved.json()
+    assert body["id"] == str(repo.id) and body["url"] == "https://github.com/example/relocated"
+    with SqlTraustUnitOfWork(context.database) as uow:
+        tombstone = uow.repositories.find_by_url(repo.url)
+        assert tombstone is not None and tombstone.id is not None
+        assert tombstone.upstream_id == repo.id
+
+
+def test_the_url_correction_refuses_an_occupied_destination_and_a_machine_caller(
+    context: Context, client: TestClient
+) -> None:
+    repo, other = seed(context, url=f"https://github.com/example/{uuid4()}")[0], seed(context)[0]
+    occupied = client.put(
+        f"/v1/repositories/{repo.id}/url",
+        json={"url": other.url},
+        headers=bearer(context),
+    )
+    assert occupied.status_code == 409, occupied.text
+    refused = client.put(
+        f"/v1/repositories/{repo.id}/url",
+        json={"url": "https://github.com/example/elsewhere"},
+        headers=machine_bearer(context),
+    )
+    assert refused.status_code == 403, refused.text
+
+
+def test_the_verify_answers_the_observation_and_the_disposition(
+    context: Context, client: TestClient
+) -> None:
+    repo, _ = seed(context, url=f"https://github.com/example/{uuid4()}")
+    context.__dict__["forge_api"] = _RefusingForge()
+    answer = client.post(f"/v1/repositories/{repo.id}/verify", headers=bearer(context))
+    assert answer.status_code == 200, answer.text
+    body = answer.json()
+    assert body["facts"]["gone_reason"] == "gone"
+    assert body["repository"]["disposition"] is None  # one gone observation: no flip yet
+    assert body["repository"]["gone_streak"] == 1
+    machine = client.post(f"/v1/repositories/{repo.id}/verify", headers=machine_bearer(context))
+    assert machine.status_code == 403, machine.text
+    unknown = client.post(f"/v1/repositories/{uuid4()}/verify", headers=bearer(context))
+    assert unknown.status_code == 404, unknown.text

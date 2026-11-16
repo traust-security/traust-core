@@ -265,7 +265,10 @@ class FindingIntake:
         self, repo: Repository, candidates: Sequence[FindingCandidate], examiner: str
     ) -> tuple[list[Fingerprint], dict[Fingerprint, FindingKind]]:
         """Each identity and its agreed kind, checked before anything is written."""
-        keys = [self._fingerprint(repo, c, examiner) for c in candidates]
+        # The move's alias URLs resolve once for the whole batch (Qodo #474:
+        # per-candidate resolution rescans the upstream edge per finding).
+        prior = self._inventory.prior_urls(repo.id) if repo.id is not None else ()
+        keys = [self._fingerprint(repo, c, examiner, prior=prior) for c in candidates]
         placed: dict[Fingerprint, dict[tuple[str, int | None], str]] = {}
         claims: dict[Fingerprint, dict[tuple[str, int | None, str], str]] = {}
         kinds: dict[Fingerprint, FindingKind] = {}
@@ -296,7 +299,12 @@ class FindingIntake:
         return keys, kinds
 
     def _fingerprint(
-        self, repo: Repository, candidate: FindingCandidate, examiner: str
+        self,
+        repo: Repository,
+        candidate: FindingCandidate,
+        examiner: str,
+        *,
+        prior: tuple[str, ...] | None = None,
     ) -> Fingerprint:
         if candidate.repository_id != repo.id:
             raise ValidationError(
@@ -322,25 +330,55 @@ class FindingIntake:
                     f"{confirmed.repository_id}, but {examiner} examined {repo.id}"
                 )
             return Fingerprint(confirmed.fingerprint_algo, confirmed.fingerprint)
+        current = self._identity_key(repo.url, candidate)
+        return self._moved_identity(repo, candidate, current, prior=prior)
+
+    def _identity_key(self, url: str, candidate: FindingCandidate) -> Fingerprint:
+        """The candidate's identity under one repository URL."""
         if candidate.exposure is not None:
             if candidate.policy:
                 raise ValidationError(
                     f"{candidate.label}: both an exposure and a policy check; "
                     "a finding has one identity"
                 )
-            return self._identity.exposure_key(repo.url, candidate.exposure)
+            return self._identity.exposure_key(url, candidate.exposure)
         spots = tuple(FingerprintLocation(path=s.path) for s in candidate.locations)
         if candidate.policy and candidate.resources:
             spots = tuple(FingerprintLocation(resource=r) for r in candidate.resources)
         return self._identity.match_key(
             FingerprintInput(
-                repo=repo.url,
+                repo=url,
                 cwes=candidate.cwes,
                 check_id=candidate.rule if candidate.policy else None,
                 locations=spots,
             ),
             strict=True,
         )
+
+    def _moved_identity(
+        self,
+        repo: Repository,
+        candidate: FindingCandidate,
+        current: Fingerprint,
+        *,
+        prior: tuple[str, ...] | None = None,
+    ) -> Fingerprint:
+        """The URL correction's identity continuity (foundry plan repo-unreachable,
+        resolved decision 4): a repository whose URL was corrected keeps findings
+        stamped under the vacated URL — the upstream edge records the move — so a
+        candidate first matches the stamps under the URLs the repository previously
+        carried before taking a new identity under the current URL. The old stamp is
+        returned unchanged: the finding keeps the identity its ledger dispositions
+        were recorded against, and the next audit at the new URL matches it again. A
+        URL that was never the repository's simply matches nothing."""
+        if repo.id is None:
+            return current
+        for url in self._inventory.prior_urls(repo.id) if prior is None else prior:
+            alias = self._identity_key(url, candidate)
+            with self._uow as uow:
+                if uow.findings.find_by_fingerprint(repo.id, alias.algo, alias.value) is not None:
+                    return alias
+        return current
 
     def _take(
         self,
@@ -380,6 +418,8 @@ class FindingIntake:
                     finding_id=finding.id,
                     assessment_id=assessment_id,
                     severity=candidate.reported_severity,
+                    cvss_vector=candidate.cvss_vector,
+                    cvss_score=candidate.cvss_score,
                     rule=candidate.rule,
                 )
             )

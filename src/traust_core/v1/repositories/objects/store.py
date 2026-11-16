@@ -3,7 +3,7 @@ from __future__ import annotations
 import contextlib
 import os
 import re
-import tempfile
+import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -62,10 +62,28 @@ class LocalObjectStore:
 
     def put(self, key: ObjectKey, data: bytes) -> ObjectRef:
         path = self._path(key)
-        fd, tmp = None, None
+        tmp: Path | None = None
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+            # The artifact store is one volume shared by every writer and reader — core's
+            # server, the engine and the claim workers — under different uids and one
+            # supplemental group, and the deployments wrap each of them in `umask 0002`
+            # exactly so the bytes land group-readable. mkstemp would force 0600 whatever
+            # the umask says, leaving every artifact readable only by the pod that wrote
+            # it: a phantom to every other reader (a row whose bytes nothing else can
+            # read — the census folds answered source_unavailable). Create the temp with
+            # O_EXCL at mode 0666 instead, where the process umask applies at creation
+            # like open()'s, so the mode the wrapper chose is the mode the bytes keep.
+            for _ in range(10):
+                candidate = path.with_name(f".{path.name}.{uuid.uuid4().hex}")
+                try:
+                    fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+                except FileExistsError:
+                    continue
+                tmp = candidate
+                break
+            else:
+                raise OSError(f"no free temp name beside {path}")
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
             Path(tmp).replace(path)

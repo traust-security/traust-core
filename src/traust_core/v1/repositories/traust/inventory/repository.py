@@ -16,6 +16,7 @@ from traust_core.v1.repositories.tables import (
     SqlMutableRepository,
     TableSpec,
     text_column,
+    timestamp_column,
     uuid_column,
 )
 
@@ -27,6 +28,12 @@ REPOSITORY = TableSpec(
         text_column("url"),
         sa.Column("public", sa.Boolean, nullable=False),
         sa.Column("archived", sa.Boolean, nullable=True),
+        # The unreachable disposition (foundry plan repo-unreachable); NULL = active.
+        sa.Column("disposition", sa.Text, nullable=True),
+        sa.Column("disposition_reason", sa.Text, nullable=True),
+        sa.Column("disposition_evidence", sa.Text, nullable=True),
+        timestamp_column("disposition_at", nullable=True),
+        sa.Column("gone_streak", sa.Integer, nullable=False, default=0),
     ),
 )
 
@@ -39,9 +46,16 @@ class RepositoryRepository(MutableRecordRepository[Repository], Protocol):
     def find_by_url_casefold(self, url: str) -> Repository | None: ...
     def lock_url(self, url: str) -> None: ...
     def find_private_mirror(self, upstream_id: UUID) -> Repository | None: ...
+    def list_by_upstream(self, upstream_id: UUID) -> list[Repository]: ...
     def list_by_ids(self, repository_ids: Collection[UUID]) -> list[Repository]: ...
     def list_all(self, *, read_budget: RecordBudget | None = None) -> list[Repository]: ...
-    def search(self, *, limit: int, after: tuple[datetime, UUID] | None) -> list[Repository]: ...
+    def search(
+        self,
+        *,
+        limit: int,
+        after: tuple[datetime, UUID] | None,
+        dispositioned: bool | None = None,
+    ) -> list[Repository]: ...
 
 
 class SqlRepositoryRepository(SqlMutableRepository[Repository]):
@@ -86,6 +100,13 @@ class SqlRepositoryRepository(SqlMutableRepository[Repository]):
             lock = sa.func.pg_advisory_xact_lock(sa.func.hashtext(url.lower()))
             self._execute(f"lock {url}", sa.select(lock))
 
+    def list_by_upstream(self, upstream_id: UUID) -> list[Repository]:
+        """Every repository whose upstream link points at `upstream_id`: its forks and
+        mirrors, and — after a URL correction — the vacated-URL rows that record where
+        the repository used to live (the same edge, read whole)."""
+        c = self.table.c
+        return self._many(f"upstream of {upstream_id}", c.upstream_id == upstream_id)
+
     def find_private_mirror(self, upstream_id: UUID) -> Repository | None:
         """A non-public repository that forks `upstream_id` (the oldest, when several do)."""
         # NEED(contracts): an index on repository(upstream_id); until then this scans the
@@ -105,5 +126,25 @@ class SqlRepositoryRepository(SqlMutableRepository[Repository]):
             read_budget=read_budget,
         )
 
-    def search(self, *, limit: int, after: tuple[datetime, UUID] | None) -> list[Repository]:
-        return self._page("search", limit=limit, after=after)
+    def search(
+        self,
+        *,
+        limit: int,
+        after: tuple[datetime, UUID] | None,
+        dispositioned: bool | None = None,
+    ) -> list[Repository]:
+        """A keyset page of repositories; `dispositioned` narrows the universe the way the
+        filter names it (None: every repository, False: only active, True: only the ones
+        carrying the unreachable disposition). The worklist form (True) leaves out a URL
+        correction's vacated-URL records — the move's own trail, not repositories
+        waiting for a person's verify (Qodo #474)."""
+        where = ()
+        if dispositioned is not None:
+            gone = self.table.c.disposition.is_not(None)
+            if dispositioned:
+                # The correction's signature: the vacated-URL rows a correction left.
+                corrected = self.table.c.disposition_evidence.like("url corrected to%")
+                where = (gone, ~corrected)
+            else:
+                where = (~gone,)
+        return self._page("search", *where, limit=limit, after=after)
