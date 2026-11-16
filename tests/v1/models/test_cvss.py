@@ -14,6 +14,7 @@ from traust_core.v1.models.cvss import (
     CvssScore,
     CvssSource,
     csaf_scores,
+    distinct,
     nvd_scores,
     osv_scores,
     rh_cve_scores,
@@ -93,12 +94,13 @@ def test_every_document_together_ranks_nist_first_and_keeps_every_source() -> No
     ]
     result = effective(every)
     assert result.source is CvssSource.NIST
-    # every source kept, in ranking order, each (source, version, vector) once
-    assert [s.source for s in result.scores] == [
-        CvssSource.NIST,
-        CvssSource.GHSA,
-        CvssSource.ADP,
-        CvssSource.RED_HAT,
+    # every document's statement kept, in ranking order: Red Hat's two documents both survive
+    assert [(s.source, s.document) for s in result.scores] == [
+        (CvssSource.NIST, "nvd:CVE-2021-44228"),
+        (CvssSource.GHSA, "osv:GHSA-jfh8-c2jp-5v3q"),
+        (CvssSource.ADP, "nvd:CVE-2021-44228"),
+        (CvssSource.RED_HAT, "rh-cve:CVE-2021-44228"),
+        (CvssSource.RED_HAT, "csaf:CVE-2021-44228"),
     ]
 
 
@@ -129,6 +131,17 @@ def _score(source: CvssSource, vector: str, stated: str | None = None) -> CvssSc
         ("CVSS:4.0/AV:N/AC:L", None, "9.2"),  # 4.0 missing base metrics
         (V40, None, "12"),
         (5, None, None),  # not a string
+        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:Q/C:H/I:H/A:H", None, None),  # a scope that isn't U or C
+        (V31 + "/E:Z", None, None),  # a temporal value no metric has
+        (V31 + "/XYZ:Q", None, None),  # a metric CVSS doesn't define
+        ("CVSS:4.0/AV:Z/AC:L/AT:P/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N", None, "9.2"),
+        (V40 + "/U:Purple", None, "9.2"),  # an urgency no metric has
+        (V31, None, "8.14"),  # stated more precisely than its vector computes
+        (V31, None, "8.1000001"),
+        (V31, None, "1e1"),
+        (V31, None, " 8.1 "),
+        (V31, None, "8_1"),
+        (V31, None, float("nan")),
     ],
 )
 def test_an_untrustworthy_score_is_refused(vector: object, version: object, stated: object) -> None:
@@ -185,8 +198,60 @@ def test_an_unreviewed_ghsa_and_another_databases_record_rank_nowhere() -> None:
     assert osv_scores(not_cve_list) == ()
 
 
-@pytest.mark.parametrize("junk", [{}, {"vulnerabilities": "x"}, {"vulnerabilities": [None]}, []])
-def test_a_malformed_document_states_nothing(junk: Any) -> None:
-    doc = junk if isinstance(junk, dict) else {}
+@pytest.mark.parametrize(
+    "doc",
+    [
+        {},
+        {"vulnerabilities": "x"},
+        {"vulnerabilities": [None]},
+        {"vulnerabilities": [{"cve": {"id": 5}}]},
+        {"id": 5, "severity": [None]},
+        {"name": "CVE-2099-1", "cvss3": "x"},
+    ],
+)
+def test_a_malformed_document_states_nothing(doc: dict[str, Any]) -> None:
     assert nvd_scores(doc) == () and osv_scores(doc) == () and rh_cve_scores(doc) == ()
     assert csaf_scores(doc, "CVE-2021-44228") == ()
+
+
+def test_a_well_formed_40_vector_with_its_supplemental_metrics_is_kept() -> None:
+    score = score_of(CvssSource.CNA, V40 + "/E:X/AU:Y/U:Clear", document="test", stated="9.2")
+    assert score is not None and score.score == Decimal("9.2")
+
+
+def test_a_cna_vector_through_nvd_and_osv_is_kept_once_per_document_scored_first() -> None:
+    nvd = score_of(CvssSource.CNA, V40, document="nvd:CVE-2099-1", stated="9.2")
+    osv = score_of(CvssSource.CNA, V40, document="osv:CVE-2099-1")
+    assert nvd is not None and osv is not None
+    assert distinct([osv, nvd]) == (osv, nvd)  # both documents' statements kept
+    unscored_first = score_of(CvssSource.CNA, V40, document="nvd:CVE-2099-1")
+    assert distinct([unscored_first, nvd]) == (nvd,)  # the scored statement wins its document
+
+
+def test_a_cve_list_lookalike_url_is_not_the_cve_list() -> None:
+    record = _doc("osv-CVE-2026-9277.json")
+    record["database_specific"]["osv_generated_from"] = "https://evil.example/cvelistV5/x.json"
+    assert osv_scores(record) == ()
+
+
+def test_an_osv_cvss_v3_entry_carrying_a_40_vector_is_refused() -> None:
+    record = _doc("osv-GHSA-jfh8-c2jp-5v3q.json")
+    record["severity"] = [{"type": "CVSS_V3", "score": V40}]
+    assert osv_scores(record) == ()
+
+
+def test_a_secondary_metric_from_nist_is_neither_nists_nor_an_adps() -> None:
+    doc = _nvd(
+        "cvssMetricV31",
+        source="nvd@nist.gov",
+        type="Secondary",
+        cvssData={"version": "3.1", "vectorString": V31, "baseScore": 8.1},
+    )
+    assert nvd_scores(doc) == ()
+
+
+def test_a_30_vector_rounds_as_30_does() -> None:
+    from traust_core.v1.models.dependencies import cvss_base_score
+
+    assert cvss_base_score(V30) == 9.1
+    assert cvss_base_score("CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:Q/C:H/I:H/A:H") is None

@@ -29,9 +29,76 @@ CvssVersion = Literal["3.0", "3.1", "4.0"]
 _VECTOR: dict[CvssVersion, re.Pattern[str]] = {
     "3.0": re.compile(r"CVSS:3\.0(/[A-Z]{1,3}:[A-Z])+"),
     "3.1": re.compile(r"CVSS:3\.1(/[A-Z]{1,3}:[A-Z])+"),
-    "4.0": re.compile(r"CVSS:4\.0(/[A-Z]{1,3}:[A-Z])+"),
+    "4.0": re.compile(r"CVSS:4\.0(/[A-Z]{1,3}:[A-Za-z]{1,5})+"),
 }
-_V4_BASE = frozenset({"AV", "AC", "AT", "PR", "UI", "VC", "VI", "VA", "SC", "SI", "SA"})
+_CIA, _MOD = ("H", "L", "N"), ("X", "H", "M", "L")
+# FIRST's metric values: 3.0 and 3.1 share one table, 4.0 has its own. Base metrics are required.
+_V3_BASE = {
+    "AV": ("N", "A", "L", "P"),
+    "AC": ("L", "H"),
+    "PR": ("N", "L", "H"),
+    "UI": ("N", "R"),
+    "S": ("U", "C"),
+    "C": _CIA,
+    "I": _CIA,
+    "A": _CIA,
+}
+_V3_METRICS = {
+    **_V3_BASE,
+    "E": ("X", "H", "F", "P", "U"),
+    "RL": ("X", "U", "W", "T", "O"),
+    "RC": ("X", "C", "R", "U"),
+    "CR": _MOD,
+    "IR": _MOD,
+    "AR": _MOD,
+    "MAV": ("X", "N", "A", "L", "P"),
+    "MAC": ("X", "L", "H"),
+    "MPR": ("X", "N", "L", "H"),
+    "MUI": ("X", "N", "R"),
+    "MS": ("X", "U", "C"),
+    "MC": ("X", *_CIA),
+    "MI": ("X", *_CIA),
+    "MA": ("X", *_CIA),
+}
+_V4_BASE = {
+    "AV": ("N", "A", "L", "P"),
+    "AC": ("L", "H"),
+    "AT": ("N", "P"),
+    "PR": ("N", "L", "H"),
+    "UI": ("N", "P", "A"),
+    "VC": _CIA,
+    "VI": _CIA,
+    "VA": _CIA,
+    "SC": _CIA,
+    "SI": _CIA,
+    "SA": _CIA,
+}
+_V4_METRICS = {
+    **_V4_BASE,
+    "E": ("X", "A", "P", "U"),
+    "CR": _MOD,
+    "IR": _MOD,
+    "AR": _MOD,
+    "MAV": ("X", "N", "A", "L", "P"),
+    "MAC": ("X", "L", "H"),
+    "MAT": ("X", "N", "P"),
+    "MPR": ("X", "N", "L", "H"),
+    "MUI": ("X", "N", "P", "A"),
+    "MVC": ("X", *_CIA),
+    "MVI": ("X", *_CIA),
+    "MVA": ("X", *_CIA),
+    "MSC": ("X", *_CIA),
+    "MSI": ("X", "S", *_CIA),
+    "MSA": ("X", "S", *_CIA),
+    "S": ("X", "N", "P"),
+    "AU": ("X", "N", "Y"),
+    "R": ("X", "A", "U", "I"),
+    "V": ("X", "D", "C"),
+    "RE": ("X", "L", "M", "H"),
+    "U": ("X", "Clear", "Green", "Amber", "Red"),
+}
+_DECIMAL = re.compile(r"\d{1,2}(\.\d{1,3})?")
+_CVE_LIST = "https://github.com/CVEProject/cvelistV5/"
 _NIST = "nvd@nist.gov"
 _NVD_BLOCKS: tuple[tuple[str, CvssVersion], ...] = (
     ("cvssMetricV31", "3.1"),
@@ -85,19 +152,16 @@ def score_of(
         return None
     if version is not None and str(version) != detected:
         return None
-    keys = [pair.split(":", 1)[0] for pair in vector.split("/")[1:]]
     claimed = _bounded(stated)
-    if len(keys) != len(set(keys)) or (stated is not None and claimed is None):
+    if not _well_formed(vector, detected) or (stated is not None and claimed is None):
         return None
     if detected == "4.0":
-        if not set(keys) >= _V4_BASE:
-            return None
         score = claimed
     else:
         if (computed := cvss_base_score(vector)) is None:
             return None
         score = Decimal(str(computed))
-        if claimed is not None and claimed.quantize(Decimal("0.1")) != score:
+        if claimed is not None and claimed != score:
             return None
     return CvssScore(
         source=source,
@@ -126,7 +190,7 @@ def nvd_scores(
                 by, kind = metric.get("source"), metric.get("type")
                 if kind == "Primary" and by == _NIST:
                     source = CvssSource.NIST
-                elif kind == "Secondary" and isinstance(by, str):
+                elif kind == "Secondary" and isinstance(by, str) and by != _NIST:
                     source = CvssSource.CNA if by == cve.get("sourceIdentifier") else CvssSource.ADP
                 else:
                     continue
@@ -157,18 +221,22 @@ def osv_scores(
         return ()
     if ident.startswith("GHSA-") and extra.get("github_reviewed") is True:
         source, by = CvssSource.GHSA, "github"
-    elif ident.startswith("CVE-") and "cvelistV5" in str(extra.get("osv_generated_from", "")):
+    elif ident.startswith("CVE-") and str(extra.get("osv_generated_from", "")).startswith(
+        _CVE_LIST
+    ):
         source, by = CvssSource.CNA, extra.get("cna_assigner")
     else:
         return ()
     found = []
     for entry in map(_map, _list(document.get("severity"))):
-        kind = str(entry.get("type"))
+        kind, vector = str(entry.get("type")), entry.get("score")
+        if kind == "CVSS_V3" and not (isinstance(vector, str) and vector.startswith("CVSS:3.")):
+            continue
         if kind in _OSV_TYPES:
             found.append(
                 score_of(
                     source,
-                    entry.get("score"),
+                    vector,
                     document=f"osv:{ident}",
                     version=_OSV_TYPES[kind],
                     scored_by=by if isinstance(by, str) else None,
@@ -232,22 +300,41 @@ def _version(vector: str) -> CvssVersion | None:
     return next((v for v, pattern in _VECTOR.items() if pattern.fullmatch(vector)), None)
 
 
+def _well_formed(vector: str, version: CvssVersion) -> bool:
+    metrics, base = (_V4_METRICS, _V4_BASE) if version == "4.0" else (_V3_METRICS, _V3_BASE)
+    pairs = [pair.split(":", 1) for pair in vector.split("/")[1:]]
+    keys = [key for key, _ in pairs]
+    return (
+        len(keys) == len(set(keys))
+        and set(base) <= set(keys)
+        and all(value in metrics.get(key, ()) for key, value in pairs)
+    )
+
+
 def _bounded(value: object) -> Decimal | None:
-    if value is None or isinstance(value, bool):
+    """A plain decimal score in 0-10: never a bool, an exponent, padding or digit separators."""
+    if isinstance(value, bool) or not isinstance(value, int | float | str | Decimal):
+        return None
+    text = str(value)
+    if not _DECIMAL.fullmatch(text):
         return None
     try:
-        number = Decimal(str(value))
+        number = Decimal(text)
     except InvalidOperation:
         return None
-    return number if number.is_finite() and 0 <= number <= 10 else None
+    return number if 0 <= number <= 10 else None
 
 
 def distinct(scores: Iterable[CvssScore | None]) -> tuple[CvssScore, ...]:
-    """The trusted scores, each (source, version, vector) once, in first-seen order."""
-    seen: dict[tuple[CvssSource, str, str], CvssScore] = {}
+    """The trusted scores, each document's (source, version, vector) once, a scored entry kept
+    over an unscored one; every document's statement survives."""
+    seen: dict[tuple[CvssSource, str, str, str], CvssScore] = {}
     for score in scores:
-        if score is not None:
-            seen.setdefault((score.source, score.version, score.vector), score)
+        if score is None:
+            continue
+        key = (score.source, score.version, score.vector, score.document)
+        if key not in seen or (seen[key].score is None and score.score is not None):
+            seen[key] = score
     return tuple(seen.values())
 
 

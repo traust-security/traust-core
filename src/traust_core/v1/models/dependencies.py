@@ -352,11 +352,14 @@ def _cvss_roundup(value: float) -> float:
 
 
 def cvss_base_score(vector: str) -> float | None:
-    """A `CVSS:3.0/` or `CVSS:3.1/` vector's base score (FIRST CVSS v3.1); None for any other."""
+    """A `CVSS:3.0/` or `CVSS:3.1/` vector's base score, rounded as its version specifies;
+    None for any other, or for a scope that is neither U nor C."""
     if not vector.startswith(("CVSS:3.0/", "CVSS:3.1/")):
         return None
     try:
         m = dict(part.split(":", 1) for part in vector.split("/")[1:])
+        if m["S"] not in ("U", "C"):
+            return None
         changed = m["S"] == "C"
         pr = (_CVSS_PR_CHANGED if changed else _CVSS_PR_UNCHANGED)[m["PR"]]
         iss = 1 - (1 - _CVSS_CIA[m["C"]]) * (1 - _CVSS_CIA[m["I"]]) * (1 - _CVSS_CIA[m["A"]])
@@ -367,6 +370,8 @@ def cvss_base_score(vector: str) -> float | None:
     if impact <= 0:
         return 0.0
     total = 1.08 * (impact + exploitability) if changed else impact + exploitability
+    if vector.startswith("CVSS:3.0/"):  # 3.0's Roundup is a plain ceiling to one decimal
+        return math.ceil(min(total, 10) * 10) / 10
     return _cvss_roundup(min(total, 10))
 
 
