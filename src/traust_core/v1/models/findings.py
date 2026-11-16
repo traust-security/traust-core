@@ -22,6 +22,7 @@ from traust_core.v1.models.common import CodeHash, CodeSpan, RepoPath
 from traust_core.v1.models.finding_claims import ClaimLocation
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import canonical_json, sha256_hex
+from traust_core.v1.models.values import canonical_decimal
 from traust_core.v1.models.vocabulary import (
     ActorKind,
     AliasMatchedBy,
@@ -654,6 +655,11 @@ class Occurrence(AppendOnly):
     cvss_vector: str | None = None
     cvss_score: Decimal | None = None
     rule: str | None = None
+
+    @pydantic.field_serializer("cvss_score", when_used="json")
+    def _cvss(self, value: Decimal | None) -> str | None:
+        # the same exact score from every backend: SQLite reads 0E-10 and 7.5000000000
+        return canonical_decimal(value)
 
 
 class Location(AppendOnly):
