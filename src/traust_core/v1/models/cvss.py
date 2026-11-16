@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Literal, TypeVar
 
-from traust_core.v1.models.base import Model
+import pydantic
+from pydantic import Field, StrictBool, StrictFloat, StrictInt, StrictStr
+
+from traust_core.v1.errors import ValidationError
+from traust_core.v1.models.base import Dto, Model
 from traust_core.v1.models.dependencies import cvss_base_score
 
 
@@ -100,12 +104,10 @@ _V4_METRICS = {
 _DECIMAL = re.compile(r"\d{1,2}(\.\d{1,3})?")
 _CVE_LIST = "https://github.com/CVEProject/cvelistV5/"
 _NIST = "nvd@nist.gov"
-_NVD_BLOCKS: tuple[tuple[str, CvssVersion], ...] = (
-    ("cvssMetricV31", "3.1"),
-    ("cvssMetricV30", "3.0"),
-    ("cvssMetricV40", "4.0"),
-)
+_NVD_BLOCKS: tuple[tuple[str, CvssVersion], ...] = (("v31", "3.1"), ("v30", "3.0"), ("v40", "4.0"))
 _OSV_TYPES: dict[str, CvssVersion | None] = {"CVSS_V3": None, "CVSS_V4": "4.0"}
+_Stated = StrictFloat | StrictInt | StrictStr | None
+_D = TypeVar("_D", bound=Dto)
 
 
 class CvssScore(Model):
@@ -174,90 +176,172 @@ def score_of(
     )
 
 
-def nvd_scores(
-    document: Mapping[str, Any], *, acquired_at: datetime | None = None
-) -> tuple[CvssScore, ...]:
+class _NvdCvssData(Dto):
+    version: StrictStr | None = None
+    vector: StrictStr | None = Field(None, alias="vectorString")
+    stated: _Stated = Field(None, alias="baseScore")
+
+
+class _NvdMetric(Dto):
+    source: StrictStr | None = None
+    type: StrictStr | None = None
+    data: _NvdCvssData = Field(alias="cvssData")
+
+
+class _NvdMetrics(Dto):
+    """The CVSS blocks only; NVD's other metrics (SSVC, CVSS 2) are not read."""
+
+    v31: tuple[_NvdMetric, ...] = Field((), alias="cvssMetricV31")
+    v30: tuple[_NvdMetric, ...] = Field((), alias="cvssMetricV30")
+    v40: tuple[_NvdMetric, ...] = Field((), alias="cvssMetricV40")
+
+
+class _NvdCve(Dto):
+    cve_id: StrictStr = Field(alias="id")
+    cna: StrictStr | None = Field(None, alias="sourceIdentifier")
+    metrics: _NvdMetrics = Field(default_factory=_NvdMetrics)
+
+
+class _NvdVulnerability(Dto):
+    cve: _NvdCve
+
+
+class _NvdRecord(Dto):
+    vulnerabilities: tuple[_NvdVulnerability, ...]
+
+
+class _OsvSeverity(Dto):
+    type: StrictStr
+    score: StrictStr
+
+
+class _OsvDatabase(Dto):
+    github_reviewed: StrictBool | None = None
+    osv_generated_from: StrictStr | None = None
+    cna_assigner: StrictStr | None = None
+
+
+class _OsvRecord(Dto):
+    record_id: StrictStr = Field(alias="id")
+    severity: tuple[_OsvSeverity, ...] = ()
+    database: _OsvDatabase = Field(default_factory=_OsvDatabase, alias="database_specific")
+
+
+class _RhCvss3(Dto):
+    stated: _Stated = Field(None, alias="cvss3_base_score")
+    vector: StrictStr | None = Field(None, alias="cvss3_scoring_vector")
+
+
+class _RhCveRecord(Dto):
+    cve_id: StrictStr = Field(alias="name")
+    cvss3: _RhCvss3 | None = None
+
+
+class _CsafCvssV3(Dto):
+    version: StrictStr | None = None
+    vector: StrictStr | None = Field(None, alias="vectorString")
+    stated: _Stated = Field(None, alias="baseScore")
+
+
+class _CsafScore(Dto):
+    cvss_v3: _CsafCvssV3 | None = None
+
+
+class _CsafVulnerability(Dto):
+    cve_id: StrictStr | None = Field(None, alias="cve")
+    scores: tuple[_CsafScore, ...] = ()
+
+
+class _CsafTracking(Dto):
+    tracking_id: StrictStr | None = Field(None, alias="id")
+
+
+class _CsafMeta(Dto):
+    tracking: _CsafTracking = Field(default_factory=_CsafTracking)
+
+
+class _CsafDocument(Dto):
+    meta: _CsafMeta = Field(default_factory=_CsafMeta, alias="document")
+    vulnerabilities: tuple[_CsafVulnerability, ...] = ()
+
+
+def _parsed(shape: type[_D], raw: bytes, kind: str) -> _D:
+    try:
+        return shape.model_validate_json(raw)
+    except pydantic.ValidationError as e:
+        raise ValidationError(f"not {kind} ({e.error_count()} problem(s))") from e
+
+
+def nvd_scores(raw: bytes, *, acquired_at: datetime | None = None) -> tuple[CvssScore, ...]:
     """An NVD CVE record's: NIST's "Primary", the CNA's "Secondary" (from the record's own
     `sourceIdentifier`), and any other "Secondary" as an ADP's."""
+    record = _parsed(_NvdRecord, raw, "an NVD API 2.0 CVE record")
     found = []
-    for vuln in _list(document.get("vulnerabilities")):
-        cve = _map(_map(vuln).get("cve"))
-        if not isinstance(ident := cve.get("id"), str):
-            continue
-        metrics = _map(cve.get("metrics"))
+    for vulnerability in record.vulnerabilities:
+        cve = vulnerability.cve
         for block, version in _NVD_BLOCKS:
-            for metric in map(_map, _list(metrics.get(block))):
-                by, kind = metric.get("source"), metric.get("type")
-                if kind == "Primary" and by == _NIST:
+            for metric in getattr(cve.metrics, block):
+                if metric.type == "Primary" and metric.source == _NIST:
                     source = CvssSource.NIST
-                elif kind == "Secondary" and isinstance(by, str) and by != _NIST:
-                    source = CvssSource.CNA if by == cve.get("sourceIdentifier") else CvssSource.ADP
+                elif metric.type == "Secondary" and metric.source not in (None, _NIST):
+                    source = CvssSource.CNA if metric.source == cve.cna else CvssSource.ADP
                 else:
                     continue
-                data = _map(metric.get("cvssData"))
-                if str(data.get("version")) != version:
+                if metric.data.version != version:
                     continue
                 found.append(
                     score_of(
                         source,
-                        data.get("vectorString"),
-                        document=f"nvd:{ident}",
+                        metric.data.vector,
+                        document=f"nvd:{cve.cve_id}",
                         version=version,
-                        stated=data.get("baseScore"),
-                        scored_by=by,
+                        stated=metric.data.stated,
+                        scored_by=metric.source,
                         acquired_at=acquired_at,
                     )
                 )
     return distinct(found)
 
 
-def osv_scores(
-    document: Mapping[str, Any], *, acquired_at: datetime | None = None
-) -> tuple[CvssScore, ...]:
+def osv_scores(raw: bytes, *, acquired_at: datetime | None = None) -> tuple[CvssScore, ...]:
     """An OSV record's: a GitHub-reviewed GHSA's, or a CVE List record's (the CNA's). Any
     other OSV record ranks nowhere."""
-    ident, extra = document.get("id"), _map(document.get("database_specific"))
-    if not isinstance(ident, str):
-        return ()
-    if ident.startswith("GHSA-") and extra.get("github_reviewed") is True:
+    record = _parsed(_OsvRecord, raw, "an OSV record")
+    database = record.database
+    if record.record_id.startswith("GHSA-") and database.github_reviewed is True:
         source, by = CvssSource.GHSA, "github"
-    elif ident.startswith("CVE-") and str(extra.get("osv_generated_from", "")).startswith(
+    elif record.record_id.startswith("CVE-") and (database.osv_generated_from or "").startswith(
         _CVE_LIST
     ):
-        source, by = CvssSource.CNA, extra.get("cna_assigner")
+        source, by = CvssSource.CNA, database.cna_assigner
     else:
         return ()
-    found = []
-    for entry in map(_map, _list(document.get("severity"))):
-        kind, vector = str(entry.get("type")), entry.get("score")
-        if kind == "CVSS_V3" and not (isinstance(vector, str) and vector.startswith("CVSS:3.")):
-            continue
-        if kind in _OSV_TYPES:
-            found.append(
-                score_of(
-                    source,
-                    vector,
-                    document=f"osv:{ident}",
-                    version=_OSV_TYPES[kind],
-                    scored_by=by if isinstance(by, str) else None,
-                    acquired_at=acquired_at,
-                )
-            )
+    found = [
+        score_of(
+            source,
+            entry.score,
+            document=f"osv:{record.record_id}",
+            version=_OSV_TYPES[entry.type],
+            scored_by=by,
+            acquired_at=acquired_at,
+        )
+        for entry in record.severity
+        if entry.type in _OSV_TYPES
+        and (entry.type != "CVSS_V3" or entry.score.startswith("CVSS:3."))
+    ]
     return distinct(found)
 
 
-def rh_cve_scores(
-    document: Mapping[str, Any], *, acquired_at: datetime | None = None
-) -> tuple[CvssScore, ...]:
+def rh_cve_scores(raw: bytes, *, acquired_at: datetime | None = None) -> tuple[CvssScore, ...]:
     """A Red Hat Security Data API CVE record's CVSS 3 score."""
-    cvss3 = _map(document.get("cvss3"))
-    if not isinstance(ident := document.get("name"), str) or not cvss3:
+    record = _parsed(_RhCveRecord, raw, "a Red Hat Security Data CVE record")
+    if record.cvss3 is None:
         return ()
     score = score_of(
         CvssSource.RED_HAT,
-        cvss3.get("cvss3_scoring_vector"),
-        document=f"rh-cve:{ident}",
-        stated=cvss3.get("cvss3_base_score"),
+        record.cvss3.vector,
+        document=f"rh-cve:{record.cve_id}",
+        stated=record.cvss3.stated,
         scored_by="redhat",
         acquired_at=acquired_at,
     )
@@ -265,29 +349,26 @@ def rh_cve_scores(
 
 
 def csaf_scores(
-    document: Mapping[str, Any], cve: str, *, acquired_at: datetime | None = None
+    raw: bytes, cve_id: str, *, acquired_at: datetime | None = None
 ) -> tuple[CvssScore, ...]:
-    """A Red Hat CSAF VEX document's distinct CVSS 3 scores for `cve`, across its product sets."""
-    tracking = _map(_map(document.get("document")).get("tracking")).get("id")
-    name = tracking if isinstance(tracking, str) else cve
-    found = []
-    for vuln in map(_map, _list(document.get("vulnerabilities"))):
-        if str(vuln.get("cve", "")).upper() != cve.upper():
-            continue
-        for entry in map(_map, _list(vuln.get("scores"))):
-            data = _map(entry.get("cvss_v3"))
-            if data:
-                found.append(
-                    score_of(
-                        CvssSource.RED_HAT,
-                        data.get("vectorString"),
-                        document=f"csaf:{name}",
-                        version=data.get("version"),
-                        stated=data.get("baseScore"),
-                        scored_by="redhat",
-                        acquired_at=acquired_at,
-                    )
-                )
+    """A Red Hat CSAF VEX document's distinct CVSS 3 scores for `cve_id`, across product sets."""
+    document = _parsed(_CsafDocument, raw, "a CSAF VEX document")
+    name = document.meta.tracking.tracking_id or cve_id
+    found = [
+        score_of(
+            CvssSource.RED_HAT,
+            entry.cvss_v3.vector,
+            document=f"csaf:{name}",
+            version=entry.cvss_v3.version,
+            stated=entry.cvss_v3.stated,
+            scored_by="redhat",
+            acquired_at=acquired_at,
+        )
+        for vulnerability in document.vulnerabilities
+        if (vulnerability.cve_id or "").upper() == cve_id.upper()
+        for entry in vulnerability.scores
+        if entry.cvss_v3 is not None
+    ]
     return distinct(found)
 
 
@@ -304,6 +385,11 @@ def _well_formed(vector: str, version: CvssVersion) -> bool:
     metrics, base = (_V4_METRICS, _V4_BASE) if version == "4.0" else (_V3_METRICS, _V3_BASE)
     pairs = [pair.split(":", 1) for pair in vector.split("/")[1:]]
     keys = [key for key, _ in pairs]
+    if version == "4.0":  # 4.0 requires the spec's order; 3.x allows any
+        order = list(metrics)
+        positions = [order.index(key) if key in metrics else -1 for key in keys]
+        if positions != sorted(positions):
+            return False
     return (
         len(keys) == len(set(keys))
         and set(base) <= set(keys)
@@ -326,21 +412,11 @@ def _bounded(value: object) -> Decimal | None:
 
 
 def distinct(scores: Iterable[CvssScore | None]) -> tuple[CvssScore, ...]:
-    """The trusted scores, each document's (source, version, vector) once, a scored entry kept
-    over an unscored one; every document's statement survives."""
-    seen: dict[tuple[CvssSource, str, str, str], CvssScore] = {}
+    """The trusted scores, each exact statement once: two authorities, or two scores for one
+    vector, are both kept."""
+    seen: dict[tuple[object, ...], CvssScore] = {}
     for score in scores:
-        if score is None:
-            continue
-        key = (score.source, score.version, score.vector, score.document)
-        if key not in seen or (seen[key].score is None and score.score is not None):
-            seen[key] = score
+        if score is not None:
+            key = (score.source, score.version, score.vector, score.document, score.scored_by)
+            seen.setdefault((*key, score.score), score)
     return tuple(seen.values())
-
-
-def _map(value: object) -> Mapping[str, Any]:
-    return value if isinstance(value, Mapping) else {}
-
-
-def _list(value: object) -> list[Any]:
-    return value if isinstance(value, list) else []

@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.cvss import (
     CvssScore,
     CvssSource,
@@ -33,6 +34,22 @@ def _doc(name: str) -> dict[str, Any]:
     return json.loads((FIXTURES / name).read_text())
 
 
+def parse_nvd(doc: Any) -> tuple[CvssScore, ...]:
+    return nvd_scores(json.dumps(doc).encode())
+
+
+def parse_osv(doc: Any) -> tuple[CvssScore, ...]:
+    return osv_scores(json.dumps(doc).encode())
+
+
+def parse_rh_cve(doc: Any) -> tuple[CvssScore, ...]:
+    return rh_cve_scores(json.dumps(doc).encode())
+
+
+def parse_csaf(doc: Any, cve_id: str) -> tuple[CvssScore, ...]:
+    return csaf_scores(json.dumps(doc).encode(), cve_id)
+
+
 def _by(scores: tuple[CvssScore, ...]) -> set[tuple[str, str, Decimal | None]]:
     return {(s.source.value, s.version, s.score) for s in scores}
 
@@ -42,7 +59,7 @@ def _by(scores: tuple[CvssScore, ...]) -> set[tuple[str, str, Decimal | None]]:
 
 def test_the_dashboard_case_takes_the_cnas_31_score_with_its_40_alongside() -> None:
     # CVE-2026-9277: NVD Deferred (no NIST score); the CNA scored 3.1 8.1 and 4.0 9.2
-    scores = nvd_scores(_doc("nvd-CVE-2026-9277.json"))
+    scores = parse_nvd(_doc("nvd-CVE-2026-9277.json"))
     assert _by(scores) == {
         ("cna", "3.1", Decimal("8.1")),
         ("cna", "4.0", Decimal("9.2")),
@@ -54,20 +71,20 @@ def test_the_dashboard_case_takes_the_cnas_31_score_with_its_40_alongside() -> N
 
 
 def test_nist_wins_when_nvd_has_analysed_the_cve() -> None:
-    scores = nvd_scores(_doc("nvd-CVE-2021-44228.json"))
+    scores = parse_nvd(_doc("nvd-CVE-2021-44228.json"))
     assert _by(scores) == {("nist", "3.1", Decimal("10.0")), ("adp", "3.1", Decimal("10.0"))}
     assert all(s.version != "2.0" for s in scores)  # CVSS 2 is never read
     assert effective(scores).source is CvssSource.NIST
 
 
 def test_a_github_reviewed_advisory_is_ghsa_and_its_temporal_metrics_dont_change_the_base() -> None:
-    (score,) = osv_scores(_doc("osv-GHSA-jfh8-c2jp-5v3q.json"))
+    (score,) = parse_osv(_doc("osv-GHSA-jfh8-c2jp-5v3q.json"))
     assert (score.source, score.version, score.score) == (CvssSource.GHSA, "3.1", Decimal("10.0"))
     assert score.vector.endswith("/E:H") and score.document == "osv:GHSA-jfh8-c2jp-5v3q"
 
 
 def test_the_cve_list_record_through_osv_is_the_cnas_and_a_bare_40_vector_has_no_score() -> None:
-    (score,) = osv_scores(_doc("osv-CVE-2026-9277.json"))
+    (score,) = parse_osv(_doc("osv-CVE-2026-9277.json"))
     assert (score.source, score.version, score.score) == (CvssSource.CNA, "4.0", None)
     assert score.scored_by == "harborist"
     result = effective([score])
@@ -76,21 +93,21 @@ def test_the_cve_list_record_through_osv_is_the_cnas_and_a_bare_40_vector_has_no
 
 
 def test_red_hats_two_documents() -> None:
-    assert _by(rh_cve_scores(_doc("rhcve-CVE-2021-44228.json"))) == {
+    assert _by(parse_rh_cve(_doc("rhcve-CVE-2021-44228.json"))) == {
         ("red-hat", "3.1", Decimal("9.8"))
     }
-    assert _by(csaf_scores(_doc("csaf-cve-2021-44228.json"), "CVE-2021-44228")) == {
+    assert _by(parse_csaf(_doc("csaf-cve-2021-44228.json"), "CVE-2021-44228")) == {
         ("red-hat", "3.1", Decimal("9.8"))
     }
-    assert csaf_scores(_doc("csaf-cve-2021-44228.json"), "CVE-2099-0001") == ()
+    assert parse_csaf(_doc("csaf-cve-2021-44228.json"), "CVE-2099-0001") == ()
 
 
 def test_every_document_together_ranks_nist_first_and_keeps_every_source() -> None:
     every = [
-        *nvd_scores(_doc("nvd-CVE-2021-44228.json")),
-        *osv_scores(_doc("osv-GHSA-jfh8-c2jp-5v3q.json")),
-        *rh_cve_scores(_doc("rhcve-CVE-2021-44228.json")),
-        *csaf_scores(_doc("csaf-cve-2021-44228.json"), "CVE-2021-44228"),
+        *parse_nvd(_doc("nvd-CVE-2021-44228.json")),
+        *parse_osv(_doc("osv-GHSA-jfh8-c2jp-5v3q.json")),
+        *parse_rh_cve(_doc("rhcve-CVE-2021-44228.json")),
+        *parse_csaf(_doc("csaf-cve-2021-44228.json"), "CVE-2021-44228"),
     ]
     result = effective(every)
     assert result.source is CvssSource.NIST
@@ -173,7 +190,7 @@ def test_a_primary_metric_from_anyone_but_nist_is_not_nists() -> None:
         type="Primary",
         cvssData={"version": "3.1", "vectorString": V31, "baseScore": 8.1},
     )
-    assert nvd_scores(doc) == ()
+    assert parse_nvd(doc) == ()
 
 
 def test_a_metric_filed_under_the_wrong_versions_block_is_refused() -> None:
@@ -183,7 +200,7 @@ def test_a_metric_filed_under_the_wrong_versions_block_is_refused() -> None:
         type="Primary",
         cvssData={"version": "3.0", "vectorString": V30, "baseScore": 9.1},
     )
-    assert nvd_scores(doc) == ()
+    assert parse_nvd(doc) == ()
 
 
 def test_an_unreviewed_ghsa_and_another_databases_record_rank_nowhere() -> None:
@@ -194,24 +211,40 @@ def test_an_unreviewed_ghsa_and_another_databases_record_rank_nowhere() -> None:
     other["id"] = "PYSEC-2099-1"
     not_cve_list = _doc("osv-CVE-2026-9277.json")
     not_cve_list["database_specific"]["osv_generated_from"] = "https://example.test/feed.json"
-    assert osv_scores(unreviewed) == () and osv_scores(other) == ()
-    assert osv_scores(not_cve_list) == ()
+    assert parse_osv(unreviewed) == () and parse_osv(other) == ()
+    assert parse_osv(not_cve_list) == ()
 
 
 @pytest.mark.parametrize(
-    "doc",
+    ("parse", "doc"),
     [
-        {},
-        {"vulnerabilities": "x"},
-        {"vulnerabilities": [None]},
-        {"vulnerabilities": [{"cve": {"id": 5}}]},
-        {"id": 5, "severity": [None]},
-        {"name": "CVE-2099-1", "cvss3": "x"},
+        (parse_nvd, {}),  # no vulnerabilities
+        (parse_nvd, {"vulnerabilities": "x"}),
+        (parse_nvd, {"vulnerabilities": [None]}),
+        (
+            parse_nvd,
+            {"vulnerabilities": [{"cve": {"id": 5}}]},
+        ),  # a mistyped field fails, never drops
+        (parse_nvd, []),
+        (parse_osv, {"id": 5}),
+        (parse_osv, {"id": "GHSA-x", "severity": [None]}),
+        (parse_osv, {"id": "GHSA-x", "database_specific": {"github_reviewed": "yes"}}),
+        (parse_rh_cve, {"name": "CVE-2099-1", "cvss3": "x"}),
+        (parse_rh_cve, {"cvss3": {}}),
+        (parse_csaf, {"vulnerabilities": "x"}),
     ],
 )
-def test_a_malformed_document_states_nothing(doc: dict[str, Any]) -> None:
-    assert nvd_scores(doc) == () and osv_scores(doc) == () and rh_cve_scores(doc) == ()
-    assert csaf_scores(doc, "CVE-2021-44228") == ()
+def test_a_document_that_doesnt_fit_its_shape_is_a_validation_error(parse: Any, doc: Any) -> None:
+    args = (doc, "CVE-2021-44228") if parse is parse_csaf else (doc,)
+    with pytest.raises(ValidationError, match=r"^not "):
+        parse(*args)
+
+
+def test_a_well_formed_document_with_no_scores_states_nothing() -> None:
+    assert parse_nvd({"vulnerabilities": [{"cve": {"id": "CVE-2099-1"}}]}) == ()
+    assert parse_osv({"id": "GHSA-x"}) == ()
+    assert parse_rh_cve({"name": "CVE-2099-1"}) == ()
+    assert parse_csaf({}, "CVE-2099-1") == ()
 
 
 def test_a_well_formed_40_vector_with_its_supplemental_metrics_is_kept() -> None:
@@ -219,25 +252,46 @@ def test_a_well_formed_40_vector_with_its_supplemental_metrics_is_kept() -> None
     assert score is not None and score.score == Decimal("9.2")
 
 
-def test_a_cna_vector_through_nvd_and_osv_is_kept_once_per_document_scored_first() -> None:
+def test_each_exact_statement_is_kept_once() -> None:
     nvd = score_of(CvssSource.CNA, V40, document="nvd:CVE-2099-1", stated="9.2")
     osv = score_of(CvssSource.CNA, V40, document="osv:CVE-2099-1")
     assert nvd is not None and osv is not None
-    assert distinct([osv, nvd]) == (osv, nvd)  # both documents' statements kept
-    unscored_first = score_of(CvssSource.CNA, V40, document="nvd:CVE-2099-1")
-    assert distinct([unscored_first, nvd]) == (nvd,)  # the scored statement wins its document
+    assert distinct([osv, nvd, osv, nvd]) == (osv, nvd)
+
+
+def test_two_authorities_with_one_vector_are_both_kept_in_either_order() -> None:
+    def adp(by: str, stated: str) -> CvssScore:
+        made = score_of(CvssSource.ADP, V40, document="nvd:CVE-2099-1", stated=stated, scored_by=by)
+        assert made is not None
+        return made
+
+    first, second = adp("adp-a", "9.2"), adp("adp-b", "8.7")
+    assert set(distinct([first, second])) == set(distinct([second, first])) == {first, second}
+
+
+def test_a_40_vector_out_of_the_specs_metric_order_is_refused() -> None:
+    swapped = "CVSS:4.0/AC:L/AV:N/AT:P/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"
+    assert score_of(CvssSource.CNA, swapped, document="test", stated="9.2") is None
+    late_base = V40.replace("/SA:N", "") + "/E:X/SA:N"
+    assert score_of(CvssSource.CNA, late_base, document="test", stated="9.2") is None
+
+
+def test_a_31_vector_may_list_its_metrics_in_any_order() -> None:
+    reordered = "CVSS:3.1/AC:H/AV:N/PR:N/UI:N/S:U/C:H/I:H/A:H"
+    score = score_of(CvssSource.CNA, reordered, document="test")
+    assert score is not None and score.score == Decimal("8.1")
 
 
 def test_a_cve_list_lookalike_url_is_not_the_cve_list() -> None:
     record = _doc("osv-CVE-2026-9277.json")
     record["database_specific"]["osv_generated_from"] = "https://evil.example/cvelistV5/x.json"
-    assert osv_scores(record) == ()
+    assert parse_osv(record) == ()
 
 
 def test_an_osv_cvss_v3_entry_carrying_a_40_vector_is_refused() -> None:
     record = _doc("osv-GHSA-jfh8-c2jp-5v3q.json")
     record["severity"] = [{"type": "CVSS_V3", "score": V40}]
-    assert osv_scores(record) == ()
+    assert parse_osv(record) == ()
 
 
 def test_a_secondary_metric_from_nist_is_neither_nists_nor_an_adps() -> None:
@@ -247,7 +301,7 @@ def test_a_secondary_metric_from_nist_is_neither_nists_nor_an_adps() -> None:
         type="Secondary",
         cvssData={"version": "3.1", "vectorString": V31, "baseScore": 8.1},
     )
-    assert nvd_scores(doc) == ()
+    assert parse_nvd(doc) == ()
 
 
 def test_a_30_vector_rounds_as_30_does() -> None:
