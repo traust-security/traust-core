@@ -1116,6 +1116,27 @@ logarithmic. `perf/queries/test_ledger.py` measures the complete countersign pat
 and 10k-event layers, separately from the append-only benchmark. Attestations use the existing
 decision event (`append_decision`), not a parallel `append_attestation` event.
 
+### Querying orders
+
+`POST /v1/orders/query` (`query_orders`) calls `OpsService.query(OrderQueryRequest)` and
+returns `OrderQueryPage`: `items` contain the native `order`, nullable `repository_url`,
+and an opaque per-item `cursor`; `next` is null at the end. Resume after any consumed
+item, not necessarily the final item fetched. Page sizes may change from 1 to 1000;
+changing filters or ordering requires a new query without a cursor (otherwise 422).
+
+Filters compose: `states`, `repository_id`, `repository_ids`, `run_batch_id`, `asset`,
+`ids` (null means unrestricted, an empty array means no matches), and `exclude_ids`.
+`q` matches a literal, case-insensitive substring of the displayed repository reference
+(URL, else repository UUID, else order UUID), asset, or verbatim state before paging.
+`sort_by` accepts `created_at`, `started_at`, `finished_at`, `asset`, `state`,
+`repository`, `reason`, `id`, or `ids`; `sort_order` is `asc` or `desc` (default
+`created_at` descending). Nulls always follow present values, text uses bytewise
+ordering, and ties use the order UUID in the requested direction. `sort_by=ids`
+requires distinct `ids` and follows their supplied sequence, independent of direction.
+The query composes inventory and operations in one SQL read, returning at most
+`limit + 1` rows internally; callers never enumerate history to search or sort.
+Existing indexed `GET /v1/orders` filters and its cursor contract remain unchanged.
+
 ### Operational classifiers
 
 `models.operations` exports the contract-backed `SessionTask` and `SessionResult`, plus

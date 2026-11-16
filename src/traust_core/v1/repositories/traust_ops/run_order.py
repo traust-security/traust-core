@@ -46,6 +46,31 @@ RUN_ORDER = TableSpec(
 )
 
 
+def order_conditions(
+    table: sa.Table,
+    *,
+    states: Collection[OrderState] = (),
+    asset: str | None = None,
+    repository_id: UUID | None = None,
+    repository_ids: Collection[UUID] = (),
+    run_batch_id: UUID | None = None,
+    work_item: bool = False,
+) -> list[sa.ColumnElement[bool]]:
+    c = table.c
+    return [
+        condition
+        for value, condition in (
+            (states, c.state.in_(list(states))),
+            (asset, c.asset == asset),
+            (repository_id, c.repository_id == repository_id),
+            (repository_ids, c.repository_id.in_(list(repository_ids))),
+            (run_batch_id, c.run_batch_id == run_batch_id),
+            (work_item, c.work_item_id.is_not(None)),
+        )
+        if value
+    ]
+
+
 class RunOrderRepository(MutableRecordRepository[RunOrder], Protocol):
     def claim(
         self,
@@ -340,19 +365,15 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
         after: tuple[datetime, UUID] | None = None,
         oldest_first: bool = False,
     ) -> list[RunOrder]:
-        c = self.table.c
-        conditions = [
-            cond
-            for value, cond in (
-                (states, c.state.in_(list(states))),
-                (asset, c.asset == asset),
-                (repository_id, c.repository_id == repository_id),
-                (repository_ids, c.repository_id.in_(list(repository_ids))),
-                (run_batch_id, c.run_batch_id == run_batch_id),
-                (work_item, c.work_item_id.is_not(None)),
-            )
-            if value
-        ]
+        conditions = order_conditions(
+            self.table,
+            states=states,
+            asset=asset,
+            repository_id=repository_id,
+            repository_ids=repository_ids,
+            run_batch_id=run_batch_id,
+            work_item=work_item,
+        )
         return self._page(
             "search", *conditions, limit=limit, after=after, oldest_first=oldest_first
         )
