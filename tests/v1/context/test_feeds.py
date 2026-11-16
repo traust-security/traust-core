@@ -403,8 +403,10 @@ def _line_of(text: str, needle: str) -> int:
 def _names_the_line_not_the_field(message: str, text: str, field: str) -> None:
     """An unknown field is located by its line; its name isn't echoed (it could be a pasted
     key)."""
-    assert f"line {_line_of(text, field)}: " in message
-    assert "<key>: Extra inputs are not permitted" in message and field not in message
+    line = _line_of(text, field)
+    assert f"line {line}: " in message
+    assert f"<key at line {line}>: Extra inputs are not permitted" in message
+    assert field not in message
 
 
 NVD_HEADER = SOURCES.rstrip() + "\n    api_key_header: apiKey\n"
@@ -538,25 +540,45 @@ def test_a_rejected_key_setting_leaves_the_context_retryable(
 SECRET = "test-only-mistyped-secret"
 
 
+_LAST = len(SOURCES.splitlines()) + 1  # the line a test appends
+
+
 @pytest.mark.parametrize(
     ("line", "names"),
     [
-        (f"    api_key: {SECRET}\n", "sources.nvd.<key>: Extra inputs are not permitted"),
-        (f"    api_key: '{SECRET}\n", "invalid YAML at line"),  # an unterminated quote
-        (f"    {SECRET}: x\n", "sources.nvd.<key>: Extra inputs are not permitted"),  # as a key
-        (f"    {SECRET}\n", "invalid YAML at line"),  # a line of its own inside a source
-        (f"  {SECRET}:\n", "sources.<key>: Input should be a valid dictionary"),  # a source name
+        (
+            f"    api_key: {SECRET}\n",
+            rf"line {_LAST}: sources\.<key at line \d+>\.<key at line {_LAST}>: Extra inputs",
+        ),
+        (f"    api_key: '{SECRET}\n", r"invalid YAML at line \d+"),  # an unterminated quote
+        (f"    {SECRET}: x\n", rf"<key at line {_LAST}>: Extra inputs are not permitted"),  # a key
+        (f"    {SECRET}\n", r"invalid YAML at line \d+"),  # a line of its own inside a source
+        (f"  {SECRET}:\n", rf"sources\.<key at line {_LAST}>: Input should be a valid dictionary"),
         (f"    api_key_header: '{SECRET} x'\n", "api_key_header is not an HTTP header name"),
+        (f"    summary: *{SECRET}\n", r"invalid YAML at line \d+"),  # an undefined alias
+        (f"    summary: !{SECRET} x\n", r"invalid YAML at line \d+"),  # an unknown tag
+        # a pasted key as a source name, on a block with a bad field: located, never named
+        (f"  {SECRET}:\n    tier: live\n    size: 5\n", rf"sources\.<key at line {_LAST}>\.<key"),
     ],
-    ids=["unknown-field", "invalid-yaml", "as-a-key", "own-line", "as-a-source", "as-a-header"],
+    ids=[
+        "unknown-field",
+        "invalid-yaml",
+        "as-a-key",
+        "own-line",
+        "as-a-source",
+        "as-a-header",
+        "as-an-alias",
+        "as-a-tag",
+        "as-a-source-with-a-bad-field",
+    ],
 )
 def test_a_secret_mistyped_into_the_registry_stays_out_of_the_error(
     tmp_path: Path, line: str, names: str
 ) -> None:
     text = SOURCES.rstrip() + "\n" + line
-    with pytest.raises(ConfigError) as raised:
+    with pytest.raises(ConfigError, match=names) as raised:
         Context(Config()).register_feeds(_registry(tmp_path, text))
-    assert names in str(raised.value) and SECRET not in str(raised.value)
+    assert SECRET not in str(raised.value)
     # nor in the cause it chains, or anywhere in the traceback
     assert raised.value.__cause__ is not None
     assert SECRET not in "".join(traceback.format_exception(raised.value))
@@ -567,6 +589,8 @@ def test_a_secret_mistyped_into_the_registry_stays_out_of_the_error(
     [
         "https://nvd.test/cves",  # one static URL: the key would go to every request
         "https://nvd.test/{year}/cves",  # a year alone names no identifier
+        "https://nvd.test/cves.json#{ident}",  # a fragment is never sent
+        "https://{ident_lower}.nvd.test/cves",  # in the host: `_resolve` refuses it
     ],
 )
 def test_a_template_naming_no_identifier_takes_no_key(tmp_path: Path, template: str) -> None:
@@ -580,4 +604,34 @@ def test_a_source_url_on_port_zero_is_a_config_error(tmp_path: Path) -> None:
     text = SOURCES.replace("https://nvd.test/cves", "https://nvd.test:0/cves")
     assert text != SOURCES
     with pytest.raises(ConfigError, match="nvd has a malformed URL port"):
+        Context(Config()).register_feeds(_registry(tmp_path, text))
+
+
+@pytest.mark.parametrize(
+    "template", ["https://nvd.test/cves/{ident}", "https://nvd.test/c?id={ident}"]
+)
+def test_a_template_sending_its_identifier_takes_a_key(tmp_path: Path, template: str) -> None:
+    text = NVD_HEADER.replace("https://nvd.test/cves?cveId={ident_upper}", template)
+    assert _sources(tmp_path, text, {"nvd": "k-1"})["nvd"]._api_key is not None
+
+
+def test_a_bad_key_names_its_variable_never_its_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TEST_NVD_KEY", "k-1 trailing")
+    ctx = Context(Config(feeds=FeedsConfig(api_keys={"nvd": "TEST_NVD_KEY"})))
+    with pytest.raises(ConfigError) as raised:
+        ctx.register_feeds(_registry(tmp_path, NVD_HEADER))
+    message = str(raised.value)
+    assert "feeds.api_keys.nvd: $TEST_NVD_KEY: " in message and "no usable header value" in message
+    assert "k-1" not in message and "apiKey" not in message
+
+
+def test_a_source_level_error_gives_the_sources_line(tmp_path: Path) -> None:
+    # a source's name is never echoed (a pasted key can't be told from one); its line is given
+    text = REGISTRY.replace(
+        "    max_age_hours: 12\n", "    max_age_hours: 12\n    api_key_header: apiKey\n"
+    )
+    line = _line_of(text, "  kev:")
+    with pytest.raises(ConfigError, match=rf"line {line}: sources\.<key at line {line}>: "):
         Context(Config()).register_feeds(_registry(tmp_path, text))

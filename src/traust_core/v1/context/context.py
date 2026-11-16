@@ -504,6 +504,7 @@ class Context:
             probe_http=HttpFetcher("traust-core", PROBE_POLICY, clock=self.clock),
             clock=self.clock,
             api_keys=api_keys,
+            api_key_variables=self.config.feeds.api_keys,
         )
         package_sources = load_package_sources(
             registry, http=HttpFetcher(PACKAGE_SOURCE_AGENT, self._http_policy, clock=self.clock)

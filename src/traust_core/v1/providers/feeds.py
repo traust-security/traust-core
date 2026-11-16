@@ -306,9 +306,8 @@ class ApiKey:
         if not is_header_name(self.header):
             raise ConfigError("the API key's header is not an HTTP header name")
         if not is_header_value(self.value):
-            raise ConfigError(
-                f"the {self.header} key holds no usable header value (visible ASCII only)"
-            )
+            # nor the header: a token-shaped key pasted as the header name would pass its check
+            raise ConfigError("the API key holds no usable header value (visible ASCII only)")
 
     def headers(self) -> dict[str, str]:
         return {self.header: self.value}
