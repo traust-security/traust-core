@@ -88,8 +88,10 @@ class FakePqc:
 
     def summary(self, filter: Any, group_by: PqcDimension) -> list[PqcRollup]:
         self.asked.append((filter.product_id, group_by))
+        # keys as Core groups them: a readiness bucket, a dominant provenance
+        key = "partial" if group_by == PqcDimension.BUCKET else "delegated-dependency"
         return [
-            PqcRollup(key=str(group_by), repositories=2, mean_overall=61.5, clock_2030=1,
+            PqcRollup(key=key, repositories=2, mean_overall=61.5, clock_2030=1,
                       hndl_priority=0, blocked=1)
         ]  # fmt: skip
 
@@ -101,7 +103,7 @@ def test_pqc_rolls_up_each_named_product_else_every_commit(products: tuple[UUID,
     expected = list(products) or [None]
     assert [s.product_id for s in model.scopes] == expected
     assert pqc.asked == [(p, d) for p in expected for d in PqcDimension]
-    assert "| bucket | 2 | 61.5 | 1 | 0 | 1 |" in md(PqcView(FakePqc()))  # type: ignore[arg-type]
+    assert "| partial | 2 | 61.5 | 1 | 0 | 1 |" in md(PqcView(FakePqc()))  # type: ignore[arg-type]
 
 
 @dataclass
@@ -155,6 +157,24 @@ def test_a_compliance_view_outside_its_contract_is_refused_by_the_build() -> Non
     with pytest.raises(DocumentError) as error:
         ComplianceDashboardView(Drifted()).build(ViewFilter())  # type: ignore[arg-type]
     assert "by_framework/0/pairs" in {issue.path for issue in error.value.issues}
+
+
+def test_the_pqc_view_refuses_an_as_of() -> None:
+    with pytest.raises(ValidationError, match="no as_of"):
+        PqcView(FakePqc()).build(ViewFilter(as_of=T0))  # type: ignore[arg-type]
+
+
+def test_a_pqc_view_outside_its_contract_is_refused_by_the_build() -> None:
+    class Drifted(FakePqc):
+        def summary(self, filter: Any, group_by: PqcDimension) -> list[PqcRollup]:
+            return [
+                r.model_copy(update={"mean_overall": 101.0})
+                for r in super().summary(filter, group_by)
+            ]
+
+    with pytest.raises(DocumentError) as error:
+        PqcView(Drifted()).build(ViewFilter())  # type: ignore[arg-type]
+    assert "scopes/0/by_bucket/0/mean_overall" in {issue.path for issue in error.value.issues}
 
 
 @pytest.mark.parametrize(

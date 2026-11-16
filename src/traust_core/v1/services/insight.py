@@ -3529,8 +3529,11 @@ class PqcView:
     def build(self, filter: ViewFilter) -> PqcDashboard:
         if filter.team_ids:
             raise ValidationError("the pqc view scopes by product, not team")
+        if filter.as_of is not None:
+            # never current readiness served as if it were historical
+            raise ValidationError("the pqc view reads readiness as it stands; no as_of")
         products: Sequence[UUID | None] = list(dict.fromkeys(filter.product_ids)) or [None]
-        return PqcDashboard(
+        model = PqcDashboard(
             scopes=tuple(
                 PqcScope(
                     product_id=p,
@@ -3544,6 +3547,8 @@ class PqcView:
                 for p in products
             )
         )
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
 
     def report(self, model: PqcDashboard, generated_at: datetime) -> Report:
         columns = ("key", "repositories", "mean overall", "2030 clock", "hndl priority", "blocked")
