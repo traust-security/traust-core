@@ -1,4 +1,5 @@
 import json
+import traceback
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -389,8 +390,21 @@ def test_a_field_the_registry_does_not_read_is_a_config_error(
     tmp_path: Path, old: str, new: str, field: str
 ) -> None:
     assert old in SOURCES
-    with pytest.raises(ConfigError, match=field):
-        Context(Config()).register_feeds(_registry(tmp_path, SOURCES.replace(old, new)))
+    text = SOURCES.replace(old, new)
+    with pytest.raises(ConfigError) as raised:
+        Context(Config()).register_feeds(_registry(tmp_path, text))
+    _names_the_line_not_the_field(str(raised.value), text, field)
+
+
+def _line_of(text: str, needle: str) -> int:
+    return next(i for i, line in enumerate(text.splitlines(), 1) if needle in line)
+
+
+def _names_the_line_not_the_field(message: str, text: str, field: str) -> None:
+    """An unknown field is located by its line; its name isn't echoed (it could be a pasted
+    key)."""
+    assert f"line {_line_of(text, field)}: " in message
+    assert "<key>: Extra inputs are not permitted" in message and field not in message
 
 
 NVD_HEADER = SOURCES.rstrip() + "\n    api_key_header: apiKey\n"
@@ -477,8 +491,9 @@ def test_a_field_nothing_reads_is_refused(tmp_path: Path, field: str) -> None:
             f"    {field}: https://vex.test/x\n",
         )
     assert text != SOURCES
-    with pytest.raises(ConfigError, match=field):
+    with pytest.raises(ConfigError) as raised:
         Context(Config()).register_feeds(_registry(tmp_path, text))
+    _names_the_line_not_the_field(str(raised.value), text, field)
 
 
 def test_the_shipped_registry_loads_with_every_field_read() -> None:
@@ -526,10 +541,14 @@ SECRET = "test-only-mistyped-secret"
 @pytest.mark.parametrize(
     ("line", "names"),
     [
-        (f"    api_key: {SECRET}\n", "sources.nvd.api_key: Extra inputs are not permitted"),
+        (f"    api_key: {SECRET}\n", "sources.nvd.<key>: Extra inputs are not permitted"),
         (f"    api_key: '{SECRET}\n", "invalid YAML at line"),  # an unterminated quote
+        (f"    {SECRET}: x\n", "sources.nvd.<key>: Extra inputs are not permitted"),  # as a key
+        (f"    {SECRET}\n", "invalid YAML at line"),  # a line of its own inside a source
+        (f"  {SECRET}:\n", "sources.<key>: Input should be a valid dictionary"),  # a source name
+        (f"    api_key_header: '{SECRET} x'\n", "api_key_header is not an HTTP header name"),
     ],
-    ids=["unknown-field", "invalid-yaml"],
+    ids=["unknown-field", "invalid-yaml", "as-a-key", "own-line", "as-a-source", "as-a-header"],
 )
 def test_a_secret_mistyped_into_the_registry_stays_out_of_the_error(
     tmp_path: Path, line: str, names: str
@@ -538,6 +557,23 @@ def test_a_secret_mistyped_into_the_registry_stays_out_of_the_error(
     with pytest.raises(ConfigError) as raised:
         Context(Config()).register_feeds(_registry(tmp_path, text))
     assert names in str(raised.value) and SECRET not in str(raised.value)
+    # nor in the cause it chains, or anywhere in the traceback
+    assert raised.value.__cause__ is not None
+    assert SECRET not in "".join(traceback.format_exception(raised.value))
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "https://nvd.test/cves",  # one static URL: the key would go to every request
+        "https://nvd.test/{year}/cves",  # a year alone names no identifier
+    ],
+)
+def test_a_template_naming_no_identifier_takes_no_key(tmp_path: Path, template: str) -> None:
+    text = NVD_HEADER.replace("https://nvd.test/cves?cveId={ident_upper}", template)
+    assert text != NVD_HEADER
+    with pytest.raises(ConfigError, match="per-identifier GET source only"):
+        Context(Config()).register_feeds(_registry(tmp_path, text))
 
 
 def test_a_source_url_on_port_zero_is_a_config_error(tmp_path: Path) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import string
 from collections.abc import Mapping
 from datetime import date, timedelta
 from pathlib import Path, PurePosixPath
@@ -111,7 +112,8 @@ class _Source(_Strict):
     @classmethod
     def _header_name(cls, value: str | None) -> str | None:
         if value is not None and not is_header_name(value):
-            raise ValueError(f"api_key_header {value!r} is not an HTTP header name")
+            # never the value: a key pasted here instead of a header name stays out of the error
+            raise ValueError("api_key_header is not an HTTP header name")
         return value
 
     @pydantic.model_validator(mode="after")
@@ -120,12 +122,24 @@ class _Source(_Strict):
         a cached source's `doc_url_template`), never a whole-file feed or a POST."""
         if self.api_key_header is None:
             return self
-        per_identifier = self.doc_url_template is not None or (
-            self.tier == "live" and self.url_template is not None
-        )
-        if self.method.upper() != "GET" or not per_identifier:
+        template = self.doc_url_template or (self.url_template if self.tier == "live" else None)
+        if self.method.upper() != "GET" or template is None or not _per_identifier(template):
             raise ValueError("api_key_header is for a per-identifier GET source only")
         return self
+
+
+# The placeholders that put an identifier in a URL (`fill_template`); `{year}` alone doesn't.
+_IDENT_PLACEHOLDERS = frozenset({"ident", "ident_lower", "ident_upper", "ident_lower_us"})
+
+
+def _per_identifier(template: str) -> bool:
+    """Whether a URL template names an identifier, so each document is its own request: a
+    template without one is a single static URL, and a key on it would go to every request."""
+    try:
+        fields = {f for _, f, _, _ in string.Formatter().parse(template) if f is not None}
+    except ValueError:  # a malformed template: refused when it's filled, never keyed
+        return False
+    return bool(fields & _IDENT_PLACEHOLDERS)
 
 
 class _Registry(_Strict):
@@ -134,22 +148,89 @@ class _Registry(_Strict):
 
 
 def _load(path: Path) -> _Registry:
-    """The registry, or a ConfigError that names where it's wrong but never echoes what's there:
-    a credential mistyped into the file (an unknown `api_key` field) stays out of the message."""
+    """The registry, or a ConfigError that says where it's wrong (a line, and the path through
+    the fields the registry defines) but never what's there. A credential pasted into the file,
+    as a value, a key or a line of its own, stays out of the message and out of its cause."""
     try:
-        return _Registry.model_validate(yaml.safe_load(path.read_text()))
+        text = path.read_text()
     except OSError as e:
         raise ConfigError(f"cannot read feeds registry {path}: {e}") from e
+    try:
+        return _Registry.model_validate(yaml.safe_load(text))
     except yaml.YAMLError as e:
+        _forget_text(e)
         mark = getattr(e, "problem_mark", None)
         where = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
-        raise ConfigError(f"cannot read feeds registry {path}: invalid YAML{where}") from None
+        raise ConfigError(f"cannot read feeds registry {path}: invalid YAML{where}") from e
     except pydantic.ValidationError as e:
-        problems = "; ".join(
-            f"{'.'.join(str(part) for part in err['loc']) or '(top level)'}: {err['msg']}"
-            for err in e.errors(include_input=False, include_url=False)
+        root = yaml.compose(text)
+        problems = []
+        for err in e.errors(include_input=False, include_url=False):
+            loc = _known(err["loc"])
+            line = _line(root, err["loc"])
+            where = f"line {line}: " if line else ""
+            problems.append(f"{where}{'.'.join(loc) or '(top level)'}: {err['msg']}")
+        cause = pydantic.ValidationError.from_exception_data(
+            e.title,
+            [
+                # a type's context is the schema's (a pattern, the allowed literals), never input
+                {"type": err["type"], "loc": tuple(_known(err["loc"])), "input": None}
+                | ({"ctx": err["ctx"]} if "ctx" in err else {})
+                for err in e.errors(include_input=False, include_url=False)
+                if err["type"] != "value_error"  # a validator's own message is in `problems`
+            ],
+            hide_input=True,
         )
-        raise ConfigError(f"cannot read feeds registry {path}: {problems}") from None
+        raise ConfigError(f"cannot read feeds registry {path}: {'; '.join(problems)}") from cause
+
+
+def _registry_fields() -> frozenset[str]:
+    models = (_Registry, _Source, _Paginate, _Incremental, _Probe, _License)
+    return frozenset(name for model in models for name in model.model_fields)
+
+
+# Path segments an error may show as written: the registry's own field names. A source's name
+# shows too when its block is a mapping (written as a source); any other key (an unknown field,
+# or a pasted key that parsed as one) shows as `<key>`, located by its line.
+_FIELDS = _registry_fields()
+
+
+def _known(loc: tuple[int | str, ...]) -> list[str]:
+    shown = []
+    for i, part in enumerate(loc):
+        is_source = i == 1 and loc[0] == "sources" and len(loc) > 2
+        shown.append(
+            str(part) if isinstance(part, int) or part in _FIELDS or is_source else "<key>"
+        )
+    return shown
+
+
+def _line(root: yaml.Node | None, loc: tuple[int | str, ...]) -> int | None:
+    """The line of the deepest node `loc` reaches in the composed document (a key's own line for
+    a mapping entry), or None."""
+    node, line = root, None
+    for part in loc:
+        if isinstance(node, yaml.MappingNode):
+            entry = next(((k, v) for k, v in node.value if k.value == part), None)
+            if entry is None:
+                break
+            line, node = entry[0].start_mark.line + 1, entry[1]
+        elif isinstance(node, yaml.SequenceNode) and isinstance(part, int):
+            if part >= len(node.value):
+                break
+            node = node.value[part]
+            line = node.start_mark.line + 1
+        else:
+            break
+    return line
+
+
+def _forget_text(e: yaml.YAMLError) -> None:
+    """Drop the document text a YAML error carries, so neither it nor a traceback that chains it
+    shows the offending line."""
+    for name in ("problem_mark", "context_mark"):
+        if (mark := getattr(e, name, None)) is not None:
+            mark.buffer = None
 
 
 _FIX_PATCHES = "fix-patches"
@@ -261,7 +342,7 @@ def load_feed_sources(
                 ident=source.ident,
                 post=post,
                 probe=probe,
-                api_key=_api_key(source, keys.get(name)),
+                api_key=_api_key(name, source, keys.get(name)),
                 http=http,
                 probe_http=probe_http,
                 clock=clock,
@@ -280,13 +361,16 @@ def _valid_port(url: str) -> bool:
     return port != 0
 
 
-def _api_key(source: _Source, value: str | None) -> ApiKey | None:
-    """The key a deployment gives a source that declares the header it travels in. ApiKey checks
-    the header and value itself, so a bad one fails at load, not at its first request; the
+def _api_key(name: str, source: _Source, value: str | None) -> ApiKey | None:
+    """The key a deployment gives a source that declares the header it travels in. ApiKey.parse
+    checks the header and value, so a bad one fails at load, not at its first request; the
     registry has already refused a header on anything but a per-identifier GET."""
     if value is None or source.api_key_header is None:
         return None
-    return ApiKey(source.api_key_header, value)
+    try:
+        return ApiKey.parse(source.api_key_header, value)
+    except ConfigError as e:
+        raise ConfigError(f"feeds.api_keys.{name}: {e}") from e
 
 
 def load_advisory_lookup(

@@ -21,7 +21,6 @@ from traust_core.v1.models.operations import (
     RecordingStartScope,
     RecordKind,
 )
-from traust_core.v1.providers.http import is_header_value
 from traust_core.v1.services.findings.rating import RatingConfig
 from traust_core.v1.services.findings.review import ReviewConfig
 from traust_core.v1.services.identity import IdentityConfig
@@ -263,16 +262,13 @@ class FeedsConfig(_Model):
     ] = pydantic.Field(default_factory=dict)
 
     def api_key_values(self) -> dict[str, str]:
-        """Each named source's API key, read from its variable: set, non-empty and visible ASCII
-        (anything else can't travel in a header), checked before any feed registers."""
+        """Each named source's API key, read from its variable, which must be set and non-empty.
+        Whether the value can travel in a header is ApiKey's check, made when the feeds load and
+        before any registers."""
         keys = {}
         for source, name in self.api_keys.items():
             value = _read_env(name, f"feeds.api_keys.{source}")
-            if value is None or not is_header_value(value):
-                raise ConfigError(
-                    f"feeds.api_keys.{source}: ${name} holds no usable header value "
-                    "(visible ASCII only)"
-                )
+            assert value is not None  # _read_env returns None only for no variable name
             keys[source] = value
         return keys
 
