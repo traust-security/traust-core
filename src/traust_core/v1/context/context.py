@@ -1265,12 +1265,8 @@ def _sla_policy(path: Path) -> SlaPolicy:
 
 
 def _store_populated(engine: Engine) -> bool:
-    """Any namespace's tables count as a populated store.
-
-    On postgres the contract's tables live in the traust schemas, not the
-    default one ``get_table_names()`` inspects - a schema-blind check reads a
-    populated store as fresh and skips the channel's policy entirely.
-    """
+    """Any namespace's tables count as a populated store: on postgres they live
+    in the traust schemas, not the default one ``get_table_names()`` inspects."""
     inspector = sa.inspect(engine)
     if inspector.get_table_names():
         return True

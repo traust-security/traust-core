@@ -146,8 +146,8 @@ def test_a_fresh_store_logs_its_bootstrap_and_channel_trail(
         _ = Context(Config(home=tmp_path)).database
 
     text = " ".join(record.message for record in caplog.records)
-    assert "store bootstrap fresh dialect=" in text  # core's policy decision
-    assert "db channel applying dialect=" in text  # the runner's trail arrives with it
+    assert "store bootstrap fresh dialect=" in text
+    assert "db channel applying dialect=" in text
     assert "db upgrade applied dialect=" in text
     assert "name=0001_repository_disposition" in text
 
@@ -169,9 +169,8 @@ def test_a_channel_refusal_surfaces_as_a_config_error(
 def test_a_populated_postgres_store_is_not_fresh_and_refuses_pending(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """On postgres the contract's tables live in schemas, not the default one
-    ``get_table_names()`` inspects: a populated configured store must still hit
-    the channel's policy, not read as fresh and skip it."""
+    """A populated configured postgres store must hit the channel's policy, not
+    read as fresh (its tables live in schemas ``get_table_names()`` skips)."""
     from traust_contracts.v1.migrations import Upgrade
 
     from tests.v1.conftest import PG_URL, contract_db
