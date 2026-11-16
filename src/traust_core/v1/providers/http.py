@@ -25,6 +25,21 @@ _NEXT = re.compile(r'<([^>]+)>\s*;\s*rel="?next"?')
 log = logging.getLogger(__name__)
 
 
+# An HTTP header name: an RFC 9110 token.
+_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+
+
+def is_header_name(name: str) -> bool:
+    """Whether `name` can be sent as an HTTP header name."""
+    return _HEADER_NAME.fullmatch(name) is not None
+
+
+def is_header_value(value: str) -> bool:
+    """Whether `value` can travel as a secret header (an API key): non-empty and visible ASCII
+    only, since a control, a space or a non-ASCII character can't be sent as-is."""
+    return bool(value) and all(0x21 <= ord(c) <= 0x7E for c in value)
+
+
 def _target_hash(url: str) -> str:
     return hashlib.sha256(url.encode()).hexdigest()[:16]
 
@@ -92,9 +107,17 @@ class HttpFetcher:
         self._clock = clock or SystemClock()
         self._sleep = sleep
 
-    def get(self, url: str, headers: Mapping[str, str] | None = None) -> bytes:
+    def get(
+        self,
+        url: str,
+        headers: Mapping[str, str] | None = None,
+        *,
+        secret_headers: Mapping[str, str] | None = None,
+    ) -> bytes:
+        """`secret_headers` (an API key) go to `url` only: never onto a redirected request, so a
+        redirect to another host can't carry them."""
         try:
-            return self._send(url, None, headers=headers)
+            return self._send(url, None, headers=headers, secret_headers=secret_headers)
         except _Refused as e:
             raise _refused(url, e.status, "http.get") from e
 
@@ -152,6 +175,7 @@ class HttpFetcher:
         *,
         read: Callable[[Any], Any] = lambda r: r.read(),
         headers: Mapping[str, str] | None = None,
+        secret_headers: Mapping[str, str] | None = None,
     ) -> Any:
         policy = self._policy
         method = "POST" if data is not None else "GET"
@@ -165,6 +189,9 @@ class HttpFetcher:
             headers["Content-Type"] = content_type
         for attempt in range(policy.max_attempts):
             req = urllib.request.Request(url, data, headers=headers)
+            for name, value in (secret_headers or {}).items():
+                # urllib copies a request's headers onto a redirect, but not unredirected ones
+                req.add_unredirected_header(name, value)
             try:
                 with urllib.request.urlopen(req, timeout=policy.timeout_seconds) as r:
                     result = read(r)

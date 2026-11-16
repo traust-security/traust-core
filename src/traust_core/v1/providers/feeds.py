@@ -8,7 +8,7 @@ import logging
 import re
 import zlib
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import PurePosixPath
 from typing import Any, Protocol
@@ -27,7 +27,7 @@ from traust_core.v1.models.values import GitSha
 from traust_core.v1.models.vocabulary import Ecosystem
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
-from traust_core.v1.providers.http import HttpFetcher
+from traust_core.v1.providers.http import HttpFetcher, is_header_name, is_header_value
 
 log = logging.getLogger(__name__)
 
@@ -286,12 +286,54 @@ def fill_template(template: str, identifier: str) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class ApiKey:
+    """A source's API key and the header it travels in, from the deployment's config (traust.yaml
+    `feeds.api_keys`). Sent only to the source's own URL, never onto a redirect; never in a URL,
+    a log line, an error or a repr."""
+
+    header: str
+    value: str = field(repr=False)
+
+    @classmethod
+    def parse(cls, header: str, value: str) -> ApiKey:
+        """A key from the deployment's config: the header must be an HTTP header name and the
+        value non-empty visible ASCII, or a ConfigError that never carries the value."""
+        return cls(header, value)
+
+    def __post_init__(self) -> None:
+        # the checks run on every construction, parse or direct, so no caller can build a key
+        # that can't be sent; the messages never carry the value
+        if not is_header_name(self.header):
+            raise ConfigError("the API key's header is not an HTTP header name")
+        if not is_header_value(self.value):
+            # nor the header: a token-shaped key pasted as the header name would pass its check
+            raise ConfigError("the API key holds no usable header value (visible ASCII only)")
+
+    def headers(self) -> dict[str, str]:
+        return {self.header: self.value}
+
+
+@dataclass(frozen=True, slots=True)
 class Probe:
     """A known-good request: an identifier (None: the source's URL as published), and for a
     package query its ecosystem."""
 
     identifier: str | None
     ecosystem: str | None = None
+
+
+def _port(url: str) -> int | None:
+    try:
+        return urlsplit(url).port
+    except ValueError:  # malformed: the registry refuses it, but never crash a message on it
+        return None
+
+
+def _host(url: str) -> str:
+    """A URL's host (and a non-default port) for a message: never its userinfo."""
+    host = urlsplit(url).hostname or ""
+    port = _port(url)
+    return f"{host}:{port}" if port is not None and port != 443 else host
 
 
 class FeedSource:
@@ -310,6 +352,7 @@ class FeedSource:
         http: HttpFetcher,
         probe_http: HttpFetcher,
         clock: Clock,
+        api_key: ApiKey | None = None,
     ) -> None:
         self.name = name
         self.url = url
@@ -320,6 +363,38 @@ class FeedSource:
         self._http = http
         self._probe_http = probe_http
         self._clock = clock
+        if api_key is not None and post:
+            raise ConfigError(f"{name}: an API key travels on a GET source only")
+        self._api_key = api_key
+
+    def _get(self, http: HttpFetcher, url: str, *, keyed: bool) -> bytes:
+        """A GET, carrying the source's API key only when `keyed` (a URL `_resolve` built from
+        the per-identifier template, so on the template's own host) and the deployment gives
+        one: a secret header, sent to this URL only. Any other request is exactly as before."""
+        if self._api_key is None or not keyed:
+            return http.get(url)
+        try:
+            return http.get(url, secret_headers=self._api_key.headers())
+        except ServiceError as e:
+            if e.status is not None and 400 <= e.status < 500 and e.status != 429:
+                # a revoked, mistyped or wrongly synced key is refused like a bad URL: say so
+                raise ServiceError(
+                    f"{e} (the request carried {self.name}'s API key, which a redirect drops: "
+                    f"a wrong or revoked key is refused this way, so check "
+                    f"feeds.api_keys.{self.name}, then the source's URL)",
+                    status=e.status,
+                    operation=e.operation,
+                    target_hash=e.target_hash,
+                ) from e
+            raise
+
+    def _probe_url(self, probe: Probe) -> tuple[str, bool]:
+        """The probe's URL, and whether it carries the key: only a per-identifier one built from
+        the template does. The source's URL as published (`ident: none`) goes keyless, even on
+        the template's host, since it may be another endpoint (a whole-file feed)."""
+        if probe.identifier is None:
+            return self.url, False
+        return self._resolve(probe.identifier), True
 
     def check(self) -> Readiness:
         """Send the probe: an HTTP refusal means the registry and the service disagree, an
@@ -327,18 +402,28 @@ class FeedSource:
         probe = self._probe
         if probe is None:
             return Readiness(ready=True, detail="no probe declared; liveness unchecked")
-        host = urlsplit(self.url).netloc
+        host = _host(self.url)
+        probed: str | None = None  # the GET's URL; a POST probe goes to the source's URL
+        keyed = False
         try:
             if self._post:
                 body = {"package": {"name": probe.identifier, "ecosystem": probe.ecosystem}}
                 self._probe_http.post_json(self.url, body)
             else:
-                url = self.url if probe.identifier is None else self._resolve(probe.identifier)
-                self._probe_http.get(url)
+                probed, keyed = self._probe_url(probe)
+                self._get(self._probe_http, probed, keyed=keyed)
         except (ConfigError, ValidationError) as e:
             return Readiness(ready=False, detail=f"probe URL could not be built: {e}")
         except ServiceError as e:
             if e.status is not None and 400 <= e.status < 500 and e.status != 429:
+                if probed is not None and keyed and self._api_key is not None:
+                    return Readiness(
+                        ready=False,
+                        detail=f"{_host(probed)} refused the probe (HTTP {e.status}), which "
+                        f"carried {self.name}'s API key unless a redirect dropped it: check the "
+                        f"key (feeds.api_keys.{self.name}) first, then the source's URL in the "
+                        "feeds registry",
+                    )
                 return Readiness(
                     ready=False,
                     detail=f"{host} answered HTTP {e.status} for the declared probe "
@@ -354,7 +439,7 @@ class FeedSource:
         """The source's document for one identifier, as it serves it now."""
         url = self._resolve(identifier)
         acquisition = Acquisition(provider=self.name, acquired_at=self._clock.now(), source=url)
-        return Result(self._http.get(url), acquisition)
+        return Result(self._get(self._http, url, keyed=True), acquisition)
 
     def _resolve(self, identifier: str) -> str:
         if self.template is None:

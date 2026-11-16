@@ -9,6 +9,7 @@ from traust_core.v1.errors import ConfigError, ServiceError, ValidationError
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.feeds import (
     MAX_PAGES,
+    ApiKey,
     FeedSource,
     HttpFileFeed,
     PagedJsonFeed,
@@ -222,6 +223,7 @@ class _Http:
     def __init__(self, answers: dict[str, bytes | Exception] | None = None) -> None:
         self.answers = answers or {}
         self.sent: list[tuple[str, object]] = []
+        self.headers: list[dict[str, str] | None] = []
 
     def _answer(self, url: str, body: object) -> bytes:
         self.sent.append((url, body))
@@ -230,7 +232,14 @@ class _Http:
             raise answer
         return answer
 
-    def get(self, url: str) -> bytes:
+    def get(
+        self,
+        url: str,
+        headers: dict[str, str] | None = None,
+        *,
+        secret_headers: dict[str, str] | None = None,
+    ) -> bytes:
+        self.headers.append(secret_headers)
         return self._answer(url, None)
 
     def post_json(self, url: str, doc: object) -> bytes:
@@ -249,6 +258,7 @@ def source(
     post: bool = False,
     probe: Probe | None = LOG4SHELL,
     http: _Http | None = None,
+    api_key: ApiKey | None = None,
 ) -> FeedSource:
     fetcher = http or _Http()
     return FeedSource(
@@ -261,6 +271,7 @@ def source(
         http=fetcher,  # type: ignore[arg-type]
         probe_http=fetcher,  # type: ignore[arg-type]
         clock=FixedClock(AT),
+        api_key=api_key,
     )
 
 
@@ -348,3 +359,155 @@ def test_a_probe_that_cannot_be_built_is_not_ready() -> None:
 def test_a_source_without_a_probe_is_ready_and_says_liveness_is_unchecked() -> None:
     readiness = source(probe=None).check()
     assert readiness.ready and readiness.detail == "no probe declared; liveness unchecked"
+
+
+SECRET = "test-only-nvd-key"
+NVD_KEY = ApiKey("apiKey", SECRET)
+
+
+def test_the_api_key_travels_as_a_secret_header_on_documents_and_probes() -> None:
+    http = _Http()
+    nvd = source(http=http, api_key=NVD_KEY)
+    nvd.document("CVE-2026-0001")
+    assert nvd.check().ready
+    assert http.headers == [{"apiKey": SECRET}, {"apiKey": SECRET}]
+    assert SECRET not in nvd.document("CVE-2026-0001").acquisition.source  # never in the URL
+
+
+def test_a_source_without_a_key_sends_none_and_says_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    http = _Http()
+    nvd = source(http=http)
+    with caplog.at_level("DEBUG"):
+        readiness = nvd.check()
+        nvd.document("CVE-2026-0001")
+    assert readiness.ready and http.headers == [None, None]
+    assert not [r for r in caplog.records if r.levelname in ("WARNING", "ERROR")]
+
+
+def test_the_key_is_in_no_readiness_log_line_or_repr(caplog: pytest.LogCaptureFixture) -> None:
+    refused = ServiceError("nvd answered 403", status=403)
+    http = _Http({"https://nvd.test/cves?cveId=CVE-2021-44228": refused})
+    nvd = source(http=http, api_key=NVD_KEY)
+    with caplog.at_level("DEBUG"):
+        readiness = nvd.check()
+    assert not readiness.ready and SECRET not in readiness.detail
+    assert all(SECRET not in r.getMessage() for r in caplog.records)
+    assert SECRET not in repr(NVD_KEY)
+
+
+def test_a_probe_on_another_host_goes_keyless() -> None:
+    http = _Http()
+    nvd = source(url="https://status.other.test/", probe=Probe(None), http=http, api_key=NVD_KEY)
+    assert nvd.check().ready
+    nvd.document("CVE-2026-0001")
+    assert http.headers == [None, {"apiKey": SECRET}]  # the probe host isn't the template's
+
+
+def test_a_refused_keyed_request_names_the_key() -> None:
+    refused = ServiceError("https://nvd.test/x: HTTP 404", status=404)
+    http = _Http(
+        {
+            "https://nvd.test/cves?cveId=CVE-2021-44228": refused,
+            "https://nvd.test/cves?cveId=CVE-2026-0001": refused,
+        }
+    )
+    nvd = source(http=http, api_key=NVD_KEY)
+    readiness = nvd.check()
+    assert not readiness.ready and "feeds.api_keys.nvd" in readiness.detail
+    with pytest.raises(ServiceError, match=r"feeds\.api_keys\.nvd") as raised:
+        nvd.document("CVE-2026-0001")
+    assert raised.value.status == 404 and SECRET not in str(raised.value)
+    # keyless, a refusal still reads as the registry and the service disagreeing
+    assert "correct its URL" in source(http=http).check().detail
+
+
+def test_a_post_source_cannot_hold_a_key() -> None:
+    with pytest.raises(ConfigError, match="GET source only"):
+        source(post=True, api_key=NVD_KEY)
+
+
+@pytest.mark.parametrize(
+    "url", ["https://nvd.test/feed.json.gz", "https://NVD.test/", "https://nvd.test:0/"]
+)
+def test_a_probe_of_the_published_url_goes_keyless_even_on_the_templates_host(url: str) -> None:
+    # `ident: none` probes the source's URL, which may be another endpoint (a whole-file feed)
+    http = _Http()
+    nvd = source(url=url, probe=Probe(None), http=http, api_key=NVD_KEY)
+    assert nvd.check().ready
+    nvd.document("CVE-2026-0001")
+    assert http.headers == [None, {"apiKey": SECRET}]  # only the template-built request
+
+
+def test_a_keyed_refusal_names_the_host_that_was_probed() -> None:
+    refused = ServiceError("HTTP 403", status=403)
+    http = _Http({"https://nvd.test/cves?cveId=CVE-2021-44228": refused})
+    readiness = source(url="https://status.other.test/", http=http, api_key=NVD_KEY).check()
+    assert readiness.detail.startswith("nvd.test refused the probe (HTTP 403)")
+    assert "feeds.api_keys.nvd" in readiness.detail
+
+
+def test_a_refused_post_probe_reports_not_ready_without_raising() -> None:
+    refused = ServiceError("HTTP 400", status=400)
+    http = _Http({"https://osv.test/v1/query": refused})
+    osv = source(
+        None,
+        url="https://osv.test/v1/query",
+        ident="package",
+        post=True,
+        probe=Probe("lodash", "npm"),
+        http=http,
+    )
+    readiness = osv.check()
+    assert not readiness.ready and "answered HTTP 400" in readiness.detail
+
+
+def test_readiness_never_shows_url_userinfo() -> None:
+    refused = ServiceError("HTTP 403", status=403)
+    template = "https://user:hunter2@nvd.test/cves?cveId={ident_upper}"
+    http = _Http({"https://user:hunter2@nvd.test/cves?cveId=CVE-2021-44228": refused})
+    readiness = source(
+        template, url="https://status.other.test/", http=http, api_key=NVD_KEY
+    ).check()
+    assert (
+        not readiness.ready and "hunter2" not in readiness.detail and "user" not in readiness.detail
+    )
+    assert readiness.detail.startswith("nvd.test refused")  # host only
+
+
+@pytest.mark.parametrize("url", ["https://nvd.test:abc/", "https://nvd.test:99999/"])
+def test_a_malformed_port_never_crashes_a_message(url: str) -> None:
+    from traust_core.v1.providers.feeds import _host
+
+    assert _host(url) == "nvd.test"
+
+
+def test_a_port_zero_url_shows_its_port() -> None:
+    from traust_core.v1.providers.feeds import _host
+
+    assert _host("https://nvd.test:0/") == "nvd.test:0"
+
+
+@pytest.mark.parametrize(
+    ("header", "value", "match"),
+    [
+        ("api key", SECRET, "not an HTTP header name"),
+        ("", SECRET, "not an HTTP header name"),
+        ("apiKey", "", "no usable header value"),
+        ("apiKey", f"{SECRET}\n", "no usable header value"),
+        ("apiKey", f"{SECRET} x", "no usable header value"),
+        ("apiKey", f"{SECRET}é", "no usable header value"),
+    ],
+)
+@pytest.mark.parametrize("build", [ApiKey, ApiKey.parse], ids=["direct", "parse"])
+def test_a_key_checks_its_own_header_and_value(
+    build: object, header: str, value: str, match: str
+) -> None:
+    with pytest.raises(ConfigError, match=match) as raised:
+        build(header, value)  # type: ignore[operator]
+    assert SECRET not in str(raised.value)  # never the value, even a malformed one
+
+
+def test_parse_gives_a_key_that_sends_its_header() -> None:
+    assert ApiKey.parse("apiKey", SECRET).headers() == {"apiKey": SECRET}

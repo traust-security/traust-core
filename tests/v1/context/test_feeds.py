@@ -1,5 +1,6 @@
 import json
-from datetime import timedelta
+import traceback
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -179,7 +180,7 @@ sources:
     file: rh_cve.json
     paginate: {page_param: page, per_page: 1000}
     incremental: {since_param: after, watermark_field: public_date, backfill_from: '2026-05-01'}
-    probe: {ident: none, expect_status: 200}
+    probe: {ident: none}
   vex:
     tier: cached
     mode: indexed-lazy
@@ -361,3 +362,301 @@ def test_an_air_gapped_osv_source_reads_exported_records_not_the_api(tmp_path: P
     record.write_text(json.dumps({"id": "GHSA-aaaa-bbbb-cccc", "affected": []}))
     ctx.use_exported_advisories([record])
     assert isinstance(ctx.advisories, ExportedAdvisoryLookup)
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "field"),
+    [
+        # a setting nothing would read is refused, never dropped
+        (
+            "    url_template: https://nvd.test/cves?cveId={ident_upper}\n",
+            "    url_template: https://nvd.test/cves?cveId={ident_upper}\n"
+            "    api_key_evn: NVD_API_KEY\n",
+            "api_key_evn",
+        ),
+        (
+            "{ident: lodash, ecosystem: npm}",
+            "{ident: lodash, ecosystem: npm, expect: 200}",
+            "expect",
+        ),
+        (
+            "{page_param: page, per_page: 1000}",
+            "{page_param: page, per_page: 1000, size: 5}",
+            "size",
+        ),
+    ],
+)
+def test_a_field_the_registry_does_not_read_is_a_config_error(
+    tmp_path: Path, old: str, new: str, field: str
+) -> None:
+    assert old in SOURCES
+    text = SOURCES.replace(old, new)
+    with pytest.raises(ConfigError) as raised:
+        Context(Config()).register_feeds(_registry(tmp_path, text))
+    _names_the_line_not_the_field(str(raised.value), text, field)
+
+
+def _line_of(text: str, needle: str) -> int:
+    return next(i for i, line in enumerate(text.splitlines(), 1) if needle in line)
+
+
+def _names_the_line_not_the_field(message: str, text: str, field: str) -> None:
+    """An unknown field is located by its line; its name isn't echoed (it could be a pasted
+    key)."""
+    line = _line_of(text, field)
+    assert f"line {line}: " in message
+    assert f"<key at line {line}>: Extra inputs are not permitted" in message
+    assert field not in message
+
+
+NVD_HEADER = SOURCES.rstrip() + "\n    api_key_header: apiKey\n"
+
+
+def _sources(tmp_path: Path, text: str, api_keys: dict[str, str]) -> dict:
+    from traust_core.v1.context.feeds import load_feed_sources
+    from traust_core.v1.providers.clock import FixedClock
+    from traust_core.v1.providers.http import HttpFetcher
+
+    http = HttpFetcher("test")
+    found = load_feed_sources(
+        _registry(tmp_path, text),
+        http=http,
+        probe_http=http,
+        clock=FixedClock(datetime(2026, 1, 1, tzinfo=UTC)),
+        api_keys=api_keys,
+    )
+    return {s.name: s for s in found}
+
+
+def test_a_deployment_key_goes_to_the_source_declaring_its_header(tmp_path: Path) -> None:
+    sources = _sources(tmp_path, NVD_HEADER, {"nvd": "k-1"})
+    assert sources["nvd"]._api_key is not None
+    assert sources["nvd"]._api_key.headers() == {"apiKey": "k-1"}
+    assert sources["vex"]._api_key is None
+
+
+def test_no_deployment_key_is_keyless(tmp_path: Path) -> None:
+    assert _sources(tmp_path, NVD_HEADER, {})["nvd"]._api_key is None
+
+
+@pytest.mark.parametrize(
+    ("text", "keys", "match"),
+    [
+        (NVD_HEADER, {"nvdd": "k"}, "not a registered feed source"),
+        (SOURCES, {"nvd": "k"}, "declares no api_key_header"),  # nowhere for it to travel
+        (NVD_HEADER, {"osv": "k"}, "declares no api_key_header"),
+        (
+            SOURCES.replace(
+                "    probe: {ident: lodash, ecosystem: npm}\n",
+                "    probe: {ident: lodash, ecosystem: npm}\n    api_key_header: apiKey\n",
+            ),
+            {"osv": "k"},
+            "per-identifier GET source only",
+        ),
+        (NVD_HEADER, {"nvd": "bad\nkey"}, "no usable header value"),
+        (NVD_HEADER, {"nvd": "clé-unicode"}, "no usable header value"),  # not sendable as a header
+        (NVD_HEADER, {"epss": "k"}, "declares no api_key_header"),  # a whole-file feed
+        (
+            NVD_HEADER.replace("api_key_header: apiKey", "api_key_header: 'api key'"),
+            {},
+            "not an HTTP header name",
+        ),
+    ],
+)
+def test_a_key_that_cannot_be_sent_fails_at_load(
+    tmp_path: Path, text: str, keys: dict[str, str], match: str
+) -> None:
+    with pytest.raises(ConfigError, match=match):
+        _sources(tmp_path, text, keys)
+
+
+def test_a_cached_whole_file_feed_takes_no_key(tmp_path: Path) -> None:
+    text = REGISTRY.replace(
+        "    max_age_hours: 12\n", "    max_age_hours: 12\n    api_key_header: apiKey\n"
+    )
+    with pytest.raises(ConfigError, match="per-identifier GET source only"):
+        Context(Config()).register_feeds(_registry(tmp_path, text))
+
+
+@pytest.mark.parametrize(
+    "field", ["deletions_url", "archive_pointer_url", "doc_cache_dir", "expect_status"]
+)
+def test_a_field_nothing_reads_is_refused(tmp_path: Path, field: str) -> None:
+    if field == "expect_status":
+        text = SOURCES.replace(
+            "    probe: {ident: none}\n", "    probe: {ident: none, expect_status: 200}\n"
+        )
+    else:
+        text = SOURCES.replace(
+            "    doc_url_template: https://vex.test/{year}/{ident_lower}.json\n",
+            "    doc_url_template: https://vex.test/{year}/{ident_lower}.json\n"
+            f"    {field}: https://vex.test/x\n",
+        )
+    assert text != SOURCES
+    with pytest.raises(ConfigError) as raised:
+        Context(Config()).register_feeds(_registry(tmp_path, text))
+    _names_the_line_not_the_field(str(raised.value), text, field)
+
+
+def test_the_shipped_registry_loads_with_every_field_read() -> None:
+    from traust_core.v1.context.feeds import _load
+
+    shipped = Path(__file__).parents[3] / "src/traust_core/v1/context/shipped/feeds.yaml"
+    assert _load(shipped).sources["nvd"].api_key_header == "apiKey"
+
+
+def test_a_source_url_with_a_malformed_port_is_a_config_error(tmp_path: Path) -> None:
+    text = SOURCES.replace(
+        "https://nvd.test/cves?cveId={ident_upper}", "https://nvd.test:abc/cves?cveId={ident_upper}"
+    )
+    assert text != SOURCES
+    with pytest.raises(ConfigError, match="nvd has a malformed URL port"):
+        Context(Config()).register_feeds(_registry(tmp_path, text))
+
+
+def test_a_malformed_port_error_never_shows_the_url(tmp_path: Path) -> None:
+    text = SOURCES.replace(
+        "https://nvd.test/cves?cveId={ident_upper}",
+        "https://user:hunter2@nvd.test:abc/cves?cveId={ident_upper}",
+    )
+    with pytest.raises(ConfigError) as raised:
+        Context(Config()).register_feeds(_registry(tmp_path, text))
+    assert "malformed URL port" in str(raised.value) and "hunter2" not in str(raised.value)
+
+
+def test_a_rejected_key_setting_leaves_the_context_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TEST_NVD_KEY", "k-1")
+    ctx = Context(Config(feeds=FeedsConfig(api_keys={"nvd": "TEST_NVD_KEY"})))
+    with pytest.raises(ConfigError, match="declares no api_key_header"):
+        ctx.register_feeds(_registry(tmp_path, SOURCES))  # epss is cached and loads first
+    assert ctx.feeds.names() == [] and ctx.feed_sources.names() == []
+    ctx.register_feeds(_registry(tmp_path, NVD_HEADER))  # corrected: starts clean
+    assert "epss" in ctx.feeds.names()
+    assert ctx.feed_sources.get("nvd")._api_key.headers() == {"apiKey": "k-1"}
+
+
+SECRET = "test-only-mistyped-secret"
+
+
+_LAST = len(SOURCES.splitlines()) + 1  # the line a test appends
+
+
+@pytest.mark.parametrize(
+    ("line", "names"),
+    [
+        (
+            f"    api_key: {SECRET}\n",
+            rf"line {_LAST}: sources\.nvd\.<key at line {_LAST}>: Extra inputs",  # a shipped name
+        ),
+        (f"    api_key: '{SECRET}\n", r"invalid YAML at line \d+"),  # an unterminated quote
+        (f"    {SECRET}: x\n", rf"<key at line {_LAST}>: Extra inputs are not permitted"),  # a key
+        (f"    {SECRET}\n", r"invalid YAML at line \d+"),  # a line of its own inside a source
+        (f"  {SECRET}:\n", rf"sources\.<key at line {_LAST}>: Input should be a valid dictionary"),
+        (f"    api_key_header: '{SECRET} x'\n", "api_key_header is not an HTTP header name"),
+        (f"    summary: *{SECRET}\n", r"invalid YAML at line \d+"),  # an undefined alias
+        (f"    summary: !{SECRET} x\n", r"invalid YAML at line \d+"),  # an unknown tag
+        # a pasted key as a source name, on a block with a bad field: located, never named
+        (f"  {SECRET}:\n    tier: live\n    size: 5\n", rf"sources\.<key at line {_LAST}>\.<key"),
+    ],
+    ids=[
+        "unknown-field",
+        "invalid-yaml",
+        "as-a-key",
+        "own-line",
+        "as-a-source",
+        "as-a-header",
+        "as-an-alias",
+        "as-a-tag",
+        "as-a-source-with-a-bad-field",
+    ],
+)
+def test_a_secret_mistyped_into_the_registry_stays_out_of_the_error(
+    tmp_path: Path, line: str, names: str
+) -> None:
+    text = SOURCES.rstrip() + "\n" + line
+    with pytest.raises(ConfigError, match=names) as raised:
+        Context(Config()).register_feeds(_registry(tmp_path, text))
+    assert SECRET not in str(raised.value)
+    # nor in the cause it chains, or anywhere in the traceback
+    assert raised.value.__cause__ is not None
+    assert SECRET not in "".join(traceback.format_exception(raised.value))
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "https://nvd.test/cves",  # one static URL: the key would go to every request
+        "https://nvd.test/{year}/cves",  # a year alone names no identifier
+        "https://nvd.test/cves.json#{ident}",  # a fragment is never sent
+        "https://{ident_lower}.nvd.test/cves",  # in the host: `_resolve` refuses it
+    ],
+)
+def test_a_template_naming_no_identifier_takes_no_key(tmp_path: Path, template: str) -> None:
+    text = NVD_HEADER.replace("https://nvd.test/cves?cveId={ident_upper}", template)
+    assert text != NVD_HEADER
+    with pytest.raises(ConfigError, match="per-identifier GET source only"):
+        Context(Config()).register_feeds(_registry(tmp_path, text))
+
+
+def test_a_source_url_on_port_zero_is_a_config_error(tmp_path: Path) -> None:
+    text = SOURCES.replace("https://nvd.test/cves", "https://nvd.test:0/cves")
+    assert text != SOURCES
+    with pytest.raises(ConfigError, match="nvd has a malformed URL port"):
+        Context(Config()).register_feeds(_registry(tmp_path, text))
+
+
+@pytest.mark.parametrize(
+    "template", ["https://nvd.test/cves/{ident}", "https://nvd.test/c?id={ident}"]
+)
+def test_a_template_sending_its_identifier_takes_a_key(tmp_path: Path, template: str) -> None:
+    text = NVD_HEADER.replace("https://nvd.test/cves?cveId={ident_upper}", template)
+    assert _sources(tmp_path, text, {"nvd": "k-1"})["nvd"]._api_key is not None
+
+
+def test_a_bad_key_names_its_variable_never_its_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TEST_NVD_KEY", "k-1 trailing")
+    ctx = Context(Config(feeds=FeedsConfig(api_keys={"nvd": "TEST_NVD_KEY"})))
+    with pytest.raises(ConfigError) as raised:
+        ctx.register_feeds(_registry(tmp_path, NVD_HEADER))
+    message = str(raised.value)
+    assert "feeds.api_keys.nvd: $TEST_NVD_KEY: " in message and "no usable header value" in message
+    assert "k-1" not in message and "apiKey" not in message
+
+
+def test_a_source_level_error_gives_the_sources_line(tmp_path: Path) -> None:
+    # a shipped source's name shows; any other source's name is located by its line, since a
+    # pasted key can't be told from a custom name
+    text = REGISTRY.replace(
+        "    max_age_hours: 12\n", "    max_age_hours: 12\n    api_key_header: apiKey\n"
+    )
+    line = _line_of(text, "  kev:")
+    with pytest.raises(ConfigError, match=rf"line {line}: sources\.kev: "):
+        Context(Config()).register_feeds(_registry(tmp_path, text))
+    custom = text.replace("  kev:", "  my-feed:")
+    with pytest.raises(ConfigError, match=rf"line {line}: sources\.<key at line {line}>: "):
+        Context(Config()).register_feeds(_registry(tmp_path, custom))
+
+
+NUMERIC = "8675309"  # an unquoted all-digit key parses as an integer
+
+
+@pytest.mark.parametrize(
+    "line",
+    [f"  {NUMERIC}:\n    tier: live\n    size: 5\n", f"    {NUMERIC}: x\n"],
+    ids=["as-a-source", "as-a-field"],
+)
+def test_a_numeric_key_is_located_never_shown(tmp_path: Path, line: str) -> None:
+    text = SOURCES.rstrip() + "\n" + line
+    with pytest.raises(ConfigError, match=rf"<key at line {_LAST}>") as raised:
+        Context(Config()).register_feeds(_registry(tmp_path, text))
+    assert NUMERIC not in "".join(traceback.format_exception(raised.value))
+
+
+def test_a_source_named_like_a_field_is_located_never_shown(tmp_path: Path) -> None:
+    text = SOURCES.rstrip() + "\n  summary:\n    tier: live\n    size: 5\n"
+    with pytest.raises(ConfigError, match=rf"sources\.<key at line {_LAST}>\."):
+        Context(Config()).register_feeds(_registry(tmp_path, text))
