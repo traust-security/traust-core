@@ -16,6 +16,7 @@ from traust_core.v1.models.operations import (
     OPEN_ORDER_STATES,
     LaneName,
     OrderQueryRequest,
+    OrderSortBy,
     OrderState,
     SpendDimension,
     SpendFilter,
@@ -224,11 +225,14 @@ def test_lane_costs_read_settled_orders_in_the_window_by_index(explained: Profil
     assert not costs.seq_scans() and costs.execution_ms < 500, costs.plan
 
 
+@pytest.mark.parametrize("sort_by", [OrderSortBy.CREATED_AT, OrderSortBy.STARTED_AT])
 @pytest.mark.parametrize(
     "search", ["", TYPICAL_REPOSITORY], ids=["first-page", "repository-search"]
 )
-def test_order_query_bounds_the_first_page_at_volume(explained: Profile, search: str) -> None:
-    query = OrderQueryRequest(q=search, limit=100)
+def test_order_query_bounds_the_first_page_at_volume(
+    explained: Profile, search: str, sort_by: OrderSortBy
+) -> None:
+    query = OrderQueryRequest(q=search, sort_by=sort_by, limit=100)
 
     def read(uow: SqlTraustUnitOfWork) -> object:
         rows = uow.order_reads.query(query, query.position())
