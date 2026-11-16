@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 
 from tests.v1.repositories.tables.conftest import Seed
@@ -47,6 +49,40 @@ def test_get_a_finding_matches_in_process(context: Context, client: TestClient) 
     finding = seed_finding(context)
     one = client.get(f"/v1/findings/{finding.id}", headers=bearer(context, ANALYST))
     same_as_in_process(one.json(), context.services().findings.get(finding.id))
+
+
+@pytest.mark.parametrize("reported", [False, True])
+def test_finding_detail_and_lists_return_canonical_report_times(
+    context: Context, client: TestClient, reported: bool
+) -> None:
+    first = datetime(2026, 10, 1, tzinfo=UTC)
+    last = first + timedelta(days=10)
+    with SqlTraustUnitOfWork(context.database) as uow:
+        seed = Seed(uow)
+        repo = seed.repository()
+        ref = seed.repository_ref(repo)
+        finding = seed.finding(repo)
+        if reported:
+            for at in (last, first, first + timedelta(days=5)):
+                seed.occurrence(finding, seed.assessment(ref, occurred_at=at))
+        uow.commit()
+    for url, params in (
+        (f"/v1/findings/{finding.id}", {}),
+        (f"/v1/repositories/{repo.id}/findings", {}),
+        ("/v1/findings", {"repository_ids": str(repo.id)}),
+    ):
+        response = client.get(url, params=params, headers=bearer(context, ANALYST))
+        assert response.status_code == 200
+        body = response.json()
+        if "items" in body:
+            assert len(body["items"]) == 1
+            body = body["items"][0]
+        if reported:
+            assert datetime.fromisoformat(body["first_reported_at"]) == first
+            assert datetime.fromisoformat(body["last_reported_at"]) == last
+        else:
+            assert body["first_reported_at"] is None
+            assert body["last_reported_at"] is None
 
 
 def test_an_unknown_finding_is_404(context: Context, client: TestClient) -> None:

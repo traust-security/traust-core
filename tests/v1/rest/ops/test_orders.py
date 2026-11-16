@@ -12,7 +12,13 @@ from tests.v1.rest.conftest import bearer, same_as_in_process
 from tests.v1.rest.ops.conftest import runner
 from traust_core.v1.context import Context
 from traust_core.v1.models.common import PageRequest
-from traust_core.v1.models.operations import OrderFilter, OrderState, RunOrder
+from traust_core.v1.models.operations import (
+    OrderFilter,
+    OrderQueryPage,
+    OrderQueryRequest,
+    OrderState,
+    RunOrder,
+)
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.operations import OpsService
 
@@ -372,3 +378,175 @@ def test_failed_and_unauthorized_order_requests_keep_their_safe_id(
 def test_reads_need_a_token(context: Context, client: TestClient) -> None:
     assert client.get("/v1/orders", params={"states": "queued"}).status_code == 401
     assert client.get(f"/v1/orders/{uuid4()}").status_code == 401
+
+
+@pytest.mark.parametrize("machine", [False, True])
+def test_query_returns_the_typed_service_page_for_authenticated_readers(
+    context: Context, client: TestClient, machine: bool
+) -> None:
+    with SqlTraustUnitOfWork(context.database) as uow:
+        seed = Seed(uow)
+        repository = seed.repository(url="https://forge.example/org/query")
+        for _ in range(3):
+            seed.run_order(repository_id=repository.id)
+        uow.commit()
+    query = OrderQueryRequest(q="ORG/QUERY", limit=2)
+    headers = runner(context) if machine else bearer(context)
+    response = client.post("/v1/orders/query", json=query.model_dump(mode="json"), headers=headers)
+    assert response.status_code == 200
+    expected = context.services().ops.query(query)
+    same_as_in_process(response.json(), expected)
+    page = OrderQueryPage.model_validate(response.json())
+    assert len(page.items) == 2 and page.next == page.items[-1].cursor
+    assert page.items[0].repository_url == repository.url
+    assert all(isinstance(item.order, RunOrder) and item.cursor for item in page.items)
+
+
+def test_query_needs_a_token(client: TestClient) -> None:
+    response = client.post("/v1/orders/query", json={})
+    assert response.status_code == 401
+    assert response.headers["content-type"] == "application/problem+json"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"limit": 0},
+        {"limit": 1001},
+        {"states": ["not-a-state"]},
+        {"repository_id": "not-a-uuid"},
+        {"repository_ids": ["not-a-uuid"]},
+        {"run_batch_id": "not-a-uuid"},
+        {"ids": ["not-a-uuid"]},
+        {"exclude_ids": ["not-a-uuid"]},
+        {"sort_by": "priority"},
+        {"sort_order": "sideways"},
+        {"sort_by": "ids"},
+        {"cursor": "not a cursor!"},
+        {"cursor": "e30="},
+    ],
+)
+def test_query_rejects_invalid_requests_as_problem_details(
+    context: Context, client: TestClient, body: dict[str, object]
+) -> None:
+    response = client.post("/v1/orders/query", json=body, headers=bearer(context))
+    assert response.status_code == 422
+    assert response.headers["content-type"] == "application/problem+json"
+    assert response.json()["detail"]
+
+
+def test_query_rejects_duplicate_sequence_ids(context: Context, client: TestClient) -> None:
+    order = seed_orders(context)
+    response = client.post(
+        "/v1/orders/query",
+        json={"sort_by": "ids", "ids": [str(order.id), str(order.id)]},
+        headers=bearer(context),
+    )
+    assert response.status_code == 422
+    assert "distinct" in response.json()["detail"]
+
+
+def test_query_item_cursors_resume_consumed_rows_with_a_different_page_size(
+    context: Context, client: TestClient
+) -> None:
+    with SqlTraustUnitOfWork(context.database) as uow:
+        seed = Seed(uow)
+        orders = [seed.run_order() for _ in range(5)]
+        uow.commit()
+    headers = bearer(context)
+    body = {"sort_by": "id", "sort_order": "asc", "limit": 3}
+    first = client.post("/v1/orders/query", json=body, headers=headers)
+    assert first.status_code == 200
+    page = OrderQueryPage.model_validate(first.json())
+    expected = sorted(order.id for order in orders)
+    assert [item.order.id for item in page.items] == expected[:3]
+    resumed = client.post(
+        "/v1/orders/query",
+        json={**body, "limit": 1000, "cursor": page.items[0].cursor},
+        headers=headers,
+    )
+    assert resumed.status_code == 200
+    rest = OrderQueryPage.model_validate(resumed.json())
+    assert [item.order.id for item in rest.items] == expected[1:]
+    assert rest.next is None
+    assert all(item.repository_url is None for item in rest.items)
+    end = client.post(
+        "/v1/orders/query",
+        json={**body, "cursor": rest.items[-1].cursor},
+        headers=headers,
+    )
+    assert end.status_code == 200 and end.json() == {"items": [], "next": None}
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"q": "audit"},
+        {"sort_order": "asc"},
+        {"sort_by": "id"},
+        {"states": ["queued"]},
+        {"ids": []},
+        {"exclude_ids": [str(uuid4())]},
+    ],
+)
+def test_query_rejects_cursors_from_a_different_query(
+    context: Context, client: TestClient, changed: dict[str, object]
+) -> None:
+    seed_orders(context)
+    headers = bearer(context)
+    first = client.post("/v1/orders/query", json={}, headers=headers)
+    assert first.status_code == 200
+    cursor = first.json()["items"][0]["cursor"]
+    response = client.post("/v1/orders/query", json={**changed, "cursor": cursor}, headers=headers)
+    assert response.status_code == 422
+    assert response.headers["content-type"] == "application/problem+json"
+    assert "cursor" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("body", [{}, {"ids": None}])
+def test_query_accepts_unfiltered_and_empty_id_reads_without_changing_get(
+    context: Context, client: TestClient, body: dict[str, object]
+) -> None:
+    order = seed_orders(context)
+    headers = bearer(context)
+    queried = client.post("/v1/orders/query", json=body, headers=headers)
+    assert queried.status_code == 200
+    assert [item["order"]["id"] for item in queried.json()["items"]] == [str(order.id)]
+    empty = client.post("/v1/orders/query", json={"sort_by": "ids", "ids": []}, headers=headers)
+    assert empty.status_code == 200 and empty.json() == {"items": [], "next": None}
+    assert client.get("/v1/orders", headers=headers).status_code == 422
+    listed = client.get("/v1/orders", params={"states": "queued"}, headers=headers)
+    assert listed.status_code == 200
+    assert listed.json()["items"][0]["id"] == str(order.id)
+
+
+@pytest.mark.parametrize("field", ["ids", "exclude_ids", "repository_ids", "states"])
+@pytest.mark.parametrize("oversized", [False, True])
+def test_query_selector_bounds_are_enforced_at_the_rest_boundary(
+    context: Context, client: TestClient, field: str, oversized: bool
+) -> None:
+    with SqlTraustUnitOfWork(context.database) as uow:
+        seed = Seed(uow)
+        repository = seed.repository()
+        order = seed.run_order(repository_id=repository.id)
+        uow.commit()
+    maximum = len(OrderState) if field == "states" else 500
+    count = maximum + int(oversized)
+    if field == "states":
+        values = [OrderState.QUEUED.value] * count
+    else:
+        last = repository.id if field == "repository_ids" else order.id
+        values = [*(str(uuid4()) for _ in range(count - 1)), str(last)]
+    body: dict[str, object] = {field: values, "limit": 1}
+    if field == "ids":
+        body["sort_by"] = "ids"
+    response = client.post("/v1/orders/query", json=body, headers=bearer(context))
+    if oversized:
+        assert response.status_code == 422
+        assert response.headers["content-type"] == "application/problem+json"
+        assert field in response.text
+    else:
+        assert response.status_code == 200
+        expected = [] if field == "exclude_ids" else [str(order.id)]
+        assert [item["order"]["id"] for item in response.json()["items"]] == expected
+        assert response.json()["next"] is None
