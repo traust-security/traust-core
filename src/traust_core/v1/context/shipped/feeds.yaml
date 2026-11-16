@@ -117,7 +117,6 @@ sources:
     project: [CVE, public_date, bugzilla_description, severity, cvss3_score, CWE]
     probe:
       ident: none
-      expect_status: 200
     consumers:
       - traust.cli.reconcile_cve_provenance
     license:
@@ -138,12 +137,11 @@ sources:
     # and the full corpus is a 293 MB zstd archive whose products are
     # mostly ones we do not ship. a `--mirror` mode would opt into the
     # complete local mirror when an offline fleet-wide query is needed.
+    # Not read yet, so not declared: Red Hat's deletions.csv (withdrawn
+    # documents) and archive_latest.txt (the full-archive pointer).
     index_url: https://access.redhat.com/security/data/csaf/v2/vex/changes.csv
     index_file: vex/changes.csv
-    deletions_url: https://access.redhat.com/security/data/csaf/v2/vex/deletions.csv
-    archive_pointer_url: https://access.redhat.com/security/data/csaf/v2/vex/archive_latest.txt
     doc_url_template: https://access.redhat.com/security/data/csaf/v2/vex/{year}/{ident_lower}.json
-    doc_cache_dir: vex
     # changes.csv is a rolling 12-month window ("path","timestamp"),
     # newest-first; median 117 changed docs/day, bursting to ~950.
     max_age_hours: 24
@@ -151,7 +149,6 @@ sources:
     ident: cve
     probe:
       ident: CVE-2021-44228
-      expect_status: 200
     consumers:
       - traust impact document (traust-core ExposureService.source_document)
       - harnessing/4-triage/triage
@@ -197,7 +194,6 @@ sources:
     probe:
       ident: lodash
       ecosystem: npm
-      expect_status: 200
     consumers:
       - traust.cli adapters fork-lag (traust-core CodeFactsService.fork_lag)
       - traust.cli.impact
@@ -234,7 +230,6 @@ sources:
     access: api
     probe:
       ident: npm/packages/express/versions/4.17.1:dependencies
-      expect_status: 200
     consumers:
       - traust.cli adapters osv (traust-core providers.tools.osv resolve_transitive)
       - traust impact below-range (dependency source in packets, traust-core BelowRangeService)
@@ -450,10 +445,12 @@ sources:
     ident: cve
     probe:
       ident: CVE-2021-44228
-      expect_status: 200
-    # Keyless is rate-limited; an NVD API key is a quality-of-service
-    # upgrade, never a correctness requirement.
-    api_key_env: NVD_API_KEY
+    # An API key is optional: keyless works at NVD's lower rate limit (about
+    # 5 requests per 30 s; 50 with a key). A deployment that has one names
+    # the variable holding it in traust.yaml (`feeds.api_keys: {nvd:
+    # NVD_API_KEY}`), never in this file; it is sent in NVD's `apiKey` header
+    # to NVD only.
+    api_key_header: apiKey
     consumers:
       - traust impact document (traust-core ExposureService.source_document)
     license:
@@ -474,7 +471,6 @@ sources:
     ident: rhsa
     probe:
       ident: RHSA-2024:6493
-      expect_status: 200
     consumers:
       - harnessing/3-audit/secure-rpm-audit
       - harnessing/3-audit/secure-container-audit
@@ -491,7 +487,6 @@ sources:
     ident: repo
     probe:
       ident: github.com/kubernetes/kubernetes
-      expect_status: 200
     consumers:
       - harnessing/3-audit/secure-code-audit
       - harnessing/3-audit/secure-rpm-audit

@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+import string
+from collections.abc import Mapping
+from datetime import date, timedelta
+from functools import cache
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
 import pydantic
 import yaml
 
+from traust_core.v1.context.redaction import yaml_cause, yaml_where
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.feeds import (
+    ApiKey,
     FeedProvider,
     FeedSource,
     HttpFileFeed,
@@ -19,7 +24,7 @@ from traust_core.v1.providers.feeds import (
     Paging,
     Probe,
 )
-from traust_core.v1.providers.http import HttpFetcher
+from traust_core.v1.providers.http import HttpFetcher, is_header_name
 from traust_core.v1.providers.osv import OsvAdvisoryLookup
 from traust_core.v1.providers.package_source import PackageSources, SourceHosts
 from traust_core.v1.repositories.objects.store import ObjectKey, ObjectStore
@@ -43,23 +48,40 @@ class ObjectCache:
         self._store.put(ObjectKey.parse(f"{self._prefix}/{key}"), data)
 
 
-class _Paginate(pydantic.BaseModel):
+class _Strict(pydantic.BaseModel):
+    """A registry block: a field the loader doesn't know is a config error, never dropped, so a
+    setting nothing reads (an API key, a status a probe should expect) can't pass silently."""
+
+    model_config = pydantic.ConfigDict(extra="forbid")
+
+
+class _Paginate(_Strict):
     page_param: str
     per_page: pydantic.PositiveInt
 
 
-class _Incremental(pydantic.BaseModel):
+class _Incremental(_Strict):
     since_param: str
     watermark_field: str
     backfill_from: str
 
 
-class _Probe(pydantic.BaseModel):
+class _Probe(_Strict):
     ident: str
     ecosystem: str | None = None
 
 
-class _Source(pydantic.BaseModel):
+class _License(_Strict):
+    """Documentation for adopters; the loader keeps it, nothing acts on it."""
+
+    id: str
+    terms: str | None = None
+    attribution: str | None = None
+    url: str | None = None
+    verified: date | str | None = None
+
+
+class _Source(_Strict):
     tier: str
     mode: str | None = None
     url: str | None = None
@@ -79,17 +101,139 @@ class _Source(pydantic.BaseModel):
     access: str = "api"
     extra_hosts: tuple[str, ...] = ()
     redirect_hosts: tuple[str, ...] = ()
+    # the header an API key travels in; the key's variable is the deployment's (traust.yaml
+    # `feeds.api_keys`), never this registry
+    api_key_header: str | None = None
+    # documentation the registry carries for adopters; nothing acts on it
+    summary: str | None = None
+    consumers: tuple[str, ...] = ()
+    license: _License | None = None
+    cadence: str | None = None
+
+    @pydantic.field_validator("api_key_header")
+    @classmethod
+    def _header_name(cls, value: str | None) -> str | None:
+        if value is not None and not is_header_name(value):
+            # never the value: a key pasted here instead of a header name stays out of the error
+            raise ValueError("api_key_header is not an HTTP header name")
+        return value
+
+    @pydantic.model_validator(mode="after")
+    def _key_on_a_per_identifier_get(self) -> _Source:
+        """A key travels only on what sends it: a per-identifier GET (a live `url_template`, or
+        a cached source's `doc_url_template`), never a whole-file feed or a POST."""
+        if self.api_key_header is None:
+            return self
+        template = self.doc_url_template or (self.url_template if self.tier == "live" else None)
+        if self.method.upper() != "GET" or template is None or not _per_identifier(template):
+            raise ValueError("api_key_header is for a per-identifier GET source only")
+        return self
 
 
-class _Registry(pydantic.BaseModel):
+# The placeholders that put an identifier in a URL (`fill_template`); `{year}` alone doesn't.
+_IDENT_PLACEHOLDERS = frozenset({"ident", "ident_lower", "ident_upper", "ident_lower_us"})
+
+
+def _per_identifier(template: str) -> bool:
+    """Whether a URL template sends an identifier, so each document is its own request: the
+    placeholder must be in the path or query. A template without one, or with one only in the
+    fragment (which a client never sends) or the host (which `_resolve` refuses), is a single
+    endpoint, and a key on it would go to every request."""
+    sent = template.split("#", 1)[0]
+    rest = sent.split("://", 1)[-1]
+    cut = [i for i in (rest.find("/"), rest.find("?")) if i >= 0]
+    path_and_query = rest[min(cut) :] if cut else ""
+    try:
+        fields = {f for _, f, _, _ in string.Formatter().parse(path_and_query) if f is not None}
+    except ValueError:  # a malformed template: refused when it's filled, never keyed
+        return False
+    return bool(fields & _IDENT_PLACEHOLDERS)
+
+
+class _Registry(_Strict):
+    version: int | None = None
     sources: dict[str, _Source]
 
 
 def _load(path: Path) -> _Registry:
+    """The registry, or a ConfigError that says where it's wrong but never what's there: lines,
+    columns and the registry's own field names only, never a value or a key the file chose (a
+    source's name included, since a pasted key can't be told from one). The cause is redacted
+    the same way."""
     try:
-        return _Registry.model_validate(yaml.safe_load(path.read_text()))
-    except (OSError, yaml.YAMLError, pydantic.ValidationError) as e:
+        text = path.read_text()
+    except OSError as e:
         raise ConfigError(f"cannot read feeds registry {path}: {e}") from e
+    try:
+        return _Registry.model_validate(yaml.safe_load(text))
+    except yaml.YAMLError as e:
+        where = yaml_where(e)
+        raise ConfigError(f"cannot read feeds registry {path}: invalid YAML{where}") from (
+            yaml_cause(e)
+        )
+    except pydantic.ValidationError as e:
+        root = yaml.compose(text)
+        problems, line_errors = [], []
+        for err in e.errors(include_input=False, include_url=False):
+            line, shown = _where(root, err["loc"])
+            at = f"line {line}: " if line else ""
+            problems.append(f"{at}{'.'.join(shown) or '(top level)'}: {err['msg']}")
+            if err["type"] != "value_error":  # a validator's own message is in `problems`
+                # a type's context is the schema's (a pattern, the allowed literals), never input
+                line_errors.append(
+                    {"type": err["type"], "loc": tuple(shown), "input": None}
+                    | ({"ctx": err["ctx"]} if "ctx" in err else {})
+                )
+        cause = pydantic.ValidationError.from_exception_data(e.title, line_errors, hide_input=True)
+        raise ConfigError(f"cannot read feeds registry {path}: {'; '.join(problems)}") from cause
+
+
+def _registry_fields() -> frozenset[str]:
+    models = (_Registry, _Source, _Paginate, _Incremental, _Probe, _License)
+    return frozenset(name for model in models for name in model.model_fields)
+
+
+# The only path segments an error shows as written: the registry's own field names, at a field's
+# position, and the names of the sources traust-core ships (no pasted key can be one of those).
+# Every other key the file chose is located by its line, never shown.
+_FIELDS = _registry_fields()
+
+
+@cache
+def _shipped_source_names() -> frozenset[str]:
+    shipped = yaml.safe_load((Path(__file__).parent / "shipped" / "feeds.yaml").read_text())
+    return frozenset(str(name) for name in shipped.get("sources", {}))
+
+
+def _where(root: yaml.Node | None, loc: tuple[int | str, ...]) -> tuple[int | None, list[str]]:
+    """Where an error's location is in the document: the line of the deepest node it reaches,
+    and its path. A sequence index shows as a number; a mapping key shows only if it's a field
+    name in a field's position, or a shipped source's name in a source's; any other (an unknown
+    field, a custom source, an unquoted number) shows as the line it's on, never its text."""
+    node, line, shown = root, None, []
+    for i, part in enumerate(loc):
+        if isinstance(node, yaml.SequenceNode) and isinstance(part, int):
+            shown.append(str(part))
+            node = node.value[part] if part < len(node.value) else None
+            line = node.start_mark.line + 1 if node is not None else line
+            continue
+        entry = None
+        if isinstance(node, yaml.MappingNode):
+            entry = next(((k, v) for k, v in node.value if k.value == str(part)), None)
+        if entry is not None:
+            line, node = entry[0].start_mark.line + 1, entry[1]
+        else:
+            node = None
+        source_position = i == 1 and loc[0] == "sources"
+        if source_position:
+            known = isinstance(part, str) and part in _shipped_source_names()
+        else:
+            known = isinstance(part, str) and part in _FIELDS
+        if known:
+            shown.append(str(part))
+        else:
+            shown.append(f"<key at line {line}>" if entry is not None else "<key>")
+    return line, shown
 
 
 _FIX_PATCHES = "fix-patches"
@@ -143,13 +287,32 @@ def load_feeds(path: Path, *, http: HttpFetcher, clock: Clock) -> tuple[FeedProv
 
 
 def load_feed_sources(
-    path: Path, *, http: HttpFetcher, probe_http: HttpFetcher, clock: Clock
+    path: Path,
+    *,
+    http: HttpFetcher,
+    probe_http: HttpFetcher,
+    clock: Clock,
+    api_keys: Mapping[str, str] | None = None,
+    api_key_variables: Mapping[str, str] | None = None,
 ) -> tuple[FeedSource, ...]:
     """A provider per source queried per identifier (a live source, or a cached one's documents)
     or carrying a probe: documents on demand, liveness from its probe. `access: disabled` opts a
     source out."""
     found = []
-    for name, source in _load(path).sources.items():
+    registry = _load(path).sources
+    keys = dict(api_keys or {})
+    for name in keys:
+        if name not in registry:
+            raise ConfigError(f"feeds.api_keys names {name}, which is not a registered feed source")
+    for name in keys:
+        source = registry[name]
+        if source.role in _HOST_ROLES or source.access == "disabled":
+            raise ConfigError(f"feeds.api_keys names {name}, which sends no API key")
+        if source.api_key_header is None:
+            raise ConfigError(
+                f"feeds.api_keys names {name}, which declares no api_key_header ({path})"
+            )
+    for name, source in registry.items():
         if source.role in _HOST_ROLES or source.access == "disabled":
             continue
         post = source.method.upper() == "POST"
@@ -163,6 +326,10 @@ def load_feed_sources(
             raise ConfigError(f"feeds registry {path}: {name} has a probe but no URL")
         if any(not u.startswith("https://") for u in (url, template) if u):
             raise ConfigError(f"feeds registry {path}: {name} must be reached over https")
+        for u in (url, template):
+            if u and not _valid_port(u):
+                # the source's name only: a URL can carry credentials
+                raise ConfigError(f"feeds registry {path}: {name} has a malformed URL port")
         declared = source.probe
         probe = (
             None
@@ -179,12 +346,37 @@ def load_feed_sources(
                 ident=source.ident,
                 post=post,
                 probe=probe,
+                api_key=_api_key(name, source, keys.get(name), (api_key_variables or {}).get(name)),
                 http=http,
                 probe_http=probe_http,
                 clock=clock,
             )
         )
     return tuple(found)
+
+
+def _valid_port(url: str) -> bool:
+    """Whether a URL's port, if any, is one a request can go to: a non-numeric or out-of-range
+    one isn't, and neither is 0."""
+    try:
+        port = urlsplit(url).port  # raises on a malformed or out-of-range port
+    except ValueError:
+        return False
+    return port != 0
+
+
+def _api_key(name: str, source: _Source, value: str | None, variable: str | None) -> ApiKey | None:
+    """The key a deployment gives a source that declares the header it travels in. ApiKey.parse
+    checks the header and value, so a bad one fails at load, not at its first request; the
+    registry has already refused a header on anything but a per-identifier GET."""
+    if value is None or source.api_key_header is None:
+        return None
+    try:
+        return ApiKey.parse(source.api_key_header, value)
+    except ConfigError as e:
+        # the source and the variable the deployment named (traust.yaml), never the value
+        held = f"${variable}: " if variable else ""
+        raise ConfigError(f"feeds.api_keys.{name}: {held}{e}") from e
 
 
 def load_advisory_lookup(
