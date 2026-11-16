@@ -486,5 +486,8 @@ def test_an_asset_repeated_in_one_list_is_allowed(tmp_path: Path) -> None:
 def test_a_config_that_is_not_utf8_is_a_config_error(tmp_path: Path) -> None:
     path = tmp_path / "traust.yaml"
     path.write_bytes(b"feeds:\n  osv_access: \xff\xfe\n")
-    with pytest.raises(ConfigError, match=r"not UTF-8 text \(byte \d+\)"):
+    with pytest.raises(ConfigError, match=r"not UTF-8 text \(byte \d+\)") as raised:
         Config.from_file(path)
+    cause = raised.value.__cause__
+    assert cause is not None and "UnicodeDecodeError at byte" in str(cause)
+    assert "0xff" not in str(cause)  # the position, never the byte

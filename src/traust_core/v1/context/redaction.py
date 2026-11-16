@@ -138,7 +138,9 @@ def load_yaml_config(
         text = raw.decode()  # exact: no newline translation, so a caller can hash it
     except UnicodeDecodeError as e:
         # the position only: the error's own text quotes the offending byte
-        raise ConfigError(f"cannot read {name}: not UTF-8 text (byte {e.start})") from None
+        where = f"byte {e.start}"
+        cause = ConfigParseError(f"{type(e).__name__} at {where}")
+        raise ConfigError(f"cannot read {name}: not UTF-8 text ({where})") from cause
     try:
         document = yaml.safe_load(text)
         if document is None:
