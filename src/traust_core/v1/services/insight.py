@@ -1136,7 +1136,7 @@ class ContainerFindingsView:
                     ),
                 )
             )
-        return ContainerFindings(
+        model = ContainerFindings(
             as_of=filter.as_of,
             repository_id=ref.repository_id,
             repository_url=repository.url,
@@ -1146,6 +1146,8 @@ class ContainerFindingsView:
             findings=tuple(rows),
             total=_tally(row.view for row in rows),
         )
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
 
     def report(self, model: ContainerFindings, generated_at: datetime) -> Report:
         return Report(

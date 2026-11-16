@@ -48,6 +48,7 @@ from traust_core.v1.models.pqc import (
     PqcWorklistEntry,
 )
 from traust_core.v1.models.validation import ValidationRollup
+from traust_core.v1.models.values import canonical_decimal
 from traust_core.v1.models.vocabulary import (
     ComplianceFramework,
     IsolationDimension,
@@ -58,16 +59,6 @@ from traust_core.v1.models.vocabulary import (
     Severity,
     SlaClockStart,
 )
-
-
-def canonical_decimal(value: Decimal | None) -> str | None:
-    """An exact decimal's shortest fixed-point form, the same whichever backend read it: SQLite
-    hands back 7.5000000000 and 0E-10 where PostgreSQL has 7.5 and 0. Only trailing zeros go;
-    no digit is rounded (Decimal.normalize would round under the context's precision)."""
-    if value is None:
-        return None
-    text = format(value, "f")
-    return text.rstrip("0").rstrip(".") if "." in text else text
 
 
 class ViewName(StrEnum):
