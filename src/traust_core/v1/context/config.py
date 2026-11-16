@@ -21,6 +21,7 @@ from traust_core.v1.models.operations import (
     RecordingStartScope,
     RecordKind,
 )
+from traust_core.v1.providers.http import is_header_value
 from traust_core.v1.services.findings.rating import RatingConfig
 from traust_core.v1.services.findings.review import ReviewConfig
 from traust_core.v1.services.identity import IdentityConfig
@@ -267,7 +268,7 @@ class FeedsConfig(_Model):
         keys = {}
         for source, name in self.api_keys.items():
             value = _read_env(name, f"feeds.api_keys.{source}")
-            if value is None or any(not 0x21 <= ord(c) <= 0x7E for c in value):
+            if value is None or not is_header_value(value):
                 raise ConfigError(
                     f"feeds.api_keys.{source}: ${name} holds no usable header value "
                     "(visible ASCII only)"

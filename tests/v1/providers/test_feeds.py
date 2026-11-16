@@ -476,3 +476,31 @@ def test_a_malformed_port_never_crashes_a_message(url: str) -> None:
     from traust_core.v1.providers.feeds import _host, _origin
 
     assert _host(url) == "nvd.test" and _origin(url) == ("nvd.test", 443)
+
+
+def test_a_port_zero_probe_goes_keyless() -> None:
+    from traust_core.v1.providers.feeds import _host, _origin
+
+    http = _Http()
+    nvd = source(url="https://nvd.test:0/", probe=Probe(None), http=http, api_key=NVD_KEY)
+    assert nvd.check().ready
+    assert http.headers == [None]  # port 0 is not the template's default 443
+    assert _origin("https://nvd.test:0/") == ("nvd.test", 0)
+    assert _host("https://nvd.test:0/") == "nvd.test:0"
+
+
+@pytest.mark.parametrize(
+    ("header", "value", "match"),
+    [
+        ("api key", SECRET, "not an HTTP header name"),
+        ("", SECRET, "not an HTTP header name"),
+        ("apiKey", "", "no usable header value"),
+        ("apiKey", f"{SECRET}\n", "no usable header value"),
+        ("apiKey", f"{SECRET} x", "no usable header value"),
+        ("apiKey", f"{SECRET}é", "no usable header value"),
+    ],
+)
+def test_a_key_checks_its_own_header_and_value(header: str, value: str, match: str) -> None:
+    with pytest.raises(ConfigError, match=match) as raised:
+        ApiKey(header, value)
+    assert SECRET not in str(raised.value)  # never the value, even a malformed one

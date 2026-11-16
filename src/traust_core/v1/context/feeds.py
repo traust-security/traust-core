@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping
 from datetime import date, timedelta
 from pathlib import Path, PurePosixPath
@@ -22,7 +21,7 @@ from traust_core.v1.providers.feeds import (
     Paging,
     Probe,
 )
-from traust_core.v1.providers.http import HttpFetcher
+from traust_core.v1.providers.http import HttpFetcher, is_header_name
 from traust_core.v1.providers.osv import OsvAdvisoryLookup
 from traust_core.v1.providers.package_source import PackageSources, SourceHosts
 from traust_core.v1.repositories.objects.store import ObjectKey, ObjectStore
@@ -79,10 +78,6 @@ class _License(_Strict):
     verified: date | str | None = None
 
 
-# An HTTP header name (RFC 9110 token).
-_HEADER = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
-
-
 class _Source(_Strict):
     tier: str
     mode: str | None = None
@@ -115,7 +110,7 @@ class _Source(_Strict):
     @pydantic.field_validator("api_key_header")
     @classmethod
     def _header_name(cls, value: str | None) -> str | None:
-        if value is not None and not _HEADER.fullmatch(value):
+        if value is not None and not is_header_name(value):
             raise ValueError(f"api_key_header {value!r} is not an HTTP header name")
         return value
 
@@ -139,10 +134,22 @@ class _Registry(_Strict):
 
 
 def _load(path: Path) -> _Registry:
+    """The registry, or a ConfigError that names where it's wrong but never echoes what's there:
+    a credential mistyped into the file (an unknown `api_key` field) stays out of the message."""
     try:
         return _Registry.model_validate(yaml.safe_load(path.read_text()))
-    except (OSError, yaml.YAMLError, pydantic.ValidationError) as e:
+    except OSError as e:
         raise ConfigError(f"cannot read feeds registry {path}: {e}") from e
+    except yaml.YAMLError as e:
+        mark = getattr(e, "problem_mark", None)
+        where = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
+        raise ConfigError(f"cannot read feeds registry {path}: invalid YAML{where}") from None
+    except pydantic.ValidationError as e:
+        problems = "; ".join(
+            f"{'.'.join(str(part) for part in err['loc']) or '(top level)'}: {err['msg']}"
+            for err in e.errors(include_input=False, include_url=False)
+        )
+        raise ConfigError(f"cannot read feeds registry {path}: {problems}") from None
 
 
 _FIX_PATCHES = "fix-patches"
@@ -254,7 +261,7 @@ def load_feed_sources(
                 ident=source.ident,
                 post=post,
                 probe=probe,
-                api_key=_api_key(path, name, source, keys.get(name), post=post),
+                api_key=_api_key(source, keys.get(name)),
                 http=http,
                 probe_http=probe_http,
                 clock=clock,
@@ -264,26 +271,21 @@ def load_feed_sources(
 
 
 def _valid_port(url: str) -> bool:
-    """Whether a URL's port, if any, parses: a non-numeric or out-of-range one doesn't."""
+    """Whether a URL's port, if any, is one a request can go to: a non-numeric or out-of-range
+    one isn't, and neither is 0."""
     try:
-        _ = urlsplit(url).port  # raises on a malformed port
+        port = urlsplit(url).port  # raises on a malformed or out-of-range port
     except ValueError:
         return False
-    return True
+    return port != 0
 
 
-def _api_key(
-    path: Path, name: str, source: _Source, value: str | None, *, post: bool
-) -> ApiKey | None:
-    """The key a deployment gives a source, checked here so a bad one fails at load, not at its
-    first request: only a source declaring the header it travels in, and only on GET."""
+def _api_key(source: _Source, value: str | None) -> ApiKey | None:
+    """The key a deployment gives a source that declares the header it travels in. ApiKey checks
+    the header and value itself, so a bad one fails at load, not at its first request; the
+    registry has already refused a header on anything but a per-identifier GET."""
     if value is None or source.api_key_header is None:
         return None
-    if post:  # unreachable: the registry refuses api_key_header on a POST source
-        raise ConfigError(f"feeds.api_keys names {name}: keys are sent on GET sources only")
-    if not value or any(not 0x21 <= ord(c) <= 0x7E for c in value):
-        # visible ASCII only: a control, a space or a non-ASCII character can't be sent
-        raise ConfigError(f"feeds.api_keys.{name}: the key holds no usable header value")
     return ApiKey(source.api_key_header, value)
 
 

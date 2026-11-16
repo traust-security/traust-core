@@ -27,7 +27,7 @@ from traust_core.v1.models.values import GitSha
 from traust_core.v1.models.vocabulary import Ecosystem
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
-from traust_core.v1.providers.http import HttpFetcher
+from traust_core.v1.providers.http import HttpFetcher, is_header_name, is_header_value
 
 log = logging.getLogger(__name__)
 
@@ -294,6 +294,16 @@ class ApiKey:
     header: str
     value: str = field(repr=False)
 
+    def __post_init__(self) -> None:
+        # the checks travel with the key, so no caller can build one that can't be sent; the
+        # messages never carry the value
+        if not is_header_name(self.header):
+            raise ConfigError(f"api key header {self.header!r} is not an HTTP header name")
+        if not is_header_value(self.value):
+            raise ConfigError(
+                f"the {self.header} key holds no usable header value (visible ASCII only)"
+            )
+
     def headers(self) -> dict[str, str]:
         return {self.header: self.value}
 
@@ -318,11 +328,14 @@ def _host(url: str) -> str:
     """A URL's host (and a non-default port) for a message: never its userinfo."""
     host = urlsplit(url).hostname or ""
     port = _port(url)
-    return f"{host}:{port}" if port and port != 443 else host
+    return f"{host}:{port}" if port is not None and port != 443 else host
 
 
 def _origin(url: str) -> tuple[str, int]:
-    return (urlsplit(url).hostname or "").lower(), _port(url) or 443
+    """Host and port, HTTPS's default only where the URL names none: an explicit port (even
+    0, which the registry refuses) never matches the default."""
+    port = _port(url)
+    return (urlsplit(url).hostname or "").lower(), 443 if port is None else port
 
 
 class FeedSource:

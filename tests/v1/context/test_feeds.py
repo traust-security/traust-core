@@ -505,3 +505,43 @@ def test_a_malformed_port_error_never_shows_the_url(tmp_path: Path) -> None:
     with pytest.raises(ConfigError) as raised:
         Context(Config()).register_feeds(_registry(tmp_path, text))
     assert "malformed URL port" in str(raised.value) and "hunter2" not in str(raised.value)
+
+
+def test_a_rejected_key_setting_leaves_the_context_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TEST_NVD_KEY", "k-1")
+    ctx = Context(Config(feeds=FeedsConfig(api_keys={"nvd": "TEST_NVD_KEY"})))
+    with pytest.raises(ConfigError, match="declares no api_key_header"):
+        ctx.register_feeds(_registry(tmp_path, SOURCES))  # epss is cached and loads first
+    assert ctx.feeds.names() == [] and ctx.feed_sources.names() == []
+    ctx.register_feeds(_registry(tmp_path, NVD_HEADER))  # corrected: starts clean
+    assert "epss" in ctx.feeds.names()
+    assert ctx.feed_sources.get("nvd")._api_key.headers() == {"apiKey": "k-1"}
+
+
+SECRET = "test-only-mistyped-secret"
+
+
+@pytest.mark.parametrize(
+    ("line", "names"),
+    [
+        (f"    api_key: {SECRET}\n", "sources.nvd.api_key: Extra inputs are not permitted"),
+        (f"    api_key: '{SECRET}\n", "invalid YAML at line"),  # an unterminated quote
+    ],
+    ids=["unknown-field", "invalid-yaml"],
+)
+def test_a_secret_mistyped_into_the_registry_stays_out_of_the_error(
+    tmp_path: Path, line: str, names: str
+) -> None:
+    text = SOURCES.rstrip() + "\n" + line
+    with pytest.raises(ConfigError) as raised:
+        Context(Config()).register_feeds(_registry(tmp_path, text))
+    assert names in str(raised.value) and SECRET not in str(raised.value)
+
+
+def test_a_source_url_on_port_zero_is_a_config_error(tmp_path: Path) -> None:
+    text = SOURCES.replace("https://nvd.test/cves", "https://nvd.test:0/cves")
+    assert text != SOURCES
+    with pytest.raises(ConfigError, match="nvd has a malformed URL port"):
+        Context(Config()).register_feeds(_registry(tmp_path, text))
