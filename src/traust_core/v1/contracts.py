@@ -205,7 +205,7 @@ def validate_config(name: str, document: Any) -> None:
     _check(name, _config_validator(name), document)
 
 
-def config_schema_errors(name: str, document: Any) -> list[SchemaViolation]:
+def config_schema_errors(name: str, document: object) -> list[SchemaViolation]:
     """A config document's contract violations, raw: for a caller that reports them without
     echoing the document (traust.yaml, which names the deployment's secrets)."""
     return _violations(_config_validator(name), document)

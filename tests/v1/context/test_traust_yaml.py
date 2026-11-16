@@ -447,3 +447,31 @@ def test_a_validator_still_says_which_rule_failed(tmp_path: Path, text: str, rea
     path.write_text(text)
     with pytest.raises(ConfigError, match=reason):
         Config.from_file(path)
+
+
+def test_a_repeated_asset_is_named_by_its_positions_never_its_value(tmp_path: Path) -> None:
+    pasted = "nvd-7f3a91c2b4d8e6f0"  # a value pasted into two recording allowlists
+    path = tmp_path / "traust.yaml"
+    path.write_text(f"recording:\n  triage: [a, {pasted}]\n  assessment: [{pasted}]\n")
+    with pytest.raises(
+        ConfigError, match=r"recording\.triage\[1\] and recording\.assessment\[0\]"
+    ) as raised:
+        Config.from_file(path)
+    import traceback
+
+    assert pasted not in "".join(traceback.format_exception(raised.value))
+
+
+def test_a_root_that_is_not_a_mapping_is_located(tmp_path: Path) -> None:
+    path = tmp_path / "traust.yaml"
+    path.write_text("# a comment\njust-a-string\n")
+    with pytest.raises(ConfigError, match=r"line 2: \$: is not of type 'object'") as raised:
+        Config.from_file(path)
+    assert "just-a-string" not in str(raised.value)
+
+
+def test_a_repeated_key_points_at_the_value_that_was_checked(tmp_path: Path) -> None:
+    path = tmp_path / "traust.yaml"
+    path.write_text("feeds:\n  osv_access: api\nfeeds:\n  osv_access: nope\n")
+    with pytest.raises(ConfigError, match=r"line 4: feeds/osv_access: is not one of"):
+        Config.from_file(path)

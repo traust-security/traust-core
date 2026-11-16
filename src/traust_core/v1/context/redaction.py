@@ -6,10 +6,12 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from pathlib import Path
 
 import yaml
 
-from traust_core.v1.contracts import SchemaViolation
+from traust_core.v1.contracts import SchemaViolation, config_property_names, config_schema_errors
+from traust_core.v1.errors import ConfigError, DocumentError, Issue
 
 
 class ConfigParseError(Exception):
@@ -33,7 +35,9 @@ def locate(
     """Where a path into a YAML document is: the line of the deepest node it reaches, and the
     path showing list indexes and the schema's own property names only. Any other key (a custom
     name, an unquoted number, a pasted key) shows as the line it's on, never its text."""
-    node, line, shown = root, None, []
+    # the root's own line, so an error at `$` (a scalar where a mapping goes) is located too
+    node, shown = root, []
+    line = root.start_mark.line + 1 if root is not None else None
     for part in path:
         if isinstance(node, yaml.SequenceNode) and isinstance(part, int):
             shown.append(str(part))
@@ -50,11 +54,14 @@ def locate(
 
 
 def _entry(node: yaml.Node | None, key: int | str) -> tuple[int | None, yaml.Node | None]:
+    """A mapping's entry for `key`: the LAST one, as `yaml.safe_load` keeps the last value of
+    a repeated key, so an error points at the value that was validated."""
+    found: tuple[int | None, yaml.Node | None] = (None, None)
     if isinstance(node, yaml.MappingNode):
         for k, v in node.value:
             if k.value == str(key):
-                return k.start_mark.line + 1, v
-    return None, None
+                found = (k.start_mark.line + 1, v)
+    return found
 
 
 def schema_issue(root: yaml.Node | None, error: SchemaViolation, names: frozenset[str]) -> str:
@@ -113,3 +120,30 @@ def _extras(root: yaml.Node | None, error: SchemaViolation, names: frozenset[str
 def _name_ok(name: object, *, value: object) -> bool:
     pattern = value.get("pattern") if isinstance(value, dict) else None
     return isinstance(name, str) and (pattern is None or re.search(pattern, name) is not None)
+
+
+def load_yaml_config(
+    path: Path, schema: str, *, label: str | None = None, empty: object = None
+) -> tuple[str, object]:
+    """A YAML config file from the deployment's home, read and checked against its contract,
+    as `(text, document)`. Every error is a ConfigError that never echoes the file: a YAML
+    failure by kind and position, a contract violation located by line and worded by the
+    schema, each with a cause redacted the same way. An empty file is `empty` (traust.yaml: {})."""
+    name = label or str(path)
+    try:
+        text = path.read_bytes().decode()  # exact: no newline translation, so a caller can hash it
+    except (OSError, UnicodeDecodeError) as e:
+        raise ConfigError(f"cannot read {name}: {e.strerror or type(e).__name__}") from e
+    try:
+        document = yaml.safe_load(text)
+        if document is None:
+            document = empty
+    except yaml.YAMLError as e:
+        raise ConfigError(f"cannot read {name}: invalid YAML{yaml_where(e)}") from yaml_cause(e)
+    if errors := config_schema_errors(schema, document):
+        names = config_property_names(schema)
+        root = yaml.compose(text)
+        issues = [schema_issue(root, e, names) for e in errors]
+        cause = DocumentError(schema, [Issue("$", issue) for issue in issues])
+        raise ConfigError(f"{name}: {'; '.join(issues)}") from cause
+    return text, document
