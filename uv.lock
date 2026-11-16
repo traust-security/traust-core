@@ -1680,7 +1680,7 @@ wheels = [
 [[package]]
 name = "traust-contracts"
 version = "0.1.0"
-source = { git = "https://github.com/traust-security/traust-contracts.git?rev=e164e4abdfe9a3128b5ecc53d1e17caae86e0d83#e164e4abdfe9a3128b5ecc53d1e17caae86e0d83" }
+source = { git = "https://github.com/traust-security/traust-contracts.git?rev=f4a6bd9cb51bdc976e977f7485cb1df9899448c4#f4a6bd9cb51bdc976e977f7485cb1df9899448c4" }
 dependencies = [
     { name = "jsonschema", extra = ["format-nongpl"] },
     { name = "pydantic" },
@@ -1746,7 +1746,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "referencing", specifier = ">=0.30" },
     { name = "sqlalchemy", specifier = ">=2.0" },
-    { name = "traust-contracts", git = "https://github.com/traust-security/traust-contracts.git?rev=e164e4abdfe9a3128b5ecc53d1e17caae86e0d83" },
+    { name = "traust-contracts", git = "https://github.com/traust-security/traust-contracts.git?rev=f4a6bd9cb51bdc976e977f7485cb1df9899448c4" },
     { name = "traust-ledger", git = "https://github.com/traust-security/traust-ledger.git?rev=95fd75ed9b7f548322f528f1fd99263ed6733960" },
     { name = "tree-sitter", specifier = "==0.26.0" },
     { name = "tree-sitter-go", specifier = "==0.25.0" },
