@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import string
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import date, timedelta
 from functools import cache
 from pathlib import Path, PurePosixPath
@@ -301,9 +301,7 @@ def load_feed_sources(
     found = []
     registry = _load(path).sources
     keys = dict(api_keys or {})
-    for name in keys:
-        if name not in registry:
-            raise ConfigError(f"feeds.api_keys names {name}, which is not a registered feed source")
+    check_api_key_sources(path, keys)
     for name in keys:
         source = registry[name]
         if source.role in _HOST_ROLES or source.access == "disabled":
@@ -353,6 +351,18 @@ def load_feed_sources(
             )
         )
     return tuple(found)
+
+
+def check_api_key_sources(path: Path, names: Iterable[str]) -> None:
+    """Every source traust.yaml's `feeds.api_keys` names is in the feeds registry. No name is
+    echoed, the unknown one or the registry's: either may be a key pasted where a source's
+    name goes. The registry file to compare against is named instead."""
+    registry = _load(path).sources
+    if unknown := [name for name in names if name not in registry]:
+        raise ConfigError(
+            f"feeds.api_keys names {len(unknown)} source(s) the feeds registry ({path}) doesn't "
+            "have; names aren't shown, since one may be a pasted key"
+        )
 
 
 def _valid_port(url: str) -> bool:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from functools import cache
@@ -202,21 +202,17 @@ def _config_validator(name: str) -> Draft202012Validator:
 
 
 def validate_config(name: str, document: Any) -> None:
-    """A deployment config document against its contract. Its errors never echo what the file
-    holds (a credential pasted where a variable's name goes must stay out of a startup error):
-    each names its path through the schema's own property names and the rule it breaks."""
-    validator = _config_validator(name)
-    errors = _violations(validator, document)
-    if errors:
-        names = _schema_property_names(name)
-        raise DocumentError(
-            name,
-            [Issue(_redacted_path(document, e.absolute_path, names), _rule(e)) for e in errors],
-        )
+    _check(name, _config_validator(name), document)
+
+
+def config_schema_errors(name: str, document: object) -> list[SchemaViolation]:
+    """A config document's contract violations, raw: for a caller that reports them without
+    echoing the document (traust.yaml, which names the deployment's secrets)."""
+    return _violations(_config_validator(name), document)
 
 
 @cache
-def _schema_property_names(name: str) -> frozenset[str]:
+def config_property_names(name: str) -> frozenset[str]:
     """Every property name a config schema declares, at any depth."""
     found: set[str] = set()
 
@@ -233,53 +229,6 @@ def _schema_property_names(name: str) -> frozenset[str]:
 
     walk(_config_validator(name).schema)
     return frozenset(found)
-
-
-def config_property_names(name: str) -> frozenset[str]:
-    """The property names a config schema declares: the only keys a config error may show."""
-    return _schema_property_names(name)
-
-
-def redacted_config_path(document: Any, path: Iterable[Any], names: frozenset[str]) -> str:
-    """A path into a config document showing list indexes and schema-declared names only; any
-    other key (a custom name, a pasted key) shows as `<key>`."""
-    return _redacted_path(document, path, names)
-
-
-def _redacted_path(document: Any, path: Iterable[Any], names: frozenset[str]) -> str:
-    shown, node = [], document
-    for part in path:
-        if isinstance(node, list) and isinstance(part, int):
-            shown.append(str(part))
-        else:
-            shown.append(part if isinstance(part, str) and part in names else "<key>")
-        try:
-            node = node[part]
-        except (KeyError, IndexError, TypeError):
-            node = None
-    return "/".join(shown) or "$"
-
-
-def _rule(e: SchemaViolation) -> str:
-    """The schema rule an error breaks, in the schema's words only, never the instance."""
-    value = e.validator_value
-    match e.validator:
-        case "required":
-            return e.message  # the missing property's name, from the schema
-        case "pattern":
-            return f"does not match the pattern {value!r}"
-        case "enum":
-            return f"is not one of {value!r}"
-        case "const":
-            return f"is not {value!r}"
-        case "type":
-            return f"is not of type {value!r}"
-        case "additionalProperties" | "unevaluatedProperties":
-            return "has a property the schema does not allow"
-        case "propertyNames":
-            return "has a property name the schema does not allow"
-        case _:
-            return f"breaks the schema's {e.validator!r} rule"
 
 
 def view_schema(name: str) -> dict[str, JsonValue]:
