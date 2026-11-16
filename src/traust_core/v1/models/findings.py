@@ -1252,6 +1252,10 @@ class FindingView(Model):
     # no assessment has reported yet.
     first_reported_at: datetime | None = None
     last_reported_at: datetime | None = None
+    # The accepted claim's description — the drawer's substance on core rows; None when
+    # no claim was accepted (the report artifact keeps the reported text, the finding
+    # row never carried it).
+    description: str | None = None
     locations: tuple[Location | ClaimLocation, ...] = ()
     cwes: tuple[str, ...] = ()
     labels: tuple[FindingLabel, ...] = ()

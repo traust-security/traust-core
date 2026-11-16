@@ -215,6 +215,7 @@ class FindingViewQuery:
             sla_due=due,
             first_reported_at=first_reported,
             last_reported_at=last_reported,
+            description=claim.description if claim is not None else None,
             locations=(
                 claim.locations
                 if claim is not None
