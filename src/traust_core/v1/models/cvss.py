@@ -102,7 +102,6 @@ _V4_METRICS = {
     "U": ("X", "Clear", "Green", "Amber", "Red"),
 }
 _DECIMAL = re.compile(r"\d{1,2}(\.\d{1,3})?")
-_CVE_LIST = "https://github.com/CVEProject/cvelistV5/"
 _NIST = "nvd@nist.gov"
 _NVD_BLOCKS: tuple[tuple[str, CvssVersion], ...] = (("v31", "3.1"), ("v30", "3.0"), ("v40", "4.0"))
 _OSV_TYPES: dict[str, CvssVersion | None] = {"CVSS_V3": None, "CVSS_V4": "4.0"}
@@ -217,8 +216,6 @@ class _OsvSeverity(Dto):
 
 class _OsvDatabase(Dto):
     github_reviewed: StrictBool | None = None
-    osv_generated_from: StrictStr | None = None
-    cna_assigner: StrictStr | None = None
 
 
 class _OsvRecord(Dto):
@@ -272,6 +269,70 @@ def _parsed(shape: type[_D], raw: bytes, kind: str) -> _D:
         raise ValidationError(f"not {kind} ({e.error_count()} problem(s))") from e
 
 
+class _CveListCvss(Dto):
+    version: StrictStr
+    vector: StrictStr = Field(alias="vectorString")
+    stated: _Stated = Field(None, alias="baseScore")
+
+
+class _CveListMetric(Dto):
+    v31: _CveListCvss | None = Field(None, alias="cvssV3_1")
+    v30: _CveListCvss | None = Field(None, alias="cvssV3_0")
+    v40: _CveListCvss | None = Field(None, alias="cvssV4_0")
+
+
+class _CveListProvider(Dto):
+    org_id: StrictStr | None = Field(None, alias="orgId")
+    short_name: StrictStr | None = Field(None, alias="shortName")
+
+
+class _CveListContainer(Dto):
+    provider: _CveListProvider = Field(alias="providerMetadata")
+    metrics: tuple[_CveListMetric, ...] = ()
+
+
+class _CveListContainers(Dto):
+    cna: _CveListContainer | None = None
+    adp: tuple[_CveListContainer, ...] = ()
+
+
+class _CveListMetadata(Dto):
+    cve_id: StrictStr = Field(alias="cveId")
+    state: StrictStr
+
+
+class _CveListRecord(Dto):
+    metadata: _CveListMetadata = Field(alias="cveMetadata")
+    containers: _CveListContainers = Field(default_factory=_CveListContainers)
+
+
+def cve_list_scores(raw: bytes, *, acquired_at: datetime | None = None) -> tuple[CvssScore, ...]:
+    """A CVE List record's (CVE JSON 5): the CNA's container, then each ADP's, by name. A
+    record that isn't PUBLISHED states nothing."""
+    record = _parsed(_CveListRecord, raw, "a CVE List record")
+    if record.metadata.state != "PUBLISHED":
+        return ()
+    containers = record.containers
+    tagged = [(CvssSource.CNA, containers.cna)] if containers.cna is not None else []
+    tagged += [(CvssSource.ADP, adp) for adp in containers.adp]
+    found = [
+        score_of(
+            source,
+            cvss.vector,
+            document=f"cve-list:{record.metadata.cve_id}",
+            version=version,
+            stated=cvss.stated,
+            scored_by=container.provider.short_name or container.provider.org_id,
+            acquired_at=acquired_at,
+        )
+        for source, container in tagged
+        for metric in container.metrics
+        for block, version in _NVD_BLOCKS
+        if (cvss := getattr(metric, block)) is not None
+    ]
+    return distinct(found)
+
+
 def nvd_scores(raw: bytes, *, acquired_at: datetime | None = None) -> tuple[CvssScore, ...]:
     """An NVD CVE record's: NIST's "Primary", the CNA's "Secondary" (from the record's own
     `sourceIdentifier`), and any other "Secondary" as an ADP's."""
@@ -304,18 +365,12 @@ def nvd_scores(raw: bytes, *, acquired_at: datetime | None = None) -> tuple[Cvss
 
 
 def osv_scores(raw: bytes, *, acquired_at: datetime | None = None) -> tuple[CvssScore, ...]:
-    """An OSV record's: a GitHub-reviewed GHSA's, or a CVE List record's (the CNA's). Any
-    other OSV record ranks nowhere."""
+    """A GitHub-reviewed GHSA record's. Any other OSV record ranks nowhere: the CNA's scores
+    come from the CVE List record itself (`cve_list_scores`), never OSV's lossy copy of it."""
     record = _parsed(_OsvRecord, raw, "an OSV record")
-    database = record.database
-    if record.record_id.startswith("GHSA-") and database.github_reviewed is True:
-        source, by = CvssSource.GHSA, "github"
-    elif record.record_id.startswith("CVE-") and (database.osv_generated_from or "").startswith(
-        _CVE_LIST
-    ):
-        source, by = CvssSource.CNA, database.cna_assigner
-    else:
+    if not (record.record_id.startswith("GHSA-") and record.database.github_reviewed is True):
         return ()
+    source, by = CvssSource.GHSA, "github"
     found = [
         score_of(
             source,
