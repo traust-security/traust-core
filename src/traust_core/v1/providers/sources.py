@@ -139,15 +139,20 @@ class SourceError(ServiceError):
         liveness_status: LivenessStatus = LivenessStatus.UNKNOWN,
         canonical_url: str | None = None,
         endpoint_unreachable: bool = False,
+        empty_repository: bool = False,
     ) -> None:
         super().__init__(message, endpoint_unreachable=endpoint_unreachable)
         self.observation_status = observation_status
         self.liveness_status = liveness_status
         self.canonical_url = canonical_url
+        self.empty_repository = empty_repository
         # The transport's positive word the repository's host is not there (NXDOMAIN,
         # refused, TLS) — unlike a timeout, gone-class evidence the unreachable
         # disposition counts with reason `unreachable`, never "gone" (foundry plan
         # repo-unreachable: unreachable-from-here, not gone).
+        # empty_repository: the repository read answered, but its default branch names
+        # no commit (an empty repository — GitHub answers 404/409 for the ref while the
+        # repository itself reports a default branch); the gone-class reason `empty`.
 
 
 class SourceProvider(Protocol):

@@ -322,25 +322,50 @@ class FindingIntake:
                     f"{confirmed.repository_id}, but {examiner} examined {repo.id}"
                 )
             return Fingerprint(confirmed.fingerprint_algo, confirmed.fingerprint)
+        current = self._identity_key(repo.url, candidate)
+        return self._moved_identity(repo, candidate, current)
+
+    def _identity_key(self, url: str, candidate: FindingCandidate) -> Fingerprint:
+        """The candidate's identity under one repository URL."""
         if candidate.exposure is not None:
             if candidate.policy:
                 raise ValidationError(
                     f"{candidate.label}: both an exposure and a policy check; "
                     "a finding has one identity"
                 )
-            return self._identity.exposure_key(repo.url, candidate.exposure)
+            return self._identity.exposure_key(url, candidate.exposure)
         spots = tuple(FingerprintLocation(path=s.path) for s in candidate.locations)
         if candidate.policy and candidate.resources:
             spots = tuple(FingerprintLocation(resource=r) for r in candidate.resources)
         return self._identity.match_key(
             FingerprintInput(
-                repo=repo.url,
+                repo=url,
                 cwes=candidate.cwes,
                 check_id=candidate.rule if candidate.policy else None,
                 locations=spots,
             ),
             strict=True,
         )
+
+    def _moved_identity(
+        self, repo: Repository, candidate: FindingCandidate, current: Fingerprint
+    ) -> Fingerprint:
+        """The URL correction's identity continuity (foundry plan repo-unreachable,
+        resolved decision 4): a repository whose URL was corrected keeps findings
+        stamped under the vacated URL — the upstream edge records the move — so a
+        candidate first matches the stamps under the URLs the repository previously
+        carried before taking a new identity under the current URL. The old stamp is
+        returned unchanged: the finding keeps the identity its ledger dispositions
+        were recorded against, and the next audit at the new URL matches it again. A
+        URL that was never the repository's simply matches nothing."""
+        if repo.id is None:
+            return current
+        for url in self._inventory.prior_urls(repo.id):
+            alias = self._identity_key(url, candidate)
+            with self._uow as uow:
+                if uow.findings.find_by_fingerprint(repo.id, alias.algo, alias.value) is not None:
+                    return alias
+        return current
 
     def _take(
         self,

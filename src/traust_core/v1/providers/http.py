@@ -33,14 +33,29 @@ def _target_hash(url: str) -> str:
 
 def _positively_unreachable(error: BaseException) -> bool:
     """Whether the transport positively established the endpoint is not there: name
-    resolution failed (NXDOMAIN), the connection was refused, or TLS failed its handshake.
-    A timeout or a reset said nothing - the endpoint might be there - so those are never
-    gone-class evidence (foundry plan repo-unreachable: the transient classes never count
-    toward the disposition, the DNS/TLS word does)."""
+    resolution answered no such name (EAI_NONAME/EAI_NODATA - not EAI_AGAIN, a resolver
+    that is merely busy), the connection was refused, or TLS refused the certificate.
+    A timeout, a reset, a busy resolver or an interrupted handshake said nothing - the
+    endpoint might be there - so those are never gone-class evidence (foundry plan
+    repo-unreachable: the transient classes never count toward the disposition, only
+    the positive word does; Qodo #474)."""
     reason = getattr(error, "reason", error)  # URLError reports its cause as `reason`
     if isinstance(reason, urllib.error.URLError):
         reason = getattr(reason, "reason", reason)
-    return isinstance(reason, (socket.gaierror, ConnectionRefusedError, ssl.SSLError))
+    if isinstance(reason, socket.gaierror):
+        return reason.errno in _NO_SUCH_NAME
+    # SSLCertVerificationError is the positive word (this certificate is not valid);
+    # SSLEOFError/SSLZeroReturnError are interrupted handshakes - transient, never counted.
+    return isinstance(reason, (ConnectionRefusedError, ssl.SSLCertVerificationError))
+
+
+#: The resolver's definitive no-such-name answers. EAI_AGAIN (a busy resolver) and
+#: EAI_FAIL are excluded: they say nothing about the name.
+_NO_SUCH_NAME = frozenset(
+    code
+    for code in (getattr(socket, "EAI_NONAME", None), getattr(socket, "EAI_NODATA", None))
+    if code is not None
+)
 
 
 def _refused(url: str, status: int, operation: str) -> ServiceError:

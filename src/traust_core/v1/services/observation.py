@@ -191,6 +191,7 @@ def observe_forge_facts(
             }
         )
     facts = facts.model_copy(update={"availability_queried": True})
+    repository_read = False  # the repository's own read answered; later calls may still fail
     try:
         info = _fetch(lambda: sources.info(repo), RepoInfo)
         if info.repo != repo:
@@ -233,6 +234,7 @@ def observe_forge_facts(
                     "gone_reason": GoneReason.GONE,
                 }
             )
+        repository_read = True
         branch = info.default_branch
         head = None
         if seen is not None and (seen.branch, seen.pushed_at) == (branch, info.pushed_at):
@@ -254,7 +256,16 @@ def observe_forge_facts(
             LivenessStatus.DISABLED,
         ):
             gone = GoneReason.GONE
-        elif exc.endpoint_unreachable:
+        elif exc.empty_repository:
+            # The repository read answered but its default branch names no commit:
+            # an empty repository (200, no commits) - gone-class with its own reason.
+            gone = GoneReason.EMPTY
+        elif exc.endpoint_unreachable and not repository_read:
+            # Only the repository read's own transport word counts: the host answered
+            # no-such-name (or refused, or refused the certificate) when asked for the
+            # repository. A later call failing that way after the repository read
+            # answered says nothing repository-level - the host was just there (Qodo
+            # #474: a failed branch read must not sideline a live repository).
             gone = GoneReason.UNREACHABLE
         return facts.model_copy(
             update={

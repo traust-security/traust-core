@@ -377,3 +377,119 @@ def test_the_verify_holds_untouched_on_a_transient_failure():
     assert after.disposition == before.disposition
     assert after.disposition_evidence == before.disposition_evidence
     assert after.gone_streak == before.gone_streak
+
+
+# The Qodo #474 rounds: the observation's own staging, the transient words, and the
+# correction's downstream invariants.
+
+
+def test_a_failed_later_read_never_clears_the_disposition():
+    """The repository read answered (the repo is alive) but the branch read failed: the
+    observation did not complete, so it is a failure — never a success that clears."""
+    harness, service, _, _, sources = observer()
+    swap = _SwappingSource(sources)
+    swap.say(_gone())
+    _observe(service, harness.repository_id, minutes=1)
+    _observe(service, harness.repository_id, minutes=2)
+    assert _repository(service, harness.repository_id).disposition is not None
+    # info answers healthy, the head read times out: a failed observation.
+    swap.say({**_healthy(), "head_error": "timed out", "head_kind": "unreachable"})
+    _observe(service, harness.repository_id, minutes=3)
+    repository = _repository(service, harness.repository_id)
+    assert repository.disposition == RepositoryDisposition.REPO_UNREACHABLE
+    assert repository.gone_streak == 2  # neither counted nor reset
+
+
+def test_a_later_reads_transport_failure_never_counts_gone():
+    """The repository read answered and a later read failed unreachable: the host was
+    just there, so the failure says nothing repository-level — no flip across two."""
+    harness, service, _, _, sources = observer()
+    swap = _SwappingSource(sources)
+    swap.say({**_healthy(), "head_error": "no route to host", "head_unreachable": True})
+    _observe(service, harness.repository_id, minutes=1)
+    _observe(service, harness.repository_id, minutes=2)
+    repository = _repository(service, harness.repository_id)
+    assert repository.disposition is None
+    assert repository.gone_streak == 0
+
+
+def test_the_github_empty_repository_flips_with_reason_empty():
+    """GitHub reports a default branch for a repository with no commits; the branch read
+    then answers 404/409 — the empty signature, not a transient error."""
+    harness, service, _, _, sources = observer()
+    swap = _SwappingSource(sources)
+    swap.say({**_healthy(), "head_error": "Git Repository is empty", "head_empty": True})
+    _observe(service, harness.repository_id, minutes=1)
+    _observe(service, harness.repository_id, minutes=2)
+    repository = _repository(service, harness.repository_id)
+    assert repository.disposition == RepositoryDisposition.REPO_UNREACHABLE
+    assert repository.disposition_reason == GoneReason.EMPTY
+
+
+def test_the_flip_timestamp_survives_later_failed_verifies():
+    """disposition_at records when the repository left the planner's universe, not when
+    it was last seen gone: the refresh carries the reason and evidence, never the time."""
+    harness, service, _, _, sources = observer()
+    swap = _SwappingSource(sources)
+    swap.say(_gone(error="the flip"))
+    _observe(service, harness.repository_id, minutes=1)
+    _observe(service, harness.repository_id, minutes=2)
+    flipped = _repository(service, harness.repository_id)
+    assert flipped.disposition_at is not None
+    swap.say(_gone(error="still gone"))
+    _observe(service, harness.repository_id, minutes=3)
+    held = _repository(service, harness.repository_id)
+    assert held.disposition_at == flipped.disposition_at
+    assert held.disposition_evidence == "still gone"
+
+
+def test_an_observation_for_a_vacated_url_counts_for_neither_side():
+    """A correction landing mid-observation: the answer belongs to the URL the row no
+    longer carries, so it neither counts nor clears."""
+    harness, service, _, _, sources = observer()
+    _set_source(service, sources, _gone())
+    facts = service.record_forge_facts(repository_id=harness.repository_id)
+    service.correct_repository_url(
+        harness.repository_id, _url("https://github.com/moved/relocated")
+    )
+    # The in-flight observation lands after the correction committed.
+    service._count_toward_disposition(harness.repository_id, facts, observed_url=facts.repo_url)
+    repository = _repository(service, harness.repository_id)
+    assert repository.url == "https://github.com/moved/relocated"
+    assert repository.gone_streak == 0  # the correction reset it; the stale answer added nothing
+
+
+def test_the_url_branch_applies_the_dispositioned_predicate():
+    harness, service, _, _, sources = observer()
+    _set_source(service, sources, _gone())
+    _observe(service, harness.repository_id, minutes=1)
+    _observe(service, harness.repository_id, minutes=2)
+    url = _repository(service, harness.repository_id).url
+    active = service.list_repositories(
+        RepositoryFilter(url=url, dispositioned=False), PageRequest(limit=10)
+    )
+    gone = service.list_repositories(
+        RepositoryFilter(url=url, dispositioned=True), PageRequest(limit=10)
+    )
+    assert active.items == ()
+    assert [r.id for r in gone.items] == [harness.repository_id]
+
+
+def test_the_tombstone_is_dispositioned_at_creation():
+    """The vacated URL is known gone — the person just corrected away from it — so its
+    row never re-enters the planner's universe to burn two observations proving it."""
+    harness, service, _, _, _sources = observer()
+    old_url = _repository(service, harness.repository_id).url
+    service.correct_repository_url(
+        harness.repository_id, _url("https://github.com/moved/relocated")
+    )
+    universe = service.list_repositories(
+        RepositoryFilter(dispositioned=False), PageRequest(limit=100)
+    )
+    assert old_url not in {r.url for r in universe.items}
+    tombstone = service.find_repository(old_url)
+    assert tombstone is not None and tombstone.disposition == (
+        RepositoryDisposition.REPO_UNREACHABLE
+    )
+    assert tombstone.disposition_reason == GoneReason.GONE
+    assert tombstone.upstream_id == harness.repository_id

@@ -46,6 +46,7 @@ class RepositoryRepository(MutableRecordRepository[Repository], Protocol):
     def find_by_url_casefold(self, url: str) -> Repository | None: ...
     def lock_url(self, url: str) -> None: ...
     def find_private_mirror(self, upstream_id: UUID) -> Repository | None: ...
+    def list_by_upstream(self, upstream_id: UUID) -> list[Repository]: ...
     def list_by_ids(self, repository_ids: Collection[UUID]) -> list[Repository]: ...
     def list_all(self, *, read_budget: RecordBudget | None = None) -> list[Repository]: ...
     def search(
@@ -98,6 +99,13 @@ class SqlRepositoryRepository(SqlMutableRepository[Repository]):
         if self._connection.dialect.name == "postgresql":
             lock = sa.func.pg_advisory_xact_lock(sa.func.hashtext(url.lower()))
             self._execute(f"lock {url}", sa.select(lock))
+
+    def list_by_upstream(self, upstream_id: UUID) -> list[Repository]:
+        """Every repository whose upstream link points at `upstream_id`: its forks and
+        mirrors, and — after a URL correction — the vacated-URL rows that record where
+        the repository used to live (the same edge, read whole)."""
+        c = self.table.c
+        return self._many(f"upstream of {upstream_id}", c.upstream_id == upstream_id)
 
     def find_private_mirror(self, upstream_id: UUID) -> Repository | None:
         """A non-public repository that forks `upstream_id` (the oldest, when several do)."""

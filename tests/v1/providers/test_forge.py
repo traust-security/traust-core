@@ -482,18 +482,29 @@ def test_an_ambiguous_forge_failure_never_proves_a_repository_is_missing(http_st
     assert error.value.liveness_status == LivenessStatus.UNKNOWN
 
 
-def test_a_repository_reads_404_is_the_forge_reports_missing():
-    """The repository read itself answering 404 is the forge's positive word the
-    repository is gone (foundry plan repo-unreachable's gone-class): it counts toward
-    the unreachable disposition, with the two-consecutive guard, the success reset and
-    the person's verify as the ambiguity net - a private repository the token cannot
-    see answers the same way, and the disposition's evidence names the forge's word."""
-    provider, _ = source("not found", status=404)
+@pytest.mark.parametrize("gone_status", [404, 410], ids=["not-found", "gone"])
+def test_the_repository_reads_404_and_410_are_the_forge_reports_missing(gone_status):
+    """The gone word (foundry plan repo-unreachable): a repository read answering 404
+    (no such repository) or 410 (gone) both carry liveness missing — the plan counts
+    the forge's 404/10 word (Qodo #474 round on the 410)."""
+    provider, _ = source("not found", status=gone_status)
 
     with pytest.raises(SourceError) as error:
         provider.info(HttpsRepoUrl("github.com", "o/r"))
 
     assert error.value.liveness_status == LivenessStatus.MISSING
+
+
+def test_the_default_branch_read_of_an_empty_repository_marks_it_empty():
+    """A repository whose own read answers but whose default branch names no commit
+    reads 404/409 - the empty repository's signature (GitHub reports a default branch
+    for a repository with no commits; Qodo #474)."""
+    provider, _ = source("Git Repository is empty", status=409)
+
+    with pytest.raises(SourceError) as error:
+        provider.head(HttpsRepoUrl("github.com", "o/r"), "main")
+
+    assert error.value.empty_repository is True
 
 
 @pytest.mark.parametrize(

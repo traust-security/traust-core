@@ -590,3 +590,38 @@ def test_a_suppressed_candidate_is_queued_for_review_even_when_another_shares_it
         rules = {f: uow.occurrences.list_for_finding(f)[0].rule for f in queued}
     assert len(findings) == 2
     assert list(rules.values()) == ["go.sql.injection"]
+
+
+def test_a_moved_repositorys_findings_keep_their_identity(engine: Engine, target: Target) -> None:
+    """The URL correction's identity continuity (foundry plan repo-unreachable, Qodo
+    #474): a repository whose URL was corrected keeps findings stamped under the
+    vacated URL — the upstream edge records the move — so the next audit at the new
+    URL attaches its occurrence to the existing finding instead of creating a
+    duplicate under the new URL's stamp. The finding keeps the identity its ledger
+    dispositions were recorded against."""
+    first = audit(engine, target)
+    stamped = intake(engine).accept(first, [candidate(target)])
+    finding_id = stamped.findings[Label("OPERATOR-abcdef0-001")]
+    original = rows(engine, finding_id)["finding"]
+
+    # The correction: the row keeps its identity at the new URL, and the vacated
+    # URL's row carries the upstream link — the same edge the fork resolution reads.
+    with SqlTraustUnitOfWork(engine) as uow:
+        repo = uow.repositories.get(target.repository.id)
+        assert repo.id is not None
+        uow.repositories.update(
+            repo.model_copy(update={"url": "https://github.com/example/relocated"})
+        )
+        uow.repositories.get_or_add(Repository(url=repo.url, public=True, upstream_id=repo.id))
+        uow.commit()
+
+    second = audit(engine, target)
+    moved = intake(engine).accept(second, [candidate(target)])
+    assert moved.findings[Label("OPERATOR-abcdef0-001")] == finding_id
+    assert moved.created == ()  # one finding, not a duplicate under the new URL
+    got = rows(engine, finding_id)
+    assert (got["finding"].fingerprint_algo, got["finding"].fingerprint) == (
+        original.fingerprint_algo,
+        original.fingerprint,
+    )
+    assert [o.assessment_id for o in got["occurrences"]] == [first, second]

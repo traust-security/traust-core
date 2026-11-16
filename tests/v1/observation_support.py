@@ -126,6 +126,13 @@ class FakeSource:
 
     def head(self, repo, branch):
         self.calls.append("head")
+        if self.info_data.get("head_error"):
+            raise SourceError(
+                self.info_data["head_error"],
+                ComparisonStatus(self.info_data.get("head_kind", "unreachable")),
+                endpoint_unreachable=bool(self.info_data.get("head_unreachable", False)),
+                empty_repository=bool(self.info_data.get("head_empty", False)),
+            )
         return self.result(GitSha(self.info_data.get("head", HEAD)))
 
     def compare(self, repo, baseline, branch):

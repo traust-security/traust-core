@@ -181,16 +181,17 @@ class CommandSourceProvider:
             else:
                 payload = self._object(repo.host, f"projects/{quote(repo.path, safe='')}")
         except SourceError as exc:
-            # The repository read itself answered 404 - visible on the refused read's
-            # cause, the fetcher's own error, because _refused flattens every fast 4xx
-            # into a plain error: the forge positively reports no such repository, so
+            # The repository read itself answered 404/410 - visible on the refused
+            # read's cause, the fetcher's own error, because _refused flattens every
+            # fast 4xx into a plain error: the forge positively reports no such
+            # repository, so
             # liveness is `missing`, the gone-class signal the unreachable disposition
             # counts (a private repository the token cannot see answers the same way;
             # the disposition's evidence names the forge's word, and a person's verify
             # or URL correction settles which it was). Other reads' 404s (a file, a
             # branch) stay plain errors.
             cause = exc.__cause__
-            if isinstance(cause, ServiceError) and cause.status == 404:
+            if isinstance(cause, ServiceError) and cause.status in (404, 410):
                 raise SourceError(
                     f"{repo}: the forge reports no such repository",
                     ComparisonStatus.ERROR,
@@ -480,18 +481,32 @@ class CommandSourceProvider:
     def head(self, repo: HttpsRepoUrl, branch: str) -> Result[GitSha]:
         """The commit a branch points at."""
         name = quote(branch, safe="")
-        if self._kind(repo) == "github":
-            payload = self._object(repo.host, f"repos/{repo.path}/branches/{name}")
-            try:
-                sha = (payload.get("commit") or {}).get("sha")
-            except (AttributeError, TypeError) as exc:
-                raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
-        else:
-            endpoint = f"projects/{quote(repo.path, safe='')}/repository/branches/{name}"
-            try:
-                sha = (self._object(repo.host, endpoint).get("commit") or {}).get("id")
-            except (AttributeError, TypeError) as exc:
-                raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
+        try:
+            if self._kind(repo) == "github":
+                payload = self._object(repo.host, f"repos/{repo.path}/branches/{name}")
+                try:
+                    sha = (payload.get("commit") or {}).get("sha")
+                except (AttributeError, TypeError) as exc:
+                    raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
+            else:
+                endpoint = f"projects/{quote(repo.path, safe='')}/repository/branches/{name}"
+                try:
+                    sha = (self._object(repo.host, endpoint).get("commit") or {}).get("id")
+                except (AttributeError, TypeError) as exc:
+                    raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
+        except SourceError as exc:
+            # A repository whose own read answered but whose default branch names no
+            # commit reads 404 (the unborn ref) or 409 ("Git Repository is empty") -
+            # the empty repository's signature, not a transport failure (Qodo #474:
+            # GitHub reports default_branch for a repository with no commits).
+            cause = exc.__cause__
+            if isinstance(cause, ServiceError) and cause.status in (404, 409):
+                raise SourceError(
+                    f"{repo}: the default branch {branch} names no commit",
+                    ComparisonStatus.ERROR,
+                    empty_repository=True,
+                ) from exc
+            raise
         try:
             return self._result(GitSha.parse(sha), repo)
         except (ValidationError, TypeError) as exc:

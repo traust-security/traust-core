@@ -43,6 +43,7 @@ from traust_core.v1.models.inventory import (
     Component,
     ComponentFilter,
     ExposureClass,
+    GoneReason,
     InventoryExportRow,
     Liveness,
     OrgName,
@@ -268,6 +269,21 @@ class Inventory:
             )
         return refs[0]
 
+    def prior_urls(self, repository_id: UUID) -> tuple[str, ...]:
+        """The URLs this repository previously carried: the vacated-URL rows pointing
+        upstream at it (the URL correction's record — the same edge the fork resolution
+        reads). Findings stamped under those URLs still belong to the repository, so the
+        finding intake matches a candidate against them before taking a new identity
+        (foundry plan repo-unreachable, resolved decision 4: the fingerprints survive
+        the move through the edge). A mirror's URL simply matches nothing."""
+        require_uuid(repository_id, "repository.id")
+        with self._uow as uow:
+            return tuple(
+                row.url
+                for row in uow.repositories.list_by_upstream(repository_id)
+                if row.id is not None
+            )
+
     def private_mirror(self, repository_id: UUID) -> Repository | None:
         with self._uow as uow:
             return uow.repositories.find_private_mirror(repository_id)
@@ -385,7 +401,7 @@ class PortfolioService:
             seen=self._seen_head(target.repository_id),
             tools=self._tools,
         )
-        self._count_toward_disposition(target.repository_id, facts)
+        self._count_toward_disposition(target.repository_id, facts, observed_url=target.repo_url)
         if facts.availability_queried:
             unknown = facts.liveness_status == LivenessStatus.UNKNOWN
             self.record_liveness(
@@ -508,7 +524,9 @@ class PortfolioService:
             )
         )
 
-    def _count_toward_disposition(self, repository_id: UUID, facts: ForgeFacts) -> None:
+    def _count_toward_disposition(
+        self, repository_id: UUID, facts: ForgeFacts, *, observed_url: str | None
+    ) -> None:
         """The gone-class failure counting (foundry plan repo-unreachable), in the
         observation's result processing — every path that lands an observation counts
         the same way: the engine's cadence, the operator's record, the verify door.
@@ -516,29 +534,37 @@ class PortfolioService:
         Two consecutive gone-class failures flip the repository's disposition to
         repo_unreachable: it leaves the planner's universe (the subject gate refuses
         every order for it) until a person's verify succeeds. A successful observation
-        resets the streak and clears the disposition — the only way it clears, because
-        a dispositioned repository is planned nothing and the only observations that
-        can arrive are deliberate acts. The transient classes (timeouts, 5xx, rate
-        limits) never count and never reset: they say nothing about the repository."""
+        — one that *completed*: the forge answered for the repository and no later read
+        failed (a successful repository read followed by a failed branch read is a
+        failed observation, never a success — Qodo #474) — resets the streak and clears
+        the disposition, the only way it clears. The transient classes (timeouts, 5xx,
+        rate limits) never count and never reset: they say nothing about the repository.
+        An observation started at a URL the row no longer carries (a correction landed
+        mid-flight) counts for neither: its answer belongs to the vacated URL."""
         with self._uow.write() as uow:
             repository = uow.repositories.get_for_update(repository_id)
+            if observed_url is not None and repository.url != observed_url:
+                return  # the row moved on: this observation answered for the vacated URL
             update: dict[str, object] = {}
             if facts.gone_reason is not None:
                 streak = repository.gone_streak + 1
                 update["gone_streak"] = streak
                 if streak >= GONE_STREAK_THRESHOLD or repository.disposition is not None:
                     # the flip at two consecutive; an already-dispositioned repository
-                    # holds, its evidence refreshed by what this observation saw
+                    # holds, its reason and evidence refreshed by what this observation
+                    # saw — the flip's own timestamp survives the refresh (it records
+                    # when the repository left, not when it was last seen gone)
                     update.update(
                         disposition=RepositoryDisposition.REPO_UNREACHABLE,
                         disposition_reason=facts.gone_reason,
                         disposition_evidence=facts.error
                         or f"forge reports repository {facts.liveness_status.value}",
-                        disposition_at=self._clock.now(),
+                        disposition_at=repository.disposition_at or self._clock.now(),
                     )
-            elif facts.availability_queried and facts.liveness_status in (
-                LivenessStatus.ACTIVE,
-                LivenessStatus.ARCHIVED,
+            elif (
+                facts.error is None
+                and facts.availability_queried
+                and facts.liveness_status in (LivenessStatus.ACTIVE, LivenessStatus.ARCHIVED)
             ):
                 update["gone_streak"] = 0
                 if repository.disposition is not None:
@@ -549,7 +575,7 @@ class PortfolioService:
                         disposition_at=None,
                     )
             else:
-                return  # a transient or skipped outcome: neutral, the streak stands
+                return  # a transient, skipped or failed outcome: neutral, the streak stands
             if any(getattr(repository, field) != value for field, value in update.items()):
                 repository = uow.repositories.update(repository.model_copy(update=update))
                 uow.commit()
@@ -593,16 +619,27 @@ class PortfolioService:
                 repository.model_copy(update={"url": new, "gone_streak": 0})
             )
             if not case_only:
-                # the vacated URL's row: the move's record, the same edge the fork
+                # The vacated URL's row: the move's record, the same edge the fork
                 # resolution reads. Public, so the private-mirror resolution never
-                # mistakes the vacated self for a push target.
+                # mistakes the vacated self for a push target; and dispositioned at
+                # creation — the vacated URL is known gone (the person just corrected
+                # away from it), so it never re-enters the planner's universe to burn
+                # two observations proving it (Qodo #474).
                 uow.repositories.lock_url(old)
                 tombstone = uow.repositories.find_by_url(old) or uow.repositories.get_or_add(
                     Repository(url=old, public=True)
                 )
-                if tombstone.id != repository.id and tombstone.upstream_id != repository.id:
+                if tombstone.id != repository.id:
                     uow.repositories.update(
-                        tombstone.model_copy(update={"upstream_id": repository.id})
+                        tombstone.model_copy(
+                            update={
+                                "upstream_id": repository.id,
+                                "disposition": RepositoryDisposition.REPO_UNREACHABLE,
+                                "disposition_reason": GoneReason.GONE,
+                                "disposition_evidence": f"url corrected to {new}",
+                                "disposition_at": self._clock.now(),
+                            }
+                        )
                     )
             uow.commit()
         self._uow.after_commit(
@@ -1559,6 +1596,12 @@ class PortfolioService:
     def list_repositories(self, filter: RepositoryFilter, page: PageRequest) -> Page[Repository]:
         if filter.url is not None:
             found = self.find_repository(filter.url)
+            if (
+                found is not None
+                and filter.dispositioned is not None
+                and (found.disposition is not None) != filter.dispositioned
+            ):
+                found = None  # the URL branch answers the same predicate as the page (Qodo #474)
             return Page(items=(found,) if found else ())
         after = page.position()
         with self._uow as uow:
