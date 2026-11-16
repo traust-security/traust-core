@@ -442,7 +442,7 @@ def test_no_deployment_key_is_keyless(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("text", "keys", "match"),
     [
-        (NVD_HEADER, {"nvdd": "k"}, "source.s. the feeds registry doesn't have"),
+        (NVD_HEADER, {"nvdd": "k"}, "source.s. the feeds registry .* doesn.t have"),
         (SOURCES, {"nvd": "k"}, "declares no api_key_header"),  # nowhere for it to travel
         (NVD_HEADER, {"osv": "k"}, "declares no api_key_header"),
         (
@@ -668,6 +668,19 @@ def test_an_unregistered_api_key_source_is_never_echoed(
     pasted = "a1b2c3d4-e5f6-7890-abcd-ef0123456789"  # passes the name pattern: a pasted key
     monkeypatch.delenv("TEST_NVD_KEY", raising=False)  # unset: the name check comes first
     ctx = Context(Config(feeds=FeedsConfig(api_keys={pasted: "TEST_NVD_KEY"})))
-    with pytest.raises(ConfigError, match="the feeds registry doesn't have") as raised:
+    with pytest.raises(ConfigError, match=r"the feeds registry .* doesn.t have") as raised:
         ctx.register_feeds(_registry(tmp_path, NVD_HEADER))
+    assert pasted not in "".join(traceback.format_exception(raised.value))
+
+
+def test_the_registry_names_are_not_listed_either(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pasted = "f0e1d2c3-b4a5-9687-7869-5a4b3c2d1e0f"  # a key pasted as a custom source's name
+    text = NVD_HEADER.replace(
+        "  nvd:", f"  {pasted}:\n    tier: live\n    url_template: https://x.test/{{ident}}\n  nvd:"
+    )
+    ctx = Context(Config(feeds=FeedsConfig(api_keys={"nvdd": "TEST_NVD_KEY"})))
+    with pytest.raises(ConfigError, match="the feeds registry") as raised:
+        ctx.register_feeds(_registry(tmp_path, text))
     assert pasted not in "".join(traceback.format_exception(raised.value))

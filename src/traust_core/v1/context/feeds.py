@@ -354,14 +354,14 @@ def load_feed_sources(
 
 
 def check_api_key_sources(path: Path, names: Iterable[str]) -> None:
-    """Every source traust.yaml's `feeds.api_keys` names is in the feeds registry. An unknown
-    name is never echoed: it may be a key pasted where the source's name goes. The registry's
-    own names are listed instead."""
+    """Every source traust.yaml's `feeds.api_keys` names is in the feeds registry. No name is
+    echoed, the unknown one or the registry's: either may be a key pasted where a source's
+    name goes. The registry file to compare against is named instead."""
     registry = _load(path).sources
     if unknown := [name for name in names if name not in registry]:
         raise ConfigError(
-            f"feeds.api_keys names {len(unknown)} source(s) the feeds registry doesn't have "
-            f"(not shown: a name there may be a pasted key); registered: {', '.join(registry)}"
+            f"feeds.api_keys names {len(unknown)} source(s) the feeds registry ({path}) doesn't "
+            "have; names aren't shown, since one may be a pasted key"
         )
 
 
