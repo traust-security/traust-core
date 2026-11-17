@@ -15,6 +15,7 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
+from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
 from traust_core.v1.models.dependencies import AffectedDependency, NoManifestSbomError
 from traust_core.v1.models.inventory import RepositoryRef
 from traust_core.v1.models.vocabulary import Ecosystem

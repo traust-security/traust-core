@@ -16,6 +16,7 @@ from traust_core.v1.repositories.tables import (
     SqlMutableRepository,
     TableSpec,
     text_column,
+    timestamp_column,
     uuid_column,
 )
 
@@ -30,6 +31,7 @@ FINDING = TableSpec(
         text_column("fingerprint"),
         text_column("kind", nullable=True),
         text_column("title"),
+        timestamp_column("first_seen", nullable=True),
     ),
 )
 

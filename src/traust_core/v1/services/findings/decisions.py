@@ -87,7 +87,9 @@ from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
 from traust_core.v1.services.artifact_publishing import AssessmentLog, record_artifact, stored_bytes
+from traust_core.v1.services.findings import state_history
 from traust_core.v1.services.findings.precedents import FindingPrecedents
+from traust_core.v1.services.findings.rating import RatingPolicy
 from traust_core.v1.services.findings.records import FindingRecords
 from traust_core.v1.services.findings.restatement import RestatementPolicy
 from traust_core.v1.services.findings.review import ReviewPolicy, request
@@ -140,6 +142,7 @@ class FindingDecisions:
         clock: Clock,
         objects: ObjectStore,
         review: ReviewPolicy,
+        rating: RatingPolicy,
         restatement: RestatementPolicy | None = None,
         validation_records: ValidationRecords | None = None,
         source: SourceProvider | None = None,
@@ -156,6 +159,7 @@ class FindingDecisions:
         self._clock = clock
         self._objects = objects
         self._review = review
+        self._rating = rating
         self._restatement = restatement or RestatementPolicy()
         self._source = source
         self._hosts = hosts
@@ -197,6 +201,7 @@ class FindingDecisions:
             if same is not None:
                 return normalize_decision(same)
             Disposition.admit(self._admission_history(draft, history), draft, principal, now)
+            draft = state_history.stamp(draft, uow, self._rating, history=history)
             saved = uow.decisions.add_statement(draft)
             if self._ledger is not None:
                 self._ledger.append_decision(saved, finding.repository_id)
@@ -366,6 +371,7 @@ class FindingDecisions:
                 if same.rationale != draft.rationale:
                     raise ConflictError("this claim decision already has a different rationale")
                 return same
+            draft = state_history.stamp(draft, uow, self._rating)
             saved = uow.decisions.add_statement(draft)
             for approver in sorted(approvers):
                 uow.decision_approvers.add(
@@ -423,6 +429,7 @@ class FindingDecisions:
             )
             if self._ledger is not None:
                 self._ledger.require_intact(finding.repository_id)
+            draft = state_history.stamp(draft, uow, self._rating)
             saved = uow.decisions.add_statement(draft)
             for approver in sorted(approvers):
                 ref = f"{ActorKind.HUMAN}:{approver}"
@@ -817,6 +824,7 @@ class FindingDecisions:
         draft = draft.model_copy(update={"statement_key": self.statement_key(draft)})
         if (same := self._same(draft)) is not None:
             return normalize_decision(same), False
+        draft = state_history.stamp(draft, uow, self._rating)
         saved = uow.decisions.add_statement(draft)
         if (reason := self._review.needs_signoff(saved)) is not None:
             request(uow, saved.finding_id, reason, saved.id)
@@ -1152,6 +1160,7 @@ class FindingDecisions:
             same := self._same(draft, uow.decisions.list_for_finding(draft.finding_id))
         ) is not None:
             return normalize_decision(same), False
+        draft = state_history.stamp(draft, uow, self._rating)
         saved = uow.decisions.add_statement(draft)
         if self._ledger is not None:
             self._ledger.append_decision(saved, repository_id, sign=False)

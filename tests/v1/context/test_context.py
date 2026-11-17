@@ -133,10 +133,14 @@ def test_a_fresh_local_store_bootstraps_with_the_channel_stamped(tmp_path: Path)
     assert "disposition" in {c["name"] for c in inspector.get_columns("repository")}
     with engine.connect() as connection:
         stamps = connection.exec_driver_sql("SELECT name FROM db_upgrade").fetchall()
-        assert [name for (name,) in stamps] == ["0001_repository_disposition"]
+        assert [name for (name,) in stamps] == [
+            "0001_repository_disposition",
+            "0002_query_statistics",
+            "0003_finding_state_columns",
+        ]
     again = Context(Config(home=tmp_path)).database  # re-open: nothing re-applied
     with again.connect() as connection:
-        assert connection.exec_driver_sql("SELECT count(*) FROM db_upgrade").fetchone()[0] == 1
+        assert connection.exec_driver_sql("SELECT count(*) FROM db_upgrade").fetchone()[0] == 3
 
 
 def test_a_fresh_store_logs_its_bootstrap_and_channel_trail(

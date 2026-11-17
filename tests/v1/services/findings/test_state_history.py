@@ -1,0 +1,191 @@
+"""The state projection's parity proof: the stored fold equals a fresh fold."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+from uuid import UUID
+
+import pytest
+from sqlalchemy.engine import Engine
+
+from tests.v1.conftest import SQL_BACKENDS, contract_db
+from tests.v1.repositories.tables.conftest import Seed
+from traust_core.v1.models.findings import Decision, RecordDecision
+from traust_core.v1.models.identity import IdentitySource, Principal
+from traust_core.v1.models.vocabulary import ActorKind
+from traust_core.v1.providers.clock import FixedClock
+from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services.findings import state_history
+from traust_core.v1.services.findings.decisions import FindingDecisions
+from traust_core.v1.services.findings.precedents import FindingPrecedents
+from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
+from traust_core.v1.services.lint import Lint
+
+ALICE = Principal(
+    identity="alice@example.com",
+    kind=ActorKind.HUMAN,
+    display="Alice",
+    verified_by=IdentitySource.OIDC,
+    roles=frozenset(),
+)
+NOW = datetime(2026, 10, 23, 9, tzinfo=UTC)
+RATING = RatingPolicy(RatingConfig())
+
+
+@pytest.fixture(params=SQL_BACKENDS)
+def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Engine:
+    with contract_db(request.param, tmp_path) as eng:
+        yield eng
+
+
+def decisions_service(engine: Engine) -> FindingDecisions:
+    uow = SqlTraustUnitOfWork(engine)
+    return FindingDecisions(
+        uow,
+        None,
+        Lint({}),
+        FindingPrecedents(uow),
+        clock=FixedClock(NOW),
+        objects=_EmptyStore(),
+        review=_NoSignoff(),
+        rating=RATING,
+    )
+
+
+class _EmptyStore:
+    def open(self, *args: Any, **kw: Any) -> None:
+        return None
+
+
+class _NoSignoff:
+    def needs_signoff(self, decision: Decision) -> None:
+        return None
+
+
+def seeded_finding(engine: Engine) -> tuple[UUID, UUID]:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repository = seed.repository(url="https://github.com/example/state")
+        ref = seed.repository_ref(repository)
+        finding = seed.finding(repository)
+        uow.commit()
+    return ref.repository_id, finding.id
+
+
+def test_every_decision_carries_the_fold_it_produced(engine: Engine) -> None:
+    """After each decision, the stored row's fold equals a fresh fold."""
+    _repository, finding = seeded_finding(engine)
+    service = decisions_service(engine)
+
+    service.decide(_say(finding, validity="confirmed", evidence_grade="E3"), ALICE)
+    service.decide(_say(finding, validity="confirmed", evidence_grade="E0"), ALICE)
+    service.decide(_say(finding, validity="false_positive", evidence_grade="E0"), ALICE)
+
+    with SqlTraustUnitOfWork(engine) as uow:
+        history = uow.decisions.list_for_finding(finding)
+        assert all(row.folded_state is not None for row in history)
+        assert all(row.folded_policy_version == state_history.POLICY_VERSION for row in history)
+
+        kind = uow.findings.get(finding).kind
+        latest = history[-1]
+        fresh = state_history.fold(uow, RATING, finding, kind, history)
+        assert latest.folded_state == fresh.state
+        assert latest.folded_decided == fresh.decided
+        assert latest.folded_proven == fresh.proven
+        assert latest.folded_unverified == fresh.unverified
+
+        # the one-query read agrees with the latest row
+        (current,) = uow.decisions.current_states([finding])
+        assert current[0] == finding
+        assert current[1] == fresh.state
+
+
+def test_the_fold_not_the_newest_decision_decides_the_state(engine: Engine) -> None:
+    """The stamped columns prove the fold, not recency."""
+    _repository, finding = seeded_finding(engine)
+    service = decisions_service(engine)
+
+    service.decide(_say(finding, validity="false_positive", evidence_grade="E3"), ALICE)
+    service.decide(_say(finding, validity="confirmed", evidence_grade="E0"), ALICE)
+
+    with SqlTraustUnitOfWork(engine) as uow:
+        history = uow.decisions.list_for_finding(finding)
+        kind = uow.findings.get(finding).kind
+        fresh = state_history.fold(uow, RATING, finding, kind, history)
+        assert history[-1].folded_state == fresh.state
+        (current,) = uow.decisions.current_states([finding])
+        assert current[1] == fresh.state
+
+
+def test_backfill_stamps_pre_projection_rows_and_check_stays_healthy(engine: Engine) -> None:
+    """The backfill stamps what the doors would have written; check stays healthy."""
+    repository, finding = seeded_finding(engine)
+    service = decisions_service(engine)
+    service.decide(_say(finding, validity="confirmed", evidence_grade="E2"), ALICE)
+
+    with SqlTraustUnitOfWork(engine) as uow:
+        # simulate a pre-projection row: clear the stamped columns directly
+        # (stamp_latest only fills NULLs - the backfill's guard)
+        import sqlalchemy as sa
+
+        from traust_core.v1.repositories.traust.findings.decision import DECISION
+
+        table = uow.tables.table(DECISION)
+        uow.connection.execute(
+            sa.update(table)
+            .where(table.c.finding_id == finding)
+            .values(
+                folded_state=None,
+                folded_severity=None,
+                folded_decided=None,
+                folded_proven=None,
+                folded_unverified=None,
+                folded_policy_version=None,
+            )
+        )
+        drift = state_history.check(uow, RATING, [repository])
+        assert drift.unstamped == 1
+        assert drift.healthy() or drift.drifted == 0
+
+        result = state_history.backfill(uow, RATING, [repository])
+        assert result.stamped == 1
+
+        after = state_history.check(uow, RATING, [repository])
+        assert after.healthy()
+        assert after.matched == 1
+
+
+def test_check_catches_a_corrupted_column(engine: Engine) -> None:
+    """A stored column that no longer equals the fold is reported."""
+    repository, finding = seeded_finding(engine)
+    service = decisions_service(engine)
+    service.decide(_say(finding, validity="confirmed", evidence_grade="E2"), ALICE)
+
+    with SqlTraustUnitOfWork(engine) as uow:
+        import sqlalchemy as sa
+
+        from traust_core.v1.repositories.traust.findings.decision import DECISION
+
+        table = uow.tables.table(DECISION)
+        uow.connection.execute(
+            sa.update(table).where(table.c.finding_id == finding).values(folded_state="resolved")
+        )
+        drift = state_history.check(uow, RATING, [repository])
+        assert drift.drifted == 1
+        assert drift.drifted_findings == (finding,)
+
+
+def test_first_seen_keeps_the_earliest_occurrence(engine: Engine) -> None:
+    """First seen keeps the earliest occurrence."""
+    repository, finding = seeded_finding(engine)
+    with SqlTraustUnitOfWork(engine) as uow:
+        state_history.note_first_seen(uow, finding, NOW)
+        state_history.note_first_seen(uow, finding, NOW.replace(year=2025))
+        stored = uow.findings.get(finding).first_seen
+        assert stored is not None and stored.year == 2025
+
+
+def _say(finding: UUID, **kw: Any) -> Any:
+    return RecordDecision(finding_id=finding, **{"rationale": "parity of the stored fold", **kw})

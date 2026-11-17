@@ -19,6 +19,7 @@ from tests.v1.repositories.tables.conftest import Seed
 from tests.v1.services.findings.test_reads import service as finding_service
 from tests.v1.services.test_pqc_rules import REPORT, STAMPS, census, hit, scan
 from traust_core.v1.context import Config, Context
+from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
 from traust_core.v1.errors import ConfigError, IntegrityError, NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import (
     PqcFactsArtifact,
