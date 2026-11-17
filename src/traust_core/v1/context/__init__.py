@@ -6,7 +6,7 @@ from traust_core.v1.context.config import (
     LoggingConfig,
     ProcessConfig,
 )
-from traust_core.v1.context.context import Context, Services
+from traust_core.v1.context.context import Context, Services, StoreState, StoreStatus
 from traust_core.v1.context.home import (
     TRAUST_CONFIG_HOME_DEFAULT,
     TRAUST_CONFIG_HOME_ENV,
@@ -44,6 +44,8 @@ __all__ = [
     "Router",
     "Services",
     "SpendService",
+    "StoreState",
+    "StoreStatus",
     "Workspace",
     "config_completeness_audit",
     "config_path",

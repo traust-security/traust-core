@@ -5,7 +5,7 @@ import pytest
 import sqlalchemy as sa
 
 from tests.v1.example.repository import SqlTaskUnitOfWork, metadata
-from traust_core.v1.context import Config, Context
+from traust_core.v1.context import Config, Context, StoreState
 from traust_core.v1.context.config import DatabaseConfig
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.repositories import ObjectKey
@@ -250,3 +250,158 @@ def test_a_local_store_applies_pending_upgrades_and_a_configured_one_refuses_the
     with pytest.raises(ConfigError, match="behind the db contract"):
         _ = Context(configured).database
     assert len(applied) == 1  # a configured database's upgrades are its deployment's
+
+
+def test_the_refusal_names_scripts_hashes_and_destructive_reasons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traust_contracts.v1.migrations import Upgrade
+
+    from traust_core.v1 import contracts
+
+    pending = [
+        Upgrade("0002_add_column", "a" * 64, ("ALTER TABLE t ADD c INT;",)),
+        Upgrade("0003_drop_column", "b" * 64, ("ALTER TABLE t DROP COLUMN c;",), "t.c is dead"),
+    ]
+    monkeypatch.setattr(contracts, "pending_db_upgrades", lambda dbapi, dialect: pending)
+    _ = Context(Config(home=tmp_path)).database  # a stamped local store
+    store = tmp_path / "traust.db"
+    configured = Config(
+        home=tmp_path / "elsewhere",
+        database=DatabaseConfig(url=f"sqlite:///{store}"),
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        _ = Context(configured).database
+    message = str(excinfo.value)
+    assert "0002_add_column sha256:aaaaaaaaaaaa" in message
+    assert "0003_drop_column sha256:bbbbbbbbbbbb" in message
+    assert "[destructive: t.c is dead]" in message
+    assert "Context.apply_db_upgrades()" in message
+
+
+def test_pending_db_upgrades_plans_without_applying(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traust_contracts.v1.migrations import Upgrade
+
+    from traust_core.v1 import contracts
+
+    _ = Context(Config(home=tmp_path)).database  # a stamped, up-to-date store
+    pending = [Upgrade("0004_future", "c" * 64, ("SELECT 1;",))]
+    monkeypatch.setattr(contracts, "pending_db_upgrades", lambda dbapi, dialect: pending)
+    context = Context(Config(home=tmp_path))
+    assert context.pending_db_upgrades() == pending  # the plan, verbatim, applied nothing
+
+
+def test_the_control_surface_refuses_stores_it_cannot_plan(
+    tmp_path: Path,
+) -> None:
+    context = Context(Config(home=tmp_path))  # home with no store at all
+    with pytest.raises(ConfigError, match="the store is empty"):
+        context.pending_db_upgrades()
+    with pytest.raises(ConfigError, match="the store is empty"):
+        context.apply_db_upgrades()
+
+
+def test_the_control_surface_refuses_a_version_0_store(tmp_path: Path) -> None:
+    engine = Context(Config(home=tmp_path)).database  # a store the channel stamped
+    with engine.begin() as connection:
+        connection.exec_driver_sql("DROP TABLE db_upgrade")  # the shape before the channel
+    engine.dispose()
+    context = Context(Config(home=tmp_path))
+    with pytest.raises(ConfigError, match="predates the upgrade channel"):
+        context.pending_db_upgrades()
+
+
+def test_apply_db_upgrades_is_the_operators_call_not_an_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traust_core.v1 import contracts
+
+    calls: list[object] = []
+    run = contracts.run_db_upgrades
+    monkeypatch.setattr(
+        contracts,
+        "run_db_upgrades",
+        lambda dbapi, dialect: calls.append(dialect) or run(dbapi, dialect),
+    )
+    context = Context(Config(home=tmp_path))
+    _ = context.database  # a stamped, up-to-date store; the local open applied the channel
+    assert len(calls) == 1
+    applied = context.apply_db_upgrades()  # idempotent: an up-to-date store runs nothing more
+    assert applied == []
+    assert len(calls) == 2  # the operator's call drove the channel once more, deliberately
+
+
+def test_apply_refuses_destructive_scripts_until_acknowledged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traust_contracts.v1.migrations import Upgrade
+
+    from traust_core.v1 import contracts
+
+    _ = Context(Config(home=tmp_path)).database  # a stamped store
+    pending = [
+        Upgrade("0004_safe", "c" * 64, ("SELECT 1;",)),
+        Upgrade("0005_drops", "d" * 64, ("DROP TABLE t;",), "t is gone"),
+    ]
+    monkeypatch.setattr(contracts, "pending_db_upgrades", lambda dbapi, dialect: pending)
+    applied: list[object] = []
+    monkeypatch.setattr(
+        contracts,
+        "run_db_upgrades",
+        lambda dbapi, dialect: applied.append(dbapi) or pending,
+    )
+    context = Context(Config(home=tmp_path))
+    with pytest.raises(ConfigError) as excinfo:
+        context.apply_db_upgrades()  # unacknowledged: the destructive script refuses
+    message = str(excinfo.value)
+    assert "0005_drops" in message
+    assert "[destructive: t is gone]" in message
+    assert "allow_destructive" in message
+    assert applied == []  # nothing ran
+
+    assert context.apply_db_upgrades(allow_destructive=True) == pending  # acknowledged
+    assert len(applied) == 1  # the channel ran, once
+
+
+def test_store_status_reads_every_state_without_the_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traust_contracts.v1.migrations import Upgrade
+
+    from traust_core.v1 import contracts
+
+    context = Context(Config(home=tmp_path))
+    assert context.store_status().state is StoreState.EMPTY
+
+    _ = Context(Config(home=tmp_path)).database  # a stamped, up-to-date store
+    assert Context(Config(home=tmp_path)).store_status().state is StoreState.CURRENT
+
+    pending = [Upgrade("0004_future", "c" * 64, ("SELECT 1;",))]
+    monkeypatch.setattr(contracts, "pending_db_upgrades", lambda dbapi, dialect: pending)
+    status = Context(Config(home=tmp_path)).store_status()
+    assert status.state is StoreState.BEHIND
+    assert status.pending == tuple(pending)  # the plan travels with the state
+
+    engine = Context(Config(home=tmp_path)).database
+    monkeypatch.undo()
+    with engine.begin() as connection:
+        connection.exec_driver_sql("DROP TABLE db_upgrade")  # the shape before the channel
+    engine.dispose()
+    assert Context(Config(home=tmp_path)).store_status().state is StoreState.VERSION_0
+
+
+def test_a_channel_error_in_the_control_surface_is_a_config_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traust_core.v1 import contracts
+
+    def refuse(dbapi: object, dialect: str) -> object:
+        raise contracts.MigrationError("upgrade 0001_x changed after databases applied it")
+
+    context = Context(Config(home=tmp_path))
+    _ = context.database  # a stamped store, opened before the channel is broken
+    monkeypatch.setattr(contracts, "run_db_upgrades", refuse)
+    with pytest.raises(ConfigError, match="upgrade channel refused this store"):
+        context.apply_db_upgrades()

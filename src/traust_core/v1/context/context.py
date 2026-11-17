@@ -7,6 +7,7 @@ import shutil
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import StrEnum
 from functools import cached_property
 from pathlib import Path
 from typing import Any, TypeVar
@@ -275,6 +276,25 @@ PACKAGE_SOURCE_AGENT = "traust-core (+https://github.com/traust-security/traust-
 
 # NEED(direction): the REST API is a thin adapter over Services, and the SDK becomes a
 # framework (prepare -> run skill -> record) on top of that REST API, not thin wrappers.
+
+
+class StoreState(StrEnum):
+    """A store's standing against the db contract, read without the open gate."""
+
+    EMPTY = "empty"  # no store yet: an open (local) or a deployment bootstraps it
+    VERSION_0 = "version_0"  # predates the channel: shape unknown, adopt or recreate
+    BEHIND = "behind"  # stamped, with pending upgrades
+    CURRENT = "current"  # stamped, up to date
+
+
+@dataclass(frozen=True, slots=True)
+class StoreStatus:
+    """What an operator or doctor asks before a pin bump reaches the store."""
+
+    state: StoreState
+    pending: tuple[contracts.Upgrade, ...] = ()  # the plan, when behind
+
+
 @dataclass(frozen=True)
 class Services:
     assessment: AssessmentService
@@ -758,11 +778,17 @@ class Context:
         )
 
     @cached_property
-    def database(self) -> Engine:
-        local = self.config.database.url is None
-        if local:
+    def _store_engine(self) -> Engine:
+        """The configured store's engine - one pool per Context, shared by the
+        open gate (``database``) and the operator's channel calls alike."""
+        if self.config.database.url is None:
             self.config.home.mkdir(parents=True, exist_ok=True)
-        engine = create_database_engine(self.config.record_store_url())
+        return create_database_engine(self.config.record_store_url())
+
+    @cached_property
+    def database(self) -> Engine:
+        engine = self._store_engine
+        local = self.config.database.url is None
         populated = _store_populated(engine)
         if local and not populated:
             dialect = Dialect.of(engine)
@@ -788,6 +814,89 @@ class Context:
                     "contract (traust-contracts db/v1/traust/README.md, Upgrades)"
                 )
         # else: a configured empty database is its deployment's, never bootstrapped
+        return engine
+
+    def pending_db_upgrades(self) -> list[contracts.Upgrade]:
+        """The db-contract upgrades this store has not run, planned not applied:
+        names, hashes and declared destructive reasons. Touches no schema -
+        not even the stamp table - so an operator looks before committing."""
+        engine = self._planable_store_engine()
+        try:
+            return on_driver_connection(
+                engine, lambda dbapi: contracts.pending_db_upgrades(dbapi, Dialect.of(engine))
+            )
+        except MigrationError as error:
+            raise ConfigError(
+                f"the db contract's upgrade channel refused this store: {error}"
+            ) from error
+
+    def apply_db_upgrades(self, *, allow_destructive: bool = False) -> list[contracts.Upgrade]:
+        """Apply the db-contract upgrade channel deliberately - the operator's
+        call, never an open's. A script that declares a destructive reason runs
+        only when the caller acknowledges it: the plan is read first, and a
+        destructive pending script without ``allow_destructive`` is a refusal
+        naming what would run and why. Each script runs whole with its stamp in
+        one transaction; the channel is idempotent and refuses drift either
+        way."""
+        engine = self._planable_store_engine()
+        try:
+            pending = on_driver_connection(
+                engine, lambda dbapi: contracts.pending_db_upgrades(dbapi, Dialect.of(engine))
+            )
+            destructive = [upgrade for upgrade in pending if upgrade.destructive]
+            if destructive and not allow_destructive:
+                raise ConfigError(
+                    f"{len(destructive)} pending upgrade(s) declare destructive work "
+                    f"({_upgrade_plan(destructive)}): read the reasons, then acknowledge "
+                    "with apply_db_upgrades(allow_destructive=True) (the CLI's "
+                    "--allow-destructive flag)"
+                )
+            return on_driver_connection(
+                engine, lambda dbapi: contracts.run_db_upgrades(dbapi, Dialect.of(engine))
+            )
+        except MigrationError as error:
+            raise ConfigError(
+                f"the db contract's upgrade channel refused this store: {error}"
+            ) from error
+
+    def store_status(self) -> StoreStatus:
+        """The store's standing against the db contract, read without opening
+        through the gate: for doctor and operators, before a refusal surprises
+        them at startup. Behind carries the plan; the other states carry their
+        own remedy in their docstring."""
+        engine = self._store_engine
+        if not _store_populated(engine):
+            return StoreStatus(StoreState.EMPTY)
+        if not _channel_stamped(engine):
+            return StoreStatus(StoreState.VERSION_0)
+        try:
+            pending = on_driver_connection(
+                engine, lambda dbapi: contracts.pending_db_upgrades(dbapi, Dialect.of(engine))
+            )
+        except MigrationError as error:
+            raise ConfigError(
+                f"the db contract's upgrade channel refused this store: {error}"
+            ) from error
+        if pending:
+            return StoreStatus(StoreState.BEHIND, tuple(pending))
+        return StoreStatus(StoreState.CURRENT)
+
+    def _planable_store_engine(self) -> Engine:
+        """The store engine for the operator's channel calls: a known shape, or
+        a refusal that says which. Version 0 and empty stores are bootstrapped
+        or recreated, never upgraded through the surface."""
+        engine = self._store_engine
+        if not _store_populated(engine):
+            raise ConfigError(
+                "the store is empty: it is bootstrapped by an open (a local store) or by its "
+                "deployment - there is nothing to plan or apply"
+            )
+        if not _channel_stamped(engine):
+            raise ConfigError(
+                "the database predates the upgrade channel: its schema has no db_upgrade "
+                "stamp table, so its shape is unknown — recreate the store from the current "
+                "contract (traust-contracts db/v1/traust/README.md, Upgrades)"
+            )
         return engine
 
     @cached_property
@@ -1302,12 +1411,11 @@ def _run_channel(engine: Engine, *, local: bool) -> None:
             f"the db contract's upgrade channel refused this store: {error}"
         ) from error
     if pending:
-        names = ", ".join(upgrade.name for upgrade in pending)
         log.warning(
             "configured database refused: behind the db contract, %d upgrade(s) pending: %s "
             "- its deployment applies them, not this open",
             len(pending),
-            names,
+            _upgrade_plan(pending),
             extra={
                 "operation": "store.bootstrap",
                 "outcome": "refused_pending",
@@ -1316,6 +1424,19 @@ def _run_channel(engine: Engine, *, local: bool) -> None:
         )
         raise ConfigError(
             f"the database is behind the db contract ({len(pending)} upgrade(s) pending: "
-            f"{names}): a configured database's upgrades are its deployment's - apply them "
-            "through the channel runner (traust_contracts.v1.migrations) with its owners"
+            f"{_upgrade_plan(pending)}): a configured database's upgrades are its "
+            "deployment's - plan them with Context.pending_db_upgrades(), apply with "
+            "Context.apply_db_upgrades() (the `traust db upgrades` CLI wraps both) "
+            "with its owners"
         )
+
+
+def _upgrade_plan(pending: Iterable[contracts.Upgrade]) -> str:
+    """One fragment per pending script: name, hash prefix, declared destructiveness."""
+    parts = []
+    for upgrade in pending:
+        part = f"{upgrade.name} sha256:{upgrade.sha256[:12]}"
+        if upgrade.destructive:
+            part += f" [destructive: {upgrade.destructive}]"
+        parts.append(part)
+    return "; ".join(parts)
