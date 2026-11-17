@@ -56,6 +56,16 @@ class DocumentRefresh(Model):
     carried: tuple[str, ...]
 
 
+class AdvisoryDocumentsRefresh(Model):
+    """One source's part of the advisory document refresh: how many identifiers it was asked
+    for, and its refresh, or why the whole source failed (`error`)."""
+
+    source: str
+    requested: int
+    refresh: DocumentRefresh | None = None
+    error: str | None = None
+
+
 class StoredDocument(Model):
     source: str
     identifier: str

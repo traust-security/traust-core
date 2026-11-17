@@ -85,6 +85,16 @@ def test_algorithm_free_fingerprint_read_has_bounded_sqlite_work(seed: Seed, mis
     assert calls <= 10
 
 
+def test_the_advisories_findings_name_are_listed_once_each(seed: Seed) -> None:
+    assert seed.uow.findings.linked_advisory_ids() == []
+    one, two = seed.advisory(), seed.advisory()
+    seed.advisory()  # named by no finding
+    for advisory in (one, one, two):
+        seed.finding(advisory_id=advisory.id, advisory_match="confirmed")
+    seed.finding()
+    assert seed.uow.findings.linked_advisory_ids() == sorted([one.id, two.id])
+
+
 def test_findings_known_as_an_advisory(seed: Seed) -> None:
     advisory = seed.advisory()
     known = seed.finding(advisory_id=advisory.id, advisory_match="confirmed")

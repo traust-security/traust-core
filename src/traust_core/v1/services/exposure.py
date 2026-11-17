@@ -41,6 +41,7 @@ from traust_core.v1.models.dependencies import (
     Advisory,
     AdvisoryIdentifier,
     AdvisoryMatch,
+    AdvisoryNames,
     AdvisoryPackage,
     AdvisoryRecord,
     AdvisorySweep,
@@ -97,6 +98,7 @@ from traust_core.v1.models.dependencies import (
     version_key,
 )
 from traust_core.v1.models.feed_documents import (
+    AdvisoryDocumentsRefresh,
     DocumentFailure,
     DocumentRefresh,
     FeedDocument,
@@ -165,6 +167,8 @@ if TYPE_CHECKING:
     from traust_core.v1.services.findings.service import FindingService
 
 FEED_ARTIFACT_KIND = "feed"
+# the per-identifier sources an advisory's names are kept from, and which names each takes
+_ADVISORY_DOCUMENT_SOURCES = {"cve-list": "cve", "nvd": "cve", "rh-cve": "cve", "ghsa": "ghsa"}
 EPSS, KEV, RH_CVE = FeedName("epss"), FeedName("kev"), FeedName("rh-cve")
 # identifiers a source matches case-insensitively, kept in one spelling (`_canonical`)
 _CVE_ID = re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE)
@@ -1303,6 +1307,77 @@ class ExposureService:
                 AdvisoryPackage(advisory_id=canonical.id, package_id=package.id)
             )
         return canonical
+
+    def advisory_names(self, finding_ids: Collection[UUID]) -> dict[UUID, AdvisoryNames]:
+        """Each finding's advisory names, canonical first, then every alias, in batched reads:
+        the one door every advisory join goes through (a canonical id can be a GHSA or GO id with
+        the CVE an alias). A finding that names no advisory is absent."""
+        named = {
+            f.id: f.advisory_id
+            for f in self._findings.list_by_ids(finding_ids)
+            if f.id is not None and f.advisory_id is not None
+        }
+        names = self._names_of(set(named.values()))
+        return {finding_id: names[advisory_id] for finding_id, advisory_id in named.items()}
+
+    def _names_of(self, advisory_ids: Collection[UUID]) -> dict[UUID, AdvisoryNames]:
+        """Each advisory's names, keyed by the id asked for (canonical or alias)."""
+        with self._uow as uow:
+            asked = {a.id: a for a in uow.advisories.list_by_ids(advisory_ids) if a.id}
+            canonical_of = {i: a.alias_of_id or i for i, a in asked.items()}
+            known = {i: a for i, a in asked.items() if a.alias_of_id is None}
+            missing = set(canonical_of.values()) - set(known)
+            known |= {a.id: a for a in uow.advisories.list_by_ids(missing) if a.id}
+            aliases = uow.advisories.list_aliases_of(list(known))
+        by_canonical: dict[UUID, list[str]] = {i: [] for i in known}
+        for alias in sorted(aliases, key=lambda a: a.identifier):
+            if alias.alias_of_id in by_canonical:
+                by_canonical[alias.alias_of_id].append(alias.identifier)
+        names = {
+            i: AdvisoryNames(advisory_id=i, identifiers=(a.identifier, *by_canonical[i]))
+            for i, a in known.items()
+        }
+        return {i: names[c] for i, c in canonical_of.items()}
+
+    def refresh_advisory_documents(
+        self, run_order_id: UUID | None = None
+    ) -> list[AdvisoryDocumentsRefresh]:
+        """Keep the documents for every advisory a finding names, from each registered source:
+        CVE ids to the CVE List, NVD and Red Hat, GHSA ids to `ghsa`. A source that fails, its
+        fetches or its storage, keeps its last manifest and says why; the others still refresh."""
+        names = self._names_of(self._findings.linked_advisory_ids()).values()
+        cves = sorted({c for n in names for c in n.cves})
+        ghsas = sorted({g for n in names for g in n.ghsas})
+        outcomes = []
+        for source, kind in _ADVISORY_DOCUMENT_SOURCES.items():
+            if source not in self._feed_sources.names():
+                continue  # not registered, or `access: disabled`
+            identifiers = cves if kind == "cve" else ghsas
+            if not identifiers:
+                outcomes.append(AdvisoryDocumentsRefresh(source=source, requested=0))
+                continue
+            try:
+                refresh = self.refresh_documents(source, identifiers, run_order_id)
+            except (ServiceError, ValidationError) as e:
+                error = _without_userinfo(str(e))
+                log.warning("%s documents not refreshed; keeping the last: %s", source, error)
+                outcomes.append(
+                    AdvisoryDocumentsRefresh(source=source, requested=len(identifiers), error=error)
+                )
+                continue
+            except (NotFoundError, IntegrityError, RepositoryError) as e:
+                # its last manifest, or the store it writes to, is unreadable: a person acts
+                log.error("%s documents not refreshed error_type=%s", source, type(e).__name__)
+                outcomes.append(
+                    AdvisoryDocumentsRefresh(
+                        source=source, requested=len(identifiers), error=_without_userinfo(str(e))
+                    )
+                )
+                continue
+            outcomes.append(
+                AdvisoryDocumentsRefresh(source=source, requested=len(identifiers), refresh=refresh)
+            )
+        return outcomes
 
     def advisories_for(self, finding_id: UUID) -> list[Advisory]:
         """The advisory a finding is about, canonical first, then every alias (CVE, GHSA, OSV

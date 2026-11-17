@@ -10,7 +10,7 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Errors** | `errors` | the exception hierarchy every layer raises (`ValidationError`, `NotFoundError`, …) | ad hoc exceptions |
 | **Models** | `models` | one model per contract table, grouped by section — `inventory`, `dependencies`, `assessment`, `findings`, `operations`, `ledger` (fields = columns) — next to that section's service types; `base` (`Model` strict, `Dto` tolerant, `Entity` with a database-generated UUIDv4 id, `AppendOnly` for tables that are never updated), `values` (`HttpsRepoUrl`, `GitSha`, `CveId`, `to_rfc3339` / `TimestampError`: the contracts' one RFC 3339 rule), `integrity` | dicts passed between scripts |
 | **Validation rules** | `models.validation` | `ValidationScope.permits(action, target, as_of=…)`, `ValidationPlan.requires_approval()`, `ValidationAttempt.soundness()` — pure scope, approval and refutation rules | duplicated harness scope and soundness rules |
-| **CVSS sources** | `models.cvss`, `services.findings.cvss`, `models.feed_documents`, `services.exposure` | the per-source documents kept daily (`exposure.refresh_documents`: one manifest snapshot per source, a failed fetch keeping the last document; `exposure.stored_document` reads one back, digest-checked); each advisory source's CVSS from its stored document (`cve_list_scores`, `nvd_scores`, `osv_scores`, `rh_cve_scores`, `csaf_scores`, `scanner_score`; `score_of` refuses a malformed vector, a version that disagrees with it, a score outside 0–10 or one its vector doesn't compute), and the one a finding shows: `effective(scores)` ranks NIST > GitHub-reviewed GHSA > CNA > ADP > Red Hat > scanner, takes a source's 3.1 before its 3.0, and keeps 4.0 alongside, never ranked | `AdvisoryRecord.cvss_score`, which reads only one feed's 3.x vectors |
+| **CVSS sources** | `models.cvss`, `services.findings.cvss`, `models.feed_documents`, `services.exposure` | the per-source documents kept daily (`exposure.refresh_documents`: one manifest snapshot per source, a failed fetch keeping the last document; `exposure.stored_document` reads one back, digest-checked); `exposure.advisory_names` is the batched door every advisory join goes through (canonical name plus aliases, CVEs split out), and `exposure.refresh_advisory_documents` keeps every linked advisory's documents; each advisory source's CVSS from its stored document (`cve_list_scores`, `nvd_scores`, `osv_scores`, `rh_cve_scores`, `csaf_scores`, `scanner_score`; `score_of` refuses a malformed vector, a version that disagrees with it, a score outside 0–10 or one its vector doesn't compute), and the one a finding shows: `effective(scores)` ranks NIST > GitHub-reviewed GHSA > CNA > ADP > Red Hat > scanner, takes a source's 3.1 before its 3.0, and keeps 4.0 alongside, never ranked | `AdvisoryRecord.cvss_score`, which reads only one feed's 3.x vectors |
 | **Validation recording** | `services.validation`, `models.validation` | `record_order(doc, provenance, bindings, run_order_id, principal)` binds machine reports to a live order lease; trusted-local `record(doc, provenance, bindings)` and `evidence(artifact_id)` retain their existing semantics | re-running probes, interpreting source labels as database IDs |
 | **Artifacts** | `models.artifacts` | the `ArtifactDocument` base + `SchemaView` (fields from the installed schema, `doc.findings[0].verdict`, unknown names raise) and the named documents (`TriageArtifact`, `SecurityAuditArtifact`, …, `Verdict`, `Severity`) | `json.load` + `.get("key")` |
 | **Artifact publishing** | `services.artifact_publishing` | `ctx.artifact_publisher(specs).publish(name, raw)` or `.publish_artifact(artifact)`: exact gate → content-addressed objects → an artifact UUID on SQLite and Postgres; `get(artifact_id)` verifies the persisted digest; `list_for_assessment(id, kind=…)` reads metadata | writing `analysis-results` files by hand or optional indexing |
@@ -428,6 +428,29 @@ in the object store at `feeds/<source>/documents/<sha256>.json`, one copy per di
 `exposure.stored_document(source, identifier)` reads the latest manifest's document back,
 checked against its digest (`IntegrityError` on a mismatch); `None` when the manifest doesn't
 name it. Reads never fetch.
+
+### Advisory names: the one door for every advisory join
+
+Core keeps the first name it saw for a vulnerability as its canonical advisory, so a finding's
+advisory can be `GHSA-…` or `GO-…` with its CVE only an alias. EPSS, KEV, NVD and the CVE List
+are all keyed by CVE, so a join on the canonical name would find nothing for a CVE that has data.
+`exposure.advisory_names(finding_ids)` is therefore the door every advisory join goes through:
+each finding's `AdvisoryNames` (`models.dependencies`), the canonical name first, then every alias,
+with `cves` (upper case) and `ghsas` split out. It takes two batched reads for any number of
+findings; a finding that names no advisory is absent.
+
+`exposure.refresh_advisory_documents(run_order_id)` keeps the documents for every advisory any
+finding names, resolved, false-positive and risk-accepted ones included, so their detail keeps its
+scores and a reopened finding already has them. CVE ids go to `cve-list`, `nvd` and `rh-cve`, and
+GHSA ids to `ghsa`. A source that isn't registered (or is `access: disabled`) is skipped. A source
+that fails keeps its last manifest and says why (`AdvisoryDocumentsRefresh.error`); the others
+still refresh.
+
+**Set an NVD API key.** This refresh asks NVD for every linked CVE every day. Without a key NVD
+allows about 5 requests per 30 seconds, so a few thousand CVEs take hours. A key is free
+(https://nvd.nist.gov/developers/request-an-api-key) and raises the limit to 50 per 30 seconds.
+Name the variable holding it in `traust.yaml` (`feeds.api_keys: {nvd: NVD_API_KEY}`), never the
+key itself.
 
 ## Repository checkouts
 

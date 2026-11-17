@@ -23,6 +23,10 @@ class FindingRecords:
         with self._uow as uow:
             return uow.findings.list_by_ids(finding_ids)
 
+    def linked_advisory_ids(self) -> list[UUID]:
+        with self._uow as uow:
+            return uow.findings.linked_advisory_ids()
+
     def decisions(self, finding_ids: Collection[UUID]) -> list[Decision]:
         with self._uow as uow:
             return uow.decisions.list_for_findings(list(finding_ids))

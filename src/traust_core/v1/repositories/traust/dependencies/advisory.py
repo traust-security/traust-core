@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import Protocol
 from uuid import UUID
 
@@ -28,6 +29,11 @@ ADVISORY = TableSpec(
 class AdvisoryRepository(MutableRecordRepository[Advisory], Protocol):
     def find_by_identifier(self, identifier: str) -> Advisory | None: ...
     def list_aliases(self, advisory_id: UUID) -> list[Advisory]: ...
+    def list_by_ids(self, advisory_ids: Collection[UUID]) -> list[Advisory]: ...
+    def list_aliases_of(self, advisory_ids: Collection[UUID]) -> list[Advisory]:
+        """Every alias of these canonical advisories, in batched reads."""
+        ...
+
     def get_or_add(self, record: Advisory) -> Advisory: ...
 
 
@@ -40,6 +46,12 @@ class SqlAdvisoryRepository(SqlMutableRepository[Advisory]):
 
     def list_aliases(self, advisory_id: UUID) -> list[Advisory]:
         return self._many(f"aliases of {advisory_id}", self.table.c.alias_of_id == advisory_id)
+
+    def list_by_ids(self, advisory_ids: Collection[UUID]) -> list[Advisory]:
+        return self._many_in("list by id", self.table.c.id, advisory_ids)
+
+    def list_aliases_of(self, advisory_ids: Collection[UUID]) -> list[Advisory]:
+        return self._many_in("aliases of many", self.table.c.alias_of_id, advisory_ids)
 
     def get_or_add(self, record: Advisory) -> Advisory:
         return self._get_or_add(
