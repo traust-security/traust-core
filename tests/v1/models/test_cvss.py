@@ -136,6 +136,9 @@ def test_a_record_that_isnt_published_states_nothing() -> None:
     assert parse_cve_list(reserved) == ()
     rejected = {"cveMetadata": {"cveId": "CVE-2099-0001", "state": "REJECTED"}}
     assert parse_cve_list(rejected) == ()
+    # an unpublished record's containers are never read, so their shape can't fail the refresh
+    odd = {**rejected, "containers": {"cna": {"rejectedReasons": [{"lang": "en", "value": "x"}]}}}
+    assert parse_cve_list(odd) == ()
 
 
 def test_an_adp_without_a_short_name_is_named_by_its_org_id() -> None:
