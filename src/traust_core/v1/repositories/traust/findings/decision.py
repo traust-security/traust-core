@@ -143,7 +143,8 @@ class SqlDecisionRepository(SqlAppendOnlyRepository[Decision]):
         )
 
     def stamp_latest(self, decision_id: UUID, folded: Mapping[str, Any]) -> None:
-        """The backfill's one sanctioned mutation: fill a row's NULL projection columns."""
+        """The backfill's one sanctioned mutation: fill a row's NULL projection
+        columns. One-time upgrade path - remove with the backfill."""
         c = self.table.c
         stmt = (
             sa.update(self.table)
