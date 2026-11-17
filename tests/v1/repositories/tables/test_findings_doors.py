@@ -128,6 +128,7 @@ def findings(uow: SqlTraustUnitOfWork) -> FindingService:
         clock=FixedClock(T0),
         objects=InMemoryObjectStore(),
         review=review,
+        rating=RatingPolicy(RatingConfig()),
     )
     return FindingService(
         uow,

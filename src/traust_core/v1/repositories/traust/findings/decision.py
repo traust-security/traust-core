@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from datetime import datetime
 from heapq import merge
 from typing import Any, Protocol
@@ -47,6 +47,12 @@ DECISION = TableSpec(
         text_column("ticket", nullable=True),
         sa.Column("auto_accept_tier", sa.Boolean, nullable=False),
         timestamp_column("occurred_at"),
+        text_column("folded_state", nullable=True),
+        text_column("folded_severity", nullable=True),
+        sa.Column("folded_decided", sa.Boolean, nullable=True),
+        sa.Column("folded_proven", sa.Boolean, nullable=True),
+        sa.Column("folded_unverified", sa.Boolean, nullable=True),
+        text_column("folded_policy_version", nullable=True),
     ),
     append_only=True,
 )
@@ -99,6 +105,16 @@ class SqlDecisionRepository(SqlAppendOnlyRepository[Decision]):
         severity = _WRITE_SEVERITY.validate_python(record.severity)
         values = super()._values(record)
         values["severity"] = severity
+        # serialization-excluded on the model; insert carries them
+        for column in (
+            "folded_state",
+            "folded_severity",
+            "folded_decided",
+            "folded_proven",
+            "folded_unverified",
+            "folded_policy_version",
+        ):
+            values[column] = getattr(record, column)
         return values
 
     def add_statement(self, decision: Decision) -> Decision:
@@ -125,6 +141,53 @@ class SqlDecisionRepository(SqlAppendOnlyRepository[Decision]):
         return self._one(
             f"find {statement_key}", c.finding_id == finding_id, c.statement_key == statement_key
         )
+
+    def stamp_latest(self, decision_id: UUID, folded: Mapping[str, Any]) -> None:
+        """The backfill's one sanctioned mutation: fill a row's NULL projection columns."""
+        c = self.table.c
+        stmt = (
+            sa.update(self.table)
+            .where(c.id == decision_id, c.folded_state.is_(None))
+            .values(**folded)
+        )
+        self._execute(f"stamp {decision_id}", stmt)
+
+    def current_states(
+        self, finding_ids: Collection[UUID]
+    ) -> list[tuple[UUID, str | None, str | None, bool | None, bool | None, bool | None]]:
+        c = self.table.c
+        latest = (
+            sa.select(
+                c.finding_id,
+                c.folded_state,
+                c.folded_severity,
+                c.folded_decided,
+                c.folded_proven,
+                c.folded_unverified,
+                sa.func.row_number()
+                .over(
+                    partition_by=c.finding_id,
+                    order_by=(c.created_at.desc(), c.id.desc()),
+                )
+                .label("rn"),
+            )
+            .where(c.finding_id.in_([*finding_ids]))
+            .subquery()
+        )
+        stmt = (
+            sa.select(
+                latest.c.finding_id,
+                latest.c.folded_state,
+                latest.c.folded_severity,
+                latest.c.folded_decided,
+                latest.c.folded_proven,
+                latest.c.folded_unverified,
+            )
+            .where(latest.c.rn == 1)
+            .order_by(latest.c.finding_id)
+        )
+        rows = self._execute(f"current states of {len(finding_ids)} findings", stmt).all()
+        return [tuple(row) for row in rows]
 
     def list_for_finding(self, finding_id: UUID) -> list[Decision]:
         c = self.table.c

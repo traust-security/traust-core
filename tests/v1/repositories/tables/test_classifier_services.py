@@ -68,6 +68,7 @@ def decisions(uow: SqlTraustUnitOfWork, ledger: LedgerService | None = None) -> 
         clock=FixedClock(T0 + timedelta(days=2)),
         objects=InMemoryObjectStore(),
         review=ReviewPolicy(),
+        rating=RatingPolicy(RatingConfig()),
     )
 
 

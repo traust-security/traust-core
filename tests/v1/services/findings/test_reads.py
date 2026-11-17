@@ -81,6 +81,7 @@ def service(engine: Engine, *, windows: WindowMemo | None = None) -> FindingServ
         clock=FixedClock(NOW),
         objects=InMemoryObjectStore(),
         review=ReviewPolicy(),
+        rating=RatingPolicy(RatingConfig()),
     )
     rating = RatingPolicy(RatingConfig())
     views = FindingViewQuery(rating)

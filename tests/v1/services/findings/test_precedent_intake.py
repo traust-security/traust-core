@@ -16,6 +16,8 @@ from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.assessment import AssessmentService
+from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
+
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.identity import IdentityPolicy
 from traust_core.v1.services.findings.intake import FindingIntake
@@ -83,6 +85,7 @@ def test_scanner_intake_produces_precedents_in_triage_preparation(
         clock=FixedClock(T0),
         objects=InMemoryObjectStore(),
         review=ReviewPolicy(),
+        rating=RatingPolicy(RatingConfig()),
     )
     [item] = triage.prepare(assessment.id).items
     assert item.locations[0].symbol == (None if unknown_function else symbol)

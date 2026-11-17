@@ -14,6 +14,7 @@ from tests.v1.services.test_assessment_scan import SCANNERS, a_ref, provenance
 from tests.v1.services.test_assessment_scan import context as context
 from tests.v1.services.test_assessment_scan import engine as engine
 from traust_core.v1.context import Context
+from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
 from traust_core.v1.errors import ConfigError, RepositoryError, ValidationError
 from traust_core.v1.models.findings import CandidateFormat, Location
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork

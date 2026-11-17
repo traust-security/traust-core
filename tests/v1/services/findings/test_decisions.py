@@ -35,6 +35,7 @@ from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.precedents import FindingPrecedents
 from traust_core.v1.services.findings.restatement import RestatementPolicy
+from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
 from traust_core.v1.services.findings.review import ReviewPolicy
 from traust_core.v1.services.ledger import LedgerConfig, LedgerService
 from traust_core.v1.services.lint import Lint
@@ -71,6 +72,7 @@ def service(engine: Engine, approvers: int = 0, ledger: bool = False) -> Finding
         clock=FixedClock(NOW),
         objects=InMemoryObjectStore(),
         review=ReviewPolicy(),
+        rating=RatingPolicy(RatingConfig()),
         restatement=RestatementPolicy(approvers),
     )
 

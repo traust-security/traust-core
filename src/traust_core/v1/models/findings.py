@@ -641,6 +641,7 @@ class Finding(Entity):
     fingerprint: str
     kind: FindingKind | str | None = Field(default=None, union_mode="left_to_right")
     title: str
+    first_seen: datetime | None = None
 
 
 # A report's claims can't change after the fact: occurrence and location rows are append-only and
@@ -727,6 +728,15 @@ class Decision(AppendOnly):
     ticket: str | None = None
     auto_accept_tier: bool = False
     occurred_at: datetime
+
+    # The state projection: stamped at insert, never updated, storage only
+    # (serialization-excluded; the repository writes them at insert).
+    folded_state: str | None = Field(default=None, exclude=True)
+    folded_severity: str | None = Field(default=None, exclude=True)
+    folded_decided: bool | None = Field(default=None, exclude=True)
+    folded_proven: bool | None = Field(default=None, exclude=True)
+    folded_unverified: bool | None = Field(default=None, exclude=True)
+    folded_policy_version: str | None = Field(default=None, exclude=True)
 
 
 class CensusDecision(NamedTuple):
@@ -956,9 +966,21 @@ def kind_of(kind: str | None, validities: Iterable[str | None]) -> str | None:
     return folded
 
 
+_PROJECTION_FIELDS = (
+    "folded_state",
+    "folded_severity",
+    "folded_decided",
+    "folded_proven",
+    "folded_unverified",
+    "folded_policy_version",
+)
+
+
 def normalize_decision(decision: Decision) -> Decision:
     """Interpret historical classifiers without changing the saved statement or its key."""
     values = decision.model_dump()
+    # serialization-excluded projection columns ride along unchanged
+    values.update({field: getattr(decision, field) for field in _PROJECTION_FIELDS})
     values.update(
         {
             field: classifier

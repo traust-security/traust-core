@@ -29,6 +29,7 @@ from tests.v1.services.test_below_range import (
     osv,
 )
 from traust_core.v1.errors import ConfigError, IntegrityError, NotFoundError, ValidationError
+from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
 from traust_core.v1.models.artifacts import BelowRangePacketsArtifact, BelowRangeVerdictsArtifact
 from traust_core.v1.models.assessment import (
     ASSESSMENT_COMPLETED,
