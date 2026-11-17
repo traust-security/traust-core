@@ -10,7 +10,7 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Errors** | `errors` | the exception hierarchy every layer raises (`ValidationError`, `NotFoundError`, …) | ad hoc exceptions |
 | **Models** | `models` | one model per contract table, grouped by section — `inventory`, `dependencies`, `assessment`, `findings`, `operations`, `ledger` (fields = columns) — next to that section's service types; `base` (`Model` strict, `Dto` tolerant, `Entity` with a database-generated UUIDv4 id, `AppendOnly` for tables that are never updated), `values` (`HttpsRepoUrl`, `GitSha`, `CveId`, `to_rfc3339` / `TimestampError`: the contracts' one RFC 3339 rule), `integrity` | dicts passed between scripts |
 | **Validation rules** | `models.validation` | `ValidationScope.permits(action, target, as_of=…)`, `ValidationPlan.requires_approval()`, `ValidationAttempt.soundness()` — pure scope, approval and refutation rules | duplicated harness scope and soundness rules |
-| **CVSS sources** | `models.cvss`, `services.findings.cvss` | each advisory source's CVSS from its stored document (`cve_list_scores`, `nvd_scores`, `osv_scores`, `rh_cve_scores`, `csaf_scores`, `scanner_score`; `score_of` refuses a malformed vector, a version that disagrees with it, a score outside 0–10 or one its vector doesn't compute), and the one a finding shows: `effective(scores)` ranks NIST > GitHub-reviewed GHSA > CNA > ADP > Red Hat > scanner, takes a source's 3.1 before its 3.0, and keeps 4.0 alongside, never ranked | `AdvisoryRecord.cvss_score`, which reads only one feed's 3.x vectors |
+| **CVSS sources** | `models.cvss`, `services.findings.cvss`, `models.feed_documents`, `services.feed_documents` | the per-source documents kept daily (`exposure.refresh_documents`: one manifest snapshot per source, a failed fetch keeping the last document; `exposure.stored_document` reads one back, digest-checked); each advisory source's CVSS from its stored document (`cve_list_scores`, `nvd_scores`, `osv_scores`, `rh_cve_scores`, `csaf_scores`, `scanner_score`; `score_of` refuses a malformed vector, a version that disagrees with it, a score outside 0–10 or one its vector doesn't compute), and the one a finding shows: `effective(scores)` ranks NIST > GitHub-reviewed GHSA > CNA > ADP > Red Hat > scanner, takes a source's 3.1 before its 3.0, and keeps 4.0 alongside, never ranked | `AdvisoryRecord.cvss_score`, which reads only one feed's 3.x vectors |
 | **Validation recording** | `services.validation`, `models.validation` | `record_order(doc, provenance, bindings, run_order_id, principal)` binds machine reports to a live order lease; trusted-local `record(doc, provenance, bindings)` and `evidence(artifact_id)` retain their existing semantics | re-running probes, interpreting source labels as database IDs |
 | **Artifacts** | `models.artifacts` | the `ArtifactDocument` base + `SchemaView` (fields from the installed schema, `doc.findings[0].verdict`, unknown names raise) and the named documents (`TriageArtifact`, `SecurityAuditArtifact`, …, `Verdict`, `Severity`) | `json.load` + `.get("key")` |
 | **Artifact publishing** | `services.artifact_publishing` | `ctx.artifact_publisher(specs).publish(name, raw)` or `.publish_artifact(artifact)`: exact gate → content-addressed objects → an artifact UUID on SQLite and Postgres; `get(artifact_id)` verifies the persisted digest; `list_for_assessment(id, kind=…)` reads metadata | writing `analysis-results` files by hand or optional indexing |
@@ -389,10 +389,34 @@ order with a usable CVSS 3.x score wins:
 - **Unscored.** No usable 3.x score anywhere is `None`, never 0.
 
 A finding's own audit-authored vector (a code finding) is not ranked against feeds; only
-advisory-backed findings take the feed-ranked score. Today the parsers and the ranking exist,
-but no view reads them yet. The daily feed refresh is to store each per-CVE document as an
-artifact plus a `feed_snapshot` row, and the findings views are to resolve the effective score
-when read, so existing findings gain feed scores without a rescan.
+advisory-backed findings take the feed-ranked score. No view reads the ranking yet: the
+findings views are to resolve the effective score when read, so existing findings gain feed
+scores without a rescan.
+
+### Kept documents
+
+`exposure.refresh_documents(source, identifiers, run_order_id)` (`services.feed_documents`) keeps
+a registered source's document for each identifier: `cve-list` (CVE Services API), `nvd`, `ghsa`
+(OSV's record by GHSA id) and `rh-cve` (the per-CVE Security Data record). One refresh is one
+manifest (`models.feed_documents.FeedDocumentManifest`: each identifier's sha256 and fetch time)
+recorded as a `feed` artifact plus a `feed_snapshot` named `<source>-documents`; the documents sit
+in the object store at `feeds/<source>/documents/<sha256>.json`, one copy per distinct document.
+
+- **Exactly what was asked.** The manifest names only the identifiers given (a CVE id in upper
+  case); one not asked for again drops out. Asking for none is a `ValidationError`.
+- **A failed fetch keeps the last document.** Its entry carries over from the previous manifest
+  with its original fetch time (`DocumentRefresh.carried`); a failed identifier with nothing to
+  carry has no entry. Every failure is reported in `DocumentRefresh.failed`.
+- **An outage writes nothing.** When no document was fetched at all, the refresh raises
+  `ServiceError` and the last snapshot stays the latest. An unreadable last manifest stops the
+  refresh too: carrying forward needs it, so a person acts.
+- **Only JSON objects.** A document that isn't one is a failure, never stored.
+- **Retries.** A retry in the same run order that kept the same documents (by digest; fetch times
+  differ) adds no snapshot.
+
+`exposure.stored_document(source, identifier)` reads the latest manifest's document back,
+checked against its digest (`IntegrityError` on a mismatch); `None` when the manifest doesn't
+name it. Reads never fetch.
 
 ## Repository checkouts
 

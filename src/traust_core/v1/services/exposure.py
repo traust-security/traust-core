@@ -96,6 +96,7 @@ from traust_core.v1.models.dependencies import (
     repo_label,
     version_key,
 )
+from traust_core.v1.models.feed_documents import DocumentRefresh, StoredDocument
 from traust_core.v1.models.findings import (
     Category,
     ExposureKey,
@@ -149,6 +150,7 @@ from traust_core.v1.services.artifact_publishing import (
     record_artifact,
     stored_bytes,
 )
+from traust_core.v1.services.feed_documents import FEED_ARTIFACT_KIND, FeedDocuments
 from traust_core.v1.services.findings.intake import FindingIntake
 from traust_core.v1.services.findings.records import FindingRecords
 from traust_core.v1.services.portfolio import Inventory, PortfolioService
@@ -157,7 +159,6 @@ from traust_core.v1.services.repo_checkout import RepoCheckoutService
 if TYPE_CHECKING:
     from traust_core.v1.services.findings.service import FindingService
 
-FEED_ARTIFACT_KIND = "feed"
 EPSS, KEV, RH_CVE = FeedName("epss"), FeedName("kev"), FeedName("rh-cve")
 # Title likeness that stamps a CVE on a finding: 53 hand-adjudicated matches at >= 0.55 held no
 # false one. A shared CWE promotes probable to confirmed; it never blocks (sibling CWEs are common).
@@ -271,6 +272,7 @@ class ExposureService:
         self._sbom_tool = sbom_tool
         self._checkout = checkout
         self._finding_service = findings
+        self._documents = FeedDocuments(uow, objects, self._feed_sources, self._clock)
 
     def refresh_feeds(
         self, feeds: Sequence[FeedName] | None = None, run_order_id: UUID | None = None
@@ -1775,6 +1777,17 @@ class ExposureService:
                 f"({', '.join(self._feed_sources.names()) or 'none registered'})"
             )
         return self._feed_sources.get(source).document(identifier).data
+
+    def refresh_documents(
+        self, source: str, identifiers: Sequence[str], run_order_id: UUID | None = None
+    ) -> DocumentRefresh:
+        """Keep a feed source's document for each identifier: one manifest snapshot per source
+        per refresh, naming exactly these identifiers (`FeedDocuments.refresh`)."""
+        return self._documents.refresh(source, identifiers, run_order_id)
+
+    def stored_document(self, source: str, identifier: str) -> StoredDocument | None:
+        """The identifier's document as the source's latest refresh kept it; never fetched."""
+        return self._documents.stored(source, identifier)
 
     def _required_payload(self, feed: FeedName) -> bytes:
         payload = self.feed_payload(feed)
