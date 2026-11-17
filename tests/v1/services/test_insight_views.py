@@ -227,6 +227,14 @@ def test_a_program_view_outside_its_contract_is_refused_by_the_build(
     assert "by_model/0/events" in {issue.path for issue in error.value.issues}
 
 
+def test_an_unnamed_asset_is_refused_at_registration(context: Context) -> None:
+    """The program view keys throughput by asset name, which its contract requires non-empty;
+    the registry refuses the empty name before any view could carry it."""
+    with pytest.raises(ConfigError, match="asset provider needs a name"):
+        context.assets.register("", lambda: None)  # type: ignore[arg-type, return-value]
+    assert "" not in context.assets.names()
+
+
 def test_the_program_view_needs_a_window(context: Context) -> None:
     with pytest.raises(ValidationError, match="needs a window"):
         context.services().insight.build(ViewName.PROGRAM, ViewFilter())

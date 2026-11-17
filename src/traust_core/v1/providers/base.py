@@ -71,6 +71,10 @@ class ProviderRegistry(Generic[P]):
         self._built: dict[str, P] = {}
 
     def register(self, name: str, factory: Callable[[], P]) -> None:
+        if not name:
+            # a provider is named wherever it surfaces (an asset in the program view, a run
+            # order's asset); an empty name could never be told apart or recorded
+            raise ConfigError(f"a {self._kind} provider needs a name")
         if name in self._factories:
             raise ConfigError(f"{self._kind} provider {name!r} registered twice")
         self._factories[name] = factory
