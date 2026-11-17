@@ -3,7 +3,7 @@ the model registry, through Context on SQLite and Postgres."""
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -19,7 +19,13 @@ from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError, ViewContractError
 from traust_core.v1.models.common import TimeWindow
 from traust_core.v1.models.insight import FindingsRollup, ViewFilter, ViewName
-from traust_core.v1.models.operations import ModelUsage, SpendDimension, SpendFilter, SpendSource
+from traust_core.v1.models.operations import (
+    ModelUsage,
+    SpendDimension,
+    SpendFilter,
+    SpendRollup,
+    SpendSource,
+)
 from traust_core.v1.models.values import ProductSlug
 from traust_core.v1.models.vocabulary import OwnershipClass
 from traust_core.v1.providers.clock import FixedClock
@@ -146,8 +152,8 @@ def test_a_spend_view_outside_its_contract_is_refused_by_the_build(
     seed_spend(context, engine)
     real = insight_spend._summed
 
-    def drifted(*args: Any) -> Any:
-        return real(*args).model_copy(update={"events": -1})
+    def drifted(key: str | None, rows: Sequence[SpendRollup]) -> SpendRollup:
+        return real(key, rows).model_copy(update={"events": -1})
 
     monkeypatch.setattr(insight_spend, "_summed", drifted)
     with pytest.raises(ViewContractError) as error:
