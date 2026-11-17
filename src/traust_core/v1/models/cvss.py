@@ -311,14 +311,21 @@ class _CveListMetadata(Dto):
 
 class _CveListRecord(Dto):
     metadata: _CveListMetadata = Field(alias="cveMetadata")
-    containers: _CveListContainers
+    containers: _CveListContainers | None = None
+
+    @pydantic.model_validator(mode="after")
+    def _published_records_carry_containers(self) -> _CveListRecord:
+        # cve.org serves a RESERVED id without containers; a PUBLISHED one always has them
+        if self.metadata.state is CveRecordState.PUBLISHED and self.containers is None:
+            raise ValueError("a PUBLISHED CVE record carries its containers")
+        return self
 
 
 def cve_list_scores(raw: bytes, *, acquired_at: datetime | None = None) -> tuple[CvssScore, ...]:
     """A CVE List record's (CVE JSON 5): the CNA's container, then each ADP's, by name. A
     record that isn't PUBLISHED states nothing."""
     record = _parsed(_CveListRecord, raw, "a CVE List record")
-    if record.metadata.state is not CveRecordState.PUBLISHED:
+    if record.metadata.state is not CveRecordState.PUBLISHED or record.containers is None:
         return ()
     containers = record.containers
     tagged = [(CvssSource.CNA, containers.cna), *((CvssSource.ADP, adp) for adp in containers.adp)]

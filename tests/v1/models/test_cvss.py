@@ -131,6 +131,11 @@ def _cve_list(state: str = "PUBLISHED", provider: Any = None, **cvss: Any) -> di
 def test_a_record_that_isnt_published_states_nothing() -> None:
     cvss = {"cvssV3_1": {"version": "3.1", "vectorString": V31, "baseScore": 8.1}}
     assert parse_cve_list(_cve_list("REJECTED", **cvss)) == ()
+    # cve.org serves a reserved id with no containers at all: nothing to state, never an error
+    reserved = {"cveMetadata": {"cveId": "CVE-2099-0001", "state": "RESERVED"}}
+    assert parse_cve_list(reserved) == ()
+    rejected = {"cveMetadata": {"cveId": "CVE-2099-0001", "state": "REJECTED"}}
+    assert parse_cve_list(rejected) == ()
 
 
 def test_an_adp_without_a_short_name_is_named_by_its_org_id() -> None:
@@ -142,7 +147,8 @@ def test_an_adp_without_a_short_name_is_named_by_its_org_id() -> None:
 def test_a_cve_list_block_and_its_version_must_agree() -> None:
     mismatched = {"cvssV3_1": {"version": "3.0", "vectorString": V30, "baseScore": 9.1}}
     assert parse_cve_list(_cve_list(**mismatched)) == ()
-    # the block says 3.1 and the vector is 3.1, but the object states 3.0: refused all the same
+    # the parser's own block check refuses it (score_of's version check has its own case above):
+    # the block says 3.1 and so does the vector, but the CVSS object states 3.0
     stated_wrong = {"cvssV3_1": {"version": "3.0", "vectorString": V31, "baseScore": 8.1}}
     assert parse_cve_list(_cve_list(**stated_wrong)) == ()
 
