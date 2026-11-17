@@ -7,8 +7,10 @@ import pytest
 
 from traust_core.v1.context import Config, Context
 from traust_core.v1.context.config import FeedsConfig
-from traust_core.v1.errors import ConfigError
-from traust_core.v1.providers.feeds import HttpFileFeed, PagedJsonFeed, Paging
+from traust_core.v1.context.feeds import load_feed_sources
+from traust_core.v1.errors import ConfigError, ValidationError
+from traust_core.v1.providers.clock import FixedClock
+from traust_core.v1.providers.feeds import FeedSource, HttpFileFeed, PagedJsonFeed, Paging
 from traust_core.v1.providers.osv import OsvAdvisoryLookup
 from traust_core.v1.repositories.objects.store import InMemoryObjectStore
 
@@ -684,3 +686,57 @@ def test_the_registry_names_are_not_listed_either(
     with pytest.raises(ConfigError, match="the feeds registry") as raised:
         ctx.register_feeds(_registry(tmp_path, text))
     assert pasted not in "".join(traceback.format_exception(raised.value))
+
+
+class _Recorder:
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+
+    def get(self, url: str, headers: object = None, *, secret_headers: object = None) -> bytes:
+        self.urls.append(url)
+        return b"{}"
+
+
+@pytest.mark.parametrize(
+    ("name", "identifier", "url"),
+    [
+        ("cve-list", "cve-2021-44228", "https://cveawg.mitre.org/api/cve/CVE-2021-44228"),
+        ("ghsa", "GHSA-jfh8-c2jp-5v3q", "https://api.osv.dev/v1/vulns/GHSA-jfh8-c2jp-5v3q"),
+        (
+            "rh-cve",
+            "cve-2021-44228",
+            "https://access.redhat.com/hydra/rest/securitydata/cve/CVE-2021-44228.json",
+        ),
+    ],
+)
+def test_the_shipped_cvss_sources_serve_one_document_per_identifier(
+    name: str, identifier: str, url: str
+) -> None:
+    shipped = Path(__file__).parents[3] / "src/traust_core/v1/context/shipped/feeds.yaml"
+    http = _Recorder()
+    sources = load_feed_sources(
+        shipped,
+        http=http,  # type: ignore[arg-type]
+        probe_http=http,  # type: ignore[arg-type]
+        clock=FixedClock(datetime(2026, 11, 17, tzinfo=UTC)),
+    )
+    [source] = [s for s in sources if s.name == name]
+    source.document(identifier)
+    assert http.urls == [url]
+
+
+@pytest.mark.parametrize(
+    "identifier",
+    ["ghsa-jfh8-c2jp-5v3q", "GHSA-jfh8-c2jp", "GHSA-jfh8-c2jp-5v3q/../x", "GHSA-abcd-c2jp-5v3q"],
+)
+def test_a_ghsa_source_takes_only_github_advisory_ids(identifier: str) -> None:
+    http = _Recorder()
+    template = "https://api.osv.dev/v1/vulns/{ident}"
+    source = FeedSource(
+        "ghsa", template, template=template, ident="ghsa", post=False, probe=None,
+        http=http, probe_http=http,  # type: ignore[arg-type]
+        clock=FixedClock(datetime(2026, 11, 17, tzinfo=UTC)),
+    )  # fmt: skip
+    with pytest.raises(ValidationError, match="not its kind of identifier"):
+        source.document(identifier)
+    assert http.urls == []

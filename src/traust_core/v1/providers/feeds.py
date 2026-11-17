@@ -265,6 +265,8 @@ def _records(raw: bytes, filename: str) -> list[dict[str, Any]]:
 _IDENTS = {
     "cve": re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE),
     "rhsa": re.compile(r"RH[SBE]A-\d{4}[:_]\d{4,}", re.IGNORECASE),
+    # GitHub's id alphabet, as OSV serves it (case-sensitive): GHSA-xxxx-xxxx-xxxx
+    "ghsa": re.compile(r"GHSA(-[23456789cfghjmpqrvwx]{4}){3}"),
     "repo": re.compile(r"[A-Za-z0-9.-]+/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+"),
 }
 _YEAR = re.compile(r"(?<!\d)(19|20)\d{2}(?!\d)")

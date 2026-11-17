@@ -115,10 +115,14 @@ sources:
     # components would save ~3.7 MB/yr and go blind on every repo audited
     # afterwards; the component join belongs in the consumer.
     project: [CVE, public_date, bugzilla_description, severity, cvss3_score, CWE]
+    # The per-CVE record, with the CVSS 3 vector the list's projection drops.
+    doc_url_template: https://access.redhat.com/hydra/rest/securitydata/cve/{ident_upper}.json
+    ident: cve
     probe:
       ident: none
     consumers:
       - traust.cli.reconcile_cve_provenance
+      - traust-core ExposureService.refresh_documents (CVSS, per CVE)
     license:
       id: CC-BY-4.0
       terms: Attribute Red Hat when redistributing. Public endpoint, no VPN.
@@ -460,6 +464,48 @@ sources:
         but is not endorsed or certified by the NVD."
       url: https://nvd.nist.gov/developers/terms-of-use
       verified: 2026-07-18
+
+  cve-list:
+    tier: live
+    summary: >-
+      The CVE List record (CVE JSON 5) from the CVE Services API: the CNA's
+      container and each ADP's, with the scores each states.
+    url_template: https://cveawg.mitre.org/api/cve/{ident_upper}
+    ident: cve
+    probe:
+      ident: CVE-2021-44228
+    consumers:
+      - traust impact document (traust-core ExposureService.source_document)
+      - traust-core ExposureService.refresh_documents (CVSS, per CVE)
+    license:
+      id: cve-terms-of-use
+      terms: >-
+        MITRE grants a perpetual, worldwide, no-charge, royalty-free,
+        irrevocable copyright license to reproduce, prepare derivative works
+        of, display, sublicense and distribute CVE, provided copies reproduce
+        MITRE's copyright designation and the license.
+      url: https://www.cve.org/Legal/TermsOfUse
+      verified: 2026-11-16
+
+  ghsa:
+    tier: live
+    summary: >-
+      One OSV record by id from OSV.dev, for GitHub Security Advisories: a
+      GitHub-reviewed GHSA states GitHub's CVSS.
+    url_template: https://api.osv.dev/v1/vulns/{ident}
+    ident: ghsa
+    probe:
+      ident: GHSA-jfh8-c2jp-5v3q
+    consumers:
+      - traust impact document (traust-core ExposureService.source_document)
+      - traust-core ExposureService.refresh_documents (CVSS, per GHSA)
+    license:
+      id: CC-BY-4.0
+      terms: >-
+        The GitHub Advisory Database is CC-BY-4.0; attribute GitHub when
+        redistributing. OSV.dev serves it unchanged.
+      url: https://github.com/github/advisory-database/blob/main/LICENSE.md
+      verified: 2026-11-17
 
   redhat-csaf:
     tier: live
