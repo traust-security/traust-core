@@ -8,6 +8,7 @@ import pytest
 from traust_core.v1.errors import ConfigError, ServiceError, ValidationError
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.feeds import (
+    DOCUMENT_BYTES,
     MAX_PAGES,
     ApiKey,
     FeedSource,
@@ -224,6 +225,7 @@ class _Http:
         self.answers = answers or {}
         self.sent: list[tuple[str, object]] = []
         self.headers: list[dict[str, str] | None] = []
+        self.limits: list[int | None] = []
 
     def _answer(self, url: str, body: object) -> bytes:
         self.sent.append((url, body))
@@ -238,8 +240,10 @@ class _Http:
         headers: dict[str, str] | None = None,
         *,
         secret_headers: dict[str, str] | None = None,
+        limit: int | None = None,
     ) -> bytes:
         self.headers.append(secret_headers)
+        self.limits.append(limit)
         return self._answer(url, None)
 
     def post_json(self, url: str, doc: object) -> bytes:
@@ -511,3 +515,29 @@ def test_a_key_checks_its_own_header_and_value(
 
 def test_parse_gives_a_key_that_sends_its_header() -> None:
     assert ApiKey.parse("apiKey", SECRET).headers() == {"apiKey": SECRET}
+
+
+def test_a_document_is_read_under_its_sources_cap_and_a_probe_without_one() -> None:
+    http = _Http()
+    capped = FeedSource(
+        "nvd", "https://nvd.test/", template="https://nvd.test/cves?cveId={ident_upper}",
+        ident="cve", post=False, probe=LOG4SHELL, http=http,  # type: ignore[arg-type]
+        probe_http=http,  # type: ignore[arg-type]
+        clock=FixedClock(AT), max_bytes=1024,
+    )  # fmt: skip
+    capped.document("CVE-2021-44228")
+    capped.check()
+    source(http=(default := _Http())).document("CVE-2021-44228")
+    assert http.limits == [1024, None] and default.limits == [DOCUMENT_BYTES]
+
+
+@pytest.mark.parametrize("cap", [0, -1])
+def test_a_document_cap_below_one_byte_is_a_config_error(cap: int) -> None:
+    http = _Http()
+    with pytest.raises(ConfigError, match="nvd: a document size cap is at least one byte"):
+        FeedSource(
+            "nvd", "https://nvd.test/", template="https://nvd.test/cves?cveId={ident_upper}",
+            ident="cve", post=False, probe=None, http=http,  # type: ignore[arg-type]
+            probe_http=http,  # type: ignore[arg-type]
+            clock=FixedClock(AT), max_bytes=cap,
+        )  # fmt: skip

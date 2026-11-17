@@ -148,6 +148,9 @@ sources:
     doc_url_template: https://access.redhat.com/security/data/csaf/v2/vex/{year}/{ident_lower}.json
     # changes.csv is a rolling 12-month window ("path","timestamp"),
     # newest-first; median 117 changed docs/day, bursting to ~950.
+    # A VEX document lists every affected product stream: the kernel's and
+    # Log4Shell's were 2-4 MB (2026-11-17), so this cap leaves room to grow.
+    max_document_bytes: 134217728
     max_age_hours: 24
     cadence: daily
     ident: cve

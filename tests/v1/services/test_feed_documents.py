@@ -62,6 +62,7 @@ class Http:
         headers: dict[str, str] | None = None,
         *,
         secret_headers: dict[str, str] | None = None,
+        limit: int | None = None,
     ) -> bytes:
         answer = self.answers.get(url, ServiceError("HTTP 404", status=404))
         if isinstance(answer, Exception):

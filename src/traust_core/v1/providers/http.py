@@ -18,7 +18,7 @@ from datetime import UTC
 from email.utils import parsedate_to_datetime
 from typing import Any, BinaryIO, TypeVar
 
-from traust_core.v1.errors import ServiceError, ValidationError
+from traust_core.v1.errors import ConfigError, ServiceError, ValidationError
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.correlation import REQUEST_ID_HEADER, current_correlation
 
@@ -40,6 +40,10 @@ def is_header_value(value: str) -> bool:
     """Whether `value` can travel as a secret header (an API key): non-empty and visible ASCII
     only, since a control, a space or a non-ASCII character can't be sent as-is."""
     return bool(value) and all(0x21 <= ord(c) <= 0x7E for c in value)
+
+
+# a refusal's body is read for its message only (a form endpoint's error JSON): never unbounded
+_ERROR_BODY_BYTES = 1024 * 1024
 
 
 def _target_hash(url: str) -> str:
@@ -142,13 +146,19 @@ class HttpFetcher:
         headers: Mapping[str, str] | None = None,
         *,
         secret_headers: Mapping[str, str] | None = None,
+        limit: int | None = None,
     ) -> bytes:
         """`secret_headers` (an API key) go to `url` only: never onto a redirected request, so a
-        redirect to another host can't carry them."""
+        redirect to another host can't carry them. A body over `limit` bytes is a bad answer."""
+        if limit is not None and limit < 0:
+            raise ConfigError("an HTTP read limit is a byte count, never negative")
         try:
-            return self._send(url, None, headers=headers, secret_headers=secret_headers)
+            body: bytes = self._send(
+                url, None, headers=headers, secret_headers=secret_headers, limit=limit
+            )
         except _Refused as e:
             raise _refused(url, e.status, "http.get") from e
+        return body
 
     def pages(self, url: str, headers: Mapping[str, str] | None = None) -> Iterator[bytes]:
         """Each page's body, following the `Link: <…>; rel="next"` header (RFC 8288)."""
@@ -205,7 +215,10 @@ class HttpFetcher:
         read: Callable[[Any], Any] = lambda r: r.read(),
         headers: Mapping[str, str] | None = None,
         secret_headers: Mapping[str, str] | None = None,
+        limit: int | None = None,
     ) -> Any:
+        """`limit` bounds a body read with the default `read`: one over it is refused, unread
+        past `limit` + 1 bytes and logged as refused."""
         policy = self._policy
         method = "POST" if data is not None else "GET"
         target_hash = _target_hash(url)
@@ -223,14 +236,18 @@ class HttpFetcher:
                 req.add_unredirected_header(name, value)
             try:
                 with urllib.request.urlopen(req, timeout=policy.timeout_seconds) as r:
-                    result = read(r)
+                    result = read(r) if limit is None else r.read(limit + 1)
+                if limit is not None and len(result) > limit:
+                    _log_http(method, target_hash, "refused", attempt + 1, started)
+                    host = urllib.parse.urlsplit(url).hostname or ""
+                    raise ValidationError(f"{host}: response over {limit} bytes, refused")
                 _log_http(method, target_hash, "completed", attempt + 1, started)
                 return result
             except urllib.error.HTTPError as e:
                 # retrying a 403/404 just burns the rate-limit window
                 if e.code != 429 and not 500 <= e.code < 600:
                     _log_http(method, target_hash, "refused", attempt + 1, started, e.code)
-                    raise _Refused(e.code, e.read() if e.fp else b"") from e
+                    raise _Refused(e.code, e.read(_ERROR_BODY_BYTES) if e.fp else b"") from e
                 last, throttled, unreachable = f"HTTP {e.code}", e.code == 429, False
                 after = self._retry_after(e.headers.get("Retry-After") if e.headers else None)
                 delay = (
