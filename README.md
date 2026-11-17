@@ -304,6 +304,9 @@ The remaining correctness changes are:
   before `build` returns, on its by-alias dump (the wire shape, where a claim's class is
   `class`). It reads the latest claims and manifests, so it refuses an `as_of` and a product
   or team scope (422).
+- `ViewName.FRESHNESS` is validated by `contracts.validate_view("freshness", document)` before
+  `build` returns; its coverage is the coverage view's definition, resolved through the view
+  registry.
 - `ViewName.EXPOSURE` is validated by `contracts.validate_view("exposure", document)` before
   `build` returns, and carries its `as_of` (the filter's, else the clock's, read once for all
   three cuts); the executive summary's exposure panel uses the same row.

@@ -16,12 +16,13 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.services.test_insight import FakePortfolio
 from traust_core.v1.context import Config, Context
-from traust_core.v1.errors import ConfigError, ValidationError
+from traust_core.v1.errors import ConfigError, ValidationError, ViewContractError
 from traust_core.v1.models.assessment import (
     ASSESSMENT_COMPLETED,
     Assessment,
     Coverage,
     CoverageGap,
+    GapSignal,
     Population,
     PopulationRow,
 )
@@ -77,7 +78,13 @@ class FakeAssessment:
         return Population(as_of=as_of, rows=self.rows)
 
     def coverage(self, filter: Any, repository_ids: Any) -> Coverage:
-        gap = CoverageGap(tool="opengrep", system="kotlin", repositories=1, signals={})
+        gap = CoverageGap(
+            tool="opengrep",
+            system="kotlin",
+            repositories=1,
+            signals={GapSignal.STRUCTURED: 1},
+            example_repository_ids=(A,),
+        )
         return Coverage(examined=1, total=2, gaps=(gap,))
 
 
@@ -120,6 +127,15 @@ def test_reads_the_scopes_completed_assessments_now() -> None:
 def test_refuses_a_point_in_time() -> None:
     with pytest.raises(ValidationError, match="no as_of"):
         view()[0].build(ViewFilter(as_of=T0))
+
+
+def test_a_freshness_view_outside_its_contract_is_refused_by_the_build() -> None:
+    """A stale input with no refresh hint drifts from the contract (stale always says how)."""
+    drifted = StaleItem(item="feeds:osv", status=Freshness.STALE, detail="old")
+    with pytest.raises(ViewContractError) as error:
+        view(items=[drifted])[0].build(ViewFilter())
+    assert str(error.value).startswith("freshness:")
+    assert "items/0/refresh" in {issue.path for issue in error.value.issues}
 
 
 @pytest.mark.parametrize(

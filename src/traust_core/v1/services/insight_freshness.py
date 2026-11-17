@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 from uuid import UUID
 
+from traust_core.v1 import contracts
 from traust_core.v1.errors import ConfigError, ValidationError
 from traust_core.v1.models.assessment import (
     ASSESSMENT_COMPLETED,
@@ -84,11 +85,13 @@ class FreshnessView:
             toolchain = None
             items.append(StaleItem(item="toolchain", status=Status.UNAVAILABLE, detail=str(e)))
         order = list(Status)
-        return FreshnessDashboard(
+        model = FreshnessDashboard(
             items=tuple(sorted(items, key=lambda i: (order.index(i.status), i.item))),
             toolchain=toolchain,
             coverage=self._assessment.coverage(AssessmentFilter(), list(urls)),  # type: ignore[arg-type]
         )
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
 
     def report(self, model: FreshnessDashboard, generated_at: datetime) -> Report:
         counts = Counter(i.status for i in model.items)
