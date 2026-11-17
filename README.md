@@ -10,6 +10,7 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Errors** | `errors` | the exception hierarchy every layer raises (`ValidationError`, `NotFoundError`, …) | ad hoc exceptions |
 | **Models** | `models` | one model per contract table, grouped by section — `inventory`, `dependencies`, `assessment`, `findings`, `operations`, `ledger` (fields = columns) — next to that section's service types; `base` (`Model` strict, `Dto` tolerant, `Entity` with a database-generated UUIDv4 id, `AppendOnly` for tables that are never updated), `values` (`HttpsRepoUrl`, `GitSha`, `CveId`, `to_rfc3339` / `TimestampError`: the contracts' one RFC 3339 rule), `integrity` | dicts passed between scripts |
 | **Validation rules** | `models.validation` | `ValidationScope.permits(action, target, as_of=…)`, `ValidationPlan.requires_approval()`, `ValidationAttempt.soundness()` — pure scope, approval and refutation rules | duplicated harness scope and soundness rules |
+| **CVSS sources** | `models.cvss`, `services.findings.cvss` | each advisory source's CVSS from its stored document (`cve_list_scores`, `nvd_scores`, `osv_scores`, `rh_cve_scores`, `csaf_scores`, `scanner_score`; `score_of` refuses a malformed vector, a version that disagrees with it, a score outside 0–10 or one its vector doesn't compute), and the one a finding shows: `effective(scores)` ranks NIST > GitHub-reviewed GHSA > CNA > ADP > Red Hat > scanner, takes a source's 3.1 before its 3.0, and keeps 4.0 alongside, never ranked | `AdvisoryRecord.cvss_score`, which reads only one feed's 3.x vectors |
 | **Validation recording** | `services.validation`, `models.validation` | `record_order(doc, provenance, bindings, run_order_id, principal)` binds machine reports to a live order lease; trusted-local `record(doc, provenance, bindings)` and `evidence(artifact_id)` retain their existing semantics | re-running probes, interpreting source labels as database IDs |
 | **Artifacts** | `models.artifacts` | the `ArtifactDocument` base + `SchemaView` (fields from the installed schema, `doc.findings[0].verdict`, unknown names raise) and the named documents (`TriageArtifact`, `SecurityAuditArtifact`, …, `Verdict`, `Severity`) | `json.load` + `.get("key")` |
 | **Artifact publishing** | `services.artifact_publishing` | `ctx.artifact_publisher(specs).publish(name, raw)` or `.publish_artifact(artifact)`: exact gate → content-addressed objects → an artifact UUID on SQLite and Postgres; `get(artifact_id)` verifies the persisted digest; `list_for_assessment(id, kind=…)` reads metadata | writing `analysis-results` files by hand or optional indexing |
@@ -347,6 +348,49 @@ The remaining correctness changes are:
   the budget, so unrelated versions cannot exhaust a selected cohort's allowance. Overflow
   advice names this direct service; it does not imply that the global view accepts filters.
   Scoring unrecorded runs stays `DetectionQualityService.score_reports`, a door, not a view.
+
+## CVSS from advisory feeds
+
+An advisory-backed finding (a dependency, image or SBOM finding tied to a CVE or GHSA) can be
+scored by several sources. `models.cvss` reads each source's scores from its stored document,
+and `services.findings.cvss.effective` picks the one the finding shows. The first source in this
+order with a usable CVSS 3.x score wins:
+
+| Rank | Source (`CvssSource`) | Read from (`models.cvss`) | How it is recognised |
+|---|---|---|---|
+| 1 | NIST (`nist`) | NVD API 2.0 CVE record (`nvd_scores`) | the `Primary` metric from `nvd@nist.gov` |
+| 2 | GitHub (`ghsa`) | OSV record (`osv_scores`) | a `GHSA-` record with `github_reviewed: true`; OSV's copy of a CVE record ranks nowhere (it can drop the CNA's scores) |
+| 3 | CNA (`cna`) | the CVE List record from cve.org (`cve_list_scores`); NVD's copy as a backup | the record's `cna` container, named by its `shortName`; an NVD `Secondary` metric from the record's own `sourceIdentifier` |
+| 4 | ADP (`adp`), e.g. CISA Vulnrichment, Red Hat's SADP | the CVE List record; NVD's copy as a backup | each `adp` container, by name; any other NVD `Secondary` metric (one from `nvd@nist.gov` ranks nowhere) |
+| 5 | Red Hat (`red-hat`) | the Security Data CVE record (`rh_cve_scores`), then CSAF VEX (`csaf_scores`) | `cvss3`; `vulnerabilities[].scores[].cvss_v3` |
+| 6 | Scanner (`scanner`) | the occurrence (`scanner_score`) | the vector the scanner reported |
+
+- **Version.** Within the winning source, its CVSS 3.1 score, else its 3.0 score. A 4.0 score is
+  kept and shown alongside (`EffectiveCvss.v4`, the highest-ranked one) but never sets the
+  score, so no 4.0 calculator ranks findings. CVSS 2 is not read.
+- **Ties.** Two 3.x scores from the same source and version: the higher one.
+- **Trust.** `score_of` refuses rather than guesses. It refuses:
+  - a key or value outside FIRST's CVSS 3.0/3.1 or 4.0 metric tables, or a missing base metric;
+  - a 4.0 vector whose metrics are out of the spec's order;
+  - a version that disagrees with the vector, or a repeated metric;
+  - a stated score outside 0–10, or anything but a plain decimal;
+  - a stated 3.x score that isn't exactly what its vector computes.
+  A 3.x score is always the one its vector computes (FIRST's formula, with 3.0's own rounding).
+- **Shape.** Each parser takes the stored document's bytes and validates them into a typed shape;
+  a document that doesn't fit it, including a present score block without its vector, is a
+  `ValidationError`, never a silently missing score.
+- **Provenance.** Every statement is kept, once each (`EffectiveCvss.scores`, in ranking order):
+  source, version, vector, score, the document it came from (`cve-list:CVE-…`, `nvd:CVE-…`,
+  `osv:GHSA-…`, `rh-cve:CVE-…`, `csaf:…`) and who scored it, so a reader sees what every
+  source said. A CNA or ADP score that both the CVE List and NVD carry appears once per
+  document; ranking is unaffected, since both are the same source.
+- **Unscored.** No usable 3.x score anywhere is `None`, never 0.
+
+A finding's own audit-authored vector (a code finding) is not ranked against feeds; only
+advisory-backed findings take the feed-ranked score. Today the parsers and the ranking exist,
+but no view reads them yet. The daily feed refresh is to store each per-CVE document as an
+artifact plus a `feed_snapshot` row, and the findings views are to resolve the effective score
+when read, so existing findings gain feed scores without a rescan.
 
 ## Repository checkouts
 
@@ -975,7 +1019,7 @@ Services own their domain's use cases and declare the section unit of work they 
 | Onboarding: bring a project under the platform | `services.onboarding` · `OnboardingService` (`plan` dry run with gaps, `onboard` registers product, repositories, branches, teams and plans the baseline orders) | none: composes `PortfolioService`, `PortfolioSync`, `OpsService` |
 | Exposure: known vulns reaching us | `services.exposure` · `ExposureService` (`refresh_feed` snapshots a feed, `refresh_feeds` every registered one (a failed feed keeps its last snapshot and reports `last_error`); an incremental feed (`providers.feeds.PagedJsonFeed`, Red Hat CVEs) builds on its last snapshot; staleness is the latest `feed_snapshot`; `exploit_signals` reads EPSS and KEV per advisory from the latest snapshots; `exploit_context` joins them onto the CVE-bearing items of an artifact's `findings` / `candidates` list, with the repository's product reach and owning teams (through `PortfolioService`); `source_document` returns a registered feed source's document for one identifier (`providers.feeds.FeedSource`: NVD, Red Hat CSAF and VEX documents, Scorecard), whose declared probes are `ProviderCatalog` readiness (`feed-source:*`); `find_advisory` fetches an advisory through `providers.osv` and keeps its identity, aliases and packages, ranges stay on the `AdvisoryRecord`; `ingest_sbom` reads CycloneDX / SPDX JSON (`models.sbom_formats`) into a commit's manifest SBOM; `dependencies(ref_id)` reads it back as package + version rows (`NoManifestSbomError` when none was ingested); `ingest_image_sbom` / `image_dependencies(digest)` do the same for an image's SBOM on its append-only `image` row (`NoImageSbomError`); `affected` is the blast radius through base images and internal libraries; `prepare` / `record` are the impact-analysis skill doors: one commit's evidence and classification (`ImpactEvidence.classification`), with the `providers.impact` tiers (govulncheck, source scans) over a checkout the caller passes; `resolve_symbols` returns the functions the advisory's fix touched (OSV-published, else mined from fix commits through `SourceProvider.commit`); `consumes_fix` says whether a commit's SBOMs carry a fix released elsewhere), then an `impact` assessment and, for an affected commit, its dependency finding) | `TraustUnitOfWork` (package, sbom, dependency, image, advisory, advisory_package, feed_snapshot + findings) |
 | Assessment: what we looked at | `services.assessment` · `AssessmentService` | `AssessmentsUnitOfWork` (assessment, artifact, occurrence, location) |
-| Findings: what's wrong and every decision on it | `services.findings` · `FindingService` + `intake`, `decisions`, `review`, `precedents`; `FindingViewQuery` shares rich views/history; `IdentityPolicy`, `RatingPolicy` | `TraustUnitOfWork` (finding, cwe, finding_cwe, finding_label, finding_external_ref, decision, decision_approver, review_item); `Disposition.fold` interprets historical classifiers and explicit evidence strength |
+| Findings: what's wrong and every decision on it | `services.findings` · `FindingService` + `intake`, `decisions`, `review`, `precedents`, `cvss` (which source's CVSS a finding shows); `FindingViewQuery` shares rich views/history; `IdentityPolicy`, `RatingPolicy` | `TraustUnitOfWork` (finding, cwe, finding_cwe, finding_label, finding_external_ref, decision, decision_approver, review_item); `Disposition.fold` interprets historical classifiers and explicit evidence strength |
 | Attestation: human sign-off | `services.attestation` · `AttestationService` | `FindingsUnitOfWork` — a human answer is a `decision` that resolves a `review_item` |
 | Identity: who is acting | `services.identity` · `IdentityService`; `models.identity` (`Principal`, `Role`) | none: principals come from `providers.identity` (OIDC, local user, directory) |
 | Operations: orders, leases, spend | `services.operations` · `OpsService`, `SpendService`, `SpendViews` (`ctx.spend_views.usage_summary(source, window, group_by)`: a source's usage per day, skill and model at list prices, unrecorded; it never opens the record store, and `SpendService.usage_summary` is the same answer); `FeedQuery` (the ops feed: orders that stopped or finished, new assessments and recorded releases after a `(timestamp, id)` cursor, oldest first; composes `OpsService`, `AssessmentService` and `PortfolioService`, whose `recorded_release` gives the router a release's repositories and change) | `OpsUnitOfWork` (run_batch, run_order, spend_event, feed_snapshot, assessment_input; composed `OrderQueryReader` for history) |

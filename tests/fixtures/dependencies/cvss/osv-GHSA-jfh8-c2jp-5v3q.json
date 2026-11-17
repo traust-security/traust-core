@@ -1,0 +1,25 @@
+{
+ "id": "GHSA-jfh8-c2jp-5v3q",
+ "aliases": [
+  "CVE-2021-44228"
+ ],
+ "modified": "2025-10-22T19:37:02.616807Z",
+ "severity": [
+  {
+   "type": "CVSS_V3",
+   "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H/E:H"
+  }
+ ],
+ "database_specific": {
+  "severity": "CRITICAL",
+  "github_reviewed": true,
+  "github_reviewed_at": "2021-12-10T00:40:41Z",
+  "nvd_published_at": "2021-12-10T10:15:00Z",
+  "cwe_ids": [
+   "CWE-20",
+   "CWE-400",
+   "CWE-502",
+   "CWE-917"
+  ]
+ }
+}
