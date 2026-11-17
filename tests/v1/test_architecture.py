@@ -37,7 +37,6 @@ SERVICE_SECTION = {
 SPANS_SECTIONS = {
     "findings",
     "exposure",
-    "feed_documents",  # a manifest artifact and its feed_snapshot
     "validation",
     "remediation",
     "remediation_scheduling",

@@ -76,7 +76,7 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
 
 
 class World:
-    def __init__(self, engine: Engine) -> None:
+    def __init__(self, engine: Engine, key: str = "cve-list") -> None:
         self.engine = engine
         self.http = Http()
         self.clock = Clock()
@@ -93,7 +93,7 @@ class World:
             clock=self.clock,
         )
         sources: ProviderRegistry[FeedSource] = ProviderRegistry("feed-source")
-        sources.register("cve-list", lambda: source)
+        sources.register(key, lambda: source)
         uow = SqlTraustUnitOfWork(engine)
         self.svc = ExposureService(
             uow,
@@ -133,7 +133,7 @@ def test_each_document_is_kept_by_digest_under_one_manifest_snapshot(world: Worl
     latest = world.latest()
     assert latest is not None and latest.retrieved_at == AT
     # the manifest names exactly the identifiers asked for, once each
-    manifest = world.svc._documents.manifest("cve-list")
+    manifest = world.svc.document_manifest("cve-list")
     assert manifest is not None and sorted(manifest.documents) == [A, B]
 
 
@@ -187,7 +187,8 @@ def test_when_nothing_is_fetched_the_refresh_raises_and_writes_nothing(world: Wo
     before = world.latest()
     world.clock.at += timedelta(days=1)
     world.http.serve(A, ServiceError("HTTP 503", status=503))
-    with pytest.raises(ServiceError, match=r"no document fetched \(1 failed; first: HTTP 503\)"):
+    outage = r"no document fetched \(1 failed, each logged; first: HTTP 503\)"
+    with pytest.raises(ServiceError, match=outage):
         world.svc.refresh_documents("cve-list", [A])
     assert world.latest() == before
 
@@ -296,3 +297,85 @@ def test_an_unreadable_last_manifest_stops_the_refresh_for_a_person_to_act(world
     world.objects._blobs.pop(ObjectKey.parse(uri))
     with pytest.raises(NotFoundError):  # carrying forward needs it; it is never silently reset
         world.svc.refresh_documents("cve-list", [A])
+
+
+def test_unchanged_content_keeps_its_first_fetch_time_and_one_manifest(world: World) -> None:
+    world.http.serve(A, doc(A))
+    world.svc.refresh_documents("cve-list", [A])
+    first = world.latest()
+    world.clock.at += timedelta(days=1)
+    world.svc.refresh_documents("cve-list", [A])
+    latest = world.latest()
+    assert latest is not None and first is not None
+    assert latest.id != first.id and latest.artifact_id == first.artifact_id
+    stored = world.svc.stored_document("cve-list", A)
+    assert stored is not None and stored.acquired_at == AT
+
+
+def test_a_late_retry_of_a_superseded_order_changes_nothing(world: World) -> None:
+    world.http.serve(A, doc(A))
+    world.http.serve(B, doc(B))
+    old, new = world.run_order(), world.run_order()
+    world.svc.refresh_documents("cve-list", [A], old)
+    world.svc.refresh_documents("cve-list", [A, B], new)
+    newest = world.latest()
+    world.svc.refresh_documents("cve-list", [A], old)
+    assert world.latest() == newest
+    assert world.svc.stored_document("cve-list", B) is not None
+
+
+def test_a_clock_that_stepped_back_still_makes_the_new_manifest_latest(world: World) -> None:
+    world.http.serve(A, doc(A))
+    world.svc.refresh_documents("cve-list", [A])
+    world.clock.at -= timedelta(hours=1)
+    world.http.serve(A, doc(A, rev=2))
+    world.svc.refresh_documents("cve-list", [A])
+    latest = world.latest()
+    assert latest is not None and latest.retrieved_at > AT
+    stored = world.svc.stored_document("cve-list", A)
+    assert stored is not None and stored.data == doc(A, rev=2)
+
+
+def test_a_failed_fetch_never_carries_a_document_the_store_lost(world: World) -> None:
+    world.http.serve(A, doc(A))
+    world.http.serve(B, doc(B))
+    world.svc.refresh_documents("cve-list", [A, B])
+    world.objects._blobs.pop(doc_key(doc(A)))
+    world.http.serve(A, ServiceError("HTTP 503", status=503))
+    refresh = world.svc.refresh_documents("cve-list", [A, B])
+    assert refresh.carried == () and [f.identifier for f in refresh.failed] == [A]
+    assert world.svc.stored_document("cve-list", A) is None
+
+
+def test_every_failure_is_logged_when_nothing_was_fetched(
+    world: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    world.http.serve(A, ServiceError("HTTP 503", status=503))
+    with pytest.raises(ServiceError, match="2 failed, each logged"):
+        world.svc.refresh_documents("cve-list", [A, B])
+    assert {A, B} <= {r.args[1] for r in caplog.records if r.args}  # type: ignore[index]
+
+
+def test_a_source_registered_under_another_key_reads_back_what_it_kept(engine: Engine) -> None:
+    aliased = World(engine, key="cna-records")  # the provider itself is named cve-list
+    aliased.http.serve(A, doc(A))
+    aliased.svc.refresh_documents("cna-records", [A])
+    stored = aliased.svc.stored_document("cna-records", A)
+    assert stored is not None and stored.data == doc(A)
+
+
+@pytest.mark.parametrize(
+    ("given", "kept"),
+    [
+        ("cve-2026-0001", "CVE-2026-0001"),
+        ("rhsa-2024:6493", "RHSA-2024:6493"),
+        ("rhsa-2024_6493", "RHSA-2024:6493"),
+        ("GHSA-jfh8-c2jp-5v3q", "GHSA-jfh8-c2jp-5v3q"),
+    ],
+)
+def test_identifiers_a_source_matches_in_any_case_are_kept_in_one_spelling(
+    given: str, kept: str
+) -> None:
+    from traust_core.v1.services.exposure import _canonical
+
+    assert _canonical(given) == kept

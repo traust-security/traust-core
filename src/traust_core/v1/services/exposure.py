@@ -7,7 +7,7 @@ import logging
 import re
 from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -96,7 +96,13 @@ from traust_core.v1.models.dependencies import (
     repo_label,
     version_key,
 )
-from traust_core.v1.models.feed_documents import DocumentRefresh, StoredDocument
+from traust_core.v1.models.feed_documents import (
+    DocumentFailure,
+    DocumentRefresh,
+    FeedDocument,
+    FeedDocumentManifest,
+    StoredDocument,
+)
 from traust_core.v1.models.findings import (
     Category,
     ExposureKey,
@@ -150,7 +156,6 @@ from traust_core.v1.services.artifact_publishing import (
     record_artifact,
     stored_bytes,
 )
-from traust_core.v1.services.feed_documents import FEED_ARTIFACT_KIND, FeedDocuments
 from traust_core.v1.services.findings.intake import FindingIntake
 from traust_core.v1.services.findings.records import FindingRecords
 from traust_core.v1.services.portfolio import Inventory, PortfolioService
@@ -159,7 +164,11 @@ from traust_core.v1.services.repo_checkout import RepoCheckoutService
 if TYPE_CHECKING:
     from traust_core.v1.services.findings.service import FindingService
 
+FEED_ARTIFACT_KIND = "feed"
 EPSS, KEV, RH_CVE = FeedName("epss"), FeedName("kev"), FeedName("rh-cve")
+# identifiers a source matches case-insensitively, kept in one spelling (`_canonical`)
+_CVE_ID = re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE)
+_RH_ADVISORY_ID = re.compile(r"RH[SBE]A-\d{4}[:_]\d{4,}", re.IGNORECASE)
 # Title likeness that stamps a CVE on a finding: 53 hand-adjudicated matches at >= 0.55 held no
 # false one. A shared CWE promotes probable to confirmed; it never blocks (sibling CWEs are common).
 AUTO_CONFIRM, AUTO_PROBABLE = 0.75, 0.55
@@ -272,7 +281,6 @@ class ExposureService:
         self._sbom_tool = sbom_tool
         self._checkout = checkout
         self._finding_service = findings
-        self._documents = FeedDocuments(uow, objects, self._feed_sources, self._clock)
 
     def refresh_feeds(
         self, feeds: Sequence[FeedName] | None = None, run_order_id: UUID | None = None
@@ -1771,23 +1779,129 @@ class ExposureService:
     def source_document(self, source: str, identifier: str) -> bytes:
         """A registered feed source's document for one identifier, as it serves it now; nothing
         is kept (`find_advisory` is the OSV record analysis works from)."""
+        return self._feed_source(source).document(identifier).data
+
+    def _feed_source(self, source: str) -> FeedSource:
         if source not in self._feed_sources.names():
             raise NotFoundError(
                 f"feed source {source}: not registered "
                 f"({', '.join(self._feed_sources.names()) or 'none registered'})"
             )
-        return self._feed_sources.get(source).document(identifier).data
+        return self._feed_sources.get(source)
 
     def refresh_documents(
         self, source: str, identifiers: Sequence[str], run_order_id: UUID | None = None
     ) -> DocumentRefresh:
-        """Keep a feed source's document for each identifier: one manifest snapshot per source
-        per refresh, naming exactly these identifiers (`FeedDocuments.refresh`)."""
-        return self._documents.refresh(source, identifiers, run_order_id)
+        """Snapshot a manifest of exactly these identifiers' documents, a failed fetch keeping the
+        last one; nothing fetched (or nothing asked) raises and writes nothing."""
+        provider = self._feed_source(source)
+        wanted = list(dict.fromkeys(map(_canonical, identifiers)))
+        if not wanted:
+            raise ValidationError(f"{source}: no identifiers to refresh documents for")
+        previous = self.document_manifest(source)
+        held = {} if previous is None else previous.documents
+        documents: dict[str, FeedDocument] = {}
+        fetched: list[str] = []
+        failed: list[DocumentFailure] = []
+        carried: list[str] = []
+        for identifier in wanted:
+            last = held.get(identifier)
+            try:
+                entry = self._fetch_document(source, provider, identifier)
+            except (ServiceError, ValidationError) as e:
+                log.warning("%s: %s not fetched: %s", source, identifier, e)
+                failed.append(DocumentFailure(identifier=identifier, error=str(e)))
+                if last is not None and self._objects.exists(_document_object(source, last.digest)):
+                    documents[identifier] = last
+                    carried.append(identifier)
+                continue
+            # unchanged content keeps its first fetch time, so an unchanged refresh is the same
+            # manifest bytes (one artifact, and a retry the snapshot check recognizes)
+            unchanged = last is not None and last.digest == entry.digest
+            documents[identifier] = last if unchanged and last is not None else entry
+            fetched.append(identifier)
+        if not fetched:
+            raise ServiceError(
+                f"{source}: no document fetched ({len(failed)} failed, each logged; "
+                f"first: {failed[0].error})"
+            )
+        manifest = FeedDocumentManifest(source=source, documents=documents)
+        self._snapshot_documents(source, manifest.to_bytes(), run_order_id)
+        return DocumentRefresh(
+            source=source, fetched=tuple(fetched), failed=tuple(failed), carried=tuple(carried)
+        )
+
+    def document_manifest(self, source: str) -> FeedDocumentManifest | None:
+        """The source's latest document manifest; None before its first refresh."""
+        with self._uow as uow:
+            latest = uow.feed_snapshots.latest(_documents_feed(source))
+        if latest is None:
+            return None
+        artifact = self._log.get_artifact(latest.artifact_id)
+        manifest = FeedDocumentManifest.from_bytes(stored_bytes(self._objects, artifact))
+        if manifest.source != source:
+            feed = _documents_feed(source)
+            raise ValidationError(f"{feed}: its manifest is {manifest.source}'s")
+        return manifest
 
     def stored_document(self, source: str, identifier: str) -> StoredDocument | None:
-        """The identifier's document as the source's latest refresh kept it; never fetched."""
-        return self._documents.stored(source, identifier)
+        """The identifier's document as the source's latest refresh kept it, checked against its
+        digest; None when that manifest doesn't name it. Never fetched."""
+        key = _canonical(identifier)
+        manifest = self.document_manifest(source)
+        entry = None if manifest is None else manifest.documents.get(key)
+        if entry is None:
+            return None
+        ref = self._objects.stat(_document_object(source, entry.digest))
+        return StoredDocument(
+            source=source,
+            identifier=key,
+            digest=entry.digest,
+            acquired_at=entry.acquired_at,
+            data=self._objects.get(replace(ref, sha256=entry.digest)),
+        )
+
+    def _fetch_document(self, source: str, provider: FeedSource, identifier: str) -> FeedDocument:
+        result = provider.document(identifier)
+        try:
+            body = json.loads(result.data)
+        except ValueError as e:
+            raise ValidationError(f"{source}: {identifier}: not a JSON document") from e
+        if not isinstance(body, dict):
+            raise ValidationError(f"{source}: {identifier}: not a JSON object")
+        ref = self._objects.put(_document_object(source, sha256_hex(result.data)), result.data)
+        return FeedDocument(digest=ref.sha256, acquired_at=result.acquisition.acquired_at)
+
+    def _snapshot_documents(self, source: str, raw: bytes, run_order_id: UUID | None) -> None:
+        """Record the manifest and its snapshot; the retry checks run after the artifact insert,
+        which serializes writers of the kind, so concurrent refreshes see each other."""
+        ref = self._objects.put(
+            ObjectKey.parse(f"feeds/{source}/manifests/{sha256_hex(raw)}.json"), raw
+        )
+        feed = _documents_feed(source)
+        with self._uow as uow:
+            artifact = record_artifact(
+                uow, Artifact(digest=ref.sha256, kind=FEED_ARTIFACT_KIND, uri=str(ref.key))
+            )
+            assert artifact.id is not None
+            latest = uow.feed_snapshots.latest(feed)
+            if run_order_id is not None and latest is not None:
+                if latest.run_order_id == run_order_id and latest.artifact_id == artifact.id:
+                    return  # a retry that kept the same documents
+                if latest.run_order_id != run_order_id and uow.feed_snapshots.for_run_order(
+                    feed, run_order_id
+                ):
+                    return  # a late retry of an order a newer one has superseded
+            now = self._clock.now()
+            # strictly after the latest, so a clock that stepped back can't hide this manifest
+            if latest is not None and now <= latest.retrieved_at:
+                now = latest.retrieved_at + timedelta(milliseconds=1)  # SQLite keeps milliseconds
+            uow.feed_snapshots.add(
+                FeedSnapshot(
+                    run_order_id=run_order_id, artifact_id=artifact.id, feed=feed, retrieved_at=now
+                )
+            )
+            uow.commit()
 
     def _required_payload(self, feed: FeedName) -> bytes:
         payload = self.feed_payload(feed)
@@ -2078,3 +2192,21 @@ def _with_judged(found: SymbolResolution | None, judged: Sequence[str]) -> Symbo
     return found.model_copy(
         update={"status": SymbolStatus.RESOLVED, "symbols": (*found.symbols, *extra)}
     )
+
+
+def _documents_feed(source: str) -> str:
+    """The `feed_snapshot.feed` a source's document manifests are recorded under."""
+    return f"{source}-documents"
+
+
+def _document_object(source: str, digest: str) -> ObjectKey:
+    return ObjectKey.parse(f"feeds/{source}/documents/{digest}.json")
+
+
+def _canonical(identifier: str) -> str:
+    """A CVE or Red Hat advisory id in upper case (an advisory's `_` as `:`); others as given."""
+    if _CVE_ID.fullmatch(identifier):
+        return identifier.upper()
+    if _RH_ADVISORY_ID.fullmatch(identifier):
+        return identifier.upper().replace("_", ":")
+    return identifier

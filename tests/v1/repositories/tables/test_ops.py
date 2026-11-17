@@ -230,6 +230,18 @@ def test_latest_feed_snapshot_by_retrieval_time(seed: Seed) -> None:
     assert feeds.latest("osv") == new
 
 
+def test_a_run_orders_newest_snapshot_of_a_feed(seed: Seed) -> None:
+    feeds = seed.uow.feed_snapshots
+    order, other = seed.run_order(), seed.run_order()
+    assert order.id is not None and other.id is not None
+    assert feeds.for_run_order("osv", order.id) is None
+    seed.feed_snapshot(feed="osv", run_order_id=order.id, retrieved_at=T0)
+    newest = seed.feed_snapshot(feed="osv", run_order_id=order.id, retrieved_at=T0 + timedelta(1))
+    seed.feed_snapshot(feed="osv", run_order_id=other.id, retrieved_at=T0 + timedelta(2))
+    seed.feed_snapshot(feed="epss", run_order_id=order.id, retrieved_at=T0 + timedelta(3))
+    assert feeds.for_run_order("osv", order.id) == newest
+
+
 def test_assessment_inputs_link_results_to_snapshots(seed: Seed) -> None:
     inputs = seed.uow.assessment_inputs
     snapshot, assessment = seed.feed_snapshot(), seed.assessment()
