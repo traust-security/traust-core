@@ -307,7 +307,7 @@ class _DepsDevHttp:
     def __init__(self) -> None:
         self.urls: list[str] = []
 
-    def get(self, url: str) -> bytes:
+    def get(self, url: str, limit: int | None = None) -> bytes:
         self.urls.append(url)
         node = {"versionKey": {"name": "idna", "version": "2.7"}, "relation": "DIRECT"}
         return json.dumps({"nodes": [node]}).encode()
@@ -692,7 +692,9 @@ class _Recorder:
     def __init__(self) -> None:
         self.urls: list[str] = []
 
-    def get(self, url: str, headers: object = None, *, secret_headers: object = None) -> bytes:
+    def get(
+        self, url: str, headers: object = None, *, secret_headers: object = None, limit: object = None
+    ) -> bytes:
         self.urls.append(url)
         return b"{}"
 
@@ -740,3 +742,12 @@ def test_a_ghsa_source_takes_only_github_advisory_ids(identifier: str) -> None:
     with pytest.raises(ValidationError, match="not its kind of identifier"):
         source.document(identifier)
     assert http.urls == []
+
+
+def test_a_sources_document_cap_comes_from_the_registry() -> None:
+    from traust_core.v1.context.feeds import _load
+
+    shipped = Path(__file__).parents[3] / "src/traust_core/v1/context/shipped/feeds.yaml"
+    sources = _load(shipped).sources
+    assert sources["vex"].max_document_bytes == 128 * 1024 * 1024
+    assert sources["nvd"].max_document_bytes is None  # the default cap

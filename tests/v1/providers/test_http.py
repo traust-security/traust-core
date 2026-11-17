@@ -26,8 +26,9 @@ class _Resp:
     def __exit__(self, *a: object) -> None:
         return None
 
-    def read(self) -> bytes:
-        return self._body
+    def read(self, n: int = -1) -> bytes:
+        self.asked = n
+        return self._body if n < 0 else self._body[:n]
 
 
 def _urlopen(actions: list[Any], calls: list[int]) -> Callable[..., _Resp]:
@@ -351,3 +352,18 @@ def test_secret_headers_go_to_the_url_only_never_onto_a_redirect(
     )
     assert redirected is not None
     assert redirected.get_header("Apikey") is None and redirected.get_header("X-plain") == "p"
+
+
+def test_a_body_within_its_limit_comes_back_whole(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch(monkeypatch, [b"12345"])
+    assert _fetcher([]).get("http://feed.test/doc", limit=5) == b"12345"
+
+
+def test_a_body_over_its_limit_is_refused_after_reading_one_byte_more(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = _Resp(b"x" * 1000)
+    monkeypatch.setattr(http.urllib.request, "urlopen", lambda req, timeout=None: body)
+    with pytest.raises(ServiceError, match=r"^feed\.test: response over 5 bytes, refused$") as e:
+        _fetcher([]).get("http://user:secret@feed.test/doc?id=1", limit=5)
+    assert body.asked == 6 and e.value.operation == "http.get"

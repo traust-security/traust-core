@@ -287,6 +287,11 @@ def fill_template(template: str, identifier: str) -> str:
         raise ConfigError(f"{template}: unknown placeholder {e}") from e
 
 
+# The most a per-identifier document may be, unless its source declares more: the largest
+# measured (2026-11-17) were Red Hat VEX documents of 2-4 MB; NVD records are ~100 KB.
+DOCUMENT_BYTES = 32 * 1024 * 1024
+
+
 @dataclass(frozen=True, slots=True)
 class ApiKey:
     """A source's API key and the header it travels in, from the deployment's config (traust.yaml
@@ -355,8 +360,10 @@ class FeedSource:
         probe_http: HttpFetcher,
         clock: Clock,
         api_key: ApiKey | None = None,
+        max_bytes: int = DOCUMENT_BYTES,
     ) -> None:
         self.name = name
+        self._max_bytes = max_bytes
         self.url = url
         self.template = template
         self._ident = _IDENTS.get(ident or "")
@@ -369,14 +376,15 @@ class FeedSource:
             raise ConfigError(f"{name}: an API key travels on a GET source only")
         self._api_key = api_key
 
-    def _get(self, http: HttpFetcher, url: str, *, keyed: bool) -> bytes:
+    def _get(self, http: HttpFetcher, url: str, *, keyed: bool, limit: int | None = None) -> bytes:
         """A GET, carrying the source's API key only when `keyed` (a URL `_resolve` built from
         the per-identifier template, so on the template's own host) and the deployment gives
         one: a secret header, sent to this URL only. Any other request is exactly as before."""
+        bound = {} if limit is None else {"limit": limit}
         if self._api_key is None or not keyed:
-            return http.get(url)
+            return http.get(url, **bound)
         try:
-            return http.get(url, secret_headers=self._api_key.headers())
+            return http.get(url, secret_headers=self._api_key.headers(), **bound)
         except ServiceError as e:
             if e.status is not None and 400 <= e.status < 500 and e.status != 429:
                 # a revoked, mistyped or wrongly synced key is refused like a bad URL: say so
@@ -438,10 +446,11 @@ class FeedSource:
         return Readiness(ready=True, detail=f"{host} answered the probe")
 
     def document(self, identifier: str) -> Result[bytes]:
-        """The source's document for one identifier, as it serves it now."""
+        """The source's document for one identifier, as it serves it now; one over the source's
+        size cap is refused (`ServiceError`) before it is read whole."""
         url = self._resolve(identifier)
         acquisition = Acquisition(provider=self.name, acquired_at=self._clock.now(), source=url)
-        return Result(self._get(self._http, url, keyed=True), acquisition)
+        return Result(self._get(self._http, url, keyed=True, limit=self._max_bytes), acquisition)
 
     def _resolve(self, identifier: str) -> str:
         if self.template is None:

@@ -16,6 +16,7 @@ from traust_core.v1.context.redaction import yaml_cause, yaml_where
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.feeds import (
+    DOCUMENT_BYTES,
     ApiKey,
     FeedProvider,
     FeedSource,
@@ -94,6 +95,8 @@ class _Source(_Strict):
     index_url: str | None = None
     index_file: str | None = None
     max_age_hours: float = 24.0
+    # a per-identifier document's size cap, when the default (DOCUMENT_BYTES) is too small
+    max_document_bytes: pydantic.PositiveInt | None = None
     paginate: _Paginate | None = None
     incremental: _Incremental | None = None
     project: tuple[str, ...] = ()
@@ -345,6 +348,7 @@ def load_feed_sources(
                 post=post,
                 probe=probe,
                 api_key=_api_key(name, source, keys.get(name), (api_key_variables or {}).get(name)),
+                max_bytes=source.max_document_bytes or DOCUMENT_BYTES,
                 http=http,
                 probe_http=probe_http,
                 clock=clock,

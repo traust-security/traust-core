@@ -142,13 +142,27 @@ class HttpFetcher:
         headers: Mapping[str, str] | None = None,
         *,
         secret_headers: Mapping[str, str] | None = None,
+        limit: int | None = None,
     ) -> bytes:
         """`secret_headers` (an API key) go to `url` only: never onto a redirected request, so a
-        redirect to another host can't carry them."""
+        redirect to another host can't carry them. A body over `limit` bytes is refused unread."""
+        read: Callable[[Any], bytes] = (
+            (lambda r: r.read()) if limit is None else (lambda r: r.read(limit + 1))
+        )
         try:
-            return self._send(url, None, headers=headers, secret_headers=secret_headers)
+            body: bytes = self._send(
+                url, None, read=read, headers=headers, secret_headers=secret_headers
+            )
         except _Refused as e:
             raise _refused(url, e.status, "http.get") from e
+        if limit is not None and len(body) > limit:
+            host = urllib.parse.urlsplit(url).hostname or ""
+            raise ServiceError(
+                f"{host}: response over {limit} bytes, refused",
+                operation="http.get",
+                target_hash=_target_hash(url),
+            )
+        return body
 
     def pages(self, url: str, headers: Mapping[str, str] | None = None) -> Iterator[bytes]:
         """Each page's body, following the `Link: <…>; rel="next"` header (RFC 8288)."""

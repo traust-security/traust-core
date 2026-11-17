@@ -34,7 +34,7 @@ class FakeHttp:
         self.reply = reply
         self.urls: list[str] = []
 
-    def get(self, url: str) -> bytes:
+    def get(self, url: str, limit: int | None = None) -> bytes:
         self.urls.append(url)
         if isinstance(self.reply, Exception):
             raise self.reply
