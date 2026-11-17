@@ -693,7 +693,12 @@ class _Recorder:
         self.urls: list[str] = []
 
     def get(
-        self, url: str, headers: object = None, *, secret_headers: object = None, limit: object = None
+        self,
+        url: str,
+        headers: object = None,
+        *,
+        secret_headers: object = None,
+        limit: object = None,
     ) -> bytes:
         self.urls.append(url)
         return b"{}"

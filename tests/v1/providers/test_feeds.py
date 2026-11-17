@@ -529,3 +529,15 @@ def test_a_document_is_read_under_its_sources_cap_and_a_probe_without_one() -> N
     capped.check()
     source(http=(default := _Http())).document("CVE-2021-44228")
     assert http.limits == [1024, None] and default.limits == [DOCUMENT_BYTES]
+
+
+@pytest.mark.parametrize("cap", [0, -1])
+def test_a_document_cap_below_one_byte_is_a_config_error(cap: int) -> None:
+    http = _Http()
+    with pytest.raises(ConfigError, match="nvd: a document size cap is at least one byte"):
+        FeedSource(
+            "nvd", "https://nvd.test/", template="https://nvd.test/cves?cveId={ident_upper}",
+            ident="cve", post=False, probe=None, http=http,  # type: ignore[arg-type]
+            probe_http=http,  # type: ignore[arg-type]
+            clock=FixedClock(AT), max_bytes=cap,
+        )  # fmt: skip

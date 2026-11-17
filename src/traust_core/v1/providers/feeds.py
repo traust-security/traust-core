@@ -362,6 +362,8 @@ class FeedSource:
         api_key: ApiKey | None = None,
         max_bytes: int = DOCUMENT_BYTES,
     ) -> None:
+        if max_bytes < 1:
+            raise ConfigError(f"{name}: a document size cap is at least one byte")
         self.name = name
         self._max_bytes = max_bytes
         self.url = url
@@ -447,7 +449,7 @@ class FeedSource:
 
     def document(self, identifier: str) -> Result[bytes]:
         """The source's document for one identifier, as it serves it now; one over the source's
-        size cap is refused (`ServiceError`) before it is read whole."""
+        size cap is refused (`ValidationError`, a bad answer) before it is read whole."""
         url = self._resolve(identifier)
         acquisition = Acquisition(provider=self.name, acquired_at=self._clock.now(), source=url)
         return Result(self._get(self._http, url, keyed=True, limit=self._max_bytes), acquisition)
