@@ -520,6 +520,22 @@ def test_a_report_finding_carries_its_owasp_llm_categories(target: Target) -> No
     assert all(f.owasp_llm_references == () for f in found[1:])
 
 
+def test_a_report_finding_carries_its_kind(target: Target) -> None:
+    """The contracts report's `findings[].kind` is the kind the intake writes onto the
+    finding row; `of_report` must not be where it drops off (the audit: only the newest
+    recordings state one, so the column reads empty on the migrated history)."""
+    from tests.v1.services.reporting.documents import valid_report
+    from traust_core.v1.models.artifacts import ReportArtifact
+
+    doc = valid_report()
+    doc["findings"][0]["kind"] = "weakness"
+    doc["findings"][1]["kind"] = "vulnerability"
+    found = FindingCandidate.of_report(
+        ReportArtifact.from_document(doc).findings, target.repository.id
+    )
+    assert [f.kind for f in found] == ["weakness", "vulnerability"]
+
+
 def test_a_report_finding_carries_its_cvss_claim(target: Target) -> None:
     """The contracts report's `findings[].cvss` block is the CVSS source the intake
     writes; `of_report` must not be where it drops off."""

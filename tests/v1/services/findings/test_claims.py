@@ -222,6 +222,26 @@ def test_retained_claim_changes_current_projection_not_reported_evidence(claims:
     assert retained.claim.title == corrected.finding.title
 
 
+def test_the_view_carries_the_claims_description(claims: Claims) -> None:
+    """The drawer's substance on core rows: the description the accepted claim states,
+    folded onto every FindingView route from the claim the fold already holds — None
+    before any claim was accepted, and for an `as_of` that predates it."""
+    before = claims.findings.get(claims.finding_id)
+    assert before.description is None
+    pending = claims.request()
+    corrected = claims.accept(pending.id)
+    assert corrected.description == (
+        "The destination buffer has the wrong bound, rather than the originally reported source."
+    )
+    assert claims.findings.get(claims.finding_id).description == corrected.description
+    [historical] = claims.findings.all(
+        FindingFilter(
+            repository_id=corrected.finding.repository_id, as_of=NOW - timedelta(seconds=1)
+        )
+    )
+    assert historical.description is None
+
+
 def test_requests_and_acceptance_retry_without_new_rows(claims: Claims) -> None:
     pending = claims.request()
     assert claims.request() == pending
