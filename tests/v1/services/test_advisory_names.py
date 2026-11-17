@@ -248,10 +248,58 @@ def test_a_source_whose_storage_fails_is_reported_and_the_rest_still_refresh(
 
     def failing(source: str, *args: object, **kw: object) -> object:
         if source == "cve-list":
-            raise RepositoryError("the store is unreachable")
+            try:
+                raise TimeoutError("socket closed")
+            except TimeoutError as cause:
+                raise RepositoryError("the store is unreachable", operation="put") from cause
         return real(source, *args, **kw)  # type: ignore[arg-type]
 
     monkeypatch.setattr(svc, "refresh_documents", failing)
     by_source = {o.source: o for o in svc.refresh_advisory_documents()}
-    assert by_source["cve-list"].error == "the store is unreachable"
+    failed = by_source["cve-list"]
+    assert not failed.ok
+    assert failed.error == "RepositoryError: the store is unreachable (cause TimeoutError, in put)"
+    assert by_source["nvd"].ok and by_source["ghsa"].ok
     assert by_source["nvd"].refresh is not None and by_source["ghsa"].refresh is not None
+
+
+def test_when_every_source_asked_fails_the_refresh_raises_with_each_reason(engine: Engine) -> None:
+    finding(engine, advisory(engine, LOG4SHELL).id)
+    http = Http()
+    for url in (
+        "https://cve.test/api/cve/CVE-2021-44228",
+        "https://nvd.test/cves?cveId=CVE-2021-44228",
+    ):
+        http.answers[url] = ServiceError(f"{url}: HTTP 503", status=503)
+    with pytest.raises(ServiceError) as raised:
+        exposure(engine, http).refresh_advisory_documents()  # ghsa is asked for nothing
+    message = str(raised.value)
+    assert message.startswith("no advisory documents refreshed (cve-list: ")
+    assert "; nvd: " in message and "cveId" not in message  # the query is redacted
+
+
+def test_with_no_linked_advisory_nothing_is_asked_and_nothing_raises(engine: Engine) -> None:
+    finding(engine, None)
+    outcomes = exposure(engine, Http()).refresh_advisory_documents()
+    assert [(o.requested, o.ok) for o in outcomes] == [(0, True)] * 3
+
+
+@pytest.mark.parametrize(
+    ("raw", "kept"),
+    [
+        (
+            "https://nvd.test/cves?cveId=CVE-1&token=s3cret: HTTP 500",
+            "https://nvd.test/cves?…: HTTP 500",
+        ),
+        (
+            "https://u:s3cret@cve.test/api/cve/CVE-1: HTTP 404",
+            "https://cve.test/api/cve/CVE-1: HTTP 404",
+        ),
+        ("https://u:p@h.test/x?a=s3cret#frag gave up", "https://h.test/x?…#frag gave up"),
+        ("no url here: HTTP 500", "no url here: HTTP 500"),
+    ],
+)
+def test_a_failures_text_never_carries_a_urls_credentials_or_query(raw: str, kept: str) -> None:
+    from traust_core.v1.services.exposure import _redacted
+
+    assert _redacted(raw) == kept

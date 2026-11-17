@@ -174,6 +174,8 @@ EPSS, KEV, RH_CVE = FeedName("epss"), FeedName("kev"), FeedName("rh-cve")
 _CVE_ID = re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE)
 _RH_ADVISORY_ID = re.compile(r"RH[SBE]A-\d{4}[:_]\d{4,}", re.IGNORECASE)
 _USERINFO = re.compile(r"(\b[a-z][a-z0-9+.-]*://)[^/@\s]*@", re.IGNORECASE)
+# a URL's query: up to its fragment, or an optional `:` before whitespace ("<url>: HTTP 404")
+_QUERY = re.compile(r"(\b[a-z][a-z0-9+.-]*://[^\s?#]+)\?[^\s#]*?(?=#|:?(?:\s|$))", re.IGNORECASE)
 # Title likeness that stamps a CVE on a finding: 53 hand-adjudicated matches at >= 0.55 held no
 # false one. A shared CWE promotes probable to confirmed; it never blocks (sibling CWEs are common).
 AUTO_CONFIRM, AUTO_PROBABLE = 0.75, 0.55
@@ -1343,8 +1345,8 @@ class ExposureService:
         self, run_order_id: UUID | None = None
     ) -> list[AdvisoryDocumentsRefresh]:
         """Keep the documents for every advisory a finding names, from each registered source:
-        CVE ids to the CVE List, NVD and Red Hat, GHSA ids to `ghsa`. A source that fails, its
-        fetches or its storage, keeps its last manifest and says why; the others still refresh."""
+        CVE ids to the CVE List, NVD and Red Hat, GHSA ids to `ghsa`. A failed source keeps its
+        last manifest and says why (`ok` false); when every source asked fails, it raises."""
         names = self._names_of(self._findings.linked_advisory_ids()).values()
         cves = sorted({c for n in names for c in n.cves})
         ghsas = sorted({g for n in names for g in n.ghsas})
@@ -1359,7 +1361,7 @@ class ExposureService:
             try:
                 refresh = self.refresh_documents(source, identifiers, run_order_id)
             except (ServiceError, ValidationError) as e:
-                error = _without_userinfo(str(e))
+                error = _redacted(str(e))
                 log.warning("%s documents not refreshed; keeping the last: %s", source, error)
                 outcomes.append(
                     AdvisoryDocumentsRefresh(source=source, requested=len(identifiers), error=error)
@@ -1367,16 +1369,28 @@ class ExposureService:
                 continue
             except (NotFoundError, IntegrityError, RepositoryError) as e:
                 # its last manifest, or the store it writes to, is unreadable: a person acts
-                log.error("%s documents not refreshed error_type=%s", source, type(e).__name__)
+                cause = type(e.__cause__).__name__ if e.__cause__ is not None else None
+                operation = getattr(e, "operation", None)
+                log.error(
+                    "%s documents not refreshed error_type=%s cause=%s operation=%s",
+                    source, type(e).__name__, cause, operation,
+                )  # fmt: skip
+                parts = (("cause", cause), ("in", operation))
+                detail = ", ".join(f"{k} {v}" for k, v in parts if v)
+                error = f"{type(e).__name__}: {_redacted(str(e))}"
+                error += f" ({detail})" if detail else ""
                 outcomes.append(
-                    AdvisoryDocumentsRefresh(
-                        source=source, requested=len(identifiers), error=_without_userinfo(str(e))
-                    )
+                    AdvisoryDocumentsRefresh(source=source, requested=len(identifiers), error=error)
                 )
                 continue
             outcomes.append(
                 AdvisoryDocumentsRefresh(source=source, requested=len(identifiers), refresh=refresh)
             )
+        attempted = [o for o in outcomes if o.requested]
+        if attempted and not any(o.ok for o in attempted):
+            # nothing refreshed anywhere: an outage, never a result a caller could take as done
+            reasons = "; ".join(f"{o.source}: {o.error}" for o in attempted)
+            raise ServiceError(f"no advisory documents refreshed ({reasons})")
         return outcomes
 
     def advisories_for(self, finding_id: UUID) -> list[Advisory]:
@@ -1885,7 +1899,7 @@ class ExposureService:
             try:
                 entry = self._fetch_document(source, provider, identifier)
             except (ServiceError, ValidationError) as e:
-                error = _without_userinfo(str(e))
+                error = _redacted(str(e))
                 log.warning("%s: %s not fetched: %s", source, identifier, error)
                 failed.append(DocumentFailure(identifier=identifier, error=error))
                 if last is not None and self._still_held(source, last):
@@ -2289,9 +2303,10 @@ def _document_object(source: str, digest: str) -> ObjectKey:
     return ObjectKey.parse(f"feeds/{source}/documents/{digest}.json")
 
 
-def _without_userinfo(text: str) -> str:
-    """An error's text with any URL's credentials (`https://user:pass@host`) removed."""
-    return _USERINFO.sub(r"\1", text)
+def _redacted(text: str) -> str:
+    """An error's text with any URL's credentials and query removed: either can carry a secret
+    (`https://user:pass@host`, `?token=…`)."""
+    return _QUERY.sub(r"\1?…", _USERINFO.sub(r"\1", text))
 
 
 def _canonical(identifier: str) -> str:

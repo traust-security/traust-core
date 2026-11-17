@@ -436,15 +436,18 @@ advisory can be `GHSA-…` or `GO-…` with its CVE only an alias. EPSS, KEV, NV
 are all keyed by CVE, so a join on the canonical name would find nothing for a CVE that has data.
 `exposure.advisory_names(finding_ids)` is therefore the door every advisory join goes through:
 each finding's `AdvisoryNames` (`models.dependencies`), the canonical name first, then every alias,
-with `cves` (upper case) and `ghsas` split out. It takes two batched reads for any number of
-findings; a finding that names no advisory is absent.
+with `cves` (upper case) and `ghsas` (GitHub's spelling) split out. It reads the findings, their
+advisories, any canonical advisory that read didn't include, then the aliases: at most four batched
+reads for any number of findings. A finding that names no advisory is absent.
 
 `exposure.refresh_advisory_documents(run_order_id)` keeps the documents for every advisory any
 finding names, resolved, false-positive and risk-accepted ones included, so their detail keeps its
 scores and a reopened finding already has them. CVE ids go to `cve-list`, `nvd` and `rh-cve`, and
 GHSA ids to `ghsa`. A source that isn't registered (or is `access: disabled`) is skipped. A source
-that fails keeps its last manifest and says why (`AdvisoryDocumentsRefresh.error`); the others
-still refresh.
+that fails keeps its last manifest and says why (`AdvisoryDocumentsRefresh.ok` false, with its
+`error`); the others still refresh. When every source asked fails, the refresh raises
+`ServiceError` naming each one's reason, so an outage never reads as a finished refresh. A
+failure's text never carries a URL's credentials or query string.
 
 **Set an NVD API key.** This refresh asks NVD for every linked CVE every day. Without a key NVD
 allows about 5 requests per 30 seconds, so a few thousand CVEs take hours. A key is free

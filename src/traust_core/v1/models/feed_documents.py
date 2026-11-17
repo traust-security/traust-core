@@ -6,7 +6,7 @@ import json
 from collections.abc import Mapping
 
 import pydantic
-from pydantic import AwareDatetime, Field
+from pydantic import AwareDatetime, Field, computed_field
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.base import Model
@@ -64,6 +64,12 @@ class AdvisoryDocumentsRefresh(Model):
     requested: int
     refresh: DocumentRefresh | None = None
     error: str | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ok(self) -> bool:
+        """Whether this source refreshed (or had nothing to refresh)."""
+        return self.error is None
 
 
 class StoredDocument(Model):
