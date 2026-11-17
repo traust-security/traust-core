@@ -379,3 +379,29 @@ def test_identifiers_a_source_matches_in_any_case_are_kept_in_one_spelling(
     from traust_core.v1.services.exposure import _canonical
 
     assert _canonical(given) == kept
+
+
+def test_a_failed_fetch_never_carries_a_document_whose_bytes_changed(world: World) -> None:
+    world.http.serve(A, doc(A))
+    world.http.serve(B, doc(B))
+    world.svc.refresh_documents("cve-list", [A, B])
+    world.objects.put(doc_key(doc(A)), b'{"tampered": 1}')
+    world.http.serve(A, ServiceError("HTTP 503", status=503))
+    refresh = world.svc.refresh_documents("cve-list", [A, B])
+    assert refresh.carried == ()
+    assert world.svc.stored_document("cve-list", A) is None
+
+
+def test_a_failure_never_repeats_a_urls_credentials(
+    world: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    world.http.serve(A, doc(A))
+    leaked = "https://user:s3cret@cve.test/api/cve/CVE-2026-0002: HTTP 500"
+    world.http.serve(B, ServiceError(leaked, status=500))
+    [failure] = world.svc.refresh_documents("cve-list", [A, B]).failed
+    assert failure.error == "https://cve.test/api/cve/CVE-2026-0002: HTTP 500"
+    assert "s3cret" not in caplog.text
+    world.http.serve(A, ServiceError(leaked, status=500))
+    with pytest.raises(ServiceError) as raised:
+        world.svc.refresh_documents("cve-list", [A, B])
+    assert "s3cret" not in str(raised.value)

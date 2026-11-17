@@ -169,6 +169,7 @@ EPSS, KEV, RH_CVE = FeedName("epss"), FeedName("kev"), FeedName("rh-cve")
 # identifiers a source matches case-insensitively, kept in one spelling (`_canonical`)
 _CVE_ID = re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE)
 _RH_ADVISORY_ID = re.compile(r"RH[SBE]A-\d{4}[:_]\d{4,}", re.IGNORECASE)
+_USERINFO = re.compile(r"(\b[a-z][a-z0-9+.-]*://)[^/@\s]*@", re.IGNORECASE)
 # Title likeness that stamps a CVE on a finding: 53 hand-adjudicated matches at >= 0.55 held no
 # false one. A shared CWE promotes probable to confirmed; it never blocks (sibling CWEs are common).
 AUTO_CONFIRM, AUTO_PROBABLE = 0.75, 0.55
@@ -1809,9 +1810,10 @@ class ExposureService:
             try:
                 entry = self._fetch_document(source, provider, identifier)
             except (ServiceError, ValidationError) as e:
-                log.warning("%s: %s not fetched: %s", source, identifier, e)
-                failed.append(DocumentFailure(identifier=identifier, error=str(e)))
-                if last is not None and self._objects.exists(_document_object(source, last.digest)):
+                error = _without_userinfo(str(e))
+                log.warning("%s: %s not fetched: %s", source, identifier, error)
+                failed.append(DocumentFailure(identifier=identifier, error=error))
+                if last is not None and self._still_held(source, last):
                     documents[identifier] = last
                     carried.append(identifier)
                 continue
@@ -1860,6 +1862,15 @@ class ExposureService:
             acquired_at=entry.acquired_at,
             data=self._objects.get(replace(ref, sha256=entry.digest)),
         )
+
+    def _still_held(self, source: str, entry: FeedDocument) -> bool:
+        """Whether the store still holds the entry's exact bytes, so it may be carried forward."""
+        try:
+            ref = self._objects.stat(_document_object(source, entry.digest))
+            self._objects.get(replace(ref, sha256=entry.digest))
+        except (NotFoundError, IntegrityError):
+            return False
+        return True
 
     def _fetch_document(self, source: str, provider: FeedSource, identifier: str) -> FeedDocument:
         result = provider.document(identifier)
@@ -2201,6 +2212,11 @@ def _documents_feed(source: str) -> str:
 
 def _document_object(source: str, digest: str) -> ObjectKey:
     return ObjectKey.parse(f"feeds/{source}/documents/{digest}.json")
+
+
+def _without_userinfo(text: str) -> str:
+    """An error's text with any URL's credentials (`https://user:pass@host`) removed."""
+    return _USERINFO.sub(r"\1", text)
 
 
 def _canonical(identifier: str) -> str:
