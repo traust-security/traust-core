@@ -315,6 +315,8 @@ The remaining correctness changes are:
   before `build` returns; the executive summary embeds the validated view.
 - `ViewName.LOC` is validated by `contracts.validate_view("loc", document)` before `build`
   returns; its first-party divisor and estimate are decimal strings, exponent form included.
+- `ViewName.PROGRAM` is validated by `contracts.validate_view("program", document)` before
+  `build` returns; its spend rollups are the shared `spend-records` definitions.
 - `ViewName.COMPLIANCE_PRECISION` wraps the existing
   `DetectionQualityService.calibrate_compliance` result under `calibration`. Its packaged
   view schema reuses the canonical compliance-assessment framework vocabulary through
