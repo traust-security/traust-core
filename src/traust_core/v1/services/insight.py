@@ -4102,7 +4102,7 @@ class ProgramView:
         if window is None:
             raise ValidationError("the program view needs a window")
         spent = SpendFilter(window=window)
-        return ProgramMetrics(
+        model = ProgramMetrics(
             window=window,
             bucket=filter.bucket,
             spend=self._spend.attribute(window),
@@ -4119,6 +4119,8 @@ class ProgramView:
                 for a in sorted(self._assets())
             },
         )
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
 
     def report(self, model: ProgramMetrics, generated_at: datetime) -> Report:
         s = model.spend

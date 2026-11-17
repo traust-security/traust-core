@@ -17,7 +17,7 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.services.test_triage_view import TRIAGE
 from traust_core.v1.context import Config, Context
-from traust_core.v1.errors import ConfigError, ValidationError
+from traust_core.v1.errors import ConfigError, DocumentError, ValidationError
 from traust_core.v1.models.artifacts import TriageArtifact
 from traust_core.v1.models.common import TimeBucket, TimeWindow
 from traust_core.v1.models.findings import FindingSeriesPoint
@@ -33,7 +33,7 @@ from traust_core.v1.models.vocabulary import Severity
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpec, PublishSpecs
-from traust_core.v1.services.insight import TriageView, _summed
+from traust_core.v1.services.insight import ProgramView, TriageView, _summed
 
 HUMAN = "human:analyst@example.com"
 DAY = timedelta(days=1)
@@ -202,6 +202,29 @@ def test_the_program_report_and_its_empty_sections(context: Context, engine: Eng
     md = insight.publish(ViewName.PROGRAM, ViewFilter(window=WEEK)).markdown
     assert "$2.50 spent, $2.00 on run orders and $0.50 no order claims" in md
     assert "| audit | 2026-10-01 | 1 | 0 | 0 | 0 | 1 |" in md
+
+
+def test_a_program_view_outside_its_contract_is_refused_by_the_build(
+    context: Context, engine: Engine
+) -> None:
+    seed_program(engine)
+    services = context.services()
+
+    class Drifted:
+        """The recorded spend, its rollups with an empty group the contract refuses."""
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(services.spend, name)
+
+        def summary(self, filter: Any, group_by: Any) -> Any:
+            return [
+                r.model_copy(update={"events": 0}) for r in services.spend.summary(filter, group_by)
+            ]
+
+    view = ProgramView(Drifted(), services.ops, lambda: ())  # type: ignore[arg-type]
+    with pytest.raises(DocumentError) as error:
+        view.build(ViewFilter(window=WEEK))
+    assert "by_model/0/events" in {issue.path for issue in error.value.issues}
 
 
 def test_the_program_view_needs_a_window(context: Context) -> None:
