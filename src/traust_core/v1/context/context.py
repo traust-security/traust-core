@@ -17,7 +17,7 @@ import sqlalchemy as sa
 import yaml
 from sqlalchemy.engine import Engine
 
-from traust_core.v1 import contracts
+from traust_core.v1 import contracts, data_migrations
 from traust_core.v1.context.attack import load_atlas_catalog, load_attack_catalog
 from traust_core.v1.context.config import (
     SHIPPED_EXTERNAL_TOOLS,
@@ -768,6 +768,7 @@ class Context:
             dialect = Dialect.of(engine)
             apply_schema(engine, contracts.database_ddl(dialect))
             _run_channel(engine, local=True)
+            data_migrations.run(engine)
             log.info(
                 "store bootstrap fresh dialect=%s: baseline schema and the whole channel applied",
                 dialect,
@@ -776,6 +777,7 @@ class Context:
         elif populated:
             if _channel_stamped(engine):
                 _run_channel(engine, local=local)
+                _run_data_channel(engine, local=local)
             else:
                 log.error(
                     "store refused: the database predates the db_upgrade stamp table "
@@ -1281,6 +1283,29 @@ def _channel_stamped(engine: Engine) -> bool:
     """The db_upgrade stamp table is the channel's mark on a database it manages."""
     schema = "traust" if Dialect.of(engine) == Dialect.POSTGRES else None
     return sa.inspect(engine).has_table("db_upgrade", schema=schema)
+
+
+def _run_data_channel(engine: Engine, *, local: bool) -> None:
+    """The data channel follows the DDL channel's rule: a local store applies it,
+    a configured database's data migrations are its deployment's - pending ones
+    are refused, not applied behind its operator's back."""
+    if local:
+        data_migrations.run(engine)
+        return
+    waiting = data_migrations.pending(engine)
+    if waiting:
+        names = ", ".join(entry.name for entry in waiting)
+        log.warning(
+            "configured database refused: behind the data channel, %d entr(y/ies) pending: %s",
+            len(waiting),
+            names,
+            extra={"operation": "store.bootstrap", "outcome": "refused_pending_data"},
+        )
+        raise ConfigError(
+            f"the database is behind the data channel ({len(waiting)} pending: {names}): "
+            "a configured database's data migrations are its deployment's - apply them "
+            "through traust_core.v1.data_migrations.run with its owners"
+        )
 
 
 def _run_channel(engine: Engine, *, local: bool) -> None:

@@ -27,6 +27,7 @@ from traust_core.v1.providers.local import LocalCheckout
 from traust_core.v1.providers.mirror import MirrorCheckout
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.sources import CheckoutRequest
+from traust_core.v1 import data_migrations
 from traust_core.v1.repositories import apply_schema, create_database_engine, on_driver_connection
 from traust_core.v1.repositories.sql import contract_dialect
 from traust_core.v1.services.repo_checkout import CheckoutProvider, RepoCheckoutService
@@ -148,6 +149,7 @@ def apply_contract_db(engine: Engine) -> None:
     on_driver_connection(  # the runner drives a raw autocommit DBAPI connection
         engine, lambda dbapi: contracts.run_db_upgrades(dbapi, contract_dialect(engine))
     )
+    data_migrations.run(engine)  # what a deployment applies: DDL, then data
 
 
 def _engine(kind: str, tmp_path: Path) -> Engine:

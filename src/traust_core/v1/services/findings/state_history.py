@@ -131,7 +131,14 @@ def backfill(
     rating: RatingPolicy,
     repository_ids: Collection[UUID],
 ) -> Backfill:
-    """Fold once per finding, stamp its latest decision row (filling NULLs)."""
+    """Fold once per finding, stamp its latest decision row (filling NULLs).
+
+    One-time upgrade path: exists only for decisions written before the
+    projection. Once every environment is stamped, remove this (and
+    DecisionRepository.stamp_latest, and the trigger carve-out it rides -
+    a later migration restores the absolute append-only guard). check()
+    stays: it is the drift detector, not the upgrade.
+    """
     stamped = absent = 0
     rows = uow.findings.census_for_repositories(repository_ids)
     for finding_id, _repository_id, kind, _title, _created in rows:
