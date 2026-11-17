@@ -16,7 +16,7 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.providers.test_model_catalog import REGISTRY
 from tests.v1.repositories.tables.conftest import T0, Seed
 from traust_core.v1.context import Config, Context
-from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
+from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError, ViewContractError
 from traust_core.v1.models.common import TimeWindow
 from traust_core.v1.models.insight import FindingsRollup, ViewFilter, ViewName
 from traust_core.v1.models.operations import ModelUsage, SpendDimension, SpendFilter, SpendSource
@@ -25,7 +25,7 @@ from traust_core.v1.models.vocabulary import OwnershipClass
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services import insight as insight_module
-from traust_core.v1.services.insight_spend import SpendDashboard
+from traust_core.v1.services.insight_spend import SpendDashboard, SpendMonth, SpendView
 
 DAY = timedelta(days=1)
 WINDOW = TimeWindow(start=datetime(2026, 9, 1, tzinfo=UTC), end=datetime(2026, 11, 1, tzinfo=UTC))
@@ -137,6 +137,28 @@ def test_unit_economics_survive_rollup_drift_in_fields_they_never_read(
     monkeypatch.setattr(insight_module._Counted, "rollup", drifted)
     ue = build(context).unit_economics
     assert ue is not None and (ue.month, ue.repositories) == ("2026-10", 3)
+
+
+def test_a_spend_view_outside_its_contract_is_refused_by_the_build(
+    context: Context, engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only each month's total drifts (a key, where a total has none): the refusal names exactly
+    those, nothing the drift did not touch."""
+    seed_spend(context, engine)
+    real = SpendView._month
+
+    def drifted(self: SpendView, *args: Any) -> SpendMonth:
+        month = real(self, *args)
+        return month.model_copy(update={"total": month.total.model_copy(update={"key": "all"})})
+
+    monkeypatch.setattr(SpendView, "_month", drifted)
+    with pytest.raises(ViewContractError) as error:
+        build(context)
+    assert str(error.value).startswith("spend:")
+    assert {issue.path for issue in error.value.issues} == {
+        "months/0/total/key",
+        "months/1/total/key",
+    }
 
 
 def test_the_spend_report_leads_with_its_limits(context: Context, engine: Engine) -> None:

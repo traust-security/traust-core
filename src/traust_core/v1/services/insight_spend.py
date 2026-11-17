@@ -9,6 +9,7 @@ from uuid import UUID
 
 from pydantic import computed_field
 
+from traust_core.v1 import contracts
 from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.common import TimeWindow
@@ -147,7 +148,7 @@ class SpendView:
         months = tuple(self._month(m, w, by_repo[m], units) for m, w in _months(window))
         unverified, unregistered, unverified_usd = self._rates(months)
         last = next((m for m in reversed(months) if m.total.events), None)
-        return SpendDashboard(
+        model = SpendDashboard(
             window=window,
             months=months,
             unverified_models=unverified,
@@ -165,6 +166,8 @@ class SpendView:
             ),
             unit_economics=None if last is None else self._unit_economics(last, filter),
         )
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
 
     def _month(
         self, month: str, window: TimeWindow, by_repo: Sequence[SpendRollup], units: dict[str, str]
