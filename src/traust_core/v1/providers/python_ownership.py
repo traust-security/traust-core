@@ -69,7 +69,7 @@ _VALIDATOR_NAME = re.compile(
 _CONVERSIONS = {"int", "str", "UUID", "uuid.UUID", "ObjectId", "bytes"}
 _INERT = re.compile(r"^(print|len|repr|isinstance|logger|log|logging|LOG|warnings)(\.|$)")
 _THROWN = re.compile(r"(Exception|Error)$")
-# a caller flag whose holders may act on any record (owner decision 2026-11-02)
+# a caller flag whose holders may act on any record
 _PRIVILEGE_FLAG = re.compile(r"^(is_)?(superuser|admin|staff)$")
 _MUTATORS = re.compile(r"^(set\w*|update|pop|clear|setdefault|__setitem__)$")
 _SETATTR = {"setattr", "object.__setattr__"}
@@ -992,7 +992,7 @@ class _Walk:
                 return
             self.hop_into(call, targets)
         elif self.kept(call) and receiver is not None and not self.v.derived(receiver):
-            # shape 4: a kept load we can't follow, handed a caller-only value (owner decision)
+            # shape 4: a kept load we can't follow, handed a caller-only value
             scoped = any(self.v.derived(v) for v in values)
             self.add(call, Lookup(span, scoped), read=False, cover=cover)
         elif _LOOKUP_NAME.match(name) and (receiver is None or not self.v.derived(receiver)):
@@ -1096,7 +1096,7 @@ class _Walk:
 
     def refuses_foreign(self, stmt: ast.stmt, record: str) -> bool:
         """`if record.<owner> != <caller-only>: raise …` and nothing else; optionally after
-        `record is None or`, and behind `not <caller>.is_superuser and` (owner decision)."""
+        `record is None or`, and behind `not <caller>.is_superuser and`."""
         if not (isinstance(stmt, ast.If) and not stmt.orelse and _raises_only(stmt.body)):
             return False
         test = stmt.test

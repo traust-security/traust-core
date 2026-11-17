@@ -32,7 +32,7 @@ CONSISTENCY_MIN_VERSION = (0, 15, 0)
 REVIEW_SURFACE_MIN_VERSION = (0, 20, 0)
 REVIEW_SURFACE_EXTENDED_MIN_VERSION = (0, 21, 0)
 DETERMINISTIC_STEPS_MIN_VERSION = (0, 60, 1)
-# Gated by audit date, not version: traust stopped bumping VERSION (2026-10-23). The schema
+# Gated by audit date, not version, because traust stopped bumping VERSION. The schema
 # doesn't require it, so reports written before this date stay valid.
 LLM_INTEGRATION_SINCE = "2026-11-02"
 LLM_INTEGRATION = "llm-integration"

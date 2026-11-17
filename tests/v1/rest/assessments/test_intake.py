@@ -78,11 +78,8 @@ def test_both_assessments_of_one_document_bind_the_same_findings_without_duplica
     provenance = Provenance(
         run_id=uuid4(), source=SourceType.VULN_SCAN_REPORT, occurred_at=recording.WHEN
     )
-    # A document-only record is no longer constructible through the record door
-    # (secure-code takes its findings in at record since 2026-11-03); this now
-    # asserts the flip's invariant instead: one document recorded as two kinds
-    # binds the same findings through each assessment's own intake, with no
-    # duplication — the fingerprint match never invents a second finding.
+    # One document recorded as two kinds binds the same findings through each
+    # assessment's intake; fingerprint matching never invents a second finding.
     source = services.assessment.record(
         recording.DOC,
         ref,

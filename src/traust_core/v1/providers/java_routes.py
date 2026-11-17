@@ -1043,7 +1043,7 @@ def _repository_entities(sources: list[Parsed]) -> tuple[dict[str, str], set[str
 
 class _Ownership:
     """A handler's ownership facts. Lookups and hand-offs are read anywhere in the body; protection
-    counts only from the allow-listed shapes 1-5 (owner decisions 2026-10-31, 2026-11-02)."""
+    counts only from the allow-listed shapes 1-5."""
 
     def __init__(self, java: _Java, t: _Type) -> None:
         self.java, self.type = java, t
@@ -1657,7 +1657,7 @@ class _Values:
                 return bool(args) and all(self.derived(a, depth + 1) for a in args)
             if obj is not None and self.derived(obj, depth + 1):
                 return all(self.derived(a, depth + 1) or _literal(a) for a in args)
-            # a resolver handed only the caller (`tenants.of(auth)`): trusted (owner decision)
+            # a resolver handed only the caller (`tenants.of(auth)`): trusted
             return (
                 obj is not None
                 and self._resolver(obj)
@@ -2007,7 +2007,7 @@ class _Walk:
             # a checkout type declares it (a query we don't read): never trusted as shape 4
             self.add(call, Lookup(span), direct=True, read=False)
         elif call.parent is not None and call.parent.type == "variable_declarator":
-            # shape 4: a kept load we can't follow, handed a caller-only value (owner decision)
+            # shape 4: a kept load we can't follow, handed a caller-only value
             scoped = any(self.v.derived(v) for v in values)
             self.add(call, Lookup(span, scoped=scoped), direct=True)
         elif rtext[:1].islower() and _LOOKUP_NAME.match(name) and not _INERT_RECEIVERS.match(rtext):

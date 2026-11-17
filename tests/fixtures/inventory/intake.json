@@ -1,5 +1,5 @@
 {
-  "source": "Sanitized from hybrid-platforms-inputs release-payload and ownership CSVs: product, version, URLs, ref names and teams replaced; full commit SHAs are synthetic test inputs because the CSV names branches.",
+  "source": "Sanitized from release-payload and ownership CSVs: product, version, URLs, ref names and teams replaced; full commit SHAs are synthetic test inputs because the CSV names branches.",
   "product": {
     "slug": "example-platform",
     "name": "Example Platform",

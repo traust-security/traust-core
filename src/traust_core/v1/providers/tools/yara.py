@@ -28,7 +28,7 @@ from traust_core.v1.providers.tools.adapter import adapter_result
 YARA_TIMEOUT = 600
 MAX_FILE_MB = 64
 RL_RULES_REPO = "https://github.com/reversinglabs/reversinglabs-yara-rules"
-RL_RULES_SHA = "e0a0be54aa1e11ccfd6854e4f19e9476f328fd84"  # develop @ 2026-08
+RL_RULES_SHA = "e0a0be54aa1e11ccfd6854e4f19e9476f328fd84"
 RL_RULES_LICENSE = (
     "ReversingLabs YARA rules: MIT (permissive, "
     "redistributable) — see docs/external-dependencies.md"

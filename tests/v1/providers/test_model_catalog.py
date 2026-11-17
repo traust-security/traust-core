@@ -115,7 +115,7 @@ def test_a_missing_registry_is_a_config_error(tmp_path: Path) -> None:
         Context(Config(home=tmp_path)).register_model_catalog(tmp_path / "absent.yaml")
 
 
-# Shaped like traust's config/model-registry.yaml roles (2026-10-26), models renamed.
+# Shaped like traust's config/model-registry.yaml roles, models renamed.
 ROLES_REGISTRY = """\
 version: 1
 updated: "2026-10-26"

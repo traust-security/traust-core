@@ -75,7 +75,7 @@ def test_npm_alias_resolved_in_package_lock() -> None:
     # "npm:@swc/helpers@=0.4.14"`) must resolve to the REAL package
     # (@swc/helpers), never the alias name — the alias name-matched a
     # malicious-package advisory (MAL-2024-7969) and produced a false
-    # positive (2026-08-05). npm records the real name in `name`.
+    # positive. npm records the real name in `name`.
     lock = json.dumps(
         {
             "name": "aliased-app",
