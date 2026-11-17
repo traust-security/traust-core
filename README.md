@@ -317,6 +317,10 @@ The remaining correctness changes are:
   returns; its first-party divisor and estimate are decimal strings, exponent form included.
 - `ViewName.PROGRAM` is validated by `contracts.validate_view("program", document)` before
   `build` returns; its spend rollups are the shared `spend-records` definitions.
+- `ViewName.SCOREBOARD` is validated by `contracts.validate_view("scoreboard", document)`
+  before `build` returns. It still composes the summary, trend and register unchecked, so
+  drift in a field it never reads cannot fail it; drift in one it carries (the trend's latest
+  point) does.
 - `ViewName.COMPLIANCE_PRECISION` wraps the existing
   `DetectionQualityService.calibrate_compliance` result under `calibration`. Its packaged
   view schema reuses the canonical compliance-assessment framework vocabulary through

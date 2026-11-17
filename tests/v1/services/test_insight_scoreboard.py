@@ -258,6 +258,27 @@ def test_the_scoreboard_reports_an_unknown_risk_index_without_failing(
     assert "| Risk index (CVSS sum of open) | — |" in md
 
 
+def test_a_scoreboard_outside_its_contract_is_refused_by_the_build(
+    context: Context, engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drift in a field the scoreboard carries (the trend's latest point) fails its own check."""
+    with SqlTraustUnitOfWork(engine) as uow:
+        s = Seed(uow)
+        svc = s.repository(url="https://github.com/example-org/svc")
+        s.occurrence(s.finding(svc), s.assessment(s.repository_ref(svc), occurred_at=T0))
+        uow.commit()
+    real = insight_module._summed
+
+    def drifted(*args: Any, **kwargs: Any) -> Any:
+        return real(*args, **kwargs).model_copy(update={"new": -1})
+
+    monkeypatch.setattr(insight_module, "_summed", drifted)
+    with pytest.raises(ViewContractError) as error:
+        context.services().insight.build(ViewName.SCOREBOARD, ViewFilter())
+    assert str(error.value).startswith("scoreboard:")
+    assert "trend" in {issue.path for issue in error.value.issues}  # a oneOf: point or null
+
+
 def test_the_scoreboard_survives_register_drift_in_fields_it_never_reads(
     context: Context, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -4882,7 +4882,7 @@ class ScoreboardView:
                 for c in clocks
             )
         rollup, t = summary.rollup, summary.rollup.total
-        return Scoreboard(
+        model = Scoreboard(
             as_of=at.as_of,
             repositories=len(rollup.repositories),
             reported=sum(_reported(r.tally) for r in rollup.repositories),
@@ -4903,6 +4903,8 @@ class ScoreboardView:
             open_threats=sum(r.threat.status in _OPEN_THREATS for r in register.threats),
             filed=filed,
         )
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
 
     def report(self, model: Scoreboard, generated_at: datetime) -> Report:
         p, o = model.trend, model.open
