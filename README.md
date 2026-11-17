@@ -307,6 +307,8 @@ The remaining correctness changes are:
 - `ViewName.EXPOSURE` is validated by `contracts.validate_view("exposure", document)` before
   `build` returns, and carries its `as_of` (the filter's, else the clock's, read once for all
   three cuts); the executive summary's exposure panel uses the same row.
+- `ViewName.SPEND` is validated by `contracts.validate_view("spend", document)` before `build`
+  returns; its rollups are the shared `spend-records` definitions.
 - `ViewName.SLA` is validated by `contracts.validate_view("sla", document)` before `build`
   returns. A median days-to-resolve can be negative when a finding was resolved before its
   clock started (filed after the fix); the contract allows it. An unrated escalation's
