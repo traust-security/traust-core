@@ -68,6 +68,9 @@ class FindingRepository(MutableRecordRepository[Finding], Protocol):
     def list_by_ids(
         self, finding_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
     ) -> list[Finding]: ...
+    def linked_advisory_ids(self) -> list[UUID]:
+        """Every advisory some finding names, once each."""
+        ...
 
 
 class SqlFindingRepository(SqlMutableRepository[Finding]):
@@ -170,3 +173,8 @@ class SqlFindingRepository(SqlMutableRepository[Finding]):
         self, finding_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
     ) -> list[Finding]:
         return self._many_in("list by id", self.table.c.id, finding_ids, read_budget=read_budget)
+
+    def linked_advisory_ids(self) -> list[UUID]:
+        c = self.table.c
+        stmt = sa.select(c.advisory_id).where(c.advisory_id.is_not(None)).distinct()
+        return sorted(UUID(str(r)) for r in self._execute("linked advisories", stmt).scalars())

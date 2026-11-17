@@ -6,7 +6,7 @@ import json
 from collections.abc import Mapping
 
 import pydantic
-from pydantic import AwareDatetime, Field
+from pydantic import AwareDatetime, Field, computed_field
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.base import Model
@@ -54,6 +54,22 @@ class DocumentRefresh(Model):
     fetched: tuple[str, ...]
     failed: tuple[DocumentFailure, ...]
     carried: tuple[str, ...]
+
+
+class AdvisoryDocumentsRefresh(Model):
+    """One source's part of the advisory document refresh: how many identifiers it was asked
+    for, and its refresh, or why the whole source failed (`error`)."""
+
+    source: str
+    requested: int
+    refresh: DocumentRefresh | None = None
+    error: str | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ok(self) -> bool:
+        """Whether this source refreshed (or had nothing to refresh)."""
+        return self.error is None
 
 
 class StoredDocument(Model):

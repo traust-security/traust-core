@@ -83,6 +83,19 @@ def test_image_get_or_add_keeps_the_first_row_for_a_digest(seed: Seed) -> None:
     assert u.images.find_by_digest("sha256:img") == first
 
 
+def test_advisories_and_their_aliases_read_in_batches(seed: Seed) -> None:
+    u = seed.uow
+    cve, other = seed.advisory(identifier="CVE-2026-2000"), seed.advisory()
+    ghsa = seed.advisory(identifier="GHSA-bbbb", alias_of_id=cve.id)
+    go = seed.advisory(identifier="GO-2026-1", alias_of_id=other.id)
+    assert cve.id and other.id and ghsa.id
+    by_name = lambda rows: sorted(rows, key=lambda a: a.identifier)  # noqa: E731
+    assert by_name(u.advisories.list_by_ids([cve.id, ghsa.id])) == by_name([cve, ghsa])
+    assert u.advisories.list_by_ids([]) == []
+    assert by_name(u.advisories.list_aliases_of([cve.id, other.id])) == by_name([ghsa, go])
+    assert u.advisories.list_aliases_of([ghsa.id]) == []  # an alias has no aliases of its own
+
+
 def test_advisory_aliases_and_affected_packages(seed: Seed) -> None:
     u = seed.uow
     cve = seed.advisory(identifier="CVE-2026-1000")

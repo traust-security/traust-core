@@ -217,6 +217,32 @@ class Advisory(Entity):
     published_at: datetime | None = None
 
 
+class AdvisoryNames(Model):
+    """One vulnerability's names: its canonical advisory, then every alias. The canonical one
+    is whichever name core saw first, so it can be a GHSA or GO id with the CVE an alias."""
+
+    advisory_id: UUID  # the canonical advisory
+    identifiers: tuple[str, ...]
+
+    @property
+    def cves(self) -> tuple[str, ...]:
+        """The CVE ids among the names, upper-cased, once each."""
+        return tuple(dict.fromkeys(i.upper() for i in self.identifiers if _CVE_NAME.fullmatch(i)))
+
+    @property
+    def ghsas(self) -> tuple[str, ...]:
+        """The GitHub advisory ids among the names, in GitHub's spelling (OSV's key), once each."""
+        return tuple(
+            dict.fromkeys(
+                f"GHSA-{i[5:].lower()}" for i in self.identifiers if _GHSA_NAME.fullmatch(i)
+            )
+        )
+
+
+_CVE_NAME = re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE)
+_GHSA_NAME = re.compile(r"GHSA(-[23456789cfghjmpqrvwx]{4}){3}", re.IGNORECASE)
+
+
 class AdvisoryPackage(Entity):
     advisory_id: UUID
     package_id: UUID
