@@ -110,7 +110,12 @@ def test_osvs_copy_of_a_cve_record_ranks_nowhere() -> None:
     assert parse_osv(_doc("osv-CVE-2026-9277.json")) == ()
 
 
-def _cve_list(state: str = "PUBLISHED", **cvss: Any) -> dict[str, Any]:
+def _cve_list(state: str = "PUBLISHED", provider: Any = None, **cvss: Any) -> dict[str, Any]:
+    if provider is not None:
+        return {
+            "cveMetadata": {"cveId": "CVE-2099-0001", "state": state},
+            "containers": {"cna": {"providerMetadata": provider, "metrics": [cvss]}},
+        }
     return {
         "cveMetadata": {"cveId": "CVE-2099-0001", "state": state},
         "containers": {
@@ -137,6 +142,9 @@ def test_an_adp_without_a_short_name_is_named_by_its_org_id() -> None:
 def test_a_cve_list_block_and_its_version_must_agree() -> None:
     mismatched = {"cvssV3_1": {"version": "3.0", "vectorString": V30, "baseScore": 9.1}}
     assert parse_cve_list(_cve_list(**mismatched)) == ()
+    # the block says 3.1 and the vector is 3.1, but the object states 3.0: refused all the same
+    stated_wrong = {"cvssV3_1": {"version": "3.0", "vectorString": V31, "baseScore": 8.1}}
+    assert parse_cve_list(_cve_list(**stated_wrong)) == ()
 
 
 def test_red_hats_two_documents() -> None:
@@ -278,6 +286,19 @@ def test_an_unreviewed_ghsa_and_another_databases_record_rank_nowhere() -> None:
         (parse_csaf, {"vulnerabilities": "x"}),
         (parse_cve_list, {"containers": {}}),  # no cveMetadata
         (parse_cve_list, {"cveMetadata": {"cveId": "CVE-2099-1"}}),  # no state
+        (
+            parse_cve_list,
+            {"cveMetadata": {"cveId": "CVE-2099-1", "state": "PUBLISHED"}},
+        ),  # truncated
+        (
+            parse_cve_list,
+            {"cveMetadata": {"cveId": "CVE-2099-1", "state": "PUBLISHED"}, "containers": {}},
+        ),
+        (
+            parse_cve_list,
+            {**_cve_list(), "cveMetadata": {"cveId": "CVE-2099-1", "state": "Published"}},
+        ),
+        (parse_cve_list, _cve_list(provider={})),  # nobody named as the scorer
         (parse_cve_list, _cve_list(cvssV3_1={"version": "3.1", "baseScore": 8.1})),  # no vector
         # a score block that's present must carry its vector: a renamed field fails, never drops
         (

@@ -282,7 +282,7 @@ class _CveListMetric(Dto):
 
 
 class _CveListProvider(Dto):
-    org_id: StrictStr | None = Field(None, alias="orgId")
+    org_id: StrictStr = Field(alias="orgId")
     short_name: StrictStr | None = Field(None, alias="shortName")
 
 
@@ -292,29 +292,36 @@ class _CveListContainer(Dto):
 
 
 class _CveListContainers(Dto):
-    cna: _CveListContainer | None = None
+    cna: _CveListContainer
     adp: tuple[_CveListContainer, ...] = ()
+
+
+class CveRecordState(StrEnum):
+    """A CVE List record's lifecycle state (CVE JSON 5 `cveMetadata.state`)."""
+
+    PUBLISHED = "PUBLISHED"
+    REJECTED = "REJECTED"
+    RESERVED = "RESERVED"
 
 
 class _CveListMetadata(Dto):
     cve_id: StrictStr = Field(alias="cveId")
-    state: StrictStr
+    state: CveRecordState
 
 
 class _CveListRecord(Dto):
     metadata: _CveListMetadata = Field(alias="cveMetadata")
-    containers: _CveListContainers = Field(default_factory=_CveListContainers)
+    containers: _CveListContainers
 
 
 def cve_list_scores(raw: bytes, *, acquired_at: datetime | None = None) -> tuple[CvssScore, ...]:
     """A CVE List record's (CVE JSON 5): the CNA's container, then each ADP's, by name. A
     record that isn't PUBLISHED states nothing."""
     record = _parsed(_CveListRecord, raw, "a CVE List record")
-    if record.metadata.state != "PUBLISHED":
+    if record.metadata.state is not CveRecordState.PUBLISHED:
         return ()
     containers = record.containers
-    tagged = [(CvssSource.CNA, containers.cna)] if containers.cna is not None else []
-    tagged += [(CvssSource.ADP, adp) for adp in containers.adp]
+    tagged = [(CvssSource.CNA, containers.cna), *((CvssSource.ADP, adp) for adp in containers.adp)]
     found = [
         score_of(
             source,
@@ -328,7 +335,7 @@ def cve_list_scores(raw: bytes, *, acquired_at: datetime | None = None) -> tuple
         for source, container in tagged
         for metric in container.metrics
         for block, version in _NVD_BLOCKS
-        if (cvss := getattr(metric, block)) is not None
+        if (cvss := getattr(metric, block)) is not None and cvss.version == version
     ]
     return distinct(found)
 
