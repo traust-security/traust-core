@@ -16,7 +16,6 @@ from tests.v1.repositories.tables.conftest import Seed
 from tests.v1.services.test_exposure_impact import LODASH, Lookup, engine
 from tests.v1.services.test_exposure_sweep import FakeCheckout, FakeSbomTool
 from traust_core.v1.errors import IntegrityError, NotFoundError, ValidationError
-from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
 from traust_core.v1.models.assessment import AssessmentKind
 from traust_core.v1.models.dependencies import (
     AdvisoryIdentifier,

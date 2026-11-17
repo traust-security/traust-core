@@ -26,8 +26,6 @@ from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects import InMemoryObjectStore
 from traust_core.v1.services.exposure import ExposureService, _provenance
 from traust_core.v1.services.findings import FindingIntake, IdentityPolicy, TaxonomyPolicy
-from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
-
 from traust_core.v1.services.findings.records import FindingRecords
 
 PAGE = Path(__file__).parents[2] / "fixtures/dependencies/feeds/rh_cve_page.json"

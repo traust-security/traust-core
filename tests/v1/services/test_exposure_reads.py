@@ -24,7 +24,6 @@ from tests.v1.services.test_exposure_impact import (
     sbom,
 )
 from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
-from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
 from traust_core.v1.models.common import Cursor, PageRequest, Provenance, every_item
 from traust_core.v1.models.dependencies import (
     AdvisoryIdentifier,

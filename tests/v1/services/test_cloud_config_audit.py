@@ -52,12 +52,11 @@ from traust_core.v1.repositories.objects import ObjectKey
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpec, PublishSpecs
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.cloud_config import CloudConfigCitations
-from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
-
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.identity import IdentityPolicy
 from traust_core.v1.services.findings.intake import FindingIntake
 from traust_core.v1.services.findings.precedents import FindingPrecedents
+from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
 from traust_core.v1.services.findings.review import ReviewPolicy
 from traust_core.v1.services.findings.taxonomy import TaxonomyPolicy
 from traust_core.v1.services.ledger import LedgerConfig, LedgerService
@@ -482,7 +481,7 @@ def test_the_same_report_again_is_the_same_assessment_and_adds_nothing(
 
 def test_assessed_decisions_are_appended_to_the_ledger_and_sealed(engine: Engine) -> None:
     uow = SqlTraustUnitOfWork(engine)
-    rating = RatingPolicy(RatingConfig())
+    _rating = RatingPolicy(RatingConfig())
     decisions = FindingDecisions(
         uow,
         LedgerService(uow, LedgerConfig()),

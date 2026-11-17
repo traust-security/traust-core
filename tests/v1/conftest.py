@@ -18,7 +18,7 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from tests.v1.example import repository as example_repository
-from traust_core.v1 import contracts
+from traust_core.v1 import contracts, data_migrations
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.providers.base import Readiness
 from traust_core.v1.providers.clock import FixedClock
@@ -27,7 +27,6 @@ from traust_core.v1.providers.local import LocalCheckout
 from traust_core.v1.providers.mirror import MirrorCheckout
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.sources import CheckoutRequest
-from traust_core.v1 import data_migrations
 from traust_core.v1.repositories import apply_schema, create_database_engine, on_driver_connection
 from traust_core.v1.repositories.sql import contract_dialect
 from traust_core.v1.services.repo_checkout import CheckoutProvider, RepoCheckoutService

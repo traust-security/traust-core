@@ -218,7 +218,7 @@ from traust_core.v1.rendering import (
     inline,
     markdown_text,
 )
-from traust_core.v1.services.findings.census import FindingCensusRow
+from traust_core.v1.services.findings.census import FindingCensusRow, StateGroup, TopCutRow
 from traust_core.v1.services.findings.intake import CATEGORY
 from traust_core.v1.services.findings.rating import CvssFloor, RatingConfig, RatingPolicy, SlaConfig
 from traust_core.v1.services.provider_catalog import core_version
@@ -1245,15 +1245,23 @@ class FindingsRollupView:
         """The rollup before its contract check, for a composite that reads only its totals
         (spend's unit economics): drift in a field it never reads must not fail it."""
         products, shipped, repositories = _scope(self._portfolio, filter)
-        # the census: the tallies read states, severities and labels off narrow rows —
-        # never a view materialized — and each batch is counted and released, never held
-        # for the whole scope
         counted = _Counted(filter, products, shipped, repositories)
-        self._findings.census(
-            [r.id for r in repositories],
-            counted.census,
-            filter.as_of,  # type: ignore[misc,arg-type]
-        )
+        if filter.as_of is None:
+            # the projection road: the tallies read the stamped state, grouped in SQL —
+            # never a row per finding. Claims stay per-finding: their category and title
+            # are a claim's, folded where the review machinery lives
+            rows = self._findings.projected_census([r.id for r in repositories])
+            counted.groups(rows.tallies)
+            counted.count_rows(rows.claimed)
+            counted.note_top(rows.top)
+        else:
+            # point-in-time: the projection is the current fold only, so the census road
+            # folds as of the filter's moment — each batch counted and released
+            self._findings.census(
+                [r.id for r in repositories],
+                counted.census,
+                filter.as_of,  # type: ignore[misc,arg-type]
+            )
         rollup = counted.rollup()
         if filter.product_ids or filter.team_ids:
             scenarios = self._assessment.attack_scenarios(
@@ -1596,6 +1604,18 @@ class _Counting:
             self.proven += row.proven
             self.unverified += row.unverified
 
+    def group(self, counted: StateGroup) -> None:
+        """The same counting, a grouped count at a time."""
+        bucket, n = counted.state, counted.count
+        self.states[bucket] += n
+        self.decided += n if counted.decided else 0
+        if bucket == FindingState.RESOLVED:
+            self.remediated[counted.severity] += n
+        if bucket == _OPEN:
+            self.opened[counted.severity] += n
+            self.proven += n if counted.proven else 0
+            self.unverified += n if counted.unverified else 0
+
     def severities(self, counts: Counter[Severity | None]) -> SeverityCounts:
         return SeverityCounts(
             **{
@@ -1653,14 +1673,7 @@ class _Counted:
         for row in rows:
             if not self.wants(row):
                 continue
-            self.total.add(row)
-            self.by_repository[row.repository_id].add(row)  # type: ignore[index]
-            if row.state is _HARDENING:
-                self.hardening[row.repository_id][row.category or "uncategorized"] += 1  # type: ignore[index]
-            for product_id, shipped in self.shipped.items():
-                if row.repository_id in shipped:
-                    self.by_product[product_id].add(row)
-            self.categories[row.category].add(row)
+            self.count(row)
             if row.state is _OPEN and str(row.severity) in _TOP:
                 self.top.append(
                     TopFinding(
@@ -1673,6 +1686,57 @@ class _Counted:
                         sla_due=row.sla_due,
                     )
                 )
+
+    def count_rows(self, rows: Iterable[FindingCensusRow]) -> None:
+        """Count the claimed few: the shared routing, the top cut served separately."""
+        for row in rows:
+            if self.wants(row):
+                self.count(row)
+
+    def count(self, row: FindingCensusRow) -> None:
+        """Count one finding: the routing every road shares, the top cut's fields unread."""
+        self.total.add(row)
+        self.by_repository[row.repository_id].add(row)  # type: ignore[index]
+        if row.state is _HARDENING:
+            self.hardening[row.repository_id][row.category or "uncategorized"] += 1  # type: ignore[index]
+        for product_id, shipped in self.shipped.items():
+            if row.repository_id in shipped:
+                self.by_product[product_id].add(row)
+        self.categories[row.category].add(row)
+
+    def groups(self, tallies: Iterable[StateGroup]) -> None:
+        """Count the unclaimed bulk's grouped tallies; a category scope keeps only groups
+        carrying one of those labels."""
+        for counted in tallies:
+            if self._wanted is not None and counted.category not in self._wanted:
+                continue
+            self.total.group(counted)
+            self.by_repository[counted.repository_id].group(counted)  # type: ignore[index]
+            if counted.state is _HARDENING:
+                bucket = counted.category or "uncategorized"  # type: ignore[index]
+                self.hardening[counted.repository_id][bucket] += counted.count
+            for product_id, shipped in self.shipped.items():
+                if counted.repository_id in shipped:
+                    self.by_product[product_id].group(counted)
+            self.categories[counted.category].group(counted)
+
+    def note_top(self, top: Iterable[TopCutRow]) -> None:
+        """The projected road's top cut, in the census's own counting order; a category
+        scope keeps only rows carrying one of those labels."""
+        for row in top:
+            if self._wanted is not None and row.category not in self._wanted:
+                continue
+            self.top.append(
+                TopFinding(
+                    finding_id=row.finding_id,
+                    repository_url=self._urls[row.repository_id],
+                    title=row.title,
+                    severity=row.severity,
+                    cvss_score=row.cvss_score,
+                    execution_proven=row.execution_proven,
+                    sla_due=row.sla_due,
+                )
+            )
 
     def rollup(self) -> FindingsRollup:
         # imported here: findings.decisions imports this module's TriageView, so a

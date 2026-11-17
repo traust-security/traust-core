@@ -86,7 +86,12 @@ from traust_core.v1.services.artifact_publishing import (
     PublishSpecs,
     stored_bytes,
 )
-from traust_core.v1.services.findings.census import FindingCensus, FindingCensusRow
+from traust_core.v1.services.findings.census import (
+    FindingCensus,
+    FindingCensusRow,
+    ProjectedCensus,
+    ProjectedRollup,
+)
 from traust_core.v1.services.findings.claims import FindingClaims, retained_claim_artifact
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.facts import FindingFacts
@@ -260,6 +265,7 @@ class FindingService:
         self._rating = rating
         self._views = FindingViewQuery(rating, objects)
         self._census = FindingCensus(rating, objects)
+        self._projected = ProjectedCensus(rating, objects)
         self._objects = objects
         self._windows = windows
         self._shared_depth = 0
@@ -893,6 +899,14 @@ class FindingService:
         with self._uow as uow:
             for rows in self._census.rows(uow, repository_ids, as_of):
                 count(rows)
+
+    def projected_census(self, repository_ids: Collection[UUID]) -> ProjectedRollup:
+        """The rollup's counted facts off the stamped projection: grouped tallies for the
+        unclaimed bulk, census rows for the claim-carrying few, the top cut bounded — the
+        same counted facts the fold serves, at a fraction of its cost. Point-in-time
+        consumers keep `census`: the projection is the current fold only."""
+        with self._uow as uow:
+            return self._projected.rows(uow, repository_ids)
 
     def on_ref(self, repository_ref_id: UUID) -> list[FindingView]:
         """Findings reported on this named line, with resolution folded on that line."""

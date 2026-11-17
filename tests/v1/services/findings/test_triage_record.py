@@ -22,7 +22,6 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.errors import DocumentError, ValidationError
-from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
 from traust_core.v1.models.artifacts import TriageArtifact
 from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.findings import Finding
@@ -39,6 +38,7 @@ from traust_core.v1.services.artifact_publishing import (
 from traust_core.v1.services.findings.citations import VerdictCitations
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.precedents import FindingPrecedents
+from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
 from traust_core.v1.services.findings.review import ReviewPolicy
 from traust_core.v1.services.ledger import LedgerConfig, LedgerService
 from traust_core.v1.services.lint import Lint
@@ -112,7 +112,7 @@ def decisions(
         clock=FixedClock(NOW),
         objects=objects or InMemoryObjectStore(),
         review=ReviewPolicy(**kw),
-    rating=RatingPolicy(RatingConfig()),
+        rating=RatingPolicy(RatingConfig()),
     )
 
 

@@ -9,7 +9,6 @@ from tests.v1.services.findings.test_intake import Target, audit, candidate, int
 from tests.v1.services.findings.test_intake import engine as engine
 from tests.v1.services.findings.test_intake import target as target
 from traust_core.v1.errors import RepositoryError, ValidationError
-from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
 from traust_core.v1.models.common import CodeSpan
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.findings import FindingIntake, IdentityPolicy, TaxonomyPolicy

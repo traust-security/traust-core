@@ -14,7 +14,6 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.providers.test_crypto import AT, DEPENDENCY_PROBES, FIXTURE, legacy_shape
 from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.context import Config, Context
-from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
 from traust_core.v1.errors import ConfigError, IntegrityError
 from traust_core.v1.models.artifacts import CodeFactsArtifact
 from traust_core.v1.models.code_facts import (

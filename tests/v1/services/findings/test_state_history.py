@@ -179,7 +179,7 @@ def test_check_catches_a_corrupted_column(engine: Engine) -> None:
 
 def test_first_seen_keeps_the_earliest_occurrence(engine: Engine) -> None:
     """First seen keeps the earliest occurrence."""
-    repository, finding = seeded_finding(engine)
+    _repository, finding = seeded_finding(engine)
     with SqlTraustUnitOfWork(engine) as uow:
         state_history.note_first_seen(uow, finding, NOW)
         state_history.note_first_seen(uow, finding, NOW.replace(year=2025))

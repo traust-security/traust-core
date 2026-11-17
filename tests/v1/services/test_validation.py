@@ -172,7 +172,7 @@ def harness(engine: Engine) -> ValidationHarness:
         clock=FixedClock(NOW),
         objects=objects,
         review=review_policy,
-    rating=RatingPolicy(RatingConfig()),
+        rating=RatingPolicy(RatingConfig()),
     )
     review = FindingReview(
         shared, review_policy, decisions, FindingViewQuery(RatingPolicy(RatingConfig()))

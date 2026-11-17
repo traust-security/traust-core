@@ -367,7 +367,13 @@ class Seed:
         return Decision(**{**values, **kw})
 
     def decision(self, finding: Finding | None = None, **kw: Any) -> Decision:
-        return self._add("decision", self.new_decision(finding, **kw))
+        # the seed is a write door: stamp the fold the production doors stamp, so a
+        # seeded decision reads the same through the projection as through the fold
+        from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
+        from traust_core.v1.services.findings.state_history import stamp
+
+        draft = stamp(self.new_decision(finding, **kw), self.uow, RatingPolicy(RatingConfig()))
+        return self._add("decision", draft)
 
     def new_decision_approver(
         self, decision: Decision | None = None, **kw: Any
