@@ -664,6 +664,13 @@ def test_loc_never_hides_broken_measurements() -> None:
         loc({RA: IntegrityError("duplicate language measurements")}, {A: RA}).build(ViewFilter())
 
 
+def test_a_loc_view_outside_its_contract_is_refused_by_the_build() -> None:
+    drifted: dict[UUID, Any] = {RA: LanguageStats(languages=(lang("Go", -5),))}
+    with pytest.raises(DocumentError) as error:
+        loc(drifted, {A: RA}).build(ViewFilter())
+    assert "repositories/0/languages/0/code" in {issue.path for issue in error.value.issues}
+
+
 def test_loc_renders_through_context(engine: Engine, tmp_path: Path) -> None:
     ctx = context(engine, tmp_path)
     doc = CodeFactsArtifact.from_document(
