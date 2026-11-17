@@ -307,6 +307,18 @@ class Services:
     checkouts: RepoCheckoutService
 
 
+@dataclass(frozen=True, slots=True)
+class StoreUpgradePlan:
+    """What a store has not run, both channels: the DDL channel's scripts and
+    the data channel's entries. Truthy when anything is pending."""
+
+    ddl: tuple[contracts.Upgrade, ...] = ()
+    data: tuple[data_migrations.DataMigration, ...] = ()
+
+    def __bool__(self) -> bool:
+        return bool(self.ddl or self.data)
+
+
 @dataclass(frozen=True)
 class _Observation:
     """What the observation door yields: the write path and the composite read."""
@@ -758,11 +770,17 @@ class Context:
         )
 
     @cached_property
-    def database(self) -> Engine:
-        local = self.config.database.url is None
-        if local:
+    def _store_engine(self) -> Engine:
+        """The configured store's engine - one pool per Context, shared by the
+        open gate (``database``) and the operator's channel calls alike."""
+        if self.config.database.url is None:
             self.config.home.mkdir(parents=True, exist_ok=True)
-        engine = create_database_engine(self.config.record_store_url())
+        return create_database_engine(self.config.record_store_url())
+
+    @cached_property
+    def database(self) -> Engine:
+        engine = self._store_engine
+        local = self.config.database.url is None
         populated = _store_populated(engine)
         if local and not populated:
             dialect = Dialect.of(engine)
@@ -790,6 +808,55 @@ class Context:
                     "contract (traust-contracts db/v1/traust/README.md, Upgrades)"
                 )
         # else: a configured empty database is its deployment's, never bootstrapped
+        return engine
+
+    def pending_db_upgrades(self) -> StoreUpgradePlan:
+        """Both channels' pending work, planned not applied: the DDL channel's
+        scripts (names, hashes, declared destructive reasons) and the data
+        channel's entries. Touches no DDL - the data channel's stamp table is
+        created empty if absent, its own pending's behaviour."""
+        return self._drive_channels(contracts.pending_db_upgrades, data_migrations.pending)
+
+    def apply_db_upgrades(self) -> StoreUpgradePlan:
+        """Apply both channels deliberately - the operator's call, never an
+        open's - DDL first, then data, the open path's own order. Each script
+        and entry runs whole with its stamp; both channels are idempotent and
+        refuse drift either way."""
+        return self._drive_channels(contracts.run_db_upgrades, data_migrations.run)
+
+    def _drive_channels(
+        self,
+        ddl_run: Callable[..., list[contracts.Upgrade]],
+        data_run: Callable[[Engine], list[data_migrations.DataMigration]],
+    ) -> StoreUpgradePlan:
+        """Drive both channels' entry points over one store engine, DDL first:
+        the same wrapping for plan and apply, so the two never drift."""
+        engine = self._planable_store_engine()
+        try:
+            ddl = on_driver_connection(engine, lambda dbapi: ddl_run(dbapi, Dialect.of(engine)))
+            data = data_run(engine)
+        except (MigrationError, data_migrations.DataMigrationError) as error:
+            raise ConfigError(
+                f"the db contract's upgrade channels refused this store: {error}"
+            ) from error
+        return StoreUpgradePlan(tuple(ddl), tuple(data))
+
+    def _planable_store_engine(self) -> Engine:
+        """The store engine for the operator's channel calls: a known shape, or
+        a refusal that says which. Version 0 and empty stores are bootstrapped
+        or recreated, never upgraded through the surface."""
+        engine = self._store_engine
+        if not _store_populated(engine):
+            raise ConfigError(
+                "the store is empty: it is bootstrapped by an open (a local store) or by its "
+                "deployment - there is nothing to plan or apply"
+            )
+        if not _channel_stamped(engine):
+            raise ConfigError(
+                "the database predates the upgrade channel: its schema has no db_upgrade "
+                "stamp table, so its shape is unknown — recreate the store from the current "
+                "contract (traust-contracts db/v1/traust/README.md, Upgrades)"
+            )
         return engine
 
     @cached_property
@@ -1294,18 +1361,23 @@ def _run_data_channel(engine: Engine, *, local: bool) -> None:
         return
     waiting = data_migrations.pending(engine)
     if waiting:
-        names = ", ".join(entry.name for entry in waiting)
         log.warning(
             "configured database refused: behind the data channel, %d entr(y/ies) pending: %s",
             len(waiting),
-            names,
+            _data_plan(waiting),
             extra={"operation": "store.bootstrap", "outcome": "refused_pending_data"},
         )
         raise ConfigError(
-            f"the database is behind the data channel ({len(waiting)} pending: {names}): "
-            "a configured database's data migrations are its deployment's - apply them "
-            "through traust_core.v1.data_migrations.run with its owners"
+            f"the database is behind the data channel ({len(waiting)} pending: "
+            f"{_data_plan(waiting)}): a configured database's data migrations are its "
+            "deployment's - plan them with `traust db upgrades`, apply them with "
+            "`traust db upgrades --apply` (or Context.apply_db_upgrades) with its owners"
         )
+
+
+def _data_plan(waiting: Iterable[data_migrations.DataMigration]) -> str:
+    """One fragment per pending entry: name and hash prefix."""
+    return "; ".join(f"{entry.name} sha256:{entry.sha256[:12]}" for entry in waiting)
 
 
 def _run_channel(engine: Engine, *, local: bool) -> None:
@@ -1327,12 +1399,11 @@ def _run_channel(engine: Engine, *, local: bool) -> None:
             f"the db contract's upgrade channel refused this store: {error}"
         ) from error
     if pending:
-        names = ", ".join(upgrade.name for upgrade in pending)
         log.warning(
             "configured database refused: behind the db contract, %d upgrade(s) pending: %s "
             "- its deployment applies them, not this open",
             len(pending),
-            names,
+            _upgrade_plan(pending),
             extra={
                 "operation": "store.bootstrap",
                 "outcome": "refused_pending",
@@ -1341,6 +1412,18 @@ def _run_channel(engine: Engine, *, local: bool) -> None:
         )
         raise ConfigError(
             f"the database is behind the db contract ({len(pending)} upgrade(s) pending: "
-            f"{names}): a configured database's upgrades are its deployment's - apply them "
-            "through the channel runner (traust_contracts.v1.migrations) with its owners"
+            f"{_upgrade_plan(pending)}): a configured database's upgrades are its "
+            "deployment's - plan them with `traust db upgrades`, apply them with "
+            "`traust db upgrades --apply` (or Context.apply_db_upgrades) with its owners"
         )
+
+
+def _upgrade_plan(pending: Iterable[contracts.Upgrade]) -> str:
+    """One fragment per pending script: name, hash prefix, declared destructiveness."""
+    parts = []
+    for upgrade in pending:
+        part = f"{upgrade.name} sha256:{upgrade.sha256[:12]}"
+        if upgrade.destructive:
+            part += f" [destructive: {upgrade.destructive}]"
+        parts.append(part)
+    return "; ".join(parts)
