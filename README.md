@@ -10,13 +10,13 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Errors** | `errors` | the exception hierarchy every layer raises (`ValidationError`, `NotFoundError`, …) | ad hoc exceptions |
 | **Models** | `models` | one model per contract table, grouped by section — `inventory`, `dependencies`, `assessment`, `findings`, `operations`, `ledger` (fields = columns) — next to that section's service types; `base` (`Model` strict, `Dto` tolerant, `Entity` with a database-generated UUIDv4 id, `AppendOnly` for tables that are never updated), `values` (`HttpsRepoUrl`, `GitSha`, `CveId`, `to_rfc3339` / `TimestampError`: the contracts' one RFC 3339 rule), `integrity` | dicts passed between scripts |
 | **Validation rules** | `models.validation` | `ValidationScope.permits(action, target, as_of=…)`, `ValidationPlan.requires_approval()`, `ValidationAttempt.soundness()` — pure scope, approval and refutation rules | duplicated harness scope and soundness rules |
+| **CVSS sources** | `models.cvss`, `services.findings.cvss`, `models.feed_documents`, `services.exposure` | the per-source documents kept daily (`exposure.refresh_documents`: one manifest snapshot per source, a failed fetch keeping the last document; `exposure.stored_document` reads one back, digest-checked); `exposure.advisory_names` is the batched door every advisory join goes through (canonical name plus aliases, CVEs split out), and `exposure.refresh_advisory_documents` keeps every linked advisory's documents; each advisory source's CVSS from its stored document (`cve_list_scores`, `nvd_scores`, `osv_scores`, `rh_cve_scores`, `csaf_scores`, `scanner_score`; `score_of` refuses a malformed vector, a version that disagrees with it, a score outside 0–10 or one its vector doesn't compute), and the one a finding shows: `effective(scores)` ranks NIST > GitHub-reviewed GHSA > CNA > ADP > Red Hat > scanner, takes a source's 3.1 before its 3.0, and keeps 4.0 alongside, never ranked | `AdvisoryRecord.cvss_score`, which reads only one feed's 3.x vectors |
 | **Validation recording** | `services.validation`, `models.validation` | `record_order(doc, provenance, bindings, run_order_id, principal)` binds machine reports to a live order lease; trusted-local `record(doc, provenance, bindings)` and `evidence(artifact_id)` retain their existing semantics | re-running probes, interpreting source labels as database IDs |
 | **Artifacts** | `models.artifacts` | the `ArtifactDocument` base + `SchemaView` (fields from the installed schema, `doc.findings[0].verdict`, unknown names raise) and the named documents (`TriageArtifact`, `SecurityAuditArtifact`, …, `Verdict`, `Severity`) | `json.load` + `.get("key")` |
 | **Artifact publishing** | `services.artifact_publishing` | `ctx.artifact_publisher(specs).publish(name, raw)` or `.publish_artifact(artifact)`: exact gate → content-addressed objects → an artifact UUID on SQLite and Postgres; `get(artifact_id)` verifies the persisted digest; `list_for_assessment(id, kind=…)` reads metadata | writing `analysis-results` files by hand or optional indexing |
-| **Code facts** | `services.code_facts`, `models.code_facts`, `providers.crypto`, `providers.crypto_image`, `providers.crypto_cluster`, `providers.route_guards`, `providers.route_ownership`, `providers.express_routes`, `providers.java_routes`, `providers.python_ownership`, `providers.express_ownership`, `providers.ruby_ownership`, `providers.syntax`, `providers.grpc_guards`, `providers.llm_app`, `providers.config_matrix`, `providers.sanitizers`, `providers.fork_lag`, `providers.priv_profile`, `providers.tree`, `models.elf_formats`, `models.crypto_formats` | `ctx.services().code_facts.collect/list/symbols/language_stats` over the latest `tool_scan` assessment's `CodeFactsArtifact`; measured LoC, exact symbol filters and snapshot-bound pagination. `code_facts.enumerate(kind, ToolRequest)` runs a deterministic `FactEnumerator` over a checkout (`CryptoProbe`: toolchains, images, policies a checkout configures; the secure-code pre-scans `RouteGuardMatrix` (Go, Django, Flask, FastAPI, aiohttp; Express, Spring and JAX-RS parsed with tree-sitter grammars loaded by `providers.syntax`), `GrpcGuardMatrix` (Go gRPC servers, their interceptors, the services registered on them and their methods), `LlmAppDetector` (whether a checkout is an LLM, agent or MCP application and which files use it, from imports, direct manifest declarations and prompt templates), `ConfigMatrix`, `SanitizerDiscovery` and `ForkDetector`, over `providers.tree`'s symlink-safe file walk); `code_facts.route_guards(ToolRequest, resolve_handlers=)` places handlers through the symbol index; route rows carry `ownership` on authenticated id routes (`providers.route_ownership`: scoped, checked, caller-blind, unchecked, none, unknown or n/a, with the spans behind it; caller-blind and unchecked rows are judged; filled for Spring and JAX-RS from each handler's path variables, caller, lookups by id, checks and one same-repository hop, for FastAPI (`providers.python_ownership`) from the handler and the dependencies handed a path id, for Express (`providers.express_ownership`) from the handler, the checkout middleware in its chain and the functions it calls, and for Rails (`providers.ruby_ownership`) from the action, its `before_action` callbacks, models, Pundit policies and the CanCanCan `Ability`); `code_facts.grpc_guards(ToolRequest)` is the gRPC service x interceptor matrix; `code_facts.coverage(ToolRequest, repository_ref_id=)` compares the repository's latest threat-model entry points (`assessment.threat_model_entry_points`) and what the pre-scans detected against the pre-scan for each entry-point kind, as covered, uncovered or unexplained; `code_facts.llm_app(ToolRequest)` is the LLM-application detection that gates the LLM review; `code_facts.priv_profile(ToolRequest, repo)` is the operator privilege profile (`PrivProfiler`: SCC requests, securityContexts, namespaces and install modes, every RBAC rule, and the shipped RBAC no `+kubebuilder:rbac` marker declares) as the contract `PrivProfileArtifact`; `code_facts.fork_lag(ToolRequest, offline=)` adds each tracked upstream version's advisories (`exposure.package_advisories`), a failed read being the result's `network` error; `code_facts.crypto(ref_id, ToolRequest)` adds the crypto packages of the ref's ingested manifest SBOM (`services.crypto_packages.CryptoPackagePolicy` over `exposure.dependencies`; `NoManifestSbomError` when none was ingested). `code_facts.image_crypto(digest, ImageRequest)` is the image tier (podman/docker inspect, create and `cp` through `ProcessRunner`, never running the image; DT_NEEDED from `models.elf_formats`) plus the crypto packages of the image's SBOM (`exposure.image_dependencies`; `NoImageSbomError`); `code_facts.cluster_crypto(ClusterRequest, ValidationScope)` is the cluster tier (`oc exec`, `openssl s_client` parsed by `models.crypto_formats`), every exec namespace gated by `ValidationScope.decide(k8s, exec)` and logged. Nothing is recorded: the facts are re-derivable from the commit | source scans at read time, a side symbol database, byte-based LoC estimates, `traust_engine.adapters.crypto_probe`, `crypto_audit` image/cluster tiers, `_util/elf.py` (linked libraries), traust secure-code-audit `enumerate_route_guards.py`, `traust_engine.adapters.llm_app`, `expand_config_matrix.py`, `probe_sanitizers.py` discovery, `run_fork_advisory_lag.py`, operator-priv-profile `build_priv_profile.py` |
+| **Code facts** | `services.code_facts`, `models.code_facts`, `providers.crypto`, `providers.crypto_image`, `providers.crypto_cluster`, `providers.route_guards`, `providers.route_ownership`, `providers.django_routes`, `providers.python_guards`, `providers.express_routes`, `providers.java_routes`, `providers.go_routes`, `providers.python_ownership`, `providers.express_ownership`, `providers.ruby_ownership`, `providers.rust_ownership`, `providers.go_ownership`, `providers.syntax`, `providers.grpc_guards`, `providers.llm_app`, `providers.config_matrix`, `providers.sanitizers`, `providers.fork_lag`, `providers.priv_profile`, `providers.tree`, `models.elf_formats`, `models.crypto_formats` | `ctx.services().code_facts.collect/list/symbols/language_stats` over the latest `tool_scan` assessment's `CodeFactsArtifact`; measured LoC, exact symbol filters and snapshot-bound pagination. `code_facts.enumerate(kind, ToolRequest)` runs a deterministic `FactEnumerator` over a checkout (`CryptoProbe`: toolchains, images, policies a checkout configures; the secure-code pre-scans `RouteGuardMatrix` (Go's net/http, gorilla/mux, chi, gin, echo and fiber routers through their groups, mounts and the places they are served, a guard credited only where it surely runs (`providers.go_routes`); Django and DRF through each urlconf's `include()` chain and routers (`providers.django_routes`), Flask with its blueprint and API prefixes, FastAPI, aiohttp; a Django, DRF or Flask guard counts only when it is a known auth library guard that no checkout definition shadows, never checkout decorators, mixins, permission classes or hooks (`providers.python_guards`); Express, Spring, JAX-RS and Go parsed with tree-sitter grammars loaded by `providers.syntax`), `GrpcGuardMatrix` (Go gRPC servers, their interceptors, the services registered on them and their methods), `LlmAppDetector` (whether a checkout is an LLM, agent or MCP application and which files use it, from imports, direct manifest declarations and prompt templates), `ConfigMatrix`, `SanitizerDiscovery` and `ForkDetector`, over `providers.tree`'s symlink-safe file walk); `code_facts.route_guards(ToolRequest, resolve_handlers=)` places handlers through the symbol index; route rows carry `ownership` on authenticated id routes (`providers.route_ownership`: scoped, checked, caller-blind, unchecked, none, unknown or n/a, with the spans behind it; caller-blind and unchecked rows are judged; filled for Spring and JAX-RS from each handler's path variables, caller, lookups by id, checks and one same-repository hop, for FastAPI (`providers.python_ownership`) from the handler and the dependencies handed a path id, for Express (`providers.express_ownership`) from the handler, the checkout middleware in its chain and the functions it calls, and for Rails (`providers.ruby_ownership`) from the action, its `before_action` callbacks, models, Pundit policies and the CanCanCan `Ability`, and for axum and actix-web (`providers.rust_ownership`, which judges the handler's reads by id but never credits a route as protected) from the handler, its auth extractors and one same-crate hop, through sqlx, diesel, sea-orm and in-memory stores, and for Go (`providers.go_ownership`, which judges a read by the path id alone and credits nothing) from the handler the route matrix resolved and one checkout call deep); `code_facts.grpc_guards(ToolRequest)` is the gRPC service x interceptor matrix; `code_facts.coverage(ToolRequest, repository_ref_id=)` compares the repository's latest threat-model entry points (`assessment.threat_model_entry_points`) and what the pre-scans detected against the pre-scan for each entry-point kind, as covered, uncovered or unexplained; `code_facts.llm_app(ToolRequest)` is the LLM-application detection that gates the LLM review; `code_facts.priv_profile(ToolRequest, repo)` is the operator privilege profile (`PrivProfiler`: SCC requests, securityContexts, namespaces and install modes, every RBAC rule, and the shipped RBAC no `+kubebuilder:rbac` marker declares) as the contract `PrivProfileArtifact`; `code_facts.fork_lag(ToolRequest, offline=)` adds each tracked upstream version's advisories (`exposure.package_advisories`), a failed read being the result's `network` error; `code_facts.crypto(ref_id, ToolRequest)` adds the crypto packages of the ref's ingested manifest SBOM (`services.crypto_packages.CryptoPackagePolicy` over `exposure.dependencies`; `NoManifestSbomError` when none was ingested). `code_facts.image_crypto(digest, ImageRequest)` is the image tier (podman/docker inspect, create and `cp` through `ProcessRunner`, never running the image; DT_NEEDED from `models.elf_formats`) plus the crypto packages of the image's SBOM (`exposure.image_dependencies`; `NoImageSbomError`); `code_facts.cluster_crypto(ClusterRequest, ValidationScope)` is the cluster tier (`oc exec`, `openssl s_client` parsed by `models.crypto_formats`), every exec namespace gated by `ValidationScope.decide(k8s, exec)` and logged. Nothing is recorded: the facts are re-derivable from the commit | source scans at read time, a side symbol database, byte-based LoC estimates, `traust_engine.adapters.crypto_probe`, `crypto_audit` image/cluster tiers, `_util/elf.py` (linked libraries), traust secure-code-audit `enumerate_route_guards.py`, `traust_engine.adapters.llm_app`, `expand_config_matrix.py`, `probe_sanitizers.py` discovery, `run_fork_advisory_lag.py`, operator-priv-profile `build_priv_profile.py` |
 | **Detection quality** | `services.detection_quality`, `services.rule_mining`, `models.detection_quality`, `models.rule_mining`, `models.validation_benchmark`, `providers.rule_drafts` | `ctx.services().detection_quality`: `record(BenchmarkTargetArtifact, provenance)` stores the recall-benchmark answer key (newest version scored; duplicate ids and held-out seeded targets refused); `run_benchmark({target_id: [assessment_id, rerun_id]})` scores each `benchmark_audit` report with the match ladder (fingerprint → advisory id + path → CWE + path ≥ 0.5 → near miss), injection canaries and rerun stability, `score_reports({target_id: [report, rerun]}, auditor_version)` scores unrecorded reports (canary runs on local repositories) the same way, derived on demand and storing nothing; `scorecards(BenchmarkFilter)` scores every recorded benchmark audit per auditor version; `BenchmarkRun.scorecard()` cuts recall by CWE/severity/provenance/language/split; `screen_injection(artifact_id)` flags obeyed-injection shapes in an audit report; `mine_rules(RulePack)` clusters confirmed findings by (primary CWE, language) against a pack, with per-rule precision from `occurrence.rule` and the calibration worklist; `regression_pairs(RegressionPairFilter)` gives each confirmed finding a decision recorded fixed on a later commit its files on the commit last reported and on the fix commit (read at the forge; nothing stored), the fixtures of a regression-rule draft; `sweep_cards(CardDeck.parse(doc).cards, ToolRequest)` runs each semantic precedent card's code-facts enumerator over a checkout and returns the rows its predicate matches as triage candidates (cards that are prose, not recipes, are rejected by `CardDeck.parse` with every reason); the class-generalization sweep: `sweep_collect(force)` classifies every confirmed finding rule-expressible or not (with why) into (CWE, language) classes, `sweep_drafts()` stages a candidate rule per class no pack rule or held draft covers, `sweep_rule(RuleSweepRequest)` runs one authored rule over the repositories with a completed secure-code audit on their default line (resumable per repository), `emit_sweep(rule, force)` turns the hits into triage candidates (never findings) with a summary, each stage's state kept in the object store; `propose_rule(RuleProposal)` is the gate for a rule inference proposes for an uncovered shape (`services.rule_proposals`: one well-formed rule, no catch-all pattern or path glob, no backreference, lookbehind or nested quantifier, its `ruleid:`/`ok:` examples firing exactly, and a capped hit count on the checkout); an admitted proposal is staged as a draft for the same calibrate-and-sweep path; `stage_regression_drafts(filter, skip_existing)` stages `regression_pairs` as drafts; `rule_lane(RuleLaneRequest)` runs the weekly rule-mining lane (mine → collect/draft → regression drafts → delta against the previous run, Stage-A gate reachability per watched pack, allowlisted-rule precision) with `RuleLane.exit_code` 0 quiet, 1 attention, 2 failed; drafts are written to the adopter's `locations.rule_drafts` by `providers.rule_drafts.RuleDraftDirectory` (`ctx.register_rule_drafts(root)`); the validation-lane benchmark: `benchmark_worklist(ValidationBenchmark)` (claims, validity unanswered), `score_benchmark(bench, run, variant, report)` onto `benchmark_scorecard()`, `benchmark_trigger(ToolRequest, since)` | `recall-benchmark/{match_benchmark,screen_injection}.py`, `traust_engine.sweep.{mining,engine,rule_lane,benchmark,calibration}`, traust `ops/compile_precedent_cards.py`, mine-ledger `emit_rule_drafts.py` |
 | **Tool runs and audits** | `services.assessment`, `models.cloud_config`, `services.cloud_config` | `assessment.run_tools(checkout, [CHECKOV])` over `ctx.tools` (every tool ready first); `CloudConfigFacts.of(CheckovScan)` turns Checkov output into cited facts, fact ids, gaps and a snapshot id; `assessment.check_audit(doc)` then `record_audit(doc, ref, provenance)`: the report gate, a `cloud-config` assessment (degraded with gaps), every finding it states and its judgment on each as a decision (`FindingDecisions.record_assessed`) | `run_checkov.py`'s normalizer, gap register and `--validate-report` |
-| **Analysis results** | `repositories.objects.analysis_results` | `ctx.analysis_results().read(TriageArtifact, subject)` / `.read_all(TriageArtifact, tree)`; raw `put/get/find(subject, kind)`; today's naming convention in one place | `json.load` + `"-security-audit.json"` path building |
 | **Table repositories** | `repositories.traust.*`, `repositories.traust_ops`, `repositories.traust_ledger`, `repositories.contract` | one repository per contract table (`uow.findings.find_by_fingerprint(...)`, `uow.run_orders.claim(...)`); `SqlTraustUnitOfWork(engine)` opens all 33 on one connection — one transaction across sections | `sqlite3.connect`, inline SQL, per-script tables |
 | **Product definitions** | `models.product_definitions`, `providers.product_definitions`, `services.portfolio` | `ctx.product_lookup.resolve_products(ctx.product_definitions(cache_dir).read(), mappings, packages=, repo_urls=, product_ids=)` (never opens the record store; `ctx.services().portfolio.resolve_products` is the same answer; `mappings` is the recorded product map, `portfolio.product_mappings()`, recorded with `portfolio.record_product_map(doc, provenance)`): ownership context from the cached product-definitions registry, a candidate generator never an owner: match tier (mapped > repo-url > advisory slug > none), the contact ladder (only `private_tracker_cc` is embargo-cleared; non-kerberos values dropped and recorded), the lifecycle window on the clock's day; a missing or malformed cache is `unavailable`, never no-match. Serialise with `model_dump(mode="json", exclude_unset=True)` | `traust_engine.registry.products`, `registry/feeds.py` (reads) |
 | **Repository observation** | `providers.forge`, `services.observation`, `services.portfolio` | `ctx.repository_observation()` records forge facts as repo-state assessments; `PortfolioService.default_ref()` resolves the current head from the latest completed default-branch observation, including when a branch returns to an earlier SHA; without one, work needing the current head requires observation first. `RepoStateQuery.repo_state()` derives exposure from component membership, repository visibility and upstream, plus risk tier and freshness from current domain data | forge scraping or adopter designation config inside Core |
@@ -62,8 +62,8 @@ The latest-recorded assessment read joins repository ownership in SQL and return
 at most one assessment without loading or binding the repository's ref history.
 Algorithm-free fingerprint reads use the contracts-owned
 `(repository_id, fingerprint)` index, retaining exact opaque identity and ambiguity
-across algorithms. Local stores receive its additive index upgrade; configured
-databases must apply `contracts.finding_fingerprint_index_upgrade(dialect)` first.
+across algorithms. The index is part of the static bootstrap schema; existing
+databases require the separately designed upgrade feature.
 
 `POST /v1/remediations/{work_item_id}/pull-request` (`record_remediation_pull_request`,
 generated `RecordRemediationPullRequest`) accepts an `ExternalRef` (`system`, actual
@@ -73,9 +73,60 @@ tracker and `pr_opened` progress commit together. Replaying the same PR is a no-
 including after merge; a different PR conflicts. Finding-wide Jira tickets retain
 their existing semantics, while PR trackers are scoped by assessment ID and never
 spread to other attempts over the same findings. Immutable worker reports are not
-rewritten. Existing local stores gain the nullable scope automatically; configured
-databases apply `contracts.finding_external_ref_assessment_upgrade(dialect)` when
-`finding_external_ref.assessment_id` is absent. Historical links remain unscoped.
+rewritten. Historical links remain unscoped. Core validates pairing on tracker
+inserts and scope changes and keeps finding repository identity immutable;
+the schema retains one guard for repository-ref moves.
+
+`POST /v1/remediations/{work_item_id}/progress` (`record_remediation_progress`,
+generated `RecordRemediationProgress`) accepts a `ProgressReport` (`status`:
+`merged` or `abandoned`, the merge commit as `merge_sha`, who ended it as `actor`)
+and returns the moved `WorkItem` — the write path for a PR-filing loop that learns
+of a merge or close outside any order lease. A verified person, or a machine
+granted `remediate_finding` on the repository in `recording.start`, may call it
+(`OpsService.authorize_write`, the same grant the scheduling door reads);
+unverified and ungranted identities are refused. A run's own statuses still come
+from its report. The ending decisions carry the merge SHA and actor as their
+rationale; replays are no-ops, and a status the forward-only state machine refuses
+answers 409.
+
+## Remediation patch retention
+
+`RemediationService.record(report, provenance, diff=draft.diff)` and the order-bound
+`record_order(..., diff=...)` retain the exact patch as a companion artifact.
+REST runners send optional UTF-8 `diff` text with `POST /v1/remediation-records`.
+The publisher derives its expected digest from the validated report's
+`patch.diff_sha256`; an absent declaration, invalid text, secrets in added
+lines and digest mismatches refuse the call before publication. Secrets only in
+removed/context lines mean the patch is **not retained but the report is still
+recorded**. That recording response has `WorkItem.patch: null` and a non-null
+`patch_refusal` naming the secret categories, never the secret values. The reason
+is response-only: report-only calls and subsequent get/list reads return
+`patch_refusal: null`; resending the refused diff returns the reason again.
+Retained patch and report references attach to the same assessment without adding
+tables. `WorkItem.patch` carries the artifact ID for authenticated
+`GET /v1/artifacts/{artifact_id}/content` reads.
+
+Patch and report uploads are staged before acquiring write intent or findings locks.
+The locked transaction rechecks the held report and records artifact rows, attachments
+and ticket links together. Runner leases are checked before staging and again under
+lock before recording. A conflict or rollback can leave unreferenced content-addressed
+objects, but no losing artifact metadata; retrying the same bytes is idempotent.
+
+**Rendering exception — pending human review (XWING-2355); no human sign-off yet.**
+Only producer-generated git patches
+for `RemediationArtifact`, stored as `ResultKind.REMEDIATION_PATCH` through
+`ArtifactPublisher.publish_companion`, are exempt from rendering over the validated
+primary model. The report contains the patch's digest and path, not its contents,
+so a renderer cannot reconstruct the patch. The exception covers only UTF-8 text
+whose SHA-256 matches the validated report's `patch.diff_sha256`; existing secret
+checks remain mandatory and accepted bytes are unchanged. All other companions
+must be rendered from the validated primary model. This is not general precedent;
+any approval must name the reviewer and link to the approving review or ticket.
+
+Report-only callers remain supported (`patch` is null). Replaying the same report
+with its patch backfills those bytes without changing later progress or resolution;
+historical patches cannot be recovered from a producer-local `diff_path` alone.
+Merged progress does not prove a finding fixed: that remains a resolution decision.
 
 ## Historical reads and reporting correctness
 
@@ -152,6 +203,133 @@ The remaining correctness changes are:
   or indexing, individual row/file byte size, or database query-planning work.
   Building and publishing do not fetch feeds, scan, write SQL rows or write object bytes.
   CSV uses the shared one-line, formula-neutralizing renderer; JSON retains original text.
+- **Reports on demand:** `GET /v1/insights/{name}/report?format=markdown|html|csv` renders
+  any insight with the same scope query and contract check as `GET /v1/insights/{name}`
+  (`InsightService.render`), built now (never a stored census build), rendered only in the
+  format asked for (`ReportFormat`) and returned as one file named by `Content-Disposition`;
+  nothing is stored. `csv` is for an insight with an export table (`inventory-export`,
+  `privileges`); others refuse it with a 422 before the view is built. Both routes take
+  `executive_panel` (repeatable: `attack`, `pqc`, `isolation`, `iac`) for the executive
+  summary's optional panels; any other view refuses it (422), so a panel never silently
+  bypasses the stored census.
+- Registering a default SLA policy defers file loading and validation until an SLA view
+  actually needs the default. Recorded policies take precedence without reading the default;
+  unrelated census builds do not depend on its file. Explicit per-run policies are still
+  validated at registration, and an unusable default remains an error when SLA output needs it.
+- The census insight views (`findings-rollup`, `coverage`, `remediation-index`,
+  `findings-trend`) are now also **stored builds** (performance-lane wave (d),
+  foundry#56): `InsightService.record_builds()` folds the four once at the GLOBAL scope
+  and publishes them as one `insight-builds` artifact (contracts
+  `artifacts_schema/v1/insight-builds.schema.json`, the SLA-policy imported-document
+  pattern); the dashboards lane's fast `insight_builds` pack asset runs it at a 5-15
+  minute cadence. `InsightService.serve()` — the door behind `GET /v1/insights/{name}` —
+  serves the newest build for an unscoped read and folds on demand for a scoped filter,
+  `?refresh`, a view the census does not carry, the first request before any build, a
+  build whose maximum qualifying statement recording time advanced past its pre-fold
+  watermark, and a build older than the 30-minute serving bound. Backdated claimed
+  moments do not hide newer recording times. This invalidation is not a commit-ordered
+  snapshot guarantee. The stored build is the GLOBAL census: one build serves every
+  scope. Permission data never rides the document; each caller's authorization filters it,
+  exactly as the on-demand fold's consumers always have. The artifact row's creation is
+  the build's publication moment and serving-age bound. The document's required
+  `built_at` records each completed cadence observation separately, so unchanged or
+  returning view content cannot reuse an older publication when the build clock advances.
+  The parse is once per publication through the Context's `ParsedBuilds`, keyed by
+  artifact row id; unreadable builds fold until the next publication.
+  `idx_decision_nonmachine_recorded` serves the freshness lookup over non-machine
+  actor statements, conservatively including legacy/unknown spellings. This does
+  not grant those actors human authority; assessment-backed and canonical `machine:`
+  statements remain excluded. Existing databases need the reviewed additive index
+  bootstrap before expecting an indexed freshness lookup; no historical rows are rewritten.
+  The response carries `X-Traust-View-Built-At` (the publication moment) when served
+  from a build.
+- `ViewName.FINDINGS_ROLLUP` is now validated by
+  `contracts.validate_view("findings-rollup", document)` against the packaged
+  `contracts.view_schema("findings-rollup")` before `build` returns, so every door
+  (`build`, `report`, `publish`, `refresh`, `GET /v1/insights/findings-rollup`) serves only
+  contract-valid output; a nonconforming model is a `DocumentError`, never a silently drifted
+  response. The model and its scoping are unchanged. The executive summary's embedded `rollup`
+  comes from `_rollup` directly and is not checked until that view has its own schema.
+  `cvss_score` serializes as the shortest fixed-point decimal string on every backend
+  (`models.insight.canonical_decimal`: `0`, `7.5`, `10`; trailing zeros only, never rounded),
+  where SQLite reads `0.0` back as `0E-10` and `7.5` as `7.5000000000`; the rollup and trend
+  reports render the same form.
+- `ViewName.FINDINGS_TREND` is validated the same way, by
+  `contracts.validate_view("findings-trend", document)` in `build`; `compose` is the unchecked
+  model for the scoreboard, which reads only the last point. A risk index is null (unknown)
+  when any standing finding has neither a CVSS score nor a severity, and a metric unknown in
+  the compared buckets has no direction rather than failing the view. The accepted-risk
+  register keeps an unrated finding (`severity` null, ranked last, rendered `unrated`), and a
+  CVSS score of 0 ranks above an unscored one.
+  Unmeasured cells in the trend report render as `—`. `ViewFilter.as_of` and `compare_as_of`
+  are timezone-aware (`AwareDatetime`); a naive datetime is refused, since every view echoes
+  `as_of` as an RFC 3339 date-time.
+- `ViewName.COVERAGE` is validated by `contracts.validate_view("coverage", document)` before
+  `build` returns. Its gap figures come from the latest default-line secure-code audits as
+  currently recorded (`AssessmentService.coverage` takes no `as_of`), while the population is
+  read as of the filter's `as_of`. An unknown gap item count renders as `—`.
+- `ViewName.REMEDIATION_INDEX` is validated by
+  `contracts.validate_view("remediation-index", document)` before `build` returns; an unforked
+  or unreported work item's fork and fix branch render as `—`.
+- `ViewName.CENSUS` is validated by `contracts.validate_view("census", document)` before
+  `build` returns. An unrated finding counts in the cuts' and layers' `unrated` severity
+  (it was dropped before: the fold keys it by `str(None)`, which the severity mapping skipped).
+- `ViewName.ATTACK_COVERAGE` is validated by
+  `contracts.validate_view("attack-coverage", document)` before `build` returns, Navigator layer
+  included; the executive summary embeds the validated view.
+- `ViewName.THREAT_REGISTER` is validated by
+  `contracts.validate_view("threat-register", document)` before `build` returns; the executive
+  summary's isolation panel embeds the validated view.
+- `ViewName.EXECUTIVE_SUMMARY` is validated by
+  `contracts.validate_view("executive-summary", document)` before `build` returns. Its contract
+  composes the component views by `$ref`, so the view validator resolves references through a
+  registry of every view schema by `$id` (on top of the artifact schemas). The scoreboard
+  reads only part of the summary and calls `compose`, the summary before its check.
+- `ViewName.COMPLIANCE` is validated by `contracts.validate_view("compliance", document)` before
+  `build` returns. It reads posture as it stands (current declarations, newest assessments), so
+  it refuses an `as_of` (422) rather than serve current posture as historical.
+- `ViewName.INSECURE_PATTERNS` is validated by
+  `contracts.validate_view("insecure-patterns", document)` before `build` returns.
+- A view Core built outside its own contract raises `ViewContractError` (a `DocumentError`):
+  over REST it is a 500, logged with its source, with a generic detail; a caller's invalid
+  request stays a 422.
+- `ViewName.PRIVILEGES` is validated by `contracts.validate_view("privileges", document)` before
+  `build` returns.
+- `ViewName.DEPENDENCY_REACH` is validated by
+  `contracts.validate_view("dependency-reach", document)` before `build` returns.
+- `ViewName.VALIDATION_FUZZ` is validated by
+  `contracts.validate_view("validation-fuzz", document)` before `build` returns.
+- `ViewName.CONTAINER_FINDINGS` is validated by
+  `contracts.validate_view("container-findings", document)` before `build` returns; its finding
+  records are the shared `finding-records` definitions.
+- `ViewName.PQC` is validated by `contracts.validate_view("pqc", document)` before `build`
+  returns. It reads readiness as it stands, so it refuses an `as_of` (422), as compliance does.
+- `ViewName.PQC_VENDORS` is validated by `contracts.validate_view("pqc-vendors", document)`
+  before `build` returns, on its by-alias dump (the wire shape, where a claim's class is
+  `class`). It reads the latest claims and manifests, so it refuses an `as_of` and a product
+  or team scope (422).
+- `ViewName.FRESHNESS` is validated by `contracts.validate_view("freshness", document)` before
+  `build` returns; its coverage is the coverage view's definition, resolved through the view
+  registry.
+- `ViewName.EXPOSURE` is validated by `contracts.validate_view("exposure", document)` before
+  `build` returns, and carries its `as_of` (the filter's, else the clock's, read once for all
+  three cuts); the executive summary's exposure panel uses the same row.
+- `ViewName.SPEND` is validated by `contracts.validate_view("spend", document)` before `build`
+  returns; its rollups are the shared `spend-records` definitions.
+- `ViewName.SLA` is validated by `contracts.validate_view("sla", document)` before `build`
+  returns. A median days-to-resolve can be negative when a finding was resolved before its
+  clock started (filed after the fix); the contract allows it. An unrated escalation's
+  severity renders as `—`.
+- `ViewName.PQC_PORTFOLIO` is validated by `contracts.validate_view("pqc-portfolio", document)`
+  before `build` returns; the executive summary embeds the validated view.
+- `ViewName.LOC` is validated by `contracts.validate_view("loc", document)` before `build`
+  returns; its first-party divisor and estimate are decimal strings, exponent form included.
+- `ViewName.PROGRAM` is validated by `contracts.validate_view("program", document)` before
+  `build` returns; its spend rollups are the shared `spend-records` definitions.
+- `ViewName.SCOREBOARD` is validated by `contracts.validate_view("scoreboard", document)`
+  before `build` returns. It still composes the summary, trend and register unchecked, so
+  drift in a field it never reads cannot fail it; drift in one it carries (the trend's latest
+  point) does.
 - `ViewName.COMPLIANCE_PRECISION` wraps the existing
   `DetectionQualityService.calibrate_compliance` result under `calibration`. Its packaged
   view schema reuses the canonical compliance-assessment framework vocabulary through
@@ -187,6 +365,104 @@ The remaining correctness changes are:
   the budget, so unrelated versions cannot exhaust a selected cohort's allowance. Overflow
   advice names this direct service; it does not imply that the global view accepts filters.
   Scoring unrecorded runs stays `DetectionQualityService.score_reports`, a door, not a view.
+
+## CVSS from advisory feeds
+
+An advisory-backed finding (a dependency, image or SBOM finding tied to a CVE or GHSA) can be
+scored by several sources. `models.cvss` reads each source's scores from its stored document,
+and `services.findings.cvss.effective` picks the one the finding shows. The first source in this
+order with a usable CVSS 3.x score wins:
+
+| Rank | Source (`CvssSource`) | Read from (`models.cvss`) | How it is recognised |
+|---|---|---|---|
+| 1 | NIST (`nist`) | NVD API 2.0 CVE record (`nvd_scores`) | the `Primary` metric from `nvd@nist.gov` |
+| 2 | GitHub (`ghsa`) | OSV record (`osv_scores`) | a `GHSA-` record with `github_reviewed: true`; OSV's copy of a CVE record ranks nowhere (it can drop the CNA's scores) |
+| 3 | CNA (`cna`) | the CVE List record from cve.org (`cve_list_scores`); NVD's copy as a backup | the record's `cna` container, named by its `shortName`; an NVD `Secondary` metric from the record's own `sourceIdentifier` |
+| 4 | ADP (`adp`), e.g. CISA Vulnrichment, Red Hat's SADP | the CVE List record; NVD's copy as a backup | each `adp` container, by name; any other NVD `Secondary` metric (one from `nvd@nist.gov` ranks nowhere) |
+| 5 | Red Hat (`red-hat`) | the Security Data CVE record (`rh_cve_scores`), then CSAF VEX (`csaf_scores`) | `cvss3`; `vulnerabilities[].scores[].cvss_v3` |
+| 6 | Scanner (`scanner`) | the occurrence (`scanner_score`) | the vector the scanner reported |
+
+- **Version.** Within the winning source, its CVSS 3.1 score, else its 3.0 score. A 4.0 score is
+  kept and shown alongside (`EffectiveCvss.v4`, the highest-ranked one) but never sets the
+  score, so no 4.0 calculator ranks findings. CVSS 2 is not read.
+- **Ties.** Two 3.x scores from the same source and version: the higher one.
+- **Trust.** `score_of` refuses rather than guesses. It refuses:
+  - a key or value outside FIRST's CVSS 3.0/3.1 or 4.0 metric tables, or a missing base metric;
+  - a 4.0 vector whose metrics are out of the spec's order;
+  - a version that disagrees with the vector, or a repeated metric;
+  - a stated score outside 0–10, or anything but a plain decimal;
+  - a stated 3.x score that isn't exactly what its vector computes.
+  A 3.x score is always the one its vector computes (FIRST's formula, with 3.0's own rounding).
+- **Shape.** Each parser takes the stored document's bytes and validates them into a typed shape;
+  a document that doesn't fit it, including a present score block without its vector, is a
+  `ValidationError`, never a silently missing score.
+- **Provenance.** Every statement is kept, once each (`EffectiveCvss.scores`, in ranking order):
+  source, version, vector, score, the document it came from (`cve-list:CVE-…`, `nvd:CVE-…`,
+  `osv:GHSA-…`, `rh-cve:CVE-…`, `csaf:…`) and who scored it, so a reader sees what every
+  source said. A CNA or ADP score that both the CVE List and NVD carry appears once per
+  document; ranking is unaffected, since both are the same source.
+- **Unscored.** No usable 3.x score anywhere is `None`, never 0.
+
+A finding's own audit-authored vector (a code finding) is not ranked against feeds; only
+advisory-backed findings take the feed-ranked score. No view reads the ranking yet: the
+findings views are to resolve the effective score when read, so existing findings gain feed
+scores without a rescan.
+
+### Kept documents
+
+`exposure.refresh_documents(source, identifiers, run_order_id)` keeps
+a registered source's document for each identifier: `cve-list` (CVE Services API), `nvd`, `ghsa`
+(OSV's record by GHSA id) and `rh-cve` (the per-CVE Security Data record). One refresh is one
+manifest (`models.feed_documents.FeedDocumentManifest`: each identifier's sha256 and fetch time)
+recorded as a `feed` artifact plus a `feed_snapshot` named `<source>-documents`; the documents sit
+in the object store at `feeds/<source>/documents/<sha256>.json`, one copy per distinct document.
+
+- **Exactly what was asked.** The manifest names only the identifiers given (CVE and Red Hat
+  advisory ids in upper case); one not asked for again drops out. Asking for none is a
+  `ValidationError`.
+- **Fetch time.** A document's `acquired_at` is when its content was first fetched; an unchanged
+  refresh is the same manifest, so it is one artifact however many days it is confirmed.
+- **A failed fetch keeps the last document.** Its entry carries over from the previous manifest
+  (`DocumentRefresh.carried`) while the store still holds it; a failed identifier with nothing to
+  carry has no entry. Every failure is logged and reported in `DocumentRefresh.failed`.
+- **An outage writes nothing.** When no document was fetched at all, the refresh raises
+  `ServiceError` and the last snapshot stays the latest. An unreadable last manifest stops the
+  refresh too: carrying forward needs it, so a person acts.
+- **Only JSON objects.** A document that isn't one is a failure, never stored.
+- **Retries.** A retry in the same run order that kept the same documents adds no snapshot, nor
+  does a late retry of an order a newer one superseded. The checks run after the manifest's
+  artifact insert, which serializes writers, so concurrent refreshes see each other. A new
+  snapshot always sorts after the last one, even when the clock stepped back.
+
+`exposure.stored_document(source, identifier)` reads the latest manifest's document back,
+checked against its digest (`IntegrityError` on a mismatch); `None` when the manifest doesn't
+name it. Reads never fetch.
+
+### Advisory names: the one door for every advisory join
+
+Core keeps the first name it saw for a vulnerability as its canonical advisory, so a finding's
+advisory can be `GHSA-…` or `GO-…` with its CVE only an alias. EPSS, KEV, NVD and the CVE List
+are all keyed by CVE, so a join on the canonical name would find nothing for a CVE that has data.
+`exposure.advisory_names(finding_ids)` is therefore the door every advisory join goes through:
+each finding's `AdvisoryNames` (`models.dependencies`), the canonical name first, then every alias,
+with `cves` (upper case) and `ghsas` (GitHub's spelling) split out. It reads the findings, their
+advisories, any canonical advisory that read didn't include, then the aliases: at most four batched
+reads for any number of findings. A finding that names no advisory is absent.
+
+`exposure.refresh_advisory_documents(run_order_id)` keeps the documents for every advisory any
+finding names, resolved, false-positive and risk-accepted ones included, so their detail keeps its
+scores and a reopened finding already has them. CVE ids go to `cve-list`, `nvd` and `rh-cve`, and
+GHSA ids to `ghsa`. A source that isn't registered (or is `access: disabled`) is skipped. A source
+that fails keeps its last manifest and says why (`AdvisoryDocumentsRefresh.ok` false, with its
+`error`); the others still refresh. When every source asked fails, the refresh raises
+`ServiceError` naming each one's reason, so an outage never reads as a finished refresh. A
+failure's text never carries a URL's credentials or query string.
+
+**Set an NVD API key.** This refresh asks NVD for every linked CVE every day. Without a key NVD
+allows about 5 requests per 30 seconds, so a few thousand CVEs take hours. A key is free
+(https://nvd.nist.gov/developers/request-an-api-key) and raises the limit to 50 per 30 seconds.
+Name the variable holding it in `traust.yaml` (`feeds.api_keys: {nvd: NVD_API_KEY}`), never the
+key itself.
 
 ## Repository checkouts
 
@@ -346,6 +622,36 @@ traust and traust-engine import core and call services in-process. The CLI exist
 
 With no `database.url`, `Context` keeps the record store in SQLite at `<home>/traust.db` (`home` defaults to `~/.traust`) and creates the schema from the traust-contracts DDL on first use. A configured `database.url` is never touched: whoever provisions it creates the schema (`apply_schema(engine, contracts.database_ddl(dialect))`). `ctx.services()` builds every service over one shared unit of work. Contracts owns and tests the schema; core tests repository behaviour.
 
+## Store upgrades
+
+A store's shape is the db contract's (traust-contracts owns and tests it). Fresh stores are
+bootstrapped whole — baseline DDL plus the upgrade channel — on first open. An existing
+store is never migrated behind an open's back: a local store applies pending upgrades at
+open (opening the new version is the consent), a configured database refuses until its
+deployment applies them.
+
+On upgrade day, an operator plans, looks, then applies:
+
+```python
+ctx = Context.from_file(Path("traust.yaml"))
+plan = ctx.store_status()  # empty | version_0 | behind | current
+for upgrade in ctx.pending_db_upgrades():
+    print(upgrade.name, upgrade.sha256[:12], upgrade.destructive or "")
+applied = ctx.apply_db_upgrades()  # the deliberate call
+```
+
+A script that declares a destructive reason (`-- destructive: …` in its header) applies
+only when acknowledged: `ctx.apply_db_upgrades(allow_destructive=True)`, after the
+refusal has named what would run and why. The `traust db upgrades` CLI wraps plan and
+apply for operators who do not embed Python.
+
+A database created before the upgrade channel (no `db_upgrade` stamp table) is version
+0: its shape is unknown, so both the open gate and the surface refuse it. Until adoption
+ships (verify the live schema against the baseline, then stamp), the path is to recreate
+the store: export what must survive (decisions and findings are the durable history —
+re-derive the rest from artifacts), create the new store at the current contract, and
+re-import. A version-0 store whose history must not be touched should wait for adoption.
+
 ## Run the REST API locally
 
 ```bash
@@ -433,9 +739,14 @@ lookalikes do not prove an authenticated caller, while genuine framework referen
 remain eligible. A field's request-ness is judged by the file declaring the field,
 not the handler's imports.
 
-`AnalysisResultsRepository` is the legacy path-keyed reader; new publisher output
-is read by artifact ID. Companion documents are rendered from the validated
+Publisher output is read by artifact ID. Companion documents are rendered from the validated
 primary and stored by digest, but only the primary is an artifact-row document.
+The sole rendering exception, pending human review (XWING-2355), is the
+[remediation git patch](#remediation-patch-retention), which retains digest-bound
+producer text and has its own artifact row.
+Aggregates use `ArtifactPublisher.stage` / `stage_companion` before acquiring write
+locks, then `publish_staged` / `record_companion` inside their metadata transaction;
+staging performs validation and object I/O only, indexing performs database I/O only.
 Publishing failure raises a typed error; an object left by a failed row write is
 safe to retry because its key is content-addressed.
 
@@ -799,20 +1110,21 @@ Everything here is `v1` API, reshaped in place until it is frozen. Each contract
 - Every table repository has behaviour tests on SQLite and Postgres; stores and providers have contract tests.
 - traust-core is the hub: other traust repos depend on it, not the reverse. The only code dependency is traust-ledger's pure functions (Merkle, signing, verifying), imported only by `services/ledger.py`; traust-contracts is pinned data. HTTP only in providers (outbound) and the HTTP adapter (inbound).
 
-## Domain services (stubs)
+## Domain services
 
-Repositories are real; services are mostly stubs. Every stub raises `NotImplementedError("stub: replaces …")` naming the code it replaces. A service declares the section unit of work it needs; `SqlTraustUnitOfWork` satisfies every one on one connection.
+Services own their domain's use cases and declare the section unit of work they need;
+`SqlTraustUnitOfWork` satisfies those protocols on one connection.
 
 | Domain | Service | Unit of work (tables) |
 |---|---|---|
 | Portfolio: what we protect | `services.portfolio` · `PortfolioService`, `PortfolioSync` (forge org listings and single repositories into the inventory; `import_owners` mirrors the one declared ownership source; `owner_hints` are OWNERS / contributor handles, never stored), `RepoStateQuery` | `InventoryUnitOfWork` (product, release, component, repository, repository_ref, team, ownership) |
 | Onboarding: bring a project under the platform | `services.onboarding` · `OnboardingService` (`plan` dry run with gaps, `onboard` registers product, repositories, branches, teams and plans the baseline orders) | none: composes `PortfolioService`, `PortfolioSync`, `OpsService` |
-| Exposure: known vulns reaching us | `services.exposure` · `ExposureService` (`refresh_feed` snapshots a feed, `refresh_feeds` every registered one (a failed feed keeps its last snapshot and reports `last_error`); an incremental feed (`providers.feeds.PagedJsonFeed`, Red Hat CVEs) builds on its last snapshot; staleness is the latest `feed_snapshot`; `exploit_signals` reads EPSS and KEV per advisory from the latest snapshots; `exploit_context` joins them onto the CVE-bearing items of an artifact's `findings` / `candidates` list, with the repository's product reach and owning teams (through `PortfolioService`); `source_document` returns a registered feed source's document for one identifier (`providers.feeds.FeedSource`: NVD, Red Hat CSAF and VEX documents, Scorecard), whose declared probes are `ProviderCatalog` readiness (`feed-source:*`); `find_advisory` fetches an advisory through `providers.osv` and keeps its identity, aliases and packages, ranges stay on the `AdvisoryRecord`; `ingest_sbom` reads CycloneDX / SPDX JSON (`models.sbom_formats`) into a commit's manifest SBOM; `dependencies(ref_id)` reads it back as package + version rows (`NoManifestSbomError` when none was ingested); `ingest_image_sbom` / `image_dependencies(digest)` do the same for an image's SBOM on its append-only `image` row (`NoImageSbomError`); `affected` is the blast radius through base images and internal libraries; `impact` answers for the whole tracked fleet (each attached branch line's latest commit — default, release-imported or user-attached, `PortfolioService.tracked_refs`; `PortfolioSync.attach_branch` / `POST /v1/repositories/{id}/branches` attaches a line, the Snyk-style "scan this branch"): rows for the refs whose SBOM uses the advisory's ecosystems (affected, fixed, not using, unresolved manifest, undetermined when a version can't be ordered), counts for the proven rest and every gap (stale line, no SBOM, coverage unknown), never silently missing, with `complete`, `fixable` and `as_of`; `fill` queues the orders (`repo_state` then `manifest_sbom`, one pair per repository with a tracked line lacking an SBOM) that complete an answer, one `run_batch` a poll can watch — an order's work walks every tracked line of its repository; `prepare` / `record` are the impact-analysis skill doors: one commit's evidence and classification (`ImpactEvidence.classification`), with the `providers.impact` tiers (govulncheck, source scans) over a checkout the caller passes; `resolve_symbols` returns the functions the advisory's fix touched (OSV-published, else mined from fix commits through `SourceProvider.commit`); `consumes_fix` says whether a commit's SBOMs carry a fix released elsewhere), then an `impact` assessment and, for an affected commit, its dependency finding) | `TraustUnitOfWork` (package, sbom, dependency, image, advisory, advisory_package, feed_snapshot + findings) |
+| Exposure: known vulns reaching us | `services.exposure` · `ExposureService` (`refresh_feed` snapshots a feed, `refresh_feeds` every registered one (a failed feed keeps its last snapshot and reports `last_error`); an incremental feed (`providers.feeds.PagedJsonFeed`, Red Hat CVEs) builds on its last snapshot; staleness is the latest `feed_snapshot`; `exploit_signals` reads EPSS and KEV per advisory from the latest snapshots; `exploit_context` joins them onto the CVE-bearing items of an artifact's `findings` / `candidates` list, with the repository's product reach and owning teams (through `PortfolioService`); `source_document` returns a registered feed source's document for one identifier (`providers.feeds.FeedSource`: NVD, Red Hat CSAF and VEX documents, Scorecard; one over the source's `max_document_bytes`, default 32 MiB, is refused after reading one byte past it), whose declared probes are `ProviderCatalog` readiness (`feed-source:*`); `find_advisory` fetches an advisory through `providers.osv` and keeps its identity, aliases and packages, ranges stay on the `AdvisoryRecord`; `ingest_sbom` reads CycloneDX / SPDX JSON (`models.sbom_formats`) into a commit's manifest SBOM; `dependencies(ref_id)` reads it back as package + version rows (`NoManifestSbomError` when none was ingested); `ingest_image_sbom` / `image_dependencies(digest)` do the same for an image's SBOM on its append-only `image` row (`NoImageSbomError`); `affected` is the blast radius through base images and internal libraries; `impact` answers for the whole tracked fleet (each attached branch line's latest commit — default, release-imported or user-attached, `PortfolioService.tracked_refs`; `PortfolioSync.attach_branch` / `POST /v1/repositories/{id}/branches` attaches a line, the Snyk-style "scan this branch"): rows for the refs whose SBOM uses the advisory's ecosystems (affected, fixed, not using, unresolved manifest, undetermined when a version can't be ordered), counts for the proven rest and every gap (stale line, no SBOM, coverage unknown), never silently missing, with `complete`, `fixable` and `as_of`; `fill` queues the orders (`repo_state` then `manifest_sbom`, one pair per repository with a tracked line lacking an SBOM) that complete an answer, one `run_batch` a poll can watch — an order's work walks every tracked line of its repository; `prepare` / `record` are the impact-analysis skill doors: one commit's evidence and classification (`ImpactEvidence.classification`), with the `providers.impact` tiers (govulncheck, source scans) over a checkout the caller passes; `resolve_symbols` returns the functions the advisory's fix touched (OSV-published, else mined from fix commits through `SourceProvider.commit`); `consumes_fix` says whether a commit's SBOMs carry a fix released elsewhere), then an `impact` assessment and, for an affected commit, its dependency finding) | `TraustUnitOfWork` (package, sbom, dependency, image, advisory, advisory_package, feed_snapshot + findings) |
 | Assessment: what we looked at | `services.assessment` · `AssessmentService` | `AssessmentsUnitOfWork` (assessment, artifact, occurrence, location) |
-| Findings: what's wrong and every decision on it | `services.findings` · `FindingService` + `intake`, `decisions`, `review`, `precedents`; `FindingViewQuery` shares rich views/history; `IdentityPolicy`, `RatingPolicy` | `TraustUnitOfWork` (finding, cwe, finding_cwe, finding_label, finding_external_ref, decision, decision_approver, review_item); `Disposition.fold` interprets historical classifiers and explicit evidence strength |
+| Findings: what's wrong and every decision on it | `services.findings` · `FindingService` + `intake`, `decisions`, `review`, `precedents`, `cvss` (which source's CVSS a finding shows); `FindingViewQuery` shares rich views/history; `IdentityPolicy`, `RatingPolicy` | `TraustUnitOfWork` (finding, cwe, finding_cwe, finding_label, finding_external_ref, decision, decision_approver, review_item); `Disposition.fold` interprets historical classifiers and explicit evidence strength |
 | Attestation: human sign-off | `services.attestation` · `AttestationService` | `FindingsUnitOfWork` — a human answer is a `decision` that resolves a `review_item` |
 | Identity: who is acting | `services.identity` · `IdentityService`; `models.identity` (`Principal`, `Role`) | none: principals come from `providers.identity` (OIDC, local user, directory) |
-| Operations: orders, leases, spend | `services.operations` · `OpsService`, `SpendService`, `SpendViews` (`ctx.spend_views.usage_summary(source, window, group_by)`: a source's usage per day, skill and model at list prices, unrecorded; it never opens the record store, and `SpendService.usage_summary` is the same answer); `FeedQuery` (the ops feed: orders that stopped or finished, new assessments and recorded releases after a `(timestamp, id)` cursor, oldest first; composes `OpsService`, `AssessmentService` and `PortfolioService`, whose `recorded_release` gives the router a release's repositories and change) | `OpsUnitOfWork` (run_batch, run_order, spend_event, feed_snapshot, assessment_input) |
+| Operations: orders, leases, spend | `services.operations` · `OpsService`, `SpendService`, `SpendViews` (`ctx.spend_views.usage_summary(source, window, group_by)`: a source's usage per day, skill and model at list prices, unrecorded; it never opens the record store, and `SpendService.usage_summary` is the same answer); `FeedQuery` (the ops feed: orders that stopped or finished, new assessments and recorded releases after a `(timestamp, id)` cursor, oldest first; composes `OpsService`, `AssessmentService` and `PortfolioService`, whose `recorded_release` gives the router a release's repositories and change) | `OpsUnitOfWork` (run_batch, run_order, spend_event, feed_snapshot, assessment_input; composed `OrderQueryReader` for history) |
 | Ledger: proof of decisions | `services.ledger` · `LedgerService`: an append grows the layer's tree from its stored frontier (O(log n), never rereads events); `decide` / `restate` sign their append, `record` seals once per triage; `verify` / `checkpoint` recompute from events; `audit` verifies every layer, for the scheduled `ledger_audit` asset | `LedgerUnitOfWork` (layers, events) |
 | PQC, code facts, compliance, detection quality | `services.pqc`, `services.code_facts`, `services.compliance`, `services.detection_quality` | `AssessmentsUnitOfWork` — content is read from the assessment's artifacts, never tables |
 | Validation: supplied machine reports | `services.validation` · `ValidationService.record`, `evidence` | `TraustUnitOfWork` — source/baseline assessments, artifacts, findings decisions and evidence external refs; no live execution |
@@ -853,6 +1165,13 @@ Unrated or unreported findings have `effective_severity=None`; only a reported o
 rating supplies a severity. `review_surfaces(repository_id, as_of=None)` merges the latest
 audit with later scans and keeps a surface open until its findings are affirmatively closed.
 Closing one review item does not bypass the finding's evidence-strength or independent-review gates.
+
+Every `FindingView`, including REST detail and repository/batch listings, carries
+`first_reported_at` and `last_reported_at`: the earliest and latest reporting
+assessments' `occurred_at`, not row creation or decision times. Both are `None` when
+no assessment has reported the finding. An `as_of` listing uses only reports at or
+before its cutoff and omits findings not yet reported, reusing the fold's loaded facts
+without another query.
 
 `FindingService.get_by_fingerprint(repository_id, fingerprint, fingerprint_algo=None)` resolves
 opaque fingerprints exactly, without trimming, recomputing identity or matching titles.
@@ -959,6 +1278,38 @@ logarithmic. `perf/queries/test_ledger.py` measures the complete countersign pat
 and 10k-event layers, separately from the append-only benchmark. Attestations use the existing
 decision event (`append_decision`), not a parallel `append_attestation` event.
 
+### Querying orders
+
+`POST /v1/orders/query` (`query_orders`) calls `OpsService.query(OrderQueryRequest)` and
+returns `OrderQueryPage`: `items` contain the native `order`, nullable `repository_url`,
+and an opaque per-item `cursor`; `next` is null at the end. Resume after any consumed
+item, not necessarily the final item fetched. Page sizes may change from 1 to 1000;
+changing filters or ordering requires a new query without a cursor (otherwise 422).
+
+Filters compose: `states`, `repository_id`, `repository_ids`, `run_batch_id`, `asset`,
+`ids` (null means unrestricted, an empty array means no matches), and `exclude_ids`.
+Each `ids`, `exclude_ids`, or `repository_ids` selector is limited to 500 entries;
+oversized selectors are rejected, not truncated. `states` is bounded by its vocabulary.
+`q` matches a literal, case-insensitive substring of the displayed repository reference
+(URL, else repository UUID, else order UUID), asset, or verbatim state before paging.
+`sort_by` accepts `created_at`, `started_at`, `finished_at`, `asset`, `state`,
+`repository`, `reason`, `id`, or `ids`; `sort_order` is `asc` or `desc` (default
+`created_at` descending). Nulls always follow present values, text uses bytewise
+ordering, and ties use the order UUID in the requested direction. `sort_by=ids`
+requires distinct `ids` and follows their supplied sequence, independent of direction.
+`OrderReads` is a cross-domain composite query, like `RepoStateQuery` and `CensusReads`,
+not a second operations table repository. The ops unit of work exposes its narrow
+`OrderQueryReader` capability without depending on the concrete SQL composer.
+Nullable sorts may read the non-null and null segments separately; combined
+materialization is bounded to `limit + 1`. Common created/started history pages use
+the corresponding contract-owned indexes; arbitrary sorts and substring searches
+can still inspect a larger matching population.
+
+Cursors enumerate current data, not a transactional snapshot. Lifecycle changes
+can move rows under mutable sorts; prefer immutable creation-time or ID ordering
+for historical walks and refresh to incorporate changes to filters or live values.
+Existing indexed `GET /v1/orders` filters and its cursor contract remain unchanged.
+
 ### Operational classifiers
 
 `models.operations` exports the contract-backed `SessionTask` and `SessionResult`, plus
@@ -1031,7 +1382,6 @@ grade is inferred from a scanner report.
 
 | Item | Where |
 |---|---|
-| Layout contract (path template + kinds) replacing today's hard-coded convention | traust-contracts, `repositories.objects.analysis_results` |
 | First real providers (git, forges; paginated and indexed feeds such as rh-cve and VEX) | packages / `providers.feeds` |
 
 ## Versioning
@@ -1041,7 +1391,7 @@ grade is inferred from a scanner report.
 ## Development
 
 ```bash
-make setup              # uv sync + git hooks (lint on commit, conventional subject, lint + coverage on push)
+make setup              # uv sync + git hooks (lint on commit, conventional subject, lint + testmon-selected tests on push; FULL=1 for the complete suite)
 make lint-fix
 make test               # unit tests
 make coverage           # + coverage (coverage-html for htmlcov/)
@@ -1051,3 +1401,52 @@ make test-integration   # Postgres tests (marked `integration`)
 make test-repositories  # repository layer on SQLite and Postgres
 make db-down
 ```
+
+## Adoption parity APIs
+
+| Capability | Core owner |
+|---|---|
+| Aliased advisory context | `ExposureService.find_advisory` / preparation preserve each alias package's ecosystem, ranges, fixes and source provenance; sweep exposes nullable `fix_available`. |
+| CVE replay | `DetectionQualityService.cve_replay`, `cve_replay_oracle`, `cve_replay_candidates`, `cve_replay_trends`; typed results in `models.cve_replay`. |
+| Spend declarations | `SpendService.record(SpendEvent(...))` retains `repository_label`, `loc`, `batch`, `note` and optional canonical `repository_id`. |
+| Repository availability | `PortfolioService.record_forge_facts`, `record_liveness`, `liveness`, `liveness_in`, `liveness_reference`; `Liveness` / `RepoLiveness` in `models.inventory`. |
+| Reviewed claim corrections | `FindingService.request_claim_correction`, `correct_claim`, `claim`; `services.findings.claims` and `models.finding_claims`. |
+| Configuration cap | `ConfigMatrix.enumerate(ToolRequest(..., params={"max_triples": n}))` accepts nonnegative integers, retains judged defaults first and reports truncation as a coverage gap. |
+
+CVE replay reads the original bound audit report, not later context. Monitor queries finish
+before any snapshot/watermark is recorded; failed or malformed sources advance nothing.
+Presence adjudication requires a verified human principal and evidence. Unknown presence
+never enters missed-finding trends, and a confirmed miss is not benchmark admission.
+
+Claim requests retain digest-checked proposal bytes and queue review. Acceptance requires
+the restate role, ticket, meaningful rationale and configured independent approvers.
+It rejects stale bases, changed original occurrence sets and fingerprint collisions.
+Title/fingerprint and the accepted claim projection change; original occurrences, reported
+severity and disposition do not. `claim(finding_id, as_of=...)` supports historical reads.
+Ledger proof and the finding/review projections share one transaction.
+
+Spend identity resolves only a registered exact URL/UUID or the associated order; ambiguous
+labels remain supplied text, with cost retained and canonical identity unknown. Ordered
+events store no independent repository ID: every rollup derives it from the order, including
+an unknown order repository. Only order-less declarations store canonical repository identity.
+Declared/measured token double counting is unchanged.
+
+Availability is `active`, `archived`, `moved`, `missing`, `disabled` or `unknown`.
+Credential/network failures remain unknown, not missing or reachable. Unqueried repositories
+have no invented observation time and are absent from stored snapshots; unchanged status
+keeps its original `status_since`. Availability is separate from successful commit observations.
+
+Imported artifact publication serializes each kind and admits a new row only when database
+statement time advances beyond its latest publication. Clock ties retry within a bounded
+window; a frozen/backward clock raises `RepositoryError` without changing history.
+SQLite's millisecond resolution limits same-kind publication throughput.
+`latest_imported` returns the retained document and prior ID; `publish_successor` rejects
+stale priors and older-digest reverts. No publication-revision column or historical backfill
+is used. New schema changes are bootstrap-only: existing databases are not upgraded by
+conditional scripts or automatic reconciliation.
+
+`ArtifactPublisher.stage` validates and uploads immutable bytes before write/lease locks;
+`publish_staged` publishes their metadata within the caller's atomic transaction.
+`ArtifactDocument.from_document` captures the serialized snapshot, not its caller's mutable
+mapping. Native scanner assessments retain `finding-intake` label/fingerprint bindings so
+claim review never guesses an original label from a replacement report.

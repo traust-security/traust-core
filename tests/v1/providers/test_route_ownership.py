@@ -8,6 +8,7 @@ from traust_core.v1.models.code_facts import RouteFamily, RouteOwnership
 from traust_core.v1.models.common import CodeSpan, RepoPath
 from traust_core.v1.providers.route_guards import _row
 from traust_core.v1.providers.route_ownership import (
+    RUST_LINK_RX,
     HandlerFacts,
     Lookup,
     classify,
@@ -15,6 +16,7 @@ from traust_core.v1.providers.route_ownership import (
     path_params,
     privileged_only,
     rank,
+    record_ownerless,
 )
 
 FIELDS = {
@@ -412,3 +414,27 @@ def test_rows_left_unclassified_carry_no_ownership() -> None:
         RouteFamily.SPRING, "GET", "/api/items/{id}", "h", "a.java", 3, [], list(AUTH), []
     ).model()
     assert model.ownership is None and model.ownership_evidence is None
+
+
+@pytest.mark.parametrize(
+    ("field", "shared", "rust"),
+    [
+        ("poster_url", True, True),
+        ("staff_count", True, True),
+        ("contact_phone", True, True),
+        ("sort_by", True, False),  # `*_by` stays a Rust link: attribution-shaped, never a credit
+        ("from", True, False),
+        ("to", True, False),
+        ("sub", True, False),
+        ("poster_id", False, False),
+        ("created_by", False, False),
+    ],
+)
+def test_a_public_catalog_field_leaves_a_record_ownerless(
+    field: str, shared: bool, rust: bool
+) -> None:
+    fields = {"Movie": ("id", "title", field)}
+    assert record_ownerless("Movie", fields) is shared
+    # Rust, which never credits, also reads `*_by`, `sub`, `from`, `to` as links, but a role
+    # word must stand alone or end id-shaped: `poster_url` is a catalog field, not a caller
+    assert record_ownerless("Movie", fields, RUST_LINK_RX) is rust

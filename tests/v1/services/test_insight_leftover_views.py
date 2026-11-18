@@ -4,7 +4,7 @@ reads, built on demand."""
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -18,7 +18,7 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.services.test_insight import FakeFindings, FakePortfolio, view
 from traust_core.v1.context import Config, Context
-from traust_core.v1.errors import IntegrityError, NotFoundError, ValidationError
+from traust_core.v1.errors import DocumentError, IntegrityError, NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import CodeFactsArtifact, ThreatModelArtifact
 from traust_core.v1.models.assessment import (
     AssessmentKind,
@@ -39,12 +39,19 @@ from traust_core.v1.models.findings import (
     ReviewCaseKind,
     ReviewItem,
 )
-from traust_core.v1.models.insight import ViewFilter, ViewName
+from traust_core.v1.models.insight import (
+    LeastPrivilege,
+    QuickWin,
+    RankedThreat,
+    ViewFilter,
+    ViewName,
+)
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.vocabulary import ReviewReason, SourceType
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services import insight as insight_module
 from traust_core.v1.services.artifact_publishing import (
     ArtifactPublisher,
     AssessmentLog,
@@ -536,12 +543,15 @@ def lang(name: str, code: int) -> LanguageCount:
 class FakeCodeFacts:
     measured: dict[UUID, LanguageStats | Exception]
 
-    def language_stats(
-        self, repository_ref_id: UUID, *, as_of: datetime | None = None
-    ) -> LanguageStats:
-        found = self.measured[repository_ref_id]
-        if isinstance(found, Exception):
-            raise found
+    def language_stats_of(
+        self, repository_ref_ids: Collection[UUID], *, as_of: datetime | None = None
+    ) -> dict[UUID, LanguageStats | str]:
+        found: dict[UUID, LanguageStats | str] = {}
+        for ref in repository_ref_ids:
+            got = self.measured[ref]
+            if isinstance(got, IntegrityError):
+                raise got
+            found[ref] = got if not isinstance(got, Exception) else str(got)
         return found
 
 
@@ -549,9 +559,14 @@ class FakeCodeFacts:
 class LocPortfolio(FakePortfolio):
     refs: dict[UUID, UUID] = field(default_factory=dict)
 
-    def default_ref(self, repository_id: UUID, as_of: datetime | None = None) -> Any:
-        ref = self.refs.get(repository_id)
-        return None if ref is None else type("Ref", (), {"id": ref})()
+    def default_refs(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> dict[UUID, Any]:
+        return {
+            repository_id: type("Ref", (), {"id": ref})()
+            for repository_id, ref in self.refs.items()
+            if repository_id in set(repository_ids)
+        }
 
 
 def loc(
@@ -649,6 +664,13 @@ def test_loc_never_hides_broken_measurements() -> None:
         loc({RA: IntegrityError("duplicate language measurements")}, {A: RA}).build(ViewFilter())
 
 
+def test_a_loc_view_outside_its_contract_is_refused_by_the_build() -> None:
+    drifted: dict[UUID, Any] = {RA: LanguageStats(languages=(lang("Go", -5),))}
+    with pytest.raises(DocumentError) as error:
+        loc(drifted, {A: RA}).build(ViewFilter())
+    assert "repositories/0/languages/0/code" in {issue.path for issue in error.value.issues}
+
+
 def test_loc_renders_through_context(engine: Engine, tmp_path: Path) -> None:
     ctx = context(engine, tmp_path)
     doc = CodeFactsArtifact.from_document(
@@ -718,7 +740,8 @@ class FakeExposure:
         assert group_by == ExposureDimension.ADVISORY
         return [
             ExposureRollup(key="CVE-2026-0001", commits=4, exposed=3, affected=2,
-                           by_classification={})
+                           by_classification={"affected": 2, "likely_affected": 1,
+                                              "not_imported": 1})
         ]  # fmt: skip
 
 
@@ -880,7 +903,7 @@ def test_executive_summary_keeps_unrated_credentials_after_known_severities(
     assert payload["credential_leaks"][-1]["severity"] is None
     assert payload["rollup"]["total"]["open"]["unrated"] == 1
     markdown = ctx.services().insight.publish(ViewName.EXECUTIVE_SUMMARY, ViewFilter()).markdown
-    assert "| Hard-coded unrated credential | - |" in markdown
+    assert "| Hard-coded unrated credential | — |" in markdown
     assert "1 unrated" in markdown
 
 
@@ -1055,3 +1078,34 @@ def test_an_out_of_vocabulary_dimension_result_is_not_read_as_passing() -> None:
     assert ranked[0].failed == ("privilege",)
     assert ranked[1].failed == ("privilege",)
     assert ranked[2].failed == ()
+
+
+def test_a_register_outside_its_contract_is_refused_by_the_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = insight_module._quick_wins
+
+    def drifted(threats: Sequence[RankedThreat]) -> tuple[QuickWin, ...]:
+        return tuple(w.model_copy(update={"effort": "m"}) for w in real(threats))
+
+    monkeypatch.setattr(insight_module, "_quick_wins", drifted)
+    threats = [threat(A, "T1", severity="critical", mitigations=(QUICK,))]
+    with pytest.raises(DocumentError) as error:
+        register(threats).build(ViewFilter())
+    assert "quick_wins/0/effort" in {issue.path for issue in error.value.issues}
+
+
+def test_a_summary_outside_its_contract_is_refused_by_the_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = insight_module.LeastPrivilege
+
+    def drifted(**fields: Any) -> LeastPrivilege:
+        return real(**{**fields, "profiles": -1})
+
+    monkeypatch.setattr(insight_module, "LeastPrivilege", drifted)
+    view, _ = executive([])
+    with pytest.raises(DocumentError) as error:
+        view.build(ViewFilter())
+    assert "privileges/profiles" in {issue.path for issue in error.value.issues}
+    assert view.compose(ViewFilter()).privileges.profiles == -1

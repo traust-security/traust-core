@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import logging
 import shutil
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import StrEnum
 from functools import cached_property
 from pathlib import Path
 from typing import Any, TypeVar
@@ -29,6 +31,7 @@ from traust_core.v1.context.feeds import (
     DEPS_DEV,
     DEPS_DEV_CACHE,
     ObjectCache,
+    check_api_key_sources,
     load_advisory_lookup,
     load_feed_sources,
     load_feeds,
@@ -37,6 +40,7 @@ from traust_core.v1.context.feeds import (
 from traust_core.v1.context.logging import configure_logging as install_logging
 from traust_core.v1.context.observation import command_source, comment_sources
 from traust_core.v1.context.preflight import preflight as preflight_requirements
+from traust_core.v1.context.redaction import load_yaml_config
 from traust_core.v1.context.tools import (
     checkov_tool,
     compliance_sources,
@@ -47,15 +51,14 @@ from traust_core.v1.context.tools import (
     load_toolchain,
     scanner_tools,
 )
+from traust_core.v1.contracts import MigrationError
 from traust_core.v1.errors import (
     ConfigError,
     DocumentError,
     NotFoundError,
-    RepositoryError,
     ValidationError,
 )
 from traust_core.v1.models.artifacts import (
-    ARTIFACT_FOR_KIND,
     AdrRegistryArtifact,
     BelowRangePacketsArtifact,
     BelowRangeVerdictsArtifact,
@@ -66,9 +69,12 @@ from traust_core.v1.models.artifacts import (
     ComplianceMappingArtifact,
     ComplianceScopeArtifact,
     CorpusRegistryArtifact,
+    CveReplayArtifact,
     DocVarianceArtifact,
+    FindingIntakeArtifact,
     FleetFixArtifact,
     FuzzReportArtifact,
+    InsightBuildsArtifact,
     IsolationReviewArtifact,
     OrgParametersArtifact,
     PqcFactsArtifact,
@@ -77,6 +83,7 @@ from traust_core.v1.models.artifacts import (
     PrivProfileArtifact,
     ProductDefinitionsMapArtifact,
     RemediationArtifact,
+    RepoLivenessArtifact,
     ReportArtifact,
     RepoStateArtifact,
     RunManifestArtifact,
@@ -156,8 +163,7 @@ from traust_core.v1.repositories import (
     create_database_engine,
 )
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
-from traust_core.v1.repositories.objects.analysis_results import AnalysisResultsRepository
-from traust_core.v1.repositories.sql import Dialect
+from traust_core.v1.repositories.sql import Dialect, on_driver_connection
 from traust_core.v1.repositories.tables import TableFactory
 from traust_core.v1.services.artifact_publishing import (
     ArtifactPublisher,
@@ -188,6 +194,7 @@ from traust_core.v1.services.findings import (
 from traust_core.v1.services.findings.citations import VerdictCitations
 from traust_core.v1.services.findings.records import FindingRecords
 from traust_core.v1.services.findings.restatement import RestatementPolicy
+from traust_core.v1.services.findings.windows import WindowMemo
 from traust_core.v1.services.identity import IdentityService
 from traust_core.v1.services.insight import (
     AttackCoverageView,
@@ -208,6 +215,7 @@ from traust_core.v1.services.insight import (
     InventoryExportView,
     LocView,
     OscalExport,
+    ParsedBuilds,
     PqcPortfolioView,
     PqcVendorsView,
     PqcView,
@@ -257,6 +265,8 @@ from traust_core.v1.services.repo_checkout import RepoCheckoutService
 from traust_core.v1.services.reporting import ReportingService
 from traust_core.v1.services.validation import ValidationRecords, ValidationService
 
+log = logging.getLogger(__name__)
+
 U = TypeVar("U", bound=UnitOfWork)
 # A liveness probe asks once, briefly: a slow or unreachable host only delays every readiness read.
 PROBE_POLICY = RetryPolicy(max_attempts=1, timeout_seconds=5.0)
@@ -266,6 +276,25 @@ PACKAGE_SOURCE_AGENT = "traust-core (+https://github.com/traust-security/traust-
 
 # NEED(direction): the REST API is a thin adapter over Services, and the SDK becomes a
 # framework (prepare -> run skill -> record) on top of that REST API, not thin wrappers.
+
+
+class StoreState(StrEnum):
+    """A store's standing against the db contract, read without the open gate."""
+
+    EMPTY = "empty"  # no store yet: an open (local) or a deployment bootstraps it
+    VERSION_0 = "version_0"  # predates the channel: shape unknown, adopt or recreate
+    BEHIND = "behind"  # stamped, with pending upgrades
+    CURRENT = "current"  # stamped, up to date
+
+
+@dataclass(frozen=True, slots=True)
+class StoreStatus:
+    """What an operator or doctor asks before a pin bump reaches the store."""
+
+    state: StoreState
+    pending: tuple[contracts.Upgrade, ...] = ()  # the plan, when behind
+
+
 @dataclass(frozen=True)
 class Services:
     assessment: AssessmentService
@@ -346,7 +375,7 @@ class Context:
         # The SLA view is built only with one: this run's policy, or the default a recorded one
         # replaces.
         self.sla_policy: SlaPolicy | None = None
-        self.default_sla_policy: SlaPolicy | None = None
+        self._default_sla_policy_path: Path | None = None
         # The ATT&CK coverage view raises without its catalog; threat-model lint requires both
         self.attack_catalog: AttackCatalog | None = None
         self.atlas_catalog: AtlasCatalog | None = None
@@ -489,23 +518,37 @@ class Context:
     def register_feeds(self, registry: Path = SHIPPED_FEEDS) -> None:
         """Register a provider for each cached feed, each per-identifier or probed source, and
         the advisory lookup, from the feeds registry traust-core ships (tests pass fixtures)."""
-        for feed in load_feeds(registry, http=self.http, clock=self.clock):
-            self.feeds.register(feed.name, lambda feed=feed: feed)
-        probe_http = HttpFetcher("traust-core", PROBE_POLICY, clock=self.clock)
-        for source in load_feed_sources(
-            registry, http=self.http, probe_http=probe_http, clock=self.clock
-        ):
-            self.feed_sources.register(source.name, lambda source=source: source)
-        self.package_sources = load_package_sources(
+        # load and check everything (the deployment's API keys, every source) before touching
+        # the registries, so a config error leaves this context as it was and a retry after
+        # fixing it starts clean
+        # the names first, so no error about a variable can echo an unregistered name
+        check_api_key_sources(registry, self.config.feeds.api_keys)
+        api_keys = self.config.feeds.api_key_values()
+        feeds = load_feeds(registry, http=self.http, clock=self.clock)
+        sources = load_feed_sources(
+            registry,
+            http=self.http,
+            probe_http=HttpFetcher("traust-core", PROBE_POLICY, clock=self.clock),
+            clock=self.clock,
+            api_keys=api_keys,
+            api_key_variables=self.config.feeds.api_keys,
+        )
+        package_sources = load_package_sources(
             registry, http=HttpFetcher(PACKAGE_SOURCE_AGENT, self._http_policy, clock=self.clock)
         )
-        self.advisories = load_advisory_lookup(
+        advisories = load_advisory_lookup(
             registry,
             http=self.http,
             clock=self.clock,
-            packages=self.package_sources,
+            packages=package_sources,
             air_gapped=self.config.feeds.osv_access == "air-gapped",
         )
+        for feed in feeds:
+            self.feeds.register(feed.name, lambda feed=feed: feed)
+        for source in sources:
+            self.feed_sources.register(source.name, lambda source=source: source)
+        self.package_sources = package_sources
+        self.advisories = advisories
 
     def use_exported_advisories(self, paths: Sequence[Path]) -> None:
         """Air-gapped runs: advisory reads answer from these exported OSV records only."""
@@ -533,20 +576,21 @@ class Context:
         self.sla_policy = _sla_policy(path)
 
     def register_default_sla_policy(self, path: Path) -> None:
-        """Build the SLA view on the policy at `path` (traust: the security pack's) until the
-        deployment records its own (`InsightService.record_sla_policy`)."""
-        self.default_sla_policy = _sla_policy(path)
+        """Register the pack's default; read and validate it only when the SLA view needs it."""
+        self._default_sla_policy_path = path
+        self.__dict__.pop("default_sla_policy", None)
+
+    @cached_property
+    def default_sla_policy(self) -> SlaPolicy | None:
+        if self._default_sla_policy_path is None:
+            return None
+        return _sla_policy(self._default_sla_policy_path)
 
     def register_model_catalog(self, path: Path) -> None:
         """Price spend and build the spend view on the model registry at `path` (contracts
         `model-registry`; traust's config/model-registry.yaml)."""
-        try:
-            raw = path.read_bytes()
-            text = raw.decode()
-            document = yaml.safe_load(text)
-            contracts.validate_config("model-registry", document)
-        except (OSError, UnicodeDecodeError, yaml.YAMLError, DocumentError) as e:
-            raise ConfigError(f"model registry {path}: {e}") from e
+        text, document = load_yaml_config(path, "model-registry", label=f"model registry {path}")
+        raw = text.encode()  # the file's exact bytes: the loader decodes them without translation
         self.model_catalog = RegistryModelCatalog.of(
             document, text, hashlib.sha256(raw).hexdigest()[:12]
         )
@@ -556,6 +600,19 @@ class Context:
     def spend_views(self) -> SpendViews:
         """Usage over a spend source a caller holds, at list prices; never opens the store."""
         return SpendViews(self.model_catalog)
+
+    @cached_property
+    def parsed_builds(self) -> ParsedBuilds:
+        """The stored census builds' parse, shared by every wired InsightService: services are
+        built per request, the parse is once per publication."""
+        return ParsedBuilds()
+
+    @cached_property
+    def window_memo(self) -> WindowMemo:
+        """The worklist windows' folded views, shared by every wired FindingService: services
+        are built per request, the memo outlives them, so concurrent readers of one scope
+        fold it once instead of once each (the 20-user stampede's fix)."""
+        return WindowMemo()
 
     def register_invoices(self, path: Path) -> None:
         """Reconcile the spend view against the billed amounts in the CSV at `path`
@@ -727,25 +784,124 @@ class Context:
         )
 
     @cached_property
-    def database(self) -> Engine:
-        local = self.config.database.url is None
-        if local:
+    def _store_engine(self) -> Engine:
+        """The configured store's engine - one pool per Context, shared by the
+        open gate (``database``) and the operator's channel calls alike."""
+        if self.config.database.url is None:
             self.config.home.mkdir(parents=True, exist_ok=True)
-        engine = create_database_engine(self.config.record_store_url())
-        if local and not sa.inspect(engine).get_table_names():
-            apply_schema(engine, contracts.database_ddl(Dialect.of(engine)))
-        else:
-            _manifest_scan_pointer(engine, upgrade=local)
-            _default_named_at(engine, upgrade=local)
-            _run_order_fork_columns(engine)  # artifact_run_order's upgrade needs these first
-            _artifact_run_order(engine, upgrade=local)
-            _run_order_fork_scheduled(engine, upgrade=local)
-            _finding_fingerprint_index(engine, upgrade=local)
-            _additive_column(
-                engine,
-                ("traust", "finding_external_ref", "assessment_id"),
-                "finding_external_ref_assessment_upgrade",
-                upgrade=local,
+        return create_database_engine(self.config.record_store_url())
+
+    @cached_property
+    def database(self) -> Engine:
+        engine = self._store_engine
+        local = self.config.database.url is None
+        populated = _store_populated(engine)
+        if local and not populated:
+            dialect = Dialect.of(engine)
+            apply_schema(engine, contracts.database_ddl(dialect))
+            _run_channel(engine, local=True)
+            log.info(
+                "store bootstrap fresh dialect=%s: baseline schema and the whole channel applied",
+                dialect,
+                extra={"operation": "store.bootstrap", "outcome": "fresh"},
+            )
+        elif populated:
+            if _channel_stamped(engine):
+                _run_channel(engine, local=local)
+            else:
+                log.error(
+                    "store refused: the database predates the db_upgrade stamp table "
+                    "(version 0) - its shape is unknown, recreate the store",
+                    extra={"operation": "store.bootstrap", "outcome": "refused_version_0"},
+                )
+                raise ConfigError(
+                    "the database predates the upgrade channel: its schema has no db_upgrade "
+                    "stamp table, so its shape is unknown — recreate the store from the current "
+                    "contract (traust-contracts db/v1/traust/README.md, Upgrades)"
+                )
+        # else: a configured empty database is its deployment's, never bootstrapped
+        return engine
+
+    def pending_db_upgrades(self) -> list[contracts.Upgrade]:
+        """The db-contract upgrades this store has not run, planned not applied:
+        names, hashes and declared destructive reasons. Touches no schema -
+        not even the stamp table - so an operator looks before committing."""
+        engine = self._planable_store_engine()
+        try:
+            return on_driver_connection(
+                engine, lambda dbapi: contracts.pending_db_upgrades(dbapi, Dialect.of(engine))
+            )
+        except MigrationError as error:
+            raise ConfigError(
+                f"the db contract's upgrade channel refused this store: {error}"
+            ) from error
+
+    def apply_db_upgrades(self, *, allow_destructive: bool = False) -> list[contracts.Upgrade]:
+        """Apply the db-contract upgrade channel deliberately - the operator's
+        call, never an open's. A script that declares a destructive reason runs
+        only when the caller acknowledges it: the plan is read first, and a
+        destructive pending script without ``allow_destructive`` is a refusal
+        naming what would run and why. Each script runs whole with its stamp in
+        one transaction; the channel is idempotent and refuses drift either
+        way."""
+        engine = self._planable_store_engine()
+        try:
+            pending = on_driver_connection(
+                engine, lambda dbapi: contracts.pending_db_upgrades(dbapi, Dialect.of(engine))
+            )
+            destructive = [upgrade for upgrade in pending if upgrade.destructive]
+            if destructive and not allow_destructive:
+                raise ConfigError(
+                    f"{len(destructive)} pending upgrade(s) declare destructive work "
+                    f"({_upgrade_plan(destructive)}): read the reasons, then acknowledge "
+                    "with apply_db_upgrades(allow_destructive=True) (the CLI's "
+                    "--allow-destructive flag)"
+                )
+            return on_driver_connection(
+                engine, lambda dbapi: contracts.run_db_upgrades(dbapi, Dialect.of(engine))
+            )
+        except MigrationError as error:
+            raise ConfigError(
+                f"the db contract's upgrade channel refused this store: {error}"
+            ) from error
+
+    def store_status(self) -> StoreStatus:
+        """The store's standing against the db contract, read without opening
+        through the gate: for doctor and operators, before a refusal surprises
+        them at startup. Behind carries the plan; the other states carry their
+        own remedy in their docstring."""
+        engine = self._store_engine
+        if not _store_populated(engine):
+            return StoreStatus(StoreState.EMPTY)
+        if not _channel_stamped(engine):
+            return StoreStatus(StoreState.VERSION_0)
+        try:
+            pending = on_driver_connection(
+                engine, lambda dbapi: contracts.pending_db_upgrades(dbapi, Dialect.of(engine))
+            )
+        except MigrationError as error:
+            raise ConfigError(
+                f"the db contract's upgrade channel refused this store: {error}"
+            ) from error
+        if pending:
+            return StoreStatus(StoreState.BEHIND, tuple(pending))
+        return StoreStatus(StoreState.CURRENT)
+
+    def _planable_store_engine(self) -> Engine:
+        """The store engine for the operator's channel calls: a known shape, or
+        a refusal that says which. Version 0 and empty stores are bootstrapped
+        or recreated, never upgraded through the surface."""
+        engine = self._store_engine
+        if not _store_populated(engine):
+            raise ConfigError(
+                "the store is empty: it is bootstrapped by an open (a local store) or by its "
+                "deployment - there is nothing to plan or apply"
+            )
+        if not _channel_stamped(engine):
+            raise ConfigError(
+                "the database predates the upgrade channel: its schema has no db_upgrade "
+                "stamp table, so its shape is unknown — recreate the store from the current "
+                "contract (traust-contracts db/v1/traust/README.md, Upgrades)"
             )
         return engine
 
@@ -800,10 +956,16 @@ class Context:
     def _wire(self, uow: SqlTraustUnitOfWork, policy: PortfolioPolicy) -> Services:
         hosts = self.config.forge_hosts
         sources = command_source(hosts, clock=self.clock, api=self.forge_api)
-        intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy())
+        intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy(), objects=self.object_store)
         ledger = None if self.config.ledger is None else LedgerService(uow, self.config.ledger)
         identity = self.config.identity
-        spend = SpendService(uow, self.clock, self.config.budgets, self.model_catalog)
+        spend = SpendService(
+            uow,
+            self.clock,
+            self.config.budgets,
+            self.model_catalog,
+            inventory=Inventory(uow, hosts),
+        )
         ops = OpsService(
             uow,
             self.clock,
@@ -847,7 +1009,7 @@ class Context:
             recording=ops,
         )
         rating = RatingPolicy(self.config.rating)
-        views = FindingViewQuery(rating)
+        views = FindingViewQuery(rating, self.object_store)
         findings = FindingService(
             uow,
             intake,
@@ -856,6 +1018,7 @@ class Context:
             precedents,
             rating,
             self.object_store,
+            windows=self.window_memo,
         )
         assessment = AssessmentService(
             uow,
@@ -875,6 +1038,7 @@ class Context:
                     PublishSpec(PrivProfileArtifact),
                     PublishSpec(CodeFactsArtifact),
                     PublishSpec(FuzzReportArtifact),
+                    PublishSpec(FindingIntakeArtifact),
                 ),
                 self.object_store,
                 uow,
@@ -893,12 +1057,14 @@ class Context:
             clock=self.clock,
             hosts=hosts,
             tools=self.tools,
+            ops=ops,
             product_definitions=self.product_definitions(),
             publisher=ArtifactPublisher(
                 PublishSpecs(
                     PublishSpec(CorpusRegistryArtifact),
                     PublishSpec(ProductDefinitionsMapArtifact),
                     PublishSpec(RepoStateArtifact),
+                    PublishSpec(RepoLivenessArtifact),
                 ),
                 self.object_store,
                 uow,
@@ -1031,6 +1197,7 @@ class Context:
                     PublishSpec(BenchmarkTargetArtifact),
                     PublishSpec(ReportArtifact),
                     PublishSpec(ComplianceAssessmentArtifact),
+                    PublishSpec(CveReplayArtifact),
                 ),
                 self.object_store,
                 uow,
@@ -1044,6 +1211,7 @@ class Context:
             sweeper=self.rule_sweeper,
             git=self.git,
             checkouts=self.checkouts,
+            exposure=exposure,
         )
         freshness = FreshnessQuery(catalog, exposure, self.clock)
         trend = FindingsTrendView(findings, portfolio, self.clock)
@@ -1147,7 +1315,7 @@ class Context:
                     trend,
                     ProgramView(spend, ops, self.assets.names),
                     CoverageView(assessment, portfolio, self.clock),
-                    ExposureView(exposure),
+                    ExposureView(exposure, self.clock),
                     DependencyReachView(exposure, portfolio),
                     PqcView(pqc),
                     PqcWorklistView(pqc),
@@ -1174,7 +1342,7 @@ class Context:
                     SlaView(
                         findings,
                         portfolio,
-                        self.sla_policy or self.default_sla_policy,
+                        lambda: self.sla_policy or self.default_sla_policy,
                         self.clock,
                         recorded=None if self.sla_policy else sla_policies,
                     ),
@@ -1191,11 +1359,13 @@ class Context:
                 ),
                 self.clock,
                 sla_policies=sla_policies,
+                builds=ArtifactPublisher(
+                    PublishSpecs(PublishSpec(InsightBuildsArtifact)), self.object_store, uow
+                ),
+                decisions=findings.decisions,
+                parsed=self.parsed_builds,
             ),
         )
-
-    def analysis_results(self) -> AnalysisResultsRepository:
-        return AnalysisResultsRepository(self.object_store, ARTIFACT_FOR_KIND)
 
     @contextmanager
     def repository_observation(
@@ -1236,131 +1406,70 @@ def _sla_policy(path: Path) -> SlaPolicy:
         raise ConfigError(f"SLA policy {path}: {e}") from e
 
 
-def _run_order_fork_columns(engine: Engine) -> None:
-    """contracts added `run_order.fork_url` / `fork_branch`: there is deliberately no upgrade
-    channel (contracts#117 — existing databases alter by hand), so a store whose run_order
-    predates the columns is refused here, with the statements to apply, rather than failing
-    the first remediate_finding order with a raw driver error."""
-    dialect = Dialect.of(engine)
-    schema = "traust_ops" if dialect == Dialect.POSTGRES else None
-    table = "run_order" if dialect == Dialect.POSTGRES else "ops_run_order"
+def _store_populated(engine: Engine) -> bool:
+    """Any namespace's tables count as a populated store: on postgres they live
+    in the traust schemas, not the default one ``get_table_names()`` inspects."""
     inspector = sa.inspect(engine)
-    if not inspector.has_table(table, schema=schema):
-        return
-    columns = {c["name"] for c in inspector.get_columns(table, schema=schema)}
-    if {"work_item_id", "fork_url", "fork_branch"} <= columns:
-        return
-    raise ConfigError(
-        f"the database's {table} predates the fork columns: apply the additive statements "
-        "documented in traust-contracts#117 (its 'Upgrading an existing database' section), "
-        "or recreate the store"
-    )
-
-
-def _manifest_scan_pointer(engine: Engine, *, upgrade: bool) -> None:
-    """contracts added `repository_ref.manifest_sbom_assessment_id`: a local store is upgraded; a
-    configured database's schema is its deployment's, so its absence is refused here rather
-    than failing every read of a commit."""
-    dialect = Dialect.of(engine)
-    schema = "traust" if dialect == Dialect.POSTGRES else None
-
-    def present() -> bool | None:
-        inspector = sa.inspect(engine)
-        if not inspector.has_table("repository_ref", schema=schema):
-            return None
-        columns = inspector.get_columns("repository_ref", schema=schema)
-        return any(c["name"] == "manifest_sbom_assessment_id" for c in columns)
-
-    if present() is not False:
-        return
-    if not upgrade:
-        raise ConfigError(
-            "the database's repository_ref predates manifest_sbom_assessment_id: apply "
-            "traust_core.v1.contracts.manifest_sbom_binding_upgrade(dialect) to it"
+    if Dialect.of(engine) == Dialect.POSTGRES:
+        return any(
+            inspector.get_table_names(schema=schema)
+            for schema in ("traust", "traust_ops", "traust_ledger")
+            if schema in inspector.get_schema_names()
         )
+    return bool(inspector.get_table_names())
+
+
+def _channel_stamped(engine: Engine) -> bool:
+    """The db_upgrade stamp table is the channel's mark on a database it manages."""
+    schema = "traust" if Dialect.of(engine) == Dialect.POSTGRES else None
+    return sa.inspect(engine).has_table("db_upgrade", schema=schema)
+
+
+def _run_channel(engine: Engine, *, local: bool) -> None:
+    """A local store is upgraded through the channel runner; a configured database's
+    upgrades are its deployment's, so pending ones are refused here rather than applied
+    behind its operator's back. The runner drives a raw DBAPI connection in autocommit
+    because it manages its own transactions, one per script with its stamp."""
+    dialect = Dialect.of(engine)
     try:
-        apply_schema(engine, contracts.manifest_sbom_binding_upgrade(dialect))
-    except RepositoryError:
-        if not present():  # else another process opening the same store upgraded it first
-            raise
-
-
-def _default_named_at(engine: Engine, *, upgrade: bool) -> None:
-    """contracts added `repository_ref.default_named_at`."""
-    _additive_column(
-        engine,
-        ("traust", "repository_ref", "default_named_at"),
-        "default_named_at_upgrade",
-        upgrade=upgrade,
-    )
-
-
-def _artifact_run_order(engine: Engine, *, upgrade: bool) -> None:
-    """contracts added `artifact.run_order_id` (contracts#128)."""
-    _additive_column(
-        engine,
-        ("traust", "artifact", "run_order_id"),
-        "artifact_run_order_upgrade",
-        upgrade=upgrade,
-    )
-
-
-def _run_order_fork_scheduled(engine: Engine, *, upgrade: bool) -> None:
-    """contracts added `run_order.fork_scheduled_at` (contracts#130)."""
-    _additive_column(
-        engine,
-        ("traust_ops", "run_order", "fork_scheduled_at"),
-        "run_order_fork_scheduled_upgrade",
-        upgrade=upgrade,
-    )
-
-
-def _additive_column(
-    engine: Engine, where: tuple[str, str, str], upgrade_door: str, *, upgrade: bool
-) -> None:
-    """A column contracts added with an explicit upgrade: a local store is upgraded; a
-    configured database's schema is its deployment's, so its absence is refused here rather
-    than failing the first read."""
-    namespace, name, column = where
-    dialect = Dialect.of(engine)
-    postgres = dialect == Dialect.POSTGRES
-    schema = namespace if postgres else None
-    table = name if postgres or namespace == "traust" else f"ops_{name}"
-
-    def present() -> bool | None:
-        inspector = sa.inspect(engine)
-        if not inspector.has_table(table, schema=schema):
-            return None
-        return any(c["name"] == column for c in inspector.get_columns(table, schema=schema))
-
-    if present() is not False:
-        return
-    if not upgrade:
-        raise ConfigError(
-            f"the database's {table} predates {column}: apply "
-            f"traust_core.v1.contracts.{upgrade_door}(dialect) to it"
+        if local:
+            on_driver_connection(engine, lambda dbapi: contracts.run_db_upgrades(dbapi, dialect))
+            return
+        pending = on_driver_connection(
+            engine, lambda dbapi: contracts.pending_db_upgrades(dbapi, dialect)
         )
-    try:
-        apply_schema(engine, getattr(contracts, upgrade_door)(dialect))
-    except RepositoryError:
-        if not present():  # else another process opening the same store upgraded it first
-            raise
-
-
-def _finding_fingerprint_index(engine: Engine, *, upgrade: bool) -> None:
-    dialect = Dialect.of(engine)
-    schema = "traust" if dialect == Dialect.POSTGRES else None
-    inspector = sa.inspect(engine)
-    if not inspector.has_table("finding", schema=schema):
-        return
-    if any(
-        index["column_names"][:2] == ["repository_id", "fingerprint"]
-        for index in inspector.get_indexes("finding", schema=schema)
-    ):
-        return
-    if not upgrade:
+    except MigrationError as error:
+        log.error("store refused: the db contract's upgrade channel rejected it - %s", error)
         raise ConfigError(
-            "the database's finding table lacks the repository/fingerprint index: apply "
-            "traust_core.v1.contracts.finding_fingerprint_index_upgrade(dialect) to it"
+            f"the db contract's upgrade channel refused this store: {error}"
+        ) from error
+    if pending:
+        log.warning(
+            "configured database refused: behind the db contract, %d upgrade(s) pending: %s "
+            "- its deployment applies them, not this open",
+            len(pending),
+            _upgrade_plan(pending),
+            extra={
+                "operation": "store.bootstrap",
+                "outcome": "refused_pending",
+                "count": len(pending),
+            },
         )
-    apply_schema(engine, contracts.finding_fingerprint_index_upgrade(dialect))
+        raise ConfigError(
+            f"the database is behind the db contract ({len(pending)} upgrade(s) pending: "
+            f"{_upgrade_plan(pending)}): a configured database's upgrades are its "
+            "deployment's - plan them with Context.pending_db_upgrades(), apply with "
+            "Context.apply_db_upgrades() (the `traust db upgrades` CLI wraps both) "
+            "with its owners"
+        )
+
+
+def _upgrade_plan(pending: Iterable[contracts.Upgrade]) -> str:
+    """One fragment per pending script: name, hash prefix, declared destructiveness."""
+    parts = []
+    for upgrade in pending:
+        part = f"{upgrade.name} sha256:{upgrade.sha256[:12]}"
+        if upgrade.destructive:
+            part += f" [destructive: {upgrade.destructive}]"
+        parts.append(part)
+    return "; ".join(parts)

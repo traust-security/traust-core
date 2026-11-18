@@ -1,4 +1,4 @@
-"""Shared helpers for the tree-sitter enumerators (Express, Java, Rust, Ruby). The grammars
+"""Shared helpers for the tree-sitter enumerators (Express, Java, Rust, Ruby, Go). The grammars
 are core dependencies, loaded here and only when asked; a host where one won't import gets a
 named coverage gap instead of a failure."""
 
@@ -91,6 +91,16 @@ def ruby_parser() -> Node | None:
     return tree_sitter.Parser(tree_sitter.Language(tree_sitter_ruby.language()))
 
 
+def go_parser() -> Node | None:
+    """The Go parser, or None when its grammar won't import on this host."""
+    try:
+        import tree_sitter
+        import tree_sitter_go
+    except ImportError:
+        return None
+    return tree_sitter.Parser(tree_sitter.Language(tree_sitter_go.language()))
+
+
 def grammar_readiness() -> dict[str, Readiness]:
     """Each route matrix's grammar by language: ready when it loads, else the coverage-gap
     wording its enumerator reports."""
@@ -99,6 +109,7 @@ def grammar_readiness() -> dict[str, Readiness]:
         ("Java", "tree-sitter-java", java_parser),
         ("Rust", "tree-sitter-rust", rust_parser),
         ("Ruby", "tree-sitter-ruby", ruby_parser),
+        ("Go", "tree-sitter-go", go_parser),
     )
     return {
         language: Readiness(ready=True)

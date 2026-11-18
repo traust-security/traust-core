@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, NewType, Self
+from typing import Any, NamedTuple, NewType, Self
 from uuid import UUID, uuid5
 
 from pydantic import Field, computed_field
@@ -324,6 +324,15 @@ class Assessment(AppendOnly):
     occurred_at: datetime
 
 
+class CensusAssessment(NamedTuple):
+    """One assessment's census columns — what the disposition line rules read, without
+    a model."""
+
+    id: UUID
+    repository_ref_id: UUID
+    baseline_assessment_id: UUID | None
+
+
 class Artifact(AppendOnly):
     """A document an assessment produced (or imported); bytes live at uri."""
 
@@ -513,6 +522,8 @@ class PrivilegeProfile(Model):
     rbac_rules: int
     wildcard_rules: int | None = None
     scc_requests: tuple[str, ...] = ()
+    # the profile's own flag: "asked for no SCC" is not "could not tell"; None when unstated
+    no_scc_request_recorded: bool | None = None
     flags: dict[str, int] = Field(default_factory=dict)  # a pattern is present only if it matched
     containers: int | None = None  # None when the profile lists no workloads
     privileged_containers: int | None = None
@@ -579,6 +590,7 @@ class PrivilegeProfile(Model):
             rbac_rules=summary["rbac_rules"],
             wildcard_rules=summary.get("wildcard_rules"),
             scc_requests=tuple(summary.get("scc_requests") or ()),
+            no_scc_request_recorded=summary.get("no_scc_request_recorded"),
             flags={k: len(v) for k, v in (profile.get("rbac_flags") or {}).items() if v},
             namespaces=tuple(profile.get("namespaces") or ()),
             install_modes=tuple(k for k, v in (profile.get("install_modes") or {}).items() if v),

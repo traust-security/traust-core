@@ -108,12 +108,13 @@ def pairs(finding_ids: list[UUID], repository_ids: list[UUID]) -> list[Remediati
 
 
 def fork_of(engine: Engine, request: list[RemediationFindingRequest]) -> str:
-    """The repository's remediation fork under PRIVATE (ForkPolicy: the fork org's mirror)."""
+    """The repository's remediation fork under PRIVATE (ForkPolicy: the convention's plain
+    patch-<name> in the fork org)."""
     if not request:  # refused before any fork is resolved
-        return "https://github.com/mirror-org/none"
+        return "https://github.com/mirror-org/patch-none"
     with SqlTraustUnitOfWork(engine) as uow:
         url = uow.repositories.get(request[0].repository_id).url
-    return f"https://github.com/mirror-org/{url.rsplit('/', 1)[-1]}"
+    return f"https://github.com/mirror-org/patch-{url.rsplit('/', 1)[-1]}"
 
 
 def folded(service: RemediationSchedulingService, effort: ScheduledEffort) -> RemediationStatus:
@@ -388,6 +389,13 @@ def test_get_and_list_filter_the_scheduled_efforts(
     assert list(service.list(PageRequest(), repository_id=repository_id).items) == [first, second]
     assert list(service.list(PageRequest(), finding_id=finding_ids[0]).items) == [first]
     assert list(service.list(PageRequest(), repository_id=other_repository).items) == [third]
+    # the batch shape: one read over several repositories, like the orders filter's set
+    assert list(
+        service.list(PageRequest(), repository_ids=(repository_id, other_repository)).items
+    ) == [first, second, third]
+    assert list(service.list(PageRequest(), repository_ids=(other_repository,)).items) == [third]
+    with pytest.raises(ValidationError):
+        service.list(PageRequest(), repository_id=repository_id, repository_ids=(repository_id,))
     assert list(service.list(PageRequest(), status=RemediationStatus("candidate")).items) == [
         first,
         second,
@@ -781,8 +789,10 @@ def test_prepare_hands_the_runner_the_scheduled_fork_and_branch(
 def test_a_fork_other_than_the_repositorys_remediation_fork_is_refused(
     service: RemediationSchedulingService, engine: Engine
 ) -> None:
-    # never a public repository: the fork is the policy's (the fork org's private mirror),
-    # not whatever the caller names, the upstream itself included
+    # never a public repository: the fork is the policy's (the fork org's private patch
+    # repository), not whatever the caller names, the upstream itself included — a public
+    # target (the seeded upstream is) answers the sharper public refusal, the rest the
+    # policy's
     _, finding_ids, repository_ids = seeded(engine)
     request = pairs(finding_ids, repository_ids)
     with SqlTraustUnitOfWork(engine) as uow:
@@ -792,9 +802,249 @@ def test_a_fork_other_than_the_repositorys_remediation_fork_is_refused(
         "https://github.com/someone-else/public-copy",
         "https://forge.example.net/o/r",
     ):
-        with pytest.raises(ValidationError, match="remediation fork"):
+        with pytest.raises(ValidationError, match=r"remediation fork|public repository"):
             service.create(fork, BRANCH, request, PERSON)
     assert list(service.list(PageRequest()).items) == []
+
+
+def test_the_conventions_collision_fallback_is_the_fork_the_provisioner_would_have_made(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    # SCI's provisioner takes sci-patch-<owner>-<name> when another upstream holds the plain
+    # name: with no registered mirror the door accepts the candidate it actually provisioned,
+    # and the order carries it — the convention is the fallback, the mirror the authority
+    _, finding_ids, repository_ids = seeded(engine)
+    request = pairs(finding_ids, repository_ids)
+    with SqlTraustUnitOfWork(engine) as uow:
+        name = uow.repositories.get(repository_ids[0]).url.rsplit("/", 1)[-1]
+    collision = f"https://github.com/mirror-org/patch-example-org-{name}"
+    scheduled = service.create(collision, BRANCH, request, PERSON)
+    assert scheduled.fork_url == collision
+    (order,) = queued_orders(engine, repository_ids[0])
+    assert order.fork_url == collision
+    prepared = context.services().remediation.prepare(scheduled.work_item.work_item_id)
+    assert (str(prepared.fork.url), prepared.fix_branch) == (collision, BRANCH)
+    with SqlTraustUnitOfWork(engine) as uow:  # a mirror registered since is the only answer
+        Seed(uow).repository(
+            url=f"https://github.com/mirror-org/patch-{name}",
+            upstream_id=repository_ids[0],
+            public=False,
+        )
+        uow.commit()
+    with pytest.raises(ValidationError, match="remediation fork"):
+        service.create(collision, BRANCH, request, PERSON)
+
+
+def test_a_collision_name_registered_to_another_upstream_is_not_this_repositorys_fork(
+    service: RemediationSchedulingService, engine: Engine
+) -> None:
+    # a/b-c and a-b/c owner-qualify to the same sci-patch-a-b-c; the one the inventory
+    # knows as the other upstream's mirror is foreign to this repository's schedule —
+    # authority over one upstream's findings must not steer its fix into another's fork
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        theirs = seed.repository(url="https://github.com/a-b/c")
+        ours = seed.repository(url="https://github.com/a/b-c")
+        findings = {}
+        for repo in (theirs, ours):
+            seed.repository_ref(repo, is_default=True)
+            found = seed.finding(repo)
+            seed.decision(found, validity="confirmed", severity="high", actor="human:a@example.com")
+            findings[repo.id] = found.id
+        seed.repository(  # the colliding name, the other upstream's registered mirror
+            url="https://github.com/mirror-org/patch-a-b-c", upstream_id=theirs.id, public=False
+        )
+        uow.commit()
+    ours_request = [RemediationFindingRequest(finding_id=findings[ours.id], repository_id=ours.id)]  # type: ignore[misc]
+    with pytest.raises(ValidationError, match="remediation fork"):
+        service.create("https://github.com/mirror-org/patch-a-b-c", BRANCH, ours_request, PERSON)
+    theirs_request = [  # the same URL is their own mirror: the authoritative answer
+        RemediationFindingRequest(finding_id=findings[theirs.id], repository_id=theirs.id)  # type: ignore[misc]
+    ]
+    scheduled = service.create(
+        "https://github.com/mirror-org/patch-a-b-c", BRANCH, theirs_request, PERSON
+    )
+    assert scheduled.fork_url == "https://github.com/mirror-org/patch-a-b-c"
+
+
+def test_a_public_plain_name_occupant_pushes_the_schedule_to_the_qualified_candidate(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    # the provisioner falls back to sci-patch-<owner>-<name> exactly when the plain name
+    # is held by someone else — a public occupant of the plain name must not block the
+    # qualified candidate's schedule, while the public name itself stays a refusal
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repo = seed.repository(url="https://github.com/example-org/svc")
+        seed.repository_ref(repo, is_default=True)
+        found = seed.finding(repo)
+        seed.decision(found, validity="confirmed", severity="high", actor="human:a@example.com")
+        seed.repository(url="https://github.com/mirror-org/patch-svc", public=True)
+        uow.commit()
+    request = [RemediationFindingRequest(finding_id=found.id, repository_id=repo.id)]  # type: ignore[misc]
+    with pytest.raises(ValidationError, match="public repository"):
+        service.create("https://github.com/mirror-org/patch-svc", BRANCH, request, PERSON)
+    qualified = "https://github.com/mirror-org/patch-example-org-svc"
+    scheduled = service.create(qualified, BRANCH, request, PERSON)
+    assert scheduled.fork_url == qualified
+    prepared = context.services().remediation.prepare(scheduled.work_item.work_item_id)
+    assert str(prepared.fork.url) == qualified
+
+
+def test_the_door_couples_on_the_prefix_not_the_candidate_spelling(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # any patch-prefixed repository in the mirror org is a convention fork: the
+    # provisioner owns the naming beyond the prefix, and core's candidates are its
+    # expectation, never the contract
+    repository_id, finding_ids, _ = seeded(engine)
+    request = pairs(finding_ids, [repository_id])
+    context = Context(Config(home=tmp_path, remediation=PRIVATE, process=GIT))
+    context.__dict__["database"] = engine
+    service = context.services().remediation_scheduling
+    with SqlTraustUnitOfWork(engine) as uow:
+        name = uow.repositories.get(repository_id).url.rsplit("/", 1)[-1]
+    for refused in (
+        f"https://github.com/mirror-org/{name}",  # bare: the shape before any prefix
+        f"https://github.com/mirror-org/patchless-{name}",
+        f"https://github.com/other-org/patch-{name}",
+        "https://github.com/mirror-org/patch-svc/../escape",
+    ):
+        with pytest.raises(ValidationError, match="remediation fork"):
+            service.create(refused, BRANCH, request, PERSON)
+    retake = fork_of(engine, request) + "-retake-2"  # a name core would not compute
+    scheduled = service.create(retake, BRANCH, request, PERSON)
+    assert scheduled.fork_url == retake
+
+
+def test_a_deployment_running_the_sci_provisioner_prefixes_its_forks(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # ours sets the prefix the provisioner names — sci-patch-, not the generic default —
+    # and the door couples on the configured prefix alone
+    repository_id, finding_ids, _ = seeded(engine)
+    request = pairs(finding_ids, [repository_id])
+    context = Context(
+        Config(
+            home=tmp_path,
+            remediation=RemediationConfig(fork_org="mirror-org", patch_prefix="sci-patch-"),
+            process=GIT,
+        )
+    )
+    context.__dict__["database"] = engine
+    service = context.services().remediation_scheduling
+    with SqlTraustUnitOfWork(engine) as uow:
+        name = uow.repositories.get(repository_id).url.rsplit("/", 1)[-1]
+    ours = f"https://github.com/mirror-org/sci-patch-{name}"
+    assert service.create(ours, BRANCH, request, PERSON).fork_url == ours
+    with pytest.raises(ValidationError, match="remediation fork"):
+        service.create(f"https://github.com/mirror-org/patch-{name}", BRANCH, request, PERSON)
+
+
+def test_a_fork_the_inventory_cannot_prove_is_not_a_push_target(
+    service: RemediationSchedulingService, engine: Engine
+) -> None:
+    # prefix shape is not ownership: a repository the inventory knows under a prefixed
+    # name — another's, or a registration without provenance — is never a push target,
+    # the upstream itself included; one the inventory does not know is the provisioner's
+    # creation, and schedules
+    repository_id, finding_ids, _ = seeded(engine)
+    request = pairs(finding_ids, [repository_id])
+    with SqlTraustUnitOfWork(engine) as uow:
+        Seed(uow).repository(  # known, no provenance: not provably this repository's
+            url="https://github.com/mirror-org/patch-someone-elses", public=False
+        )
+        seed = Seed(uow)
+        self_named = seed.repository(url="https://github.com/mirror-org/patch-self", public=False)
+        seed.repository_ref(self_named, is_default=True)
+        found = seed.finding(self_named)
+        seed.decision(found, validity="confirmed", severity="high", actor="human:a@example.com")
+        uow.commit()
+    with pytest.raises(ValidationError, match="remediation fork"):
+        service.create("https://github.com/mirror-org/patch-someone-elses", BRANCH, request, PERSON)
+    own = [RemediationFindingRequest(finding_id=found.id, repository_id=self_named.id)]  # type: ignore[misc]
+    with pytest.raises(ValidationError, match="remediation fork"):  # the upstream itself
+        service.create("https://github.com/mirror-org/patch-self", BRANCH, own, PERSON)
+    made_up = fork_of(engine, request) + "-2"  # unknown: the provisioner's to have created
+    assert service.create(made_up, BRANCH, request, PERSON).fork_url == made_up
+
+
+def test_exhausted_candidates_do_not_block_a_valid_custom_fork(
+    service: RemediationSchedulingService, engine: Engine
+) -> None:
+    # both names core would suggest registered to other upstreams, and the provisioner's
+    # actual fork carrying a different prefixed name: the door judges the target, never
+    # core's suggestions
+    repository_id, finding_ids, _ = seeded(engine)
+    request = pairs(finding_ids, [repository_id])
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        name = uow.repositories.get(repository_id).url.rsplit("/", 1)[-1]
+        for candidate in (f"patch-{name}", f"patch-example-org-{name}"):
+            other = seed.repository(url=f"https://github.com/example-org/{candidate}-upstream")
+            seed.repository(  # both suggestions provably another upstream's
+                url=f"https://github.com/mirror-org/{candidate}", upstream_id=other.id, public=False
+            )
+        uow.commit()
+    custom = f"https://github.com/mirror-org/patch-{name}-retaken"
+    assert service.create(custom, BRANCH, request, PERSON).fork_url == custom
+
+
+def test_an_unstamped_bare_url_order_whose_fork_changed_ownership_no_longer_vouches(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    # the historical bare name stays vouchable only while nothing proves it another
+    # upstream's: once the inventory does, the era's order binds to nothing
+    world = World(engine, patched_name="main")
+    audited(engine, world, world.base)
+    request = pairs(world.ids, [world.repo.id] * len(world.ids))
+    scheduled = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    unstamped(engine, scheduled)
+    with SqlTraustUnitOfWork(engine) as uow:
+        name = uow.repositories.get(world.repo.id).url.rsplit("/", 1)[-1]  # type: ignore[arg-type]
+        bare = f"https://github.com/mirror-org/{name}"  # the policy's answer before the change
+        order = uow.run_orders.get(scheduled.order_id)  # type: ignore[arg-type]
+        uow.run_orders.update(order.model_copy(update={"fork_url": bare}))
+        uow.commit()
+    with SqlTraustUnitOfWork(engine) as uow:  # the bare name now another upstream's mirror
+        other = Seed(uow).repository(url="https://github.com/example-org/other")
+        Seed(uow).repository(url=bare, upstream_id=other.id, public=False)
+        uow.commit()
+    remediation = context.services().remediation
+    assert remediation.scheduled_order(scheduled.work_item.work_item_id) is None
+    with pytest.raises(ValidationError, match="can't vouch for"):
+        remediation.record(
+            pushed(scheduled, world.ids, fork__url=bare, fork__fix_commit=world.patched.sha),
+            provenance(),
+        )
+
+
+def test_an_unstamped_order_scheduled_before_the_convention_still_vouches(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    # orders from before contracts#130's stamp carry the bare fork the policy answered
+    # before the sci-patch convention: their door-set facts stay vouched across the change
+    world = World(engine, patched_name="main")
+    audited(engine, world, world.base)
+    request = pairs(world.ids, [world.repo.id] * len(world.ids))
+    scheduled = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    unstamped(engine, scheduled)
+    with SqlTraustUnitOfWork(engine) as uow:
+        name = uow.repositories.get(world.repo.id).url.rsplit("/", 1)[-1]  # type: ignore[arg-type]
+        bare = f"https://github.com/mirror-org/{name}"  # the policy's answer before the change
+        order = uow.run_orders.get(scheduled.order_id)  # type: ignore[arg-type]
+        uow.run_orders.update(order.model_copy(update={"fork_url": bare}))
+        uow.commit()
+    remediation = context.services().remediation
+    assert remediation.scheduled_order(scheduled.work_item.work_item_id) is not None
+    assert service.get(scheduled.work_item.work_item_id).fork_url == bare
+    recorded = remediation.record(
+        pushed(scheduled, world.ids, fork__url=bare, fork__fix_commit=world.patched.sha),
+        provenance(),
+    )
+    assert recorded.report is not None
+    # nothing wider vouches: an unstamped URL the door never answered is still refused
+    # (test_a_report_on_an_order_scheduling_no_longer_vouches_for_is_refused below)
 
 
 # scheduling the same findings again
@@ -1467,7 +1717,9 @@ def test_a_repository_whose_fork_policy_fails_drops_out_of_the_listing_alone(
     broken, kept = efforts
     unstamped(engine, broken)
     with SqlTraustUnitOfWork(engine) as uow:  # its mirror turned public: no fork for it now
-        Seed(uow).repository(url=str(broken.fork_url), public=True)
+        Seed(uow).repository(
+            url=str(broken.fork_url), upstream_id=broken.repository_id, public=True
+        )
         uow.commit()
     with caplog.at_level(logging.WARNING, logger="traust_core.v1.services.remediation"):
         listed = service.list(PageRequest()).items
@@ -1501,29 +1753,22 @@ def test_a_report_on_an_order_scheduling_no_longer_vouches_for_is_refused(
     assert context.services().remediation.get(scheduled.work_item.work_item_id).report is None
 
 
-def test_an_attached_report_still_finishes_its_resolution_after_the_policy_changed(
+def test_a_legacy_attached_report_still_finishes_its_resolution_after_the_policy_changed(
     service: RemediationSchedulingService,
     context: Context,
     engine: Engine,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from traust_core.v1.services.findings.decisions import FindingDecisions
-
     world = World(engine, patched_name="main")
     audited(engine, world, world.base)
     request = pairs(world.ids, [world.repo.id] * len(world.ids))
     scheduled = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
     unstamped(engine, scheduled)
     doc = pushed(scheduled, world.ids, fork__fix_commit=world.patched.sha)
-    write = FindingDecisions.record_resolution
-
-    def interrupted(*args: Any, **kwargs: Any) -> Any:
-        raise RuntimeError("connection lost")
-
-    monkeypatch.setattr(FindingDecisions, "record_resolution", interrupted)
-    with pytest.raises(RuntimeError):
-        context.services().remediation.record(doc, provenance())  # attached, unresolved
-    monkeypatch.setattr(FindingDecisions, "record_resolution", write)
+    remediation = context.services().remediation
+    published = remediation._publisher.publish_ref(doc)
+    with remediation._uow as uow:
+        remediation._log.attach(scheduled.work_item.work_item_id, published.id, published.digest)
+        uow.commit()
     with SqlTraustUnitOfWork(engine) as uow:  # a private mirror registered since: a new fork
         Seed(uow).repository(
             url="https://github.com/mirror-org/registered-since",
@@ -1531,7 +1776,6 @@ def test_an_attached_report_still_finishes_its_resolution_after_the_policy_chang
             public=False,
         )
         uow.commit()
-    remediation = context.services().remediation
     assert remediation.scheduled_order(scheduled.work_item.work_item_id) is None
     finished = remediation.record(doc, provenance())
     assert finished.report is not None and finished.status == "checks_passed"

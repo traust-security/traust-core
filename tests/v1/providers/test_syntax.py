@@ -12,7 +12,7 @@ from traust_core.v1.providers import syntax
 
 def test_every_shipped_grammar_loads() -> None:
     readiness = syntax.grammar_readiness()
-    assert sorted(readiness) == ["JS/TS", "Java", "Ruby", "Rust"]
+    assert sorted(readiness) == ["Go", "JS/TS", "Java", "Ruby", "Rust"]
     assert all(r.ready and r.detail == "" for r in readiness.values())
 
 
@@ -23,6 +23,7 @@ def test_every_shipped_grammar_loads() -> None:
         ("java_parser", "Java", "tree-sitter-java"),
         ("rust_parser", "Rust", "tree-sitter-rust"),
         ("ruby_parser", "Ruby", "tree-sitter-ruby"),
+        ("go_parser", "Go", "tree-sitter-go"),
     ],
 )
 def test_a_grammar_that_wont_load_names_its_gap(

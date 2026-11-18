@@ -10,6 +10,7 @@ from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.models.findings import (
     Finding,
     FindingExternalRef,
+    FindingLabel,
     FindingView,
     Location,
     ReviewItem,
@@ -18,7 +19,9 @@ from traust_core.v1.models.findings import (
     normalize_finding,
 )
 from traust_core.v1.repositories.contract import TraustUnitOfWork
+from traust_core.v1.repositories.objects import ObjectStore
 from traust_core.v1.services.artifact_publishing import AssessmentLog
+from traust_core.v1.services.findings.claims import claim_fold
 from traust_core.v1.services.findings.facts import FindingFacts
 from traust_core.v1.services.findings.rating import RatingPolicy
 
@@ -26,8 +29,9 @@ from traust_core.v1.services.findings.rating import RatingPolicy
 class FindingViewQuery:
     """Batched finding context and normalized history, within the caller's transaction."""
 
-    def __init__(self, rating: RatingPolicy) -> None:
+    def __init__(self, rating: RatingPolicy, objects: ObjectStore | None = None) -> None:
         self._rating = rating
+        self._objects = objects
 
     def views(
         self,
@@ -37,13 +41,21 @@ class FindingViewQuery:
         *,
         facts: FindingFacts | None = None,
         read_budget: RecordBudget | None = None,
+        census: bool = False,
     ) -> list[FindingView]:
         facts = (
             facts
             if facts is not None
-            else FindingFacts.load(uow, findings, until=as_of, read_budget=read_budget)
+            else FindingFacts.load(
+                uow,
+                findings,
+                until=as_of,
+                read_budget=read_budget,
+                objects=self._objects,
+                census=census,
+            )
         )
-        return self._views(uow, findings, as_of, facts, read_budget=read_budget)
+        return self._views(uow, findings, as_of, facts, read_budget=read_budget, census=census)
 
     def _views(
         self,
@@ -53,19 +65,24 @@ class FindingViewQuery:
         facts: FindingFacts,
         *,
         read_budget: RecordBudget | None = None,
+        census: bool = False,
     ) -> list[FindingView]:
-        latest_ids = [
-            seen[-1].id
-            for finding in findings
-            if finding.id and (seen := facts.reported_by(finding.id, as_of)) and seen[-1].id
-        ]
-        places: defaultdict[UUID, list[Location]] = defaultdict(list)
-        for location in (
-            uow.locations.list_for_occurrences(latest_ids, read_budget=read_budget)
-            if latest_ids
-            else ()
-        ):
-            places[location.occurrence_id].append(location)
+        places: Mapping[UUID, Sequence[Location]] = {}
+        if not census:
+            # a census counts: the locations a tally never reads stay unread
+            latest_ids = [
+                seen[-1].id
+                for finding in findings
+                if finding.id and (seen := facts.reported_by(finding.id, as_of)) and seen[-1].id
+            ]
+            held: defaultdict[UUID, list[Location]] = defaultdict(list)
+            for location in (
+                uow.locations.list_for_occurrences(latest_ids, read_budget=read_budget)
+                if latest_ids
+                else ()
+            ):
+                held[location.occurrence_id].append(location)
+            places = held
         return [
             view
             for finding in findings
@@ -78,7 +95,7 @@ class FindingViewQuery:
         if not items:
             return []
         findings = uow.findings.list_by_ids({item.finding_id for item in items})
-        facts = FindingFacts.load(uow, findings, until=None)
+        facts = FindingFacts.load(uow, findings, until=None, objects=self._objects)
         by_id = {view.finding.id: view for view in self._views(uow, findings, None, facts)}
         histories = {
             finding_id: tuple(normalize_decision(row) for row in rows)
@@ -168,20 +185,65 @@ class FindingViewQuery:
         if as_of is not None and not reported:
             return None
         finding = normalize_finding(finding, facts.decided_by(finding.id, as_of))
+        folded = claim_fold(facts.claims.get(finding.id, ()), as_of)
+        if folded is not None:
+            finding = finding.model_copy(
+                update={
+                    "title": folded.title,
+                    "fingerprint_algo": folded.fingerprint_algo,
+                    "fingerprint": folded.fingerprint,
+                }
+            )
         latest = reported[-1] if reported else None
         disposition = facts.disposition(finding.id, as_of)
         severity = self._rating.effective_severity(latest, disposition)
+        # the reporting assessments' own times — the occurrence→assessment
+        # join the census reads for its SLA `first` — computed once here for
+        # the view's date fields (facts.at already holds them for the fold)
+        first_reported = facts.at[reported[0].assessment_id] if reported else None
+        last_reported = facts.at[latest.assessment_id] if latest is not None else None
         due = None
         if latest is not None and (disposition is None or disposition.is_open()):
-            opened = facts.at[reported[0].assessment_id]
+            opened = first_reported
             due = self._rating.sla_due(severity, opened, latest.cvss_score)
+        claim = folded.claim if folded is not None else None
         return FindingView(
             finding=finding,
             occurrence=latest,
             disposition=disposition,
             effective_severity=severity,
             sla_due=due,
-            locations=tuple(places.get(latest.id, ())) if latest and latest.id else (),
-            cwes=tuple(sorted(facts.cwes.get(finding.id, ()))),
-            labels=tuple(facts.labels.get(finding.id, ())),
+            first_reported_at=first_reported,
+            last_reported_at=last_reported,
+            description=claim.description if claim is not None else None,
+            locations=(
+                claim.locations
+                if claim is not None
+                else tuple(places.get(latest.id, ()))
+                if latest and latest.id
+                else ()
+            ),
+            cwes=(
+                tuple(claim.cwes)
+                if claim is not None
+                else tuple(sorted(facts.cwes.get(finding.id, ())))
+            ),
+            labels=(
+                tuple(
+                    label
+                    for label in facts.labels.get(finding.id, ())
+                    if label.taxonomy != "category"
+                )
+                + (
+                    (
+                        FindingLabel(
+                            finding_id=finding.id, taxonomy="category", label=claim.category
+                        ),
+                    )
+                    if claim.category is not None
+                    else ()
+                )
+                if claim is not None
+                else tuple(facts.labels.get(finding.id, ()))
+            ),
         )

@@ -302,3 +302,192 @@ def test_a_registry_naming_osv_access_itself_is_refused(tmp_path: Path) -> None:
     registry.write_text(LIVE_OSV + "    access: air-gapped\n")
     with pytest.raises(ConfigError, match=r"feeds\.osv_access"):
         Context(Config()).register_feeds(registry)
+
+
+NVD_REGISTRY = """\
+version: 1
+sources:
+  nvd:
+    tier: live
+    url_template: https://nvd.test/cves?cveId={ident_upper}
+    ident: cve
+    api_key_header: apiKey
+"""
+
+
+def test_feeds_api_keys_give_a_source_the_key_its_variable_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TEST_NVD_KEY", "k-1")
+    registry = tmp_path / "feeds.yaml"
+    registry.write_text(NVD_REGISTRY)
+    config = Config.from_home(_home(tmp_path, "feeds: {api_keys: {nvd: TEST_NVD_KEY}}\n"))
+    assert config.feeds.api_keys == {"nvd": "TEST_NVD_KEY"}
+    ctx = Context(config)
+    ctx.register_feeds(registry)
+    key = ctx.feed_sources.get("nvd")._api_key
+    assert key is not None and key.headers() == {"apiKey": "k-1"}
+
+
+def test_no_api_keys_is_keyless(tmp_path: Path) -> None:
+    registry = tmp_path / "feeds.yaml"
+    registry.write_text(NVD_REGISTRY)
+    ctx = Context(Config.from_home(_home(tmp_path, "feeds: {osv_access: api}\n")))
+    ctx.register_feeds(registry)
+    assert ctx.feed_sources.get("nvd")._api_key is None
+
+
+def test_a_named_key_variable_that_is_unset_is_a_config_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("TEST_NVD_KEY", raising=False)
+    registry = tmp_path / "feeds.yaml"
+    registry.write_text(NVD_REGISTRY)
+    ctx = Context(Config.from_home(_home(tmp_path, "feeds: {api_keys: {nvd: TEST_NVD_KEY}}\n")))
+    with pytest.raises(
+        ConfigError, match=r"feeds\.api_keys\.nvd names unset variable TEST_NVD_KEY"
+    ):
+        ctx.register_feeds(registry)
+
+
+@pytest.mark.parametrize(
+    "text", ["feeds: {api_keys: {nvd: nvd-key}}\n", "feeds: {api_keys: {NVD: K}}\n"]
+)
+def test_feeds_api_keys_take_registry_names_and_variable_names(tmp_path: Path, text: str) -> None:
+    with pytest.raises(ConfigError):
+        Config.from_home(_home(tmp_path, text))
+
+
+def test_a_retry_after_setting_the_key_registers_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("TEST_NVD_KEY", raising=False)
+    registry = tmp_path / "feeds.yaml"
+    registry.write_text(NVD_REGISTRY)
+    ctx = Context(Config.from_home(_home(tmp_path, "feeds: {api_keys: {nvd: TEST_NVD_KEY}}\n")))
+    with pytest.raises(ConfigError, match="unset variable"):
+        ctx.register_feeds(registry)
+    assert ctx.feed_sources.names() == []  # nothing half-registered
+    monkeypatch.setenv("TEST_NVD_KEY", "k-1")
+    ctx.register_feeds(registry)
+    assert ctx.feed_sources.get("nvd")._api_key is not None
+
+
+def test_a_malformed_key_fails_before_anything_registers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TEST_NVD_KEY", "bad key")  # a space can't travel in a header
+    registry = tmp_path / "feeds.yaml"
+    registry.write_text(NVD_REGISTRY)
+    ctx = Context(Config.from_home(_home(tmp_path, "feeds: {api_keys: {nvd: TEST_NVD_KEY}}\n")))
+    with pytest.raises(ConfigError, match="no usable header value"):
+        ctx.register_feeds(registry)
+    assert ctx.feed_sources.names() == []
+    monkeypatch.setenv("TEST_NVD_KEY", "good-key")
+    ctx.register_feeds(registry)
+    assert ctx.feed_sources.get("nvd")._api_key is not None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "feeds:\n  api_keys:\n    nvd: nvd-7f3a91c2b4d8e6f0\n",  # a key, not a variable's name
+        "feeds:\n  api_keys:\n    nvd: *nvd-7f3a91c2b4d8e6f0\n",  # as a YAML alias
+        "feeds:\n  osv_access: !nvd-7f3a91c2b4d8e6f0 api\n",  # as a YAML tag
+    ],
+    ids=["as-a-value", "as-an-alias", "as-a-tag"],
+)
+def test_a_pasted_key_stays_out_of_the_startup_error(tmp_path: Path, text: str) -> None:
+    import traceback
+
+    path = tmp_path / "traust.yaml"
+    path.write_text(text)
+    with pytest.raises(ConfigError) as raised:
+        Config.from_file(path)
+    assert raised.value.__cause__ is not None
+    assert "7f3a91c2b4d8e6f0" not in "".join(traceback.format_exception(raised.value))
+
+
+def test_a_schema_error_is_located_and_worded_by_the_schema(tmp_path: Path) -> None:
+    pasted = "nvd-7f3a91c2b4d8e6f0"  # a key pasted where the variable's name goes
+    path = tmp_path / "traust.yaml"
+    path.write_text(f"feeds:\n  api_keys:\n    nvd: {pasted}\n")
+    with pytest.raises(ConfigError) as raised:
+        Config.from_file(path)
+    message = str(raised.value)
+    assert "line 3: feeds/api_keys/<key at line 3>: does not match the pattern" in message
+    assert pasted not in message
+
+
+def test_an_unknown_key_is_named_by_its_line(tmp_path: Path) -> None:
+    path = tmp_path / "traust.yaml"
+    path.write_text("feeds:\n  osv_access: api\n  nvd_key_value_pasted: x\n")
+    with pytest.raises(
+        ConfigError,
+        match=r"has a property the schema does not allow: "
+        r"<key at line 3>",
+    ) as raised:
+        Config.from_file(path)
+    assert "nvd_key_value_pasted" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("text", "reason"),
+    [
+        ("artifacts:\n  path: a\n  s3: {bucket: b}\n", "cannot set path and s3 together"),
+        (
+            "artifacts:\n  s3: {bucket: b, endpoint_url: 'http://rgw.example.com'}\n",
+            "requires HTTPS outside loopback",
+        ),
+    ],
+    ids=["path-and-s3", "plain-http-endpoint"],
+)
+def test_a_validator_still_says_which_rule_failed(tmp_path: Path, text: str, reason: str) -> None:
+    path = tmp_path / "traust.yaml"
+    path.write_text(text)
+    with pytest.raises(ConfigError, match=reason):
+        Config.from_file(path)
+
+
+def test_a_repeated_asset_is_named_by_its_positions_never_its_value(tmp_path: Path) -> None:
+    pasted = "nvd-7f3a91c2b4d8e6f0"  # a value pasted into two recording allowlists
+    path = tmp_path / "traust.yaml"
+    path.write_text(f"recording:\n  triage: [a, {pasted}]\n  assessment: [{pasted}]\n")
+    with pytest.raises(
+        ConfigError, match=r"recording\.triage\[1\] and recording\.assessment\[0\]"
+    ) as raised:
+        Config.from_file(path)
+    import traceback
+
+    assert pasted not in "".join(traceback.format_exception(raised.value))
+
+
+def test_a_root_that_is_not_a_mapping_is_located(tmp_path: Path) -> None:
+    path = tmp_path / "traust.yaml"
+    path.write_text("# a comment\njust-a-string\n")
+    with pytest.raises(ConfigError, match=r"line 2: \$: is not of type 'object'") as raised:
+        Config.from_file(path)
+    assert "just-a-string" not in str(raised.value)
+
+
+def test_a_repeated_key_points_at_the_value_that_was_checked(tmp_path: Path) -> None:
+    path = tmp_path / "traust.yaml"
+    path.write_text("feeds:\n  osv_access: api\nfeeds:\n  osv_access: nope\n")
+    with pytest.raises(ConfigError, match=r"line 4: feeds/osv_access: is not one of"):
+        Config.from_file(path)
+
+
+def test_an_asset_repeated_in_one_list_is_allowed(tmp_path: Path) -> None:
+    path = tmp_path / "traust.yaml"
+    path.write_text("recording:\n  triage: [audit, audit]\n")
+    assert Config.from_file(path).recording.triage == ("audit", "audit")
+
+
+def test_a_config_that_is_not_utf8_is_a_config_error(tmp_path: Path) -> None:
+    path = tmp_path / "traust.yaml"
+    path.write_bytes(b"feeds:\n  osv_access: \xff\xfe\n")
+    with pytest.raises(ConfigError, match=r"not UTF-8 text \(byte \d+\)") as raised:
+        Config.from_file(path)
+    cause = raised.value.__cause__
+    assert cause is not None and "UnicodeDecodeError at byte" in str(cause)
+    assert "0xff" not in str(cause)  # the position, never the byte

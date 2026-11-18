@@ -17,6 +17,54 @@ export const listReqs = new Counter('list_requests');
 export const feedReqs = new Counter('feed_requests');
 export const insightLatency = new Trend('insight_latency', true);
 export const insightReqs = new Counter('insight_requests');
+export const consumerLatency = new Trend('consumer_latency', true);
+export const consumerReqs = new Counter('consumer_requests');
+
+// The consumer read family: a hot repository's findings paged by cursor, its summary and
+// timeline, and the review queue — the shapes SCI and the CLI read under load.
+export function pageFindings(data) {
+  const first = http.get(
+    `${BASE}/v1/repositories/${data.repository}/findings?limit=100`,
+    READER
+  );
+  consumerLatency.add(first.timings.duration);
+  consumerReqs.add(1);
+  check(first, { 'findings page is 200': (r) => r.status === 200 });
+  const next = first.json('next');
+  if (next) {
+    const second = http.get(
+      `${BASE}/v1/repositories/${data.repository}/findings?limit=100&cursor=${encodeURIComponent(next)}`,
+      READER
+    );
+    consumerLatency.add(second.timings.duration);
+    consumerReqs.add(1);
+    check(second, { 'findings next page is 200': (r) => r.status === 200 });
+  }
+}
+
+export function readSummary(data) {
+  const res = http.get(
+    `${BASE}/v1/repositories/${data.repository}/findings/summary?group_by=cwe`,
+    READER
+  );
+  consumerLatency.add(res.timings.duration);
+  consumerReqs.add(1);
+  check(res, { 'summary is 200': (r) => r.status === 200 });
+}
+
+export function readTimeline(data) {
+  const res = http.get(`${BASE}/v1/repositories/${data.repository}/findings/timeline`, READER);
+  consumerLatency.add(res.timings.duration);
+  consumerReqs.add(1);
+  check(res, { 'timeline is 200': (r) => r.status === 200 });
+}
+
+export function readReviewQueue() {
+  const res = http.get(`${BASE}/v1/findings/review-queue?limit=100`, READER);
+  consumerLatency.add(res.timings.duration);
+  consumerReqs.add(1);
+  check(res, { 'review queue is 200': (r) => r.status === 200 });
+}
 
 export function claim() {
   const res = http.post(`${BASE}/v1/orders/claim`, JSON.stringify({ lease_seconds: 300 }), RUNNER);
@@ -57,7 +105,14 @@ export function setup() {
   if (!product) {
     throw new Error('no product to scope the insight read to');
   }
-  return { product };
+  // a repository with findings to page: the first the products page's scope admits, else the
+  // fleet's first — the scenarios only need a real, non-empty read shape
+  const found = http.get(`${BASE}/v1/repositories?limit=1`, READER);
+  const repository = found.json('items.0.id');
+  if (!repository) {
+    throw new Error('no repository to page findings of');
+  }
+  return { product, repository };
 }
 
 // The dashboard's heaviest view family: an insight built on demand. Scoped to one product so
@@ -83,10 +138,12 @@ export function summary(data, extra = {}) {
     list_p95_ms: p95('list_latency'),
     feed_p95_ms: p95('feed_latency'),
     insight_p95_ms: p95('insight_latency'),
+    consumer_p95_ms: p95('consumer_latency'),
     claim_rps: rate('claim_requests'),
     list_rps: rate('list_requests'),
     feed_rps: rate('feed_requests'),
     insight_rps: rate('insight_requests'),
+    consumer_rps: rate('consumer_requests'),
     http_reqs_rate: rate('http_reqs'),
     ...extra,
   };

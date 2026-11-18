@@ -19,10 +19,10 @@ from traust_core.v1.models.common import PageRequest
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 
 
-def seed(context: Context):
+def seed(context: Context, url: str | None = None):
     with SqlTraustUnitOfWork(context.database) as uow:
         s = Seed(uow)
-        repo = s.repository()
+        repo = s.repository(**({"url": url} if url else {}))
         ref = s.repository_ref(repo)
         assessment = s.assessment(ref)
         uow.commit()
@@ -40,7 +40,7 @@ def test_list_a_refs_assessments_matches_in_process(context: Context, client: Te
     same_as_in_process(body, expected)
 
 
-def test_list_without_a_ref_is_422(context: Context, client: TestClient) -> None:
+def test_list_without_a_scope_is_422(context: Context, client: TestClient) -> None:
     assert client.get("/v1/assessments", headers=bearer(context)).status_code == 422
 
 
@@ -66,6 +66,101 @@ def test_a_repositorys_assessments(context: Context, client: TestClient) -> None
     svc = context.services().assessment
     body = client.get(f"/v1/repositories/{repo.id}/assessments", headers=bearer(context)).json()
     assert body == [a.model_dump(mode="json") for a in svc.list_for_repository(repo.id)]
+
+
+# the cross-repository batch assessments listing (the collection's set scope)
+def test_the_batch_assessments_listing_matches_in_process(
+    context: Context, client: TestClient
+) -> None:
+    repo, ref, _ = seed(context)
+    other, other_ref, _ = seed(context, "https://github.com/org/other")
+    with SqlTraustUnitOfWork(context.database) as uow:
+        s = Seed(uow)
+        s.assessment(ref, kind="triage", occurred_at=T0 + timedelta(days=1))
+        s.assessment(other_ref)
+        uow.commit()
+    svc = context.services().assessment
+    body = client.get(
+        "/v1/assessments",
+        params={"repository_ids": [str(repo.id), str(other.id)]},
+        headers=bearer(context),
+    )
+    assert body.status_code == 200
+    expected = svc.list_for_repositories([repo.id, other.id], None, PageRequest(limit=100))
+    same_as_in_process(body.json(), expected)
+
+
+def test_the_batch_assessments_listing_serves_one_kind(
+    context: Context, client: TestClient
+) -> None:
+    repo, ref, _ = seed(context)
+    with SqlTraustUnitOfWork(context.database) as uow:
+        Seed(uow).assessment(ref, kind="triage")
+        uow.commit()
+    svc = context.services().assessment
+    body = client.get(
+        "/v1/assessments",
+        params={"repository_ids": [str(repo.id)], "kind": "triage"},
+        headers=bearer(context),
+    )
+    assert body.status_code == 200
+    expected = svc.list_for_repositories([repo.id], AssessmentKind.TRIAGE, PageRequest(limit=100))
+    same_as_in_process(body.json(), expected)
+    assert {row["kind"] for row in body.json()["items"]} == {"triage"}
+
+
+def test_the_batch_assessments_listing_pages_by_cursor(
+    context: Context, client: TestClient
+) -> None:
+    repo, ref, _ = seed(context)  # the seed's own assessment is the fifth row
+    with SqlTraustUnitOfWork(context.database) as uow:
+        s = Seed(uow)
+        for day in range(4):
+            s.assessment(ref, occurred_at=T0 + timedelta(days=day))
+        uow.commit()
+    served, cursor = [], None
+    for _ in range(10):
+        params = {"repository_ids": [str(repo.id)], "limit": 2}
+        if cursor is not None:
+            params["cursor"] = cursor
+        page = client.get("/v1/assessments", params=params, headers=bearer(context))
+        assert page.status_code == 200
+        body = page.json()
+        served += [(row["occurred_at"], row["id"]) for row in body["items"]]
+        cursor = body["next"]
+        if cursor is None:
+            break
+    assert len(served) == 5
+    assert len(set(served)) == 5  # the cursor never repeats a row, ties included
+    at = [row[0] for row in served]
+    assert at == sorted(at, reverse=True)  # newest first, the collection's order
+
+
+def test_the_batch_assessments_listing_refuses_both_and_neither_scope(
+    context: Context, client: TestClient
+) -> None:
+    repo, ref, _ = seed(context)
+    both = client.get(
+        "/v1/assessments",
+        params={"repository_ref_id": str(ref.id), "repository_ids": [str(repo.id)]},
+        headers=bearer(context),
+    )
+    assert both.status_code == 422
+    assert client.get("/v1/assessments", headers=bearer(context)).status_code == 422
+
+
+def test_the_batch_assessments_listing_refuses_oversized_sets(
+    context: Context, client: TestClient
+) -> None:
+    repo, _, _ = seed(context)
+    many = [str(repo.id)] * 501
+    bad = client.get("/v1/assessments", params={"repository_ids": many}, headers=bearer(context))
+    assert bad.status_code == 422
+
+
+def test_the_batch_assessments_listing_needs_a_token(context: Context, client: TestClient) -> None:
+    ids = [str(uuid4())]
+    assert client.get("/v1/assessments", params={"repository_ids": ids}).status_code == 401
 
 
 @pytest.mark.parametrize(

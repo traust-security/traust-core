@@ -25,6 +25,9 @@ class ComponentRepository(MutableRecordRepository[Component], Protocol):
     def get_or_add(self, record: Component) -> Component: ...
     def find(self, release_id: UUID, repository_ref_id: UUID) -> Component | None: ...
     def list_for_release(self, release_id: UUID) -> list[Component]: ...
+    def list_for_releases(
+        self, release_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[Component]: ...
     def list_for_ref(self, repository_ref_id: UUID) -> list[Component]: ...
     def list_for_refs(
         self, repository_ref_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
@@ -55,6 +58,16 @@ class SqlComponentRepository(SqlMutableRepository[Component]):
 
     def list_for_release(self, release_id: UUID) -> list[Component]:
         return self._many(f"list for {release_id}", self.table.c.release_id == release_id)
+
+    def list_for_releases(
+        self, release_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[Component]:
+        return self._many_in(
+            f"list {len(release_ids)} releases' components",
+            self.table.c.release_id,
+            release_ids,
+            read_budget=read_budget,
+        )
 
     def list_for_ref(self, repository_ref_id: UUID) -> list[Component]:
         return self._many(

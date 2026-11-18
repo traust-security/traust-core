@@ -19,6 +19,7 @@ from tests.v1.services.test_verification import World, audited, report
 from traust_core.v1.context import Context
 from traust_core.v1.models.common import PageRequest
 from traust_core.v1.models.operations import RecordingStartScope
+from traust_core.v1.models.remediation import ACTOR_CAP
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 
 URL = "/v1/remediations"
@@ -43,11 +44,12 @@ def seeded(engine: Engine, *, findings: int = 1) -> tuple[str, list[str]]:
 def schedule(
     engine: Engine, repository_id: str, finding_ids: list[str], branch: str = BRANCH
 ) -> dict[str, object]:
-    """The request, on the repository's remediation fork (ForkPolicy: the fork org's mirror)."""
+    """The request, on the repository's remediation fork (ForkPolicy: the convention's plain
+    patch-<name> in the fork org)."""
     with SqlTraustUnitOfWork(engine) as uow:
         url = uow.repositories.get(UUID(repository_id)).url
     return {
-        "fork_url": f"https://github.com/mirror-org/{url.rsplit('/', 1)[-1]}",
+        "fork_url": f"https://github.com/mirror-org/patch-{url.rsplit('/', 1)[-1]}",
         "fork_branch": branch,
         "findings": [{"finding_id": f, "repository_id": repository_id} for f in finding_ids],
     }
@@ -208,3 +210,139 @@ def test_pull_request_record_requires_manual_identity_and_valid_existing_item(
         response = client.post(route, json=invalid, headers=bearer(context))
         assert response.status_code == 422, response.text
     assert context.services().remediation.get(UUID(work_item_id)).status == "candidate"
+
+
+def opened_pr(context: Context, client: TestClient, engine: Engine) -> tuple[str, str]:
+    """A scheduled effort whose person-recorded PR is open: where a filing loop's
+    tracking takes over. Its work item id and repository id."""
+    repository_id, finding_ids = seeded(engine)
+    made = client.post(
+        URL, json=schedule(engine, repository_id, finding_ids), headers=bearer(context)
+    )
+    work_item_id = made.json()["work_item"]["work_item_id"]
+    opened = client.post(
+        f"{URL}/{work_item_id}/pull-request",
+        json={"system": "github", "ref": "https://github.com/example-org/service/pull/101"},
+        headers=bearer(context),
+    )
+    assert opened.status_code == 200, opened.text
+    return work_item_id, repository_id
+
+
+def test_progress_records_an_attempt_s_end_and_the_reads_fold_it(
+    context: Context, client: TestClient, engine: Engine
+) -> None:
+    work_item_id, _ = opened_pr(context, client, engine)
+    route = f"{URL}/{work_item_id}/progress"
+    sha = "1f0e8dad" + "0" * 32
+    merged = client.post(
+        route,
+        json={"status": "merged", "merge_sha": sha, "actor": "octocat"},
+        headers=bearer(context),
+    )
+    assert merged.status_code == 200, merged.text
+    assert merged.json()["status"] == "merged"
+    assert merged.json()["tracker"] == {
+        "system": "github",
+        "ref": "https://github.com/example-org/service/pull/101",
+    }
+    same_as_in_process(merged.json(), context.services().remediation.get(UUID(work_item_id)))
+    replay = client.post(
+        route, json={"status": "merged", "merge_sha": sha}, headers=bearer(context)
+    )
+    assert replay.json() == merged.json()
+    effort = client.get(f"{URL}/{work_item_id}", headers=bearer(context)).json()
+    assert effort["status"] == "merged"
+    assert effort["work_item"]["tracker"] == {
+        "system": "github",
+        "ref": "https://github.com/example-org/service/pull/101",
+    }
+    listed = client.get(URL, params={"status": "merged"}, headers=bearer(context))
+    assert [e["work_item"]["work_item_id"] for e in listed.json()["items"]] == [work_item_id]
+    conflict = client.post(route, json={"status": "abandoned"}, headers=bearer(context))
+    assert conflict.status_code == 409
+    assert conflict.headers["content-type"] == "application/problem+json"
+
+
+def test_progress_door_takes_a_person_a_granted_machine_and_no_one_else(
+    context: Context, client: TestClient, engine: Engine
+) -> None:
+    work_item_id, repository_id = opened_pr(context, client, engine)
+    route = f"{URL}/{work_item_id}/progress"
+    body = {"status": "abandoned"}
+    assert client.post(route, json=body).status_code == 401
+    refused = client.post(route, json=body, headers=runner(context))
+    assert refused.status_code == 403, refused.text  # no recording.start grant: no outcome
+    probe = client.post(f"{URL}/{uuid4()}/progress", json=body, headers=runner(context))
+    assert probe.status_code == 403, probe.text  # refused before the read: no existence oracle
+    grant = RecordingStartScope(
+        principal="machine:runner-7",
+        assets=("remediate_finding",),
+        repository_ids=(UUID(repository_id),),
+    )
+    context.config = context.config.model_copy(
+        update={"recording": context.config.recording.model_copy(update={"start": (grant,)})}
+    )
+    ended = client.post(route, json=body, headers=runner(context))
+    assert ended.status_code == 200, ended.text
+    assert ended.json()["status"] == "abandoned"
+
+    other_id, _ = opened_pr(context, client, engine)  # another repository, outside the grant
+    out_of_scope = client.post(f"{URL}/{other_id}/progress", json=body, headers=runner(context))
+    assert out_of_scope.status_code == 403, out_of_scope.text
+    person = client.post(f"{URL}/{other_id}/progress", json=body, headers=bearer(context))
+    assert person.status_code == 200, person.text
+    assert person.json()["status"] == "abandoned"
+
+
+def test_progress_door_validates_its_body_and_the_state_machine(
+    context: Context, client: TestClient, engine: Engine
+) -> None:
+    work_item_id, _ = opened_pr(context, client, engine)
+    route = f"{URL}/{work_item_id}/progress"
+    sha = "1f0e8dad" + "0" * 32
+    missing = client.post(
+        f"{URL}/{uuid4()}/progress", json={"status": "merged"}, headers=bearer(context)
+    )
+    assert missing.status_code == 404
+    for invalid in (
+        {"status": "patched"},  # a run's own progress, not an attempt's end
+        {"status": "forked"},
+        {"status": "abandoned", "merge_sha": sha},
+        {"status": "merged", "merge_sha": "not-a-sha"},
+        {"status": "merged", "actor": " "},
+        {"status": "merged", "actor": "a" * (ACTOR_CAP + 1)},  # past the intake cap
+        {"status": "unknown_status"},
+    ):
+        response = client.post(route, json=invalid, headers=bearer(context))
+        assert response.status_code == 422, (invalid, response.text)
+    assert context.services().remediation.get(UUID(work_item_id)).status == "pr_opened"
+
+
+def test_the_listing_reads_several_repositories_in_one_filter(
+    context: Context, client: TestClient, engine: Engine
+) -> None:
+    repository_id, finding_ids = seeded(engine, findings=1)
+    other_repository, other_findings = seeded(engine, findings=1)
+    service = context.services().remediation_scheduling
+    client.post(URL, json=schedule(engine, repository_id, finding_ids), headers=bearer(context))
+    from tests.v1.repositories.tables.conftest import apart
+
+    apart()  # listed by when each was scheduled: the store stamps milliseconds
+    client.post(
+        URL, json=schedule(engine, other_repository, other_findings), headers=bearer(context)
+    )
+    both = client.get(
+        URL, params={"repository_ids": [repository_id, other_repository]}, headers=bearer(context)
+    )
+    assert both.status_code == 200
+    assert [r["repository_id"] for r in both.json()["items"]] == [
+        repository_id,
+        other_repository,
+    ]
+    one = client.get(URL, params={"repository_ids": [other_repository]}, headers=bearer(context))
+    assert [r["repository_id"] for r in one.json()["items"]] == [other_repository]
+    expected = service.list(
+        PageRequest(), repository_ids=(UUID(repository_id), UUID(other_repository))
+    )
+    assert both.json()["items"] == [r.model_dump(mode="json") for r in expected.items]

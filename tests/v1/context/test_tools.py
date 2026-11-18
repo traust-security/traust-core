@@ -205,7 +205,7 @@ def test_grypes_cache_defaults_under_home(monkeypatch: pytest.MonkeyPatch) -> No
     ("text", "message"),
     [
         (None, "No such file"),
-        ("tools: [unclosed\n", "while parsing"),
+        ("tools: [unclosed\n", "invalid YAML at line"),
         ("tools: []\n", "external-tools"),
         ("tools:\n  - {name: x, expected: '1', version_regex: 5}\n", "version_regex"),
     ],
@@ -447,7 +447,7 @@ def test_without_a_rule_pack_its_doors_say_how_to_register_one(tmp_path: Path) -
 
 @pytest.mark.parametrize(
     ("text", "message"),
-    [(None, "No such file"), ("packs: [oh no\n  : :\n", "while parsing"), ("{}\n", "packs")],
+    [(None, "No such file"), ("packs: [oh no\n  : :\n", "invalid YAML at line"), ("{}\n", "packs")],
 )
 def test_a_bad_allowlist_is_a_config_error_naming_it(
     tmp_path: Path, text: str | None, message: str
@@ -674,3 +674,14 @@ def test_an_empty_or_missing_rule_allowlist_fails_closed(tmp_path: Path) -> None
         load_rule_allowlist(",  ,")
     with pytest.raises(ValidationError, match="no such file"):
         load_rule_allowlist(f"@{tmp_path / 'nope.yaml'}")
+
+
+def test_a_pasted_key_in_the_allowlist_is_located_never_echoed(tmp_path: Path) -> None:
+    pasted = "nvd-7f3a91c2b4d8e6f0"
+    path = tmp_path / "rule-pack-allowlist.yaml"
+    path.write_text(f"packs:\n  {pasted}: 5\n")  # a pack name the file chose; not a mapping
+    ctx = Context(Config(home=tmp_path))
+    ctx.register_rule_pack(tmp_path, path)
+    with pytest.raises(ConfigError, match=r"<key at line 2>") as raised:
+        ctx.rule_pack_supplements  # noqa: B018
+    assert pasted not in str(raised.value)

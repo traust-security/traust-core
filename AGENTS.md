@@ -64,7 +64,7 @@ Python 3.11+ library. The platform API lives in `traust_core.v1`. Overview: [REA
 - traust-contracts is a pinned dependency; read its data through `traust_core.v1.contracts` only, never import `traust_contracts`
 - Nothing from traust-contracts is copied or generated into this repo
 - Artifacts are named types in `models/artifacts.py` (`TriageArtifact`, ...); their fields come from the installed schema, never a hand-written copy
-- Write with `ArtifactPublisher` (exact schema gate); read with `ArtifactPublisher.get(ArtifactId)`. `AnalysisResultsRepository.read(XArtifact, subject)` is legacy (path-keyed) until the Artifacts slice. No `json.load`/`.get()`/`json.dump` on artifacts
+- Write with `ArtifactPublisher` (exact schema gate); read with `ArtifactPublisher.get(ArtifactId)`. No `json.load`/`.get()`/`json.dump` on artifacts
 - Names: `models/artifacts.py` = what an artifact document is (`ArtifactDocument` and its named types); `models/assessment.py::Artifact` = the `artifact` table row; `repositories/objects/store.py` = raw bytes; `services/artifact_publishing.py` = the publish use case. Modules name the subject; the package names the role (no `_service` suffix)
 - Core never tests the DDL: traust-contracts owns and tests its schema. Core tests repository behaviour against it
 - Artifacts produced by the harness or an LLM go through `ArtifactPublisher`; nothing writes `analysis-results` files directly

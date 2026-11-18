@@ -86,9 +86,43 @@ def test_an_invalid_policy_cannot_be_recorded() -> None:
         policy("bad", clock_start="whenever")
 
 
-def test_an_unreadable_default_is_a_config_error(tmp_path: Path) -> None:
-    with pytest.raises(ConfigError, match="cannot read SLA policy"):
-        Context(Config(home=tmp_path)).register_default_sla_policy(tmp_path / "absent.yaml")
+@pytest.mark.parametrize("contents", [None, "policy_name: [", "policy_name: incomplete\n"])
+def test_an_unusable_default_is_an_error_when_sla_is_requested(
+    context: Context, tmp_path: Path, contents: str | None
+) -> None:
+    path = tmp_path / "default.yaml"
+    if contents is not None:
+        path.write_text(contents)
+    context.register_default_sla_policy(path)
+    with pytest.raises(ConfigError, match="SLA policy"):
+        shown(context)
+
+
+@pytest.mark.parametrize("contents", [None, "policy_name: [", "policy_name: incomplete\n"])
+@pytest.mark.parametrize("recorded", [False, True])
+def test_a_policy_override_does_not_require_a_usable_default(
+    context: Context, tmp_path: Path, contents: str | None, recorded: bool
+) -> None:
+    path = tmp_path / "default.yaml"
+    if contents is not None:
+        path.write_text(contents)
+    context.register_default_sla_policy(path)
+    if recorded:
+        context.services().insight.record_sla_policy(policy("recorded"), provenance())
+    else:
+        context.register_sla_policy(POLICY)
+    assert shown(context) == ("recorded" if recorded else "example-sla-policy")
+
+
+def test_registering_another_default_replaces_the_loaded_policy(
+    context: Context, tmp_path: Path
+) -> None:
+    context.register_default_sla_policy(POLICY)
+    assert shown(context) == "example-sla-policy"
+    path = tmp_path / "replacement.yaml"
+    path.write_bytes(policy("replacement").payload)
+    context.register_default_sla_policy(path)
+    assert shown(context) == "replacement"
 
 
 def test_recording_without_an_artifact_store_is_a_config_error() -> None:

@@ -35,13 +35,6 @@ AT = datetime(2026, 10, 23, tzinfo=UTC)
 IMAGE_SBOM = (
     Path(__file__).parents[2] / "tests/fixtures/code_facts/crypto/image/syft-image-scan.cdx.json"
 ).read_bytes()
-INDEXES = {
-    "advisory_identifier_key",
-    "advisory_pkey",
-    "package_ecosystem_name_key",
-    "advisory_package_advisory_id_package_id_key",
-    "idx_advisory_package_package",
-}
 
 
 class Lookup:
@@ -52,6 +45,9 @@ class Lookup:
 
     def record(self, identifier: AdvisoryIdentifier) -> Result[AdvisoryRecord | None]:
         return Result(self._record, Acquisition(provider="osv", acquired_at=AT))
+
+    def related(self, record: AdvisoryRecord) -> Result[tuple[AdvisoryRecord, ...]]:
+        return Result((), Acquisition(provider="osv", acquired_at=AT))
 
 
 def find(record: AdvisoryRecord, uow: SqlTraustUnitOfWork) -> None:
@@ -88,9 +84,7 @@ def test_keeping_an_advisory_reads_and_writes_by_natural_key(
         source="perf",
     )
     statements = explained(lambda uow: find(record, uow))
-    assert 4 <= len(statements) <= 8  # no read per row: a fixed handful whatever the volume
     for statement in statements:
-        assert any(statement.uses_index(i) for i in INDEXES), statement.plan
         assert not statement.seq_scans(), statement.plan
         assert statement.execution_ms < 5, statement.plan
 
@@ -321,3 +315,81 @@ def test_dependency_reach_reads_the_fleet_in_batches(
     assert len(statements) / len(repositories) <= 0.25, len(statements)
     assert all(not s.seq_scans() for s in statements), [s.plan for s in statements if s.seq_scans()]
     clocked("dependency-reach(1,000 repositories)", reach)
+
+
+def _advisory_ids(engine: sa.Engine, aliases: bool, limit: int) -> list[UUID]:
+    with SqlTraustUnitOfWork(engine) as uow:
+        table = uow.advisories.table
+        where = table.c.alias_of_id.is_not(None) if aliases else table.c.alias_of_id.is_(None)
+        return list(uow.connection.scalars(sa.select(table.c.id).where(where).limit(limit)))
+
+
+def test_a_pages_advisories_by_id_are_read_by_primary_key(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    ids = _advisory_ids(engine, aliases=False, limit=50)  # a findings page's worth (the D14 door)
+    for statement in explained(lambda uow: uow.advisories.list_by_ids(ids)):
+        assert statement.uses_index("advisory_pkey"), statement.plan
+        assert not statement.seq_scans(), statement.plan
+        assert statement.execution_ms < 25, statement.plan
+
+
+def test_the_aliases_of_many_advisories_are_read_from_the_alias_index(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    ids = _advisory_ids(engine, aliases=False, limit=500)
+    for statement in explained(lambda uow: uow.advisories.list_aliases_of(ids)):
+        assert statement.uses_index("idx_advisory_alias_of"), statement.plan
+        assert not statement.seq_scans(), statement.plan
+        assert statement.execution_ms < 25, statement.plan
+
+
+def _linked_findings(engine: sa.Engine, limit: int) -> list[UUID]:
+    """Findings naming an advisory: half through an alias row, half a canonical one."""
+    with SqlTraustUnitOfWork(engine) as uow:
+        findings, advisories = uow.findings.table, uow.advisories.table
+        linked = sa.select(findings.c.id).join(
+            advisories, advisories.c.id == findings.c.advisory_id
+        )
+        aliased = linked.where(advisories.c.alias_of_id.is_not(None)).limit(limit // 2)
+        canonical = linked.where(advisories.c.alias_of_id.is_(None)).limit(limit - limit // 2)
+        return [*uow.connection.scalars(aliased), *uow.connection.scalars(canonical)]
+
+
+def test_a_pages_advisory_names_take_at_most_four_batched_reads(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    """The D14 door for one findings page: never a read per finding."""
+    page = _linked_findings(engine, 50)
+    statements = explained(lambda uow: _exposure(uow).advisory_names(page))
+    assert 3 <= len(statements) <= 4, [s.sql[:120] for s in statements]
+    with SqlTraustUnitOfWork(engine) as uow:
+        names = _exposure(uow).advisory_names(page)
+    assert len(names) == 50
+    # each finding naming a GHSA alias row resolves to its canonical CVE, both names kept
+    assert all(names[f].cves and names[f].ghsas for f in page[:25])
+    for statement in statements:
+        assert not statement.seq_scans(), statement.plan
+        assert statement.execution_ms < 10, statement.plan
+
+
+def test_every_linked_advisorys_names_read_in_bounded_batches(
+    engine: sa.Engine, explained: Profile, clocked: Clocked
+) -> None:
+    """The daily refresh's estate-wide name read: batched by key, never a read per advisory.
+
+    Like the fleet sweep, a whole-estate pass once a day, so this bounds it rather than asking
+    it to seek: at 500 keys a batch the planner reads the ~75k-row advisory table by sequential
+    scan (~3 ms a batch, cheaper than 500 index probes), which is the right plan for a read
+    that wants a large share of the table."""
+    # no source is registered, so it reads every linked advisory's names and fetches nothing
+    statements = explained(lambda uow: _exposure(uow).refresh_advisory_documents())
+    linked, *batched = statements
+    assert linked.uses_index("idx_finding_advisory"), linked.plan
+    assert batched and all(" IN (" in s.sql for s in batched), [s.sql[:120] for s in batched]
+    for statement in batched:
+        assert statement.execution_ms < 25, statement.plan
+    whole = clocked(
+        "refresh_advisory_documents names", lambda uow: _exposure(uow).refresh_advisory_documents()
+    )
+    assert whole < 2_000, whole

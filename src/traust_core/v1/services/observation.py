@@ -15,6 +15,7 @@ from typing import Any, TypeVar
 from traust_core.v1.errors import ConfigError, IntegrityError, ValidationError
 from traust_core.v1.models.artifacts import AdapterResultArtifact
 from traust_core.v1.models.assessment import ToolName
+from traust_core.v1.models.inventory import GoneReason
 from traust_core.v1.models.observation import (
     SENSITIVE_RX,
     ChangeMetrics,
@@ -26,6 +27,7 @@ from traust_core.v1.models.observation import (
     is_first_party,
 )
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
+from traust_core.v1.models.vocabulary import LivenessStatus
 from traust_core.v1.providers.base import ProviderRegistry, Result
 from traust_core.v1.providers.sources import (
     ChangedFile,
@@ -188,31 +190,97 @@ def observe_forge_facts(
                 "error": "skipped: consecutive-error streak suggests a GitHub secondary ban",
             }
         )
+    facts = facts.model_copy(update={"availability_queried": True})
+    repository_read = False  # the repository's own read answered; later calls may still fail
     try:
         info = _fetch(lambda: sources.info(repo), RepoInfo)
         if info.repo != repo:
             raise SourceError(
                 "forge response identifies a different repository", ComparisonStatus.ERROR
             )
+        availability = info.liveness_status
+        if availability is None:
+            availability = (
+                LivenessStatus.ARCHIVED
+                if info.archived is True
+                else LivenessStatus.ACTIVE
+                if info.archived is False
+                else LivenessStatus.UNKNOWN
+            )
+        facts = facts.model_copy(
+            update={
+                key: getattr(info, key)
+                for key in (
+                    "pushed_at",
+                    "archived",
+                    "default_branch",
+                    "visibility",
+                    "fork",
+                    "parent",
+                    "canonical_url",
+                )
+            }
+            | {"liveness_status": availability}
+        )
+        if availability in (
+            LivenessStatus.MOVED,
+            LivenessStatus.MISSING,
+            LivenessStatus.DISABLED,
+        ):
+            return facts.model_copy(
+                update={
+                    "status": ComparisonStatus.ERROR,
+                    "error": f"forge reports repository {availability.value}",
+                    "gone_reason": GoneReason.GONE,
+                }
+            )
+        repository_read = True
         branch = info.default_branch
         head = None
         if seen is not None and (seen.branch, seen.pushed_at) == (branch, info.pushed_at):
             head = seen.head
         elif branch:
             head = str(_fetch(lambda: sources.head(repo, branch), GitSha))
+        if branch is None and availability in (LivenessStatus.ACTIVE, LivenessStatus.ARCHIVED):
+            # The forge answered and the repository is there, but it names no default
+            # branch: a repository with no commits (200, empty). Gone-class with its own
+            # reason — the remediation waits for a push, not a URL correction.
+            facts = facts.model_copy(update={"gone_reason": GoneReason.EMPTY})
     except SourceError as exc:
         if github:
             breaker.record(False)
-        return facts.model_copy(update={"status": exc.observation_status, "error": str(exc)})
+        gone: GoneReason | None = None
+        if exc.liveness_status in (
+            LivenessStatus.MOVED,
+            LivenessStatus.MISSING,
+            LivenessStatus.DISABLED,
+        ):
+            gone = GoneReason.GONE
+        elif exc.empty_repository:
+            # The repository read answered but its default branch names no commit:
+            # an empty repository (200, no commits) - gone-class with its own reason.
+            gone = GoneReason.EMPTY
+        elif exc.endpoint_unreachable and not repository_read:
+            # Only the repository read's own transport word counts: the host answered
+            # no-such-name (or refused, or refused the certificate) when asked for the
+            # repository. A later call failing that way after the repository read
+            # answered says nothing repository-level - the host was just there (Qodo
+            # #474: a failed branch read must not sideline a live repository).
+            gone = GoneReason.UNREACHABLE
+        return facts.model_copy(
+            update={
+                "status": exc.observation_status,
+                "error": str(exc),
+                "liveness_status": exc.liveness_status
+                if facts.liveness_status == LivenessStatus.UNKNOWN
+                else facts.liveness_status,
+                "canonical_url": exc.canonical_url or facts.canonical_url,
+                "gone_reason": gone,
+            }
+        )
     if github:
         breaker.record(True)
-    facts = facts.model_copy(
-        update={
-            key: getattr(info, key)
-            for key in ("pushed_at", "archived", "default_branch", "visibility", "fork", "parent")
-        }
-        | {"head": head}
-    )
+    facts = facts.model_copy(update={"head": head})
     pushed, audited = parse_audit_date(info.pushed_at), parse_audit_date(target.audit_date)
     if status == ComparisonStatus.NEVER_AUDITED or not (pushed and audited and pushed >= audited):
         return facts

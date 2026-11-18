@@ -23,7 +23,8 @@ PRIVILEGED_RX = re.compile(
 # an admin of one tenant can still reach another tenant's objects (owner decision 2026-11-02)
 _TENANT_ADMIN_RX = re.compile(
     r"(?i)(tenant|org|organi[sz]ation|customer|team|project|workspace|group|account|company|"
-    r"client|realm|site|store|shop|partner|department|non|not|no)[_\-\s]?admin"
+    r"client|realm|site|store|shop|partner|department|channel|non|not|no)[_\-\s]?"
+    r"(admin|staff|operator)"
 )
 _QUOTED_RX = re.compile(r"'([^'\"]*)'|\"([^'\"]*)\"")
 _ALTERNATIVE_RX = re.compile(r"(?i:\bor\b|\|\||_or_|#\w|principal|authentication\.)|Or[A-Z]")
@@ -41,10 +42,20 @@ OWNER_CHECK_RX = re.compile(
     r"workspace|team|client|group|project|company|realm)(_?(id|uuid|key))?)$"
 )
 # fields that tie a record to something else (`patientId`, `recipient`): not ownerless
-_LINK_RX = re.compile(
+LINK_RX = re.compile(
     r"(?i)^(?!_?id$)(\w*(_id|id|_uuid|uuid|_key|key)|_?(recipient|sender|assignee|reporter|holder|"
     r"subscriber|buyer|seller|payer|payee|patient|email|login|principal|participant|requester|"
     r"approver|reviewer|parent)\w*)$"
+)
+# Rust, which never credits (D34), also reads role words, `*_by`, `sub`, `from`, `to` as
+# links; a role word must stand alone or end in an id-like suffix, so `poster_id` is a link
+# but `poster_url`, `staff_count` and `contact_phone` are the catalog fields they look like
+RUST_LINK_RX = re.compile(
+    r"(?i)^(?!_?id$)(\w*(_id|id|_uuid|uuid|_key|key)|_?(recipient|sender|assignee|reporter|holder|"
+    r"subscriber|buyer|seller|payer|payee|patient|email|login|principal|participant|requester|"
+    r"approver|reviewer|parent|employee|staff|student|driver|worker|beneficiary|grantee|"
+    r"uploader|poster|submitter|publisher|issuer|signer|person|people|contact)"
+    r"(_(id|uuid|key|email|login))?|\w+_by(_\w+)?|\w*_owner\w*|sub|from|to)$"
 )
 _SPEL_ROLE_CALL = re.compile(r"has(?:Any)?(?:Role|Authority)\((.*)\)")
 _CONSTANT_ROLE = re.compile(r"\b(?:[A-Z]\w*\.)?[A-Z][A-Z0-9_]{2,}\b")
@@ -132,12 +143,26 @@ def owner_field(record_type: str | None, fields: Mapping[str, Sequence[str]]) ->
     return next((f for f in fields.get(record_type or "", ()) if OWNER_FIELD_RX.match(f)), None)
 
 
+def record_ownerless(
+    record_type: str | None, fields: Mapping[str, Sequence[str]], links: re.Pattern[str] = LINK_RX
+) -> bool:
+    """A record type the checkout declares with no owner field and nothing linking it to anyone."""
+    names = fields.get(record_type or "")
+    return (
+        names is not None
+        and owner_field(record_type, fields) is None
+        and not any(links.match(f) for f in names)
+    )
+
+
 def classify(
     method: str,
     pattern: str,
     guards: Sequence[str],
     facts: HandlerFacts,
     fields: Mapping[str, Sequence[str]],
+    *,
+    links: re.Pattern[str] = LINK_RX,
 ) -> tuple[RouteOwnership, OwnershipEvidence | None]:
     """`guards` are the route's effective guards; `fields` maps each record type the checkout
     declares to its field names."""
@@ -150,12 +175,7 @@ def classify(
         return RouteOwnership.NOT_APPLICABLE, None
 
     def ownerless(x: Lookup) -> bool:
-        names = fields.get(x.record_type or "")
-        return (
-            names is not None
-            and owner_field(x.record_type, fields) is None
-            and not any(_LINK_RX.match(f) for f in names)
-        )
+        return record_ownerless(x.record_type, fields, links)
 
     exposed = [x for x in facts.lookups if not (x.scoped or x.checked or ownerless(x))]
     # the most concerning access decides: an unprotected owner-bearing record, then any other

@@ -35,6 +35,7 @@ THIRD_PARTY = {
         "tree_sitter_java",
         "tree_sitter_rust",
         "tree_sitter_ruby",
+        "tree_sitter_go",
     },
     "repositories": {"sqlalchemy", "psycopg", "pydantic", "boto3", "botocore"},  # boto*: [s3] extra
     "rendering": {"pydantic"},

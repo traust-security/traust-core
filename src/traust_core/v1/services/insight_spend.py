@@ -9,6 +9,7 @@ from uuid import UUID
 
 from pydantic import computed_field
 
+from traust_core.v1 import contracts
 from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.common import TimeWindow
@@ -147,7 +148,7 @@ class SpendView:
         months = tuple(self._month(m, w, by_repo[m], units) for m, w in _months(window))
         unverified, unregistered, unverified_usd = self._rates(months)
         last = next((m for m in reversed(months) if m.total.events), None)
-        return SpendDashboard(
+        model = SpendDashboard(
             window=window,
             months=months,
             unverified_models=unverified,
@@ -165,6 +166,8 @@ class SpendView:
             ),
             unit_economics=None if last is None else self._unit_economics(last, filter),
         )
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
 
     def _month(
         self, month: str, window: TimeWindow, by_repo: Sequence[SpendRollup], units: dict[str, str]
@@ -186,10 +189,12 @@ class SpendView:
         doc = self._portfolio.corpus_registry(filter.as_of)
         registry = CorpusRegistry() if doc is None else CorpusRegistry.of(doc)
         units = {}
-        for key in sorted(k for k in keys if k is not None):
+        wanted = sorted(k for k in keys if k is not None)
+        products_of = self._portfolio.list_products_of_all(UUID(k) for k in wanted)
+        for key in wanted:
             found = {
                 s.business_unit
-                for p in self._portfolio.list_products_of(UUID(key))
+                for p in products_of.get(UUID(key), ())
                 if (s := registry.subject(str(p.id))) is not None
             }
             if len(found) == 1:
@@ -228,7 +233,7 @@ class SpendView:
         )
 
     def _unit_economics(self, month: SpendMonth, filter: ViewFilter) -> UnitEconomics:
-        rollup = self._rollup.build(ViewFilter(as_of=filter.as_of))
+        rollup = self._rollup.compose(ViewFilter(as_of=filter.as_of))
         t = rollup.total
         return UnitEconomics(
             month=month.month,

@@ -56,11 +56,19 @@ class ServiceError(TraustError):
         *,
         operation: str | None = None,
         target_hash: str | None = None,
+        endpoint_unreachable: bool = False,
     ) -> None:
         super().__init__(message)
         self.status = status
         self.operation = operation
         self.target_hash = target_hash
+        # True only when the transport positively established the endpoint is not
+        # there - name resolution failed (NXDOMAIN), the connection was refused, or
+        # TLS failed its handshake. A timeout or a reset said nothing (the endpoint
+        # might be there), so it is never this: the gone-class distinction the
+        # repository's unreachable disposition counts on (foundry plan
+        # repo-unreachable: only the gone-class counts, never the transient classes).
+        self.endpoint_unreachable = endpoint_unreachable
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,3 +85,12 @@ class DocumentError(ValidationError):
         )
         self.document = document
         self.issues = issues
+
+
+class ViewContractError(DocumentError):
+    """A view Core built fails its own contract: Core's fault (500, logged), never the caller's
+    request; it stays a DocumentError, so a caller catching that still catches it."""
+
+
+class RemovedSecretError(DocumentError):
+    """A patch carries high-confidence secrets only outside its added lines."""

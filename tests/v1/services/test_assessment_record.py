@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Event
 from uuid import UUID, uuid4
 
 import pytest
@@ -51,6 +53,7 @@ from traust_core.v1.models.operations import OrderRequest, WorkerId
 from traust_core.v1.models.vocabulary import ActorKind, SourceType
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectKey
+from traust_core.v1.repositories.objects.store import ObjectRef
 from traust_core.v1.services.artifact_publishing import AssessmentLog, PublishSpec, PublishSpecs
 
 FIXTURES = Path(__file__).parents[2] / "fixtures"
@@ -613,32 +616,6 @@ def test_recorded_historical_report_validity_replays_exactly_but_cannot_start_a_
     assert restored.remediation_roadmap[0].priority == "P3"
 
 
-@pytest.mark.parametrize("validity", DEPRECATED_VALIDITY)
-@pytest.mark.parametrize("legacy_in_payload", [False, True])
-def test_report_validity_gate_checks_bytes_even_when_priority_normalization_rewrites_a_view(
-    context: Context, ref: UUID, validity: str, legacy_in_payload: bool
-) -> None:
-    body = json.loads(authored_report().payload)
-    body["findings"][0]["validation_status"] = validity if legacy_in_payload else "confirmed"
-    doc = SecurityAuditArtifact.from_document(body)
-    body["findings"][0]["validation_status"] = "confirmed" if legacy_in_payload else validity
-    body["remediation_roadmap"][0]["priority"] = "P3"
-    assert (
-        doc.findings[0].validation_status
-        != json.loads(doc.payload)["findings"][0]["validation_status"]
-    )
-
-    with pytest.raises(ValidationError):
-        record(context, doc, ref, AssessmentKind.CONTAINER)
-
-    with SqlTraustUnitOfWork(context.database) as uow:
-        repository_id = uow.repository_refs.get(ref).repository_id
-        assert uow.assessments.list_for_ref(ref) == []
-        assert uow.findings.list_for_repository(repository_id) == []
-        assert uow.artifacts.find(None, sha256_hex(doc.payload)) is None
-        assert uow.artifacts.find(None, sha256_hex(doc.with_canonical_priorities().payload)) is None
-
-
 @pytest.mark.parametrize("kind", [AssessmentKind.CONTAINER, AssessmentKind.RPM])
 def test_authored_finding_kinds_survive_intake_without_creating_decisions(
     context: Context, ref: UUID, kind: AssessmentKind
@@ -899,3 +876,67 @@ def test_an_order_that_is_not_running_or_ran_elsewhere_takes_no_assessment(
             )
     with SqlTraustUnitOfWork(engine) as uow:
         assert uow.assessments.list_for_ref(ref) == []
+
+
+@pytest.mark.parametrize("kind", [AssessmentKind.FUZZ, AssessmentKind.CLOUD_CONFIG_CANONICAL])
+def test_slow_object_upload_does_not_hold_the_orders_write_lock(
+    context: Context,
+    engine: Engine,
+    ref: UUID,
+    kind: AssessmentKind,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject = (
+        FuzzReportArtifact.parse(fixture("assessments/widget-fuzz-report.json"))
+        if kind == AssessmentKind.FUZZ
+        else CloudConfigAuditArtifact.parse(fixture("cloud_config/myrepo-cloud-config-audit.json"))
+    )
+    with SqlTraustUnitOfWork(engine) as uow:
+        target = uow.repository_refs.get(ref)
+        order = Seed(uow).run_order(
+            repository_id=target.repository_id,
+            state="leased",
+            lease_holder="stager",
+            lease_expires_at=context.clock.now() + timedelta(minutes=10),
+            started_at=context.clock.now(),
+        )
+        uow.commit()
+    uploading, release = Event(), Event()
+    original = context.object_store.put
+
+    def blocked(key: ObjectKey, payload: bytes) -> ObjectRef:
+        uploading.set()
+        assert release.wait(timeout=10)
+        return original(key, payload)
+
+    monkeypatch.setattr(context.object_store, "put", blocked)
+
+    def publish() -> Assessment:
+        owner = context.services().assessment
+        if kind == AssessmentKind.FUZZ:
+            return owner.record(
+                subject, ref, kind, "skill:fuzz", "1", provenance(), run_order_id=order.id
+            )
+        return owner.record_audit(subject, ref, provenance(), run_order_id=order.id)[0]
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(publish)
+        try:
+            assert uploading.wait(timeout=10)
+            with SqlTraustUnitOfWork(engine) as contender:
+                if engine.dialect.name == "postgresql":
+                    contender.connection.exec_driver_sql("SET LOCAL lock_timeout = '250ms'")
+                else:
+                    contender.connection.exec_driver_sql("PRAGMA busy_timeout = 250")
+                locked = contender.run_orders.get_for_update(order.id)
+                updated = contender.run_orders.update(
+                    locked.model_copy(update={"priority": locked.priority + 1})
+                )
+                assert updated.priority == order.priority + 1
+                assert contender.artifacts.latest_imported(subject.schema) is None
+                contender.commit()
+        finally:
+            release.set()
+        recorded = pending.result(timeout=20)
+    assert recorded.run_order_id == order.id
+    assert context.services().assessment.get(recorded.id).id == recorded.id

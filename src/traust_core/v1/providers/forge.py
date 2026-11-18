@@ -11,6 +11,7 @@ from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.observation import ComparisonStatus
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl, RepoPath
+from traust_core.v1.models.vocabulary import LivenessStatus
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.forge_api import ForgeApi
@@ -117,14 +118,21 @@ class CommandSourceProvider:
         """A failed REST read as an observation status. The fetcher
         retries 429 and 5xx itself (Retry-After, capped backoff), so what
         arrives here failed fast (4xx) or gave up (status None); ForgeApi's
-        JSON errors chain a ValueError and stay plain errors."""
+        JSON errors chain a ValueError and stay plain errors. A give-up the
+        transport answered positively (NXDOMAIN, refused, TLS) carries that
+        word, so the observation can count it as unreachable-from-here —
+        a timeout or a 5xx said nothing and never counts."""
         if isinstance(exc.__cause__, ValueError):
             return SourceError(str(exc)[:120], ComparisonStatus.ERROR)
         if exc.status == 401:
             return SourceError(str(exc)[:120], ComparisonStatus.NO_CREDENTIALS)
         if exc.status is None:
-            return SourceError(str(exc)[:120], ComparisonStatus.UNREACHABLE)
-        return SourceError(str(exc)[:120], ComparisonStatus.ERROR, http_status=exc.status)
+            return SourceError(
+                str(exc)[:120],
+                ComparisonStatus.UNREACHABLE,
+                endpoint_unreachable=exc.endpoint_unreachable,
+            )
+        return SourceError(str(exc)[:120], ComparisonStatus.ERROR)
 
     def _object(self, host: str, endpoint: str) -> Mapping[str, Any]:
         """One REST read, parsed as an object; a non-object answer is malformed."""
@@ -167,8 +175,30 @@ class CommandSourceProvider:
 
     def info(self, repo: HttpsRepoUrl) -> Result[RepoInfo]:
         kind = self._kind(repo)
+        try:
+            if kind == "github":
+                payload = self._object(repo.host, f"repos/{repo.path}")
+            else:
+                payload = self._object(repo.host, f"projects/{quote(repo.path, safe='')}")
+        except SourceError as exc:
+            # The repository read itself answered 404/410 - visible on the refused
+            # read's cause, the fetcher's own error, because _refused flattens every
+            # fast 4xx into a plain error: the forge positively reports no such
+            # repository, so
+            # liveness is `missing`, the gone-class signal the unreachable disposition
+            # counts (a private repository the token cannot see answers the same way;
+            # the disposition's evidence names the forge's word, and a person's verify
+            # or URL correction settles which it was). Other reads' 404s (a file, a
+            # branch) stay plain errors.
+            cause = exc.__cause__
+            if isinstance(cause, ServiceError) and cause.status in (404, 410):
+                raise SourceError(
+                    f"{repo}: the forge reports no such repository",
+                    ComparisonStatus.ERROR,
+                    liveness_status=LivenessStatus.MISSING,
+                ) from exc
+            raise
         if kind == "github":
-            payload = self._object(repo.host, f"repos/{repo.path}")
             try:
                 parent = (payload.get("parent") or {}).get("full_name")
             except (AttributeError, TypeError) as exc:
@@ -182,7 +212,6 @@ class CommandSourceProvider:
                 "parent": parent,
             }
         else:
-            payload = self._object(repo.host, f"projects/{quote(repo.path, safe='')}")
             try:
                 parent = (payload.get("forked_from_project") or {}).get("path_with_namespace")
             except (AttributeError, TypeError) as exc:
@@ -196,6 +225,32 @@ class CommandSourceProvider:
                 parent=parent,
             )
         try:
+            raw_canonical = payload.get("html_url" if kind == "github" else "web_url")
+            canonical = (
+                HttpsRepoUrl.parse(raw_canonical, self._hosts)
+                if raw_canonical is not None
+                else None
+            )
+            moved = canonical is not None and (
+                str(canonical).lower() != str(repo).lower()
+                if kind == "github"
+                else canonical != repo
+            )
+            disabled = payload.get("disabled")
+            if disabled is not None and not isinstance(disabled, bool):
+                raise ValueError("forge disabled flag is not boolean")
+            data["liveness_status"] = (
+                LivenessStatus.DISABLED
+                if disabled is True
+                else LivenessStatus.MOVED
+                if moved
+                else LivenessStatus.ARCHIVED
+                if data["archived"] is True
+                else LivenessStatus.ACTIVE
+                if data["archived"] is False
+                else LivenessStatus.UNKNOWN
+            )
+            data["canonical_url"] = str(canonical) if moved else None
             info = RepoInfo.model_validate(dict(repo=repo, **data), strict=True)
         except (ValueError, TypeError) as exc:
             raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
@@ -426,18 +481,34 @@ class CommandSourceProvider:
     def head(self, repo: HttpsRepoUrl, branch: str) -> Result[GitSha]:
         """The commit a branch points at."""
         name = quote(branch, safe="")
-        if self._kind(repo) == "github":
-            payload = self._object(repo.host, f"repos/{repo.path}/branches/{name}")
-            try:
-                sha = (payload.get("commit") or {}).get("sha")
-            except (AttributeError, TypeError) as exc:
-                raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
-        else:
-            endpoint = f"projects/{quote(repo.path, safe='')}/repository/branches/{name}"
-            try:
-                sha = (self._object(repo.host, endpoint).get("commit") or {}).get("id")
-            except (AttributeError, TypeError) as exc:
-                raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
+        try:
+            if self._kind(repo) == "github":
+                payload = self._object(repo.host, f"repos/{repo.path}/branches/{name}")
+                try:
+                    sha = (payload.get("commit") or {}).get("sha")
+                except (AttributeError, TypeError) as exc:
+                    raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
+            else:
+                endpoint = f"projects/{quote(repo.path, safe='')}/repository/branches/{name}"
+                try:
+                    sha = (self._object(repo.host, endpoint).get("commit") or {}).get("id")
+                except (AttributeError, TypeError) as exc:
+                    raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
+        except SourceError as exc:
+            # A repository whose own read answered but whose branch names no commit
+            # reads 404 (the unborn ref) or 409 ("Git Repository is empty") - the
+            # empty repository's signature when the branch is the default (the only
+            # caller that reads the empty marker; a branch import of a missing name
+            # carries the same error without the marker mattering), never a
+            # transport failure (Qodo #474).
+            cause = exc.__cause__
+            if isinstance(cause, ServiceError) and cause.status in (404, 409):
+                raise SourceError(
+                    f"{repo}: no commit on branch {branch}",
+                    ComparisonStatus.ERROR,
+                    empty_repository=True,
+                ) from exc
+            raise
         try:
             return self._result(GitSha.parse(sha), repo)
         except (ValidationError, TypeError) as exc:

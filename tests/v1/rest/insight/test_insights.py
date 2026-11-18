@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -9,10 +9,13 @@ from fastapi.testclient import TestClient
 from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.rest.conftest import bearer, same_as_in_process
 from tests.v1.services.test_detection_quality_doors import WINDOW, Campaign, World
+from tests.v1.services.test_pqc import PROVENANCE
+from tests.v1.services.test_pqc_vendors import claims
 from traust_core.v1 import contracts
 from traust_core.v1.context import Context
 from traust_core.v1.models.common import TimeBucket
 from traust_core.v1.models.insight import ViewFilter, ViewName
+from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 
 
@@ -213,3 +216,56 @@ def test_critical_misses_http_refuses_incomplete_invalid_or_unsupported_filters(
     response = client.get("/v1/insights/critical-misses", params=params, headers=bearer(context))
     assert response.status_code == 422
     assert response.headers["content-type"] == "application/problem+json"
+
+
+def test_an_unscoped_census_read_serves_the_stored_build_with_its_moment(
+    context: Context, client: TestClient
+) -> None:
+    with SqlTraustUnitOfWork(context.database) as uow:
+        seed = Seed(uow)
+        ref = seed.repository_ref()
+        seed.occurrence(seed.finding(), seed.assessment(ref))
+        uow.commit()
+    context.services().insight.record_builds()
+
+    response = client.get("/v1/insights/findings-rollup", headers=bearer(context))
+    assert response.status_code == 200
+    served = context.services().insight.serve(ViewName.FINDINGS_ROLLUP, ViewFilter())
+    same_as_in_process(response.json(), served.model)
+    assert response.headers["X-Traust-View-Built-At"] == served.built_at.isoformat()
+
+
+def test_refresh_folds_the_census_on_demand(context: Context, client: TestClient) -> None:
+    with SqlTraustUnitOfWork(context.database) as uow:
+        seed = Seed(uow)
+        ref = seed.repository_ref()
+        seed.occurrence(seed.finding(), seed.assessment(ref))
+        uow.commit()
+    context.services().insight.record_builds()
+
+    folded = client.get(
+        "/v1/insights/findings-rollup", params={"refresh": "true"}, headers=bearer(context)
+    )
+    assert folded.status_code == 200
+    assert "X-Traust-View-Built-At" not in folded.headers
+    expected = context.services().insight.build(ViewName.FINDINGS_ROLLUP, ViewFilter())
+    same_as_in_process(folded.json(), expected)
+
+
+def test_the_first_census_read_before_any_build_folds(context: Context, client: TestClient) -> None:
+    context.__dict__["clock"] = FixedClock(datetime.now(UTC))
+    response = client.get("/v1/insights/coverage", headers=bearer(context))
+    assert response.status_code == 200
+    assert "X-Traust-View-Built-At" not in response.headers
+    expected = context.services().insight.build(ViewName.COVERAGE, ViewFilter())
+    same_as_in_process(response.json(), expected)
+
+
+def test_the_pqc_vendors_insight_serves_its_contract_by_alias(
+    context: Context, client: TestClient
+) -> None:
+    """The wire names a claim's class "class" (by alias): the shape the build validates."""
+    context.services().pqc.record_claims(claims(), PROVENANCE)
+    body = client.get("/v1/insights/pqc-vendors", headers=bearer(context)).json()
+    contracts.validate_view(ViewName.PQC_VENDORS, body)
+    assert {"class", "status"} <= set(body["vendors"][0]["claim"])

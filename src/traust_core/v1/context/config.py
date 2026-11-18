@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -12,7 +12,8 @@ import sqlalchemy as sa
 import yaml
 
 from traust_core.v1 import contracts
-from traust_core.v1.errors import ConfigError, DocumentError
+from traust_core.v1.context.redaction import load_yaml_config, locate
+from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.compliance import DocsTarget
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
 from traust_core.v1.models.operations import (
@@ -127,7 +128,13 @@ class HttpConfig(_Model):
     jitter_seconds: float = 0.5
 
 
-FIRST_PARTY_LOGGERS = ("traust", "traust_core", "traust_engine", "traust_ledger")
+FIRST_PARTY_LOGGERS = (
+    "traust",
+    "traust_core",
+    "traust_engine",
+    "traust_ledger",
+    "traust_contracts",
+)
 
 
 class LoggingConfig(_Model):
@@ -255,6 +262,23 @@ class Locations(_Model):
 
 class FeedsConfig(_Model):
     osv_access: Literal["api", "air-gapped"] = "api"  # air-gapped: exported OSV records only
+    # source -> the environment variable holding its API key (`nvd: NVD_API_KEY`). Optional:
+    # a source not named here goes keyless; a named variable that is unset is a config error.
+    api_keys: dict[
+        Annotated[str, pydantic.StringConstraints(pattern=r"^[a-z0-9][a-z0-9_-]*$")],
+        Annotated[str, pydantic.StringConstraints(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")],
+    ] = pydantic.Field(default_factory=dict)
+
+    def api_key_values(self) -> dict[str, str]:
+        """Each named source's API key, read from its variable, which must be set and non-empty.
+        Whether the value can travel in a header is ApiKey's check, made when the feeds load and
+        before any registers."""
+        keys = {}
+        for source, name in self.api_keys.items():
+            value = _read_env(name, f"feeds.api_keys.{source}")
+            assert value is not None  # _read_env returns None only for no variable name
+            keys[source] = value
+        return keys
 
 
 class ComplianceConfig(_Model):
@@ -323,25 +347,30 @@ class RecordingConfig(_Model):
         deliberate alias (remediation rides the triage allowlist until contracts grows a
         recording.remediation section) and is legal on triage only — anywhere else it is
         a misbinding whose remediation prerequisite nothing wires."""
-        names: dict[str, RecordKind] = {}
+        # errors name list positions, never the asset: a value pasted into a list stays out.
+        # A repeat within one kind's list is harmless (each allowlist is a set downstream);
+        # only the same asset on two kinds is ambiguous.
+        names: dict[str, tuple[RecordKind, str]] = {}
         for kind in (
             RecordKind.TRIAGE,
             RecordKind.ASSESSMENT,
             RecordKind.VALIDATION,
             RecordKind.VERIFICATION,
         ):
-            for asset in getattr(self, kind.value):
+            for index, asset in enumerate(getattr(self, kind.value)):
+                at = f"recording.{kind.value}[{index}]"
                 if asset == REMEDIATE_FINDING:
                     if kind is not RecordKind.TRIAGE:
                         raise ValueError(
-                            f"recording.{kind.value} lists asset {asset}: the remediation "
-                            "alias belongs to the triage allowlist"
+                            f"{at} is the remediation alias {REMEDIATE_FINDING}, which belongs "
+                            "to the triage allowlist"
                         )
                     continue
-                if (first := names.setdefault(asset, kind)) is not kind:
+                first_kind, first_at = names.setdefault(asset, (kind, at))
+                if first_kind is not kind:
                     raise ValueError(
-                        f"recording.{first.value} and recording.{kind.value} both list asset "
-                        f"{asset}: a recording asset belongs to one report kind"
+                        f"{first_at} and {at} list the same asset: a recording asset belongs "
+                        "to one report kind"
                     )
         return self
 
@@ -450,19 +479,22 @@ class Config(_Model):
     @classmethod
     def from_file(cls, path: Path) -> Config:
         """A traust.yaml, schema-checked; relative locations and overrides resolve beside it."""
+        # traust.yaml names the deployment's secrets: its errors are located by line and worded
+        # by the schema, never echoing what the file holds
+        text, data = load_yaml_config(path, "traust", empty={})
+        provided = frozenset(data)
         try:
-            data = yaml.safe_load(path.read_text()) or {}
-        except (OSError, yaml.YAMLError) as e:
-            raise ConfigError(f"cannot read {path}") from e
-        try:
-            contracts.validate_config("traust", data)
-            provided = frozenset(data)
             locations = Locations.model_validate(
                 {k: v for k, v in data.pop("locations", {}).items() if k in Locations.model_fields}
             )
+        except pydantic.ValidationError as e:
+            error, cause = _redacted(path, text, e, under=("locations",))
+            raise error from cause  # the cause is rebuilt without the input, never `e`
+        try:
             config = cls.model_validate(data)
-        except (DocumentError, pydantic.ValidationError) as e:
-            raise ConfigError(f"{path}: {e}") from e
+        except pydantic.ValidationError as e:
+            error, cause = _redacted(path, text, e)
+            raise error from cause
         home = path.parent
         overrides = {k: (home / v).resolve() for k, v in config.overrides if v is not None}
         loaded = config.model_copy(
@@ -474,3 +506,27 @@ class Config(_Model):
         loaded._provided = provided
         loaded._config_home = home
         return loaded
+
+
+def _redacted(
+    path: Path, text: str, e: pydantic.ValidationError, *, under: tuple[str, ...] = ()
+) -> tuple[ConfigError, pydantic.ValidationError]:
+    """A traust.yaml model error that never echoes the file: located by line, through the
+    schema's own names, with the validators' own messages (code-authored, they say which rule
+    failed). Its cause is rebuilt the same way, with inputs hidden."""
+    names = contracts.config_property_names("traust")
+    root = yaml.compose(text)
+    issues, line_errors = [], []
+    for err in e.errors(include_input=False, include_url=False):
+        line, where = locate(root, (*under, *err["loc"]), names)
+        at = f"line {line}: " if line else ""
+        issues.append(f"{at}{where}: {err['msg']}")
+        detail = {"type": err["type"], "loc": tuple(where.split("/")), "input": None}
+        if "ctx" in err:
+            ctx = dict(err["ctx"])
+            if err["type"] == "value_error":
+                ctx["error"] = ValueError(str(ctx.get("error", "")))
+            detail["ctx"] = ctx
+        line_errors.append(detail)
+    cause = pydantic.ValidationError.from_exception_data(e.title, line_errors, hide_input=True)
+    return ConfigError(f"{path}: {'; '.join(issues)}"), cause

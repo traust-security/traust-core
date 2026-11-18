@@ -6,15 +6,20 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import pytest
+import sqlalchemy as sa
 
 from perf.harness import Explained, Profile
-from perf.seed import TYPICAL_REPOSITORY
+from perf.seed import RUN_ORDERS, TYPICAL_REPOSITORY
 from traust_core.v1.models.common import TimeWindow
 from traust_core.v1.models.operations import (
     FEED_ORDER_STATES,
     FINISHED_ORDER_STATES,
     OPEN_ORDER_STATES,
     LaneName,
+    OrderQueryPosition,
+    OrderQueryRequest,
+    OrderSortBy,
+    OrderSortOrder,
     OrderState,
     SpendDimension,
     SpendFilter,
@@ -40,6 +45,14 @@ def test_claim_takes_the_queue_head_by_index(explained: Profile) -> None:
 def test_claim_of_some_assets_walks_the_queue_head_by_index(explained: Profile) -> None:
     assets = ("feeds_cache", "repo_state", "ledger_audit")
     lease, *_ = explained(lambda uow: uow.run_orders.claim("perf", NOW, LEASE, assets))
+    fast(lease, "idx_ops_run_order_claim", 5)
+
+
+def test_claim_with_mirror_affinity_walks_the_queue_head_by_index(explained: Profile) -> None:
+    assets = ("feeds_cache", "repo_state", "ledger_audit")
+    lease, *_ = explained(
+        lambda uow: uow.run_orders.claim("perf", NOW, LEASE, assets, mirror_affinity=True)
+    )
     fast(lease, "idx_ops_run_order_claim", 5)
 
 
@@ -175,11 +188,21 @@ def test_an_assets_throughput_over_a_month_is_index_only(explained: Profile) -> 
     fast(found, "idx_ops_run_order_asset_state", 50)
 
 
-def test_spend_by_repository_joins_the_month_to_its_orders_by_key(explained: Profile) -> None:
+@pytest.mark.parametrize("attributed", [None, True, False])
+def test_spend_by_repository_joins_the_month_to_its_orders_by_key(
+    explained: Profile, attributed: bool | None
+) -> None:
     (by_repository,) = explained(
-        lambda uow: uow.spend_events.sum_by(SpendFilter(window=MONTH), SpendDimension.REPOSITORY)
+        lambda uow: uow.spend_events.sum_by(
+            SpendFilter(window=MONTH, attributed=attributed), SpendDimension.REPOSITORY
+        )
     )
-    fast(by_repository, "idx_ops_spend_event_occurred", 500)
+    assert by_repository.uses_index("idx_ops_spend_event_occurred"), by_repository.plan
+    # the planner hashes the whole run_order dimension (2M seeded orders) instead of nesting
+    # loops over its key — cheaper by an order of magnitude at this volume. What must never
+    # regress is the spend window's index read and the statement's budget.
+    assert not [s for s in by_repository.seq_scans() if "spend_event" in s], by_repository.plan
+    assert by_repository.execution_ms < 500, by_repository.plan
 
 
 @pytest.mark.parametrize("since", ["a minute ago", "a day ago", "the start"])
@@ -203,3 +226,107 @@ def test_the_last_routed_order_is_read_once_per_start(explained: Profile) -> Non
 def test_lane_costs_read_settled_orders_in_the_window_by_index(explained: Profile) -> None:
     (costs,) = explained(lambda uow: uow.spend_events.order_costs(MONTH.start, MONTH.end))
     assert not costs.seq_scans() and costs.execution_ms < 500, costs.plan
+
+
+@pytest.mark.parametrize("sort_by", [OrderSortBy.CREATED_AT, OrderSortBy.STARTED_AT])
+def test_order_query_substring_search_has_a_bounded_result_and_scan_budget(
+    explained: Profile, sort_by: OrderSortBy
+) -> None:
+    query = OrderQueryRequest(q=TYPICAL_REPOSITORY, sort_by=sort_by, limit=100)
+
+    def read(uow: SqlTraustUnitOfWork) -> object:
+        rows = uow.order_reads.query(query, query.position())
+        assert 0 < len(rows) <= query.limit + 1
+        return rows
+
+    (page,) = explained(read)
+    assert "LIMIT" in page.sql.upper(), page.sql
+    assert any("Limit" in line for line in page.plan), page.plan
+    assert page.execution_ms < 2000, page.plan
+
+
+@pytest.mark.parametrize("sort_order", list(OrderSortOrder))
+@pytest.mark.parametrize("deep", [False, True], ids=["first-page", "deep-page"])
+@pytest.mark.parametrize(
+    ("sort_by", "index"),
+    [
+        (OrderSortBy.CREATED_AT, "idx_ops_run_order_created"),
+        (OrderSortBy.STARTED_AT, "idx_ops_run_order_started"),
+        (OrderSortBy.ID, "run_order_pkey"),
+    ],
+)
+def test_common_empty_search_order_pages_seek_indexes(
+    explained: Profile, sort_by: OrderSortBy, index: str, deep: bool, sort_order: OrderSortOrder
+) -> None:
+    query = OrderQueryRequest(sort_by=sort_by, sort_order=sort_order, limit=100)
+    middle_id = UUID(int=1 << 127)
+    value = (
+        str(middle_id)
+        if sort_by is OrderSortBy.ID
+        else (NOW - timedelta(seconds=RUN_ORDERS * 15 // 2)).isoformat()
+    )
+    position = (
+        OrderQueryPosition(fingerprint=query.fingerprint(), value=value, order_id=middle_id)
+        if deep
+        else None
+    )
+
+    def read(uow: SqlTraustUnitOfWork) -> object:
+        rows = uow.order_reads.query(query, position)
+        assert len(rows) == query.limit + 1
+        return rows
+
+    (page,) = explained(read)
+    fast(page, index, 50)
+    assert "OFFSET" not in page.sql.upper(), page.sql
+    assert not any("Sort" in line for line in page.plan), page.plan
+
+
+@pytest.mark.parametrize("sort_order", list(OrderSortOrder))
+def test_deep_null_started_segment_seeks_its_partial_index(
+    explained: Profile, sort_order: OrderSortOrder
+) -> None:
+    query = OrderQueryRequest(sort_by=OrderSortBy.STARTED_AT, sort_order=sort_order, limit=100)
+    position = OrderQueryPosition(
+        fingerprint=query.fingerprint(), value=None, order_id=UUID(int=1 << 127)
+    )
+
+    def read(uow: SqlTraustUnitOfWork) -> object:
+        rows = uow.order_reads.query(query, position)
+        assert len(rows) == query.limit + 1
+        assert all(value is None for _, _, value in rows)
+        return rows
+
+    (page,) = explained(read)
+    fast(page, "idx_ops_run_order_unstarted", 50)
+    assert not any("Sort" in line for line in page.plan), page.plan
+
+
+def _snapshot_order(engine: sa.Engine, feed: str) -> UUID:
+    with SqlTraustUnitOfWork(engine) as uow:
+        snapshots = uow.feed_snapshots.table
+        return uow.connection.scalar(  # type: ignore[no-any-return]
+            sa.select(snapshots.c.run_order_id).where(snapshots.c.feed == feed).limit(1)
+        )
+
+
+def test_a_run_orders_snapshot_of_a_feed_is_found_by_the_feed_index(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    """The document refresh's late-retry check (`ExposureService._snapshot_documents`)."""
+    order = _snapshot_order(engine, "nvd-documents")
+    assert order is not None  # the seed keeps documents snapshots for run orders
+    (found,) = explained(lambda uow: uow.feed_snapshots.for_run_order("nvd-documents", order))
+    fast(found, "idx_ops_feed_snapshot_feed_retrieved", 5)
+    with SqlTraustUnitOfWork(engine) as uow:
+        snapshot = uow.feed_snapshots.for_run_order("nvd-documents", order)
+    assert snapshot is not None and snapshot.run_order_id == order
+
+
+def test_a_documents_feeds_latest_snapshot_is_found_by_the_feed_index(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    (latest,) = explained(lambda uow: uow.feed_snapshots.latest("nvd-documents"))
+    fast(latest, "idx_ops_feed_snapshot_feed_retrieved", 5)
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.feed_snapshots.latest("nvd-documents") is not None

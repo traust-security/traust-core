@@ -72,17 +72,25 @@ def test_atomic_artifact_retry_reads_the_winner_by_digest(
         row = unit.artifacts.get(existing)
     write, read = explained(
         lambda unit: unit.artifacts.get_or_add(
-            Artifact(digest=row.digest, kind=row.kind, uri=row.uri)
+            Artifact(
+                digest=row.digest,
+                kind=row.kind,
+                uri=row.uri,
+            )
         )
     )
-    assert not write.seq_scans(), write.plan
-    assert write.execution_ms < 5, write.plan
+    fast(write, "idx_artifact_imported_kind", 5)
     fast(read, "uq_artifact_imported", 5)
 
 
 def test_latest_imported_document_of_a_kind_uses_the_kind_index(explained: Profile) -> None:
     (latest,) = explained(lambda unit: unit.artifacts.latest_imported("code-facts"))
     fast(latest, "idx_artifact_imported_kind", 5)
+
+
+def test_imported_history_uses_the_time_ordered_kind_index(explained: Profile) -> None:
+    (history,) = explained(lambda unit: unit.artifacts.list_imported("code-facts", limit=100))
+    fast(history, "idx_artifact_imported_kind", 5)
 
 
 def test_batch_review_evidence_reads_all_companions_by_assessment_index(

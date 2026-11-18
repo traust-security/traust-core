@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Collection
+from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
-from traust_core.v1.errors import ConflictError, NotFoundError
+import sqlalchemy as sa
+
+from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
 from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.models.findings import Finding
 from traust_core.v1.repositories.tables import (
@@ -40,15 +43,45 @@ class FindingRepository(MutableRecordRepository[Finding], Protocol):
 
     def list_for_repository(self, repository_id: UUID) -> list[Finding]: ...
     def list_for_repositories(self, repository_ids: Collection[UUID]) -> list[Finding]: ...
+    def census_for_repositories(
+        self, repository_ids: Collection[UUID]
+    ) -> list[tuple[UUID, UUID, str | None, str, datetime]]:
+        """(id, repository_id, kind, title, created_at) per finding of the repositories,
+        newest first in bounded batches: the census counts states, severities and labels
+        without materializing a model per row, in the order the views' own fold counts."""
+        ...
+
+    def census_counts_for_repositories(
+        self, repository_ids: Collection[UUID]
+    ) -> list[tuple[UUID, int]]:
+        """How many findings each repository holds, one narrow count row per repository:
+        what bounds a census batch by findings, never by repository count alone."""
+        ...
+
+    def page_for_repositories(
+        self,
+        repository_ids: Collection[UUID],
+        limit: int,
+        after: tuple[datetime, UUID] | None = None,
+    ) -> list[Finding]: ...
     def list_for_advisory(self, advisory_id: UUID) -> list[Finding]: ...
     def list_by_ids(
         self, finding_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
     ) -> list[Finding]: ...
+    def linked_advisory_ids(self) -> list[UUID]:
+        """Every advisory some finding names, once each."""
+        ...
 
 
 class SqlFindingRepository(SqlMutableRepository[Finding]):
     spec = FINDING
     record = Finding
+
+    def update(self, record: Finding) -> Finding:
+        record = self._to_record(record)
+        if record.id is not None and self.get(record.id).repository_id != record.repository_id:
+            raise ValidationError("a finding's repository identity cannot change")
+        return super().update(record)
 
     def get_for_update(self, finding_id: UUID) -> Finding:
         stmt = self._select().where(self.table.c.id == finding_id).with_for_update()
@@ -79,6 +112,58 @@ class SqlFindingRepository(SqlMutableRepository[Finding]):
     def list_for_repositories(self, repository_ids: Collection[UUID]) -> list[Finding]:
         return self._many_in("list for repositories", self.table.c.repository_id, repository_ids)
 
+    def census_for_repositories(
+        self, repository_ids: Collection[UUID]
+    ) -> list[tuple[UUID, UUID, str | None, str, datetime]]:
+        """(id, repository_id, kind, title, created_at) per finding of the repositories,
+        newest first in bounded batches: the census counts states, severities and labels
+        without materializing a model per row, in the order the views' own fold counts."""
+        c = self.table.c
+        found: list[tuple[UUID, UUID, str | None, str, datetime]] = []
+        for batch in self._batches(repository_ids):
+            stmt = (
+                sa.select(c.id, c.repository_id, c.kind, c.title, c.created_at)
+                .where(c.repository_id.in_(batch))
+                .order_by(c.created_at.desc(), c.id.desc())
+            )
+            rows = self._execute(f"census for {len(batch)} repositories", stmt)
+            found.extend((row[0], row[1], row[2], row[3], row[4]) for row in rows)
+        return found
+
+    def census_counts_for_repositories(
+        self, repository_ids: Collection[UUID]
+    ) -> list[tuple[UUID, int]]:
+        """How many findings each repository holds, one narrow count row per repository:
+        what bounds a census batch by findings, never by repository count alone."""
+        c = self.table.c
+        found: list[tuple[UUID, int]] = []
+        for batch in self._batches(repository_ids):
+            stmt = (
+                sa.select(c.repository_id, sa.func.count())
+                .where(c.repository_id.in_(batch))
+                .group_by(c.repository_id)
+            )
+            rows = self._execute(f"census counts for {len(batch)} repositories", stmt)
+            found.extend((row[0], row[1]) for row in rows)
+        return found
+
+    def page_for_repositories(
+        self,
+        repository_ids: Collection[UUID],
+        limit: int,
+        after: tuple[datetime, UUID] | None = None,
+    ) -> list[Finding]:
+        """The repositories' findings newest first, keyset-paged across the whole set: one
+        indexed query over a page's worth of repositories (the `repository_ids` batch shape
+        `OrderFilter` set), not one walk per repository. An empty set pages over nothing."""
+        wanted = list(dict.fromkeys(repository_ids))
+        return self._page(
+            f"page for {len(wanted)} repositories",
+            self.table.c.repository_id.in_(wanted),
+            limit=limit,
+            after=after,
+        )
+
     def list_for_advisory(self, advisory_id: UUID) -> list[Finding]:
         return self._many(
             f"list for advisory {advisory_id}", self.table.c.advisory_id == advisory_id
@@ -88,3 +173,8 @@ class SqlFindingRepository(SqlMutableRepository[Finding]):
         self, finding_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
     ) -> list[Finding]:
         return self._many_in("list by id", self.table.c.id, finding_ids, read_budget=read_budget)
+
+    def linked_advisory_ids(self) -> list[UUID]:
+        c = self.table.c
+        stmt = sa.select(c.advisory_id).where(c.advisory_id.is_not(None)).distinct()
+        return sorted(UUID(str(r)) for r in self._execute("linked advisories", stmt).scalars())

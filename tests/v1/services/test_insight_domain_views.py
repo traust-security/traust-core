@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -15,9 +16,15 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.services.test_insight import FakePortfolio
 from traust_core.v1.context import Config, Context
-from traust_core.v1.errors import ValidationError
-from traust_core.v1.models.assessment import Coverage, CoverageGap, Population, PopulationRow
-from traust_core.v1.models.compliance import ComplianceDimension, ComplianceRollup
+from traust_core.v1.errors import DocumentError, ValidationError
+from traust_core.v1.models.assessment import (
+    Coverage,
+    CoverageGap,
+    GapSignal,
+    Population,
+    PopulationRow,
+)
+from traust_core.v1.models.compliance import COVERAGE_KEYS, ComplianceDimension, ComplianceRollup
 from traust_core.v1.models.dependencies import ExposureDimension, ExposureFilter, ExposureRollup
 from traust_core.v1.models.insight import ViewFilter, ViewName
 from traust_core.v1.models.pqc import PqcDimension, PqcRollup
@@ -41,14 +48,25 @@ class FakeExposure:
     asked: list[ExposureDimension] = field(default_factory=list)
 
     def summary(self, filter: Any, group_by: ExposureDimension) -> list[ExposureRollup]:
+        # rows as Core counts them: verdict counts summing to the commits, verdict rows keyed
+        # by a verdict, and only product rows unkeyed (commits no product ships)
         self.asked.append(group_by)
-        none: dict[Any, int] = {}
-        return [
-            ExposureRollup(
-                key=f"{group_by}-a", commits=3, exposed=2, affected=1, by_classification=none
-            ),
-            ExposureRollup(key=None, commits=1, exposed=0, affected=0, by_classification=none),
+        three = {"affected": 1, "likely_affected": 1, "not_imported": 1}
+        keyed = "affected" if group_by == ExposureDimension.CLASSIFICATION else f"{group_by}-a"
+        rows = [
+            ExposureRollup(key=keyed, commits=3, exposed=2, affected=1, by_classification=three)
         ]
+        if group_by == ExposureDimension.PRODUCT:
+            rows.append(
+                ExposureRollup(
+                    key=None,
+                    commits=1,
+                    exposed=0,
+                    affected=0,
+                    by_classification={"not_observed": 1},
+                )
+            )
+        return rows
 
 
 def test_exposure_groups_by_advisory_product_and_verdict() -> None:
@@ -70,8 +88,10 @@ class FakePqc:
 
     def summary(self, filter: Any, group_by: PqcDimension) -> list[PqcRollup]:
         self.asked.append((filter.product_id, group_by))
+        # keys as Core groups them: a readiness bucket, a dominant provenance
+        key = "partial" if group_by == PqcDimension.BUCKET else "delegated-dependency"
         return [
-            PqcRollup(key=str(group_by), repositories=2, mean_overall=61.5, clock_2030=1,
+            PqcRollup(key=key, repositories=2, mean_overall=61.5, clock_2030=1,
                       hndl_priority=0, blocked=1)
         ]  # fmt: skip
 
@@ -83,21 +103,78 @@ def test_pqc_rolls_up_each_named_product_else_every_commit(products: tuple[UUID,
     expected = list(products) or [None]
     assert [s.product_id for s in model.scopes] == expected
     assert pqc.asked == [(p, d) for p in expected for d in PqcDimension]
-    assert "| bucket | 2 | 61.5 | 1 | 0 | 1 |" in md(PqcView(FakePqc()))  # type: ignore[arg-type]
+    assert "| partial | 2 | 61.5 | 1 | 0 | 1 |" in md(PqcView(FakePqc()))  # type: ignore[arg-type]
 
 
 @dataclass
 class FakeCompliance:
+    """Rows as Core counts them: a registered framework, the assessment's full coverage block,
+    and a framework row keyed by its framework."""
+
     def summary(self, filter: Any, group_by: ComplianceDimension) -> list[ComplianceRollup]:
-        coverage = {"nist-800-53": {"pass": 4, "fail": 1}}
-        return [ComplianceRollup(key=str(group_by), pairs=2, assessed=1, coverage=coverage)]
+        counts = dict.fromkeys(COVERAGE_KEYS, 0) | {"satisfied": 4, "not_satisfied": 1}
+        key = "nist-800-53-rev5" if group_by == ComplianceDimension.FRAMEWORK else "tenant-plane"
+        coverage = {"nist-800-53-rev5": counts}
+        return [ComplianceRollup(key=key, pairs=2, assessed=1, coverage=coverage)]
 
 
 def test_compliance_posture_per_framework_and_boundary() -> None:
     model = ComplianceDashboardView(FakeCompliance()).build(ViewFilter())  # type: ignore[arg-type]
-    assert [r.key for r in (*model.by_framework, *model.by_scope)] == ["framework", "scope"]
+    assert [r.key for r in (*model.by_framework, *model.by_scope)] == [
+        "nist-800-53-rev5",
+        "tenant-plane",
+    ]
     text = md(ComplianceDashboardView(FakeCompliance()))  # type: ignore[arg-type]
-    assert "| framework | 2 | 1 | nist-800-53: fail 1, pass 4 |" in text
+    assert "| tenant-plane | 2 | 1 | nist-800-53-rev5: " in text
+    assert "not_satisfied 1" in text and "satisfied 4" in text
+
+
+def test_a_boundary_declared_with_an_empty_name_builds() -> None:
+    # the compliance-scope contract lets a declaration name a boundary "", and the
+    # summary keys its row by that name: the view's contract accepts it
+    class Unnamed(FakeCompliance):
+        def summary(self, filter: Any, group_by: ComplianceDimension) -> list[ComplianceRollup]:
+            rows = super().summary(filter, group_by)
+            if group_by == ComplianceDimension.SCOPE:
+                return [r.model_copy(update={"key": ""}) for r in rows]
+            return rows
+
+    model = ComplianceDashboardView(Unnamed()).build(ViewFilter())  # type: ignore[arg-type]
+    assert [r.key for r in model.by_scope] == [""]
+
+
+def test_the_compliance_view_refuses_an_as_of() -> None:
+    view = ComplianceDashboardView(FakeCompliance())  # type: ignore[arg-type]
+    with pytest.raises(ValidationError, match="no as_of"):
+        view.build(ViewFilter(as_of=T0))
+
+
+def test_a_compliance_view_outside_its_contract_is_refused_by_the_build() -> None:
+    class Drifted(FakeCompliance):
+        def summary(self, filter: Any, group_by: ComplianceDimension) -> list[ComplianceRollup]:
+            return [r.model_copy(update={"pairs": 0}) for r in super().summary(filter, group_by)]
+
+    with pytest.raises(DocumentError) as error:
+        ComplianceDashboardView(Drifted()).build(ViewFilter())  # type: ignore[arg-type]
+    assert "by_framework/0/pairs" in {issue.path for issue in error.value.issues}
+
+
+def test_the_pqc_view_refuses_an_as_of() -> None:
+    with pytest.raises(ValidationError, match="no as_of"):
+        PqcView(FakePqc()).build(ViewFilter(as_of=T0))  # type: ignore[arg-type]
+
+
+def test_a_pqc_view_outside_its_contract_is_refused_by_the_build() -> None:
+    class Drifted(FakePqc):
+        def summary(self, filter: Any, group_by: PqcDimension) -> list[PqcRollup]:
+            return [
+                r.model_copy(update={"mean_overall": 101.0})
+                for r in super().summary(filter, group_by)
+            ]
+
+    with pytest.raises(DocumentError) as error:
+        PqcView(Drifted()).build(ViewFilter())  # type: ignore[arg-type]
+    assert "scopes/0/by_bucket/0/mean_overall" in {issue.path for issue in error.value.issues}
 
 
 @pytest.mark.parametrize(
@@ -118,6 +195,7 @@ def test_views_refuse_a_scope_their_domain_cannot_cut(
 @dataclass
 class FakeAssessment:
     asked: list[tuple[Any, list[UUID]]] = field(default_factory=list)
+    signals: dict[GapSignal, int] = field(default_factory=lambda: {GapSignal.STRUCTURED: 1})
 
     def population(self, as_of: Any, filter: Any, repository_ids: Any) -> Population:
         self.asked.append((as_of, list(repository_ids)))
@@ -129,7 +207,13 @@ class FakeAssessment:
         )
 
     def coverage(self, filter: Any, repository_ids: Any) -> Coverage:
-        gap = CoverageGap(tool="opengrep", system="kotlin", repositories=1, signals={})
+        gap = CoverageGap(
+            tool="opengrep",
+            system="kotlin",
+            repositories=1,
+            signals=self.signals,
+            example_repository_ids=(repository_ids[0],),
+        )
         return Coverage(examined=1, total=2, gaps=(gap,))
 
 
@@ -146,8 +230,17 @@ def test_coverage_counts_the_scope_as_of_its_point_in_time() -> None:
     view.build(ViewFilter(as_of=T0.replace(year=2025)))
     assert assessment.asked[-1][0].year == 2025
     text = md(view)
-    assert "2 never assessed" in text and "| opengrep | kotlin | 1 | - |" in text
+    assert "2 never assessed" in text and "| opengrep | kotlin | 1 | — |" in text
     assert "_Nothing assessed._" in text
+
+
+def test_a_coverage_view_outside_its_contract_is_refused_by_the_build() -> None:
+    a = uuid4()
+    portfolio = FakePortfolio(repositories={a: "https://forge.example/o/a"})
+    view = CoverageView(FakeAssessment(signals={}), portfolio, FixedClock(T0))  # type: ignore[arg-type]
+    with pytest.raises(DocumentError) as error:
+        view.build(ViewFilter())
+    assert "gaps/gaps/0/signals" in {issue.path for issue in error.value.issues}
 
 
 @pytest.fixture(params=SQL_BACKENDS)
@@ -180,3 +273,33 @@ def test_exposure_reads_the_analyses_as_of_the_views_point_in_time() -> None:
 
     ExposureView(AsOf()).build(ViewFilter(as_of=T0))  # type: ignore[arg-type]
     assert seen and {f.as_of for f in seen} == {T0}
+
+
+def test_an_exposure_view_outside_its_contract_is_refused_by_the_build() -> None:
+    class Drifted(FakeExposure):
+        def summary(
+            self, filter: ExposureFilter, group_by: ExposureDimension
+        ) -> list[ExposureRollup]:
+            rows = super().summary(filter, group_by)
+            return [rows[0].model_copy(update={"commits": 0}), *rows[1:]]
+
+    with pytest.raises(DocumentError) as error:
+        ExposureView(Drifted()).build(ViewFilter())  # type: ignore[arg-type]
+    assert "by_advisory/0/commits" in {issue.path for issue in error.value.issues}
+
+
+def test_the_exposure_view_carries_the_moment_it_read_at() -> None:
+    seen: list[ExposureFilter] = []
+
+    class Seen(FakeExposure):
+        def summary(
+            self, filter: ExposureFilter, group_by: ExposureDimension
+        ) -> list[ExposureRollup]:
+            seen.append(filter)
+            return super().summary(filter, group_by)
+
+    now = ExposureView(Seen(), FixedClock(T0)).build(ViewFilter())  # type: ignore[arg-type]
+    assert now.as_of == T0 and {f.as_of for f in seen} == {T0}
+    pinned = T0 - timedelta(days=1)
+    past = ExposureView(Seen(), FixedClock(T0)).build(ViewFilter(as_of=pinned))  # type: ignore[arg-type]
+    assert past.as_of == pinned

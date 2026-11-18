@@ -7,7 +7,14 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
-from pydantic import ConfigDict, Field, SerializeAsAny, computed_field
+from pydantic import (
+    AwareDatetime,
+    ConfigDict,
+    Field,
+    SerializeAsAny,
+    computed_field,
+    field_serializer,
+)
 
 from traust_core.v1.models.assessment import (
     AttackScenario,
@@ -41,6 +48,7 @@ from traust_core.v1.models.pqc import (
     PqcWorklistEntry,
 )
 from traust_core.v1.models.validation import ValidationRollup
+from traust_core.v1.models.values import canonical_decimal
 from traust_core.v1.models.vocabulary import (
     ComplianceFramework,
     IsolationDimension,
@@ -117,6 +125,23 @@ class CompliancePrecision(ViewModel):
     calibration: ComplianceCalibration
 
 
+class ReportFormat(StrEnum):
+    """A rendered report's format: markdown and html for every insight, csv for one with an
+    export table. Each format carries its media type and file suffix."""
+
+    MARKDOWN = "markdown"
+    HTML = "html"
+    CSV = "csv"
+
+    @property
+    def media_type(self) -> str:
+        return {"markdown": "text/markdown", "html": "text/html", "csv": "text/csv"}[self.value]
+
+    @property
+    def suffix(self) -> str:
+        return {"markdown": "md", "html": "html", "csv": "csv"}[self.value]
+
+
 class ExecutivePanel(StrEnum):
     ATTACK = "attack"
     PQC = "pqc"
@@ -133,7 +158,7 @@ class ViewFilter(Model):
     # category-label values (free text until the weakness classification lands); when set,
     # findings without one of these categories are out of scope
     categories: tuple[str, ...] = ()
-    as_of: datetime | None = None
+    as_of: AwareDatetime | None = None
     window: TimeWindow | None = None
     bucket: TimeBucket = TimeBucket.MONTH
     artifact_id: UUID | None = None
@@ -141,7 +166,7 @@ class ViewFilter(Model):
     executive_panels: tuple[ExecutivePanel, ...] = ()
     assessment_id: UUID | None = None
     report_stem: str | None = None
-    compare_as_of: datetime | None = None
+    compare_as_of: AwareDatetime | None = None
     first_party_divisor: Decimal | None = Field(default=None, gt=0, allow_inf_nan=False)
     repository_ref_ids: tuple[UUID, ...] | None = None
     pqc_chokepoints: tuple[str, ...] = ()
@@ -207,6 +232,10 @@ class TopFinding(Model):
     cvss_score: Decimal | None = None
     execution_proven: bool = False
     sla_due: datetime | None = None
+
+    @field_serializer("cvss_score", when_used="json")
+    def _cvss(self, value: Decimal | None) -> str | None:
+        return canonical_decimal(value)
 
 
 class ContainerReport(Model):
@@ -318,11 +347,15 @@ class AcceptedRisk(Model):
     finding_id: UUID
     repository_url: str
     title: str
-    severity: Severity
+    severity: Severity | None  # None: unrated
     cvss_score: Decimal | None = None
     accepted_at: datetime | None = None
     accepted_by: str | None = None
     rationale: str | None = None
+
+    @field_serializer("cvss_score", when_used="json")
+    def _cvss(self, value: Decimal | None) -> str | None:
+        return canonical_decimal(value)
 
 
 class FindingsTrend(ViewModel):
@@ -455,8 +488,10 @@ class PqcVendorRoadmap(ViewModel):
 
 
 class ExposureDashboard(ViewModel):
-    """Dependency exposure from the latest impact analyses, by advisory, product and verdict."""
+    """Dependency exposure from the latest impact analyses as of `as_of`, by advisory, product
+    and verdict."""
 
+    as_of: datetime
     by_advisory: tuple[ExposureRollup, ...] = ()
     by_product: tuple[ExposureRollup, ...] = ()
     by_classification: tuple[ExposureRollup, ...] = ()
@@ -496,6 +531,7 @@ class PrivilegeRow(Model):
     rbac_rules: int
     wildcard_rules: int | None = None
     scc_requests: tuple[str, ...] = ()
+    no_scc_request_recorded: bool | None = None
     flags: Mapping[str, int] = Field(default_factory=dict)
     containers: int | None = None
     privileged_containers: int | None = None
@@ -983,6 +1019,19 @@ class SlaDashboard(ViewModel):
     profiles: tuple[SlaProfileView, ...]
 
 
+class RenderedReport(Model):
+    """A view built and rendered in one format, on demand; nothing is stored."""
+
+    view: ViewName
+    format: ReportFormat
+    stem: str
+    body: str
+
+    @property
+    def filename(self) -> str:
+        return f"{self.stem}.{self.format.suffix}"
+
+
 class RenderedView(Model):
     """A view built and rendered; nothing is stored, the caller writes `<stem>.md/.html/.json`."""
 
@@ -999,3 +1048,21 @@ class RefreshResult(Model):
 
     rendered: Mapping[ViewName, RenderedView] = Field(default_factory=dict)
     failed: Mapping[ViewName, str] = Field(default_factory=dict)
+
+
+class InsightBuilds(Model):
+    """One stored build of the census views: the GLOBAL census as the dashboards cadence last
+    folded it. One build serves every scope; the caller's authorization filters it. The
+    publication row is the build's moment; folded_after is the person-judgement watermark the
+    fold read before it started."""
+
+    folded_after: datetime | None
+    views: Mapping[ViewName, SerializeAsAny[ViewModel]] = Field(default_factory=dict)
+
+
+class ServedInsight(Model):
+    """One insight as served: its model, and when the stored census it came from was built
+    (None: folded on demand for this request)."""
+
+    model: SerializeAsAny[ViewModel]
+    built_at: datetime | None = None

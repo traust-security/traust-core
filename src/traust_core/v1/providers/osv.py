@@ -4,14 +4,14 @@ ids touching package versions (querybatch)."""
 from __future__ import annotations
 
 import json
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from traust_core.v1.errors import ServiceError, ValidationError
+from traust_core.v1.errors import ConfigError, ServiceError, ValidationError
 from traust_core.v1.models.dependencies import (
     AdvisoryHits,
     AdvisoryIdentifier,
@@ -21,9 +21,12 @@ from traust_core.v1.models.dependencies import (
     Package,
     PackageVersion,
     Version,
+    is_advisory_identifier,
     malicious_id,
     package_name,
+    parse_advisory_identifier,
 )
+from traust_core.v1.models.values import GitSha
 from traust_core.v1.models.vocabulary import Ecosystem
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
@@ -62,6 +65,7 @@ _MALWARE = ("malware", "malicious")
 class OsvAdvisoryLookup:
     name = "osv"
     ecosystems = frozenset(OSV_NAMES)
+    supports_commit_queries = True
 
     def __init__(
         self,
@@ -93,6 +97,73 @@ class OsvAdvisoryLookup:
                 return Result(None, acquisition)
             raise
         return Result(parse_osv(raw, url), acquisition)
+
+    def related(self, record: AdvisoryRecord) -> Result[tuple[AdvisoryRecord, ...]]:
+        pending = list(record.aliases)
+        seen = {record.identifier.upper()}
+        known = {record.identifier.upper(): record}
+        records = []
+        for identifier in pending:
+            if identifier.upper() in seen or not is_advisory_identifier(identifier):
+                continue
+            seen.add(identifier.upper())
+            found = self.record(identifier).data
+            if found is None:
+                continue
+            if identifier.upper() not in {
+                name.upper() for name in (found.identifier, *found.aliases)
+            }:
+                raise ValidationError(
+                    f"{found.source}: returned an unrelated advisory for {identifier}"
+                )
+            prior = known.get(found.identifier.upper())
+            if prior is not None:
+                excluded = {"source", "advisory_id"}
+                if prior.model_dump(exclude=excluded) != found.model_dump(exclude=excluded):
+                    raise ValidationError(
+                        f"{prior.source} and {found.source}: "
+                        f"conflicting records for {found.identifier}"
+                    )
+                continue
+            known[found.identifier.upper()] = found
+            records.append(found)
+            pending.extend(found.aliases)
+        acquisition = Acquisition(
+            provider=self.name, acquired_at=self._clock.now(), source=record.source
+        )
+        return Result(tuple(records), acquisition)
+
+    def for_commit(self, commit: GitSha) -> Result[tuple[AdvisoryRecord, ...]]:
+        url = f"{self._base}/query"
+        acquisition = Acquisition(provider=self.name, acquired_at=self._clock.now(), source=url)
+        body: dict[str, Any] = {"commit": str(commit)}
+        tokens: set[str] = set()
+        records: dict[str, AdvisoryRecord] = {}
+        documents: dict[str, Mapping[str, Any]] = {}
+        while True:
+            answer = _answer(self._http.post_json(url, body))
+            vulns = answer.get("vulns", [])
+            if not isinstance(vulns, list):
+                raise ValidationError(f"{url}: commit query vulns is not an advisory list")
+            for document in vulns:
+                if not isinstance(document, dict) or not isinstance(document.get("id"), str):
+                    raise ValidationError(f"{url}: commit query returned a non-record advisory")
+                identifier = parse_advisory_identifier(document["id"])
+                prior = documents.get(identifier)
+                if prior is not None and prior != document:
+                    raise ValidationError(f"{url}: conflicting commit records for {identifier}")
+                documents[identifier] = document
+                records[identifier] = parse_osv(json.dumps(document).encode(), url)
+            if "next_page_token" not in answer:
+                break
+            token = answer["next_page_token"]
+            if not isinstance(token, str) or token in tokens:
+                raise ValidationError(f"{url}: invalid or repeated commit query page token")
+            if not token:
+                break
+            tokens.add(token)
+            body = {"commit": str(commit), "page_token": token}
+        return Result(tuple(records.values()), acquisition)
 
     def affecting(self, queries: Sequence[PackageVersion]) -> Result[AdvisoryHits]:
         """Batches of 800, every page followed. A batch that fails counts its queries by status;
@@ -167,17 +238,32 @@ class ExportedAdvisoryLookup:
 
     name = "osv-export"
     ecosystems = frozenset(OSV_NAMES)
+    supports_commit_queries = False
 
     def __init__(self, paths: Sequence[Path], *, clock: Clock) -> None:
         self._clock = clock
         self._records: list[AdvisoryRecord] = []
+        # identifier/alias (uppercased) -> the records naming it: one index built at load,
+        # so alias-closure expansion visits each record once instead of rescanning the corpus.
+        self._by_name: defaultdict[str, list[AdvisoryRecord]] = defaultdict(list)
+        documents: dict[str, tuple[Mapping[str, Any], str]] = {}
         for path in paths:
             uri = Path(path).resolve().as_uri()
             try:
                 raw = Path(path).read_bytes()
             except OSError as e:
                 raise ValidationError(f"{uri}: unreadable advisory record: {e}") from e
-            self._records.append(parse_osv(raw, uri))
+            record = parse_osv(raw, uri)
+            document = _answer(raw)
+            prior = documents.get(record.identifier.upper())
+            if prior is not None and prior[0] != document:
+                raise ValidationError(
+                    f"{record.identifier}: conflicting exported records {prior[1]} and {uri}"
+                )
+            documents[record.identifier.upper()] = (document, uri)
+            self._records.append(record)
+            for name in (record.identifier, *record.aliases):
+                self._by_name[str(name).upper()].append(record)
 
     def check(self) -> Readiness:
         return Readiness(ready=bool(self._records), detail="" if self._records else "no records")
@@ -192,12 +278,35 @@ class ExportedAdvisoryLookup:
         acquisition = Acquisition(provider=self.name, acquired_at=self._clock.now(), source=source)
         return Result(found, acquisition)
 
+    def related(self, record: AdvisoryRecord) -> Result[tuple[AdvisoryRecord, ...]]:
+        selected: list[AdvisoryRecord] = []
+        seen: set[str] = set()
+        pending = [str(name).upper() for name in (record.identifier, *record.aliases)]
+        while pending:
+            names = set(pending)
+            pending = []
+            for name in names - seen:
+                seen.add(name)
+                for candidate in self._by_name[name]:
+                    if candidate is record or candidate in selected:
+                        continue
+                    selected.append(candidate)
+                    pending.extend(
+                        str(alias).upper() for alias in (candidate.identifier, *candidate.aliases)
+                    )
+        return Result(tuple(selected), self._acquired())
+
+    def for_commit(self, commit: GitSha) -> Result[tuple[AdvisoryRecord, ...]]:
+        raise ConfigError("exported OSV records do not contain commit-query results")
+
     def affecting(self, queries: Sequence[PackageVersion]) -> Result[AdvisoryHits]:
         ids = tuple(
             tuple(
-                r.identifier
-                for r in self._records
-                if (hit := self._named(r, q.package)) and hit.affects(q.version)
+                dict.fromkeys(
+                    r.identifier
+                    for r in self._records
+                    if (hit := self._named(r, q.package)) and hit.affects(q.version)
+                )
             )
             for q in queries
         )
@@ -205,7 +314,8 @@ class ExportedAdvisoryLookup:
 
     def naming(self, packages: Sequence[Package]) -> Result[AdvisoryHits]:
         ids = tuple(
-            tuple(r.identifier for r in self._records if self._named(r, p)) for p in packages
+            tuple(dict.fromkeys(r.identifier for r in self._records if self._named(r, p)))
+            for p in packages
         )
         return Result(AdvisoryHits(ids=ids), self._acquired())
 
@@ -368,4 +478,11 @@ def _spans(rng: Mapping[str, Any]) -> Iterator[AffectedSpan]:
 
 
 def _timestamp(raw: object) -> datetime | None:
-    return datetime.fromisoformat(str(raw).replace("Z", "+00:00")) if raw else None
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError("OSV publication must be an offset-aware timestamp")
+    parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    if parsed.utcoffset() is None:
+        raise ValueError("OSV publication must be an offset-aware timestamp")
+    return parsed

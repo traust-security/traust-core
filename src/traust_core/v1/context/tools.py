@@ -10,9 +10,9 @@ from uuid import UUID
 import pydantic
 import yaml
 
-from traust_core.v1 import contracts
 from traust_core.v1.context.config import Locations
-from traust_core.v1.errors import ConfigError, DocumentError, ValidationError
+from traust_core.v1.context.redaction import load_yaml_config
+from traust_core.v1.errors import ConfigError, ValidationError
 from traust_core.v1.models.artifacts import AdapterResultArtifact
 from traust_core.v1.models.common import ToolTarget
 from traust_core.v1.models.compliance import DocsTarget
@@ -315,12 +315,8 @@ def load_detection_quality(
 
 
 def _config(path: Path, schema: str) -> Any:
-    try:
-        document = yaml.safe_load(path.read_text())
-        contracts.validate_config(schema, document)
-    except (OSError, yaml.YAMLError, DocumentError) as e:
-        raise ConfigError(f"{path}: {e}") from e
-    return document
+    """A rule-pack or tool config: its errors are located by line, never echoing the file."""
+    return load_yaml_config(path, schema)[1]
 
 
 def load_rule_allowlist(spec: str | None) -> opengrep.RuleAllowlist | None:

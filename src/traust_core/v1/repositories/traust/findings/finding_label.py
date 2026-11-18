@@ -27,6 +27,7 @@ class FindingLabelRepository(MutableRecordRepository[FindingLabel], Protocol):
     def list_for_findings(
         self, finding_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
     ) -> list[FindingLabel]: ...
+
     def list_with(self, taxonomy: str, label: str) -> list[FindingLabel]: ...
 
 
@@ -44,8 +45,15 @@ class SqlFindingLabelRepository(SqlMutableRepository[FindingLabel]):
     def list_for_findings(
         self, finding_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
     ) -> list[FindingLabel]:
-        return self._many(
-            f"list for {len(finding_ids)} findings",
-            self.table.c.finding_id.in_(finding_ids),
-            read_budget=read_budget,
-        )
+        """Labels on these findings, read in bounded batches so a whole scope's ids cannot
+        exceed the bind limit."""
+        c = self.table.c
+        return [
+            label
+            for batch in self._batches(finding_ids)
+            for label in self._many(
+                f"list for {len(finding_ids)} findings",
+                c.finding_id.in_(batch),
+                read_budget=read_budget,
+            )
+        ]

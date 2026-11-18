@@ -197,6 +197,26 @@ def test_the_roadmap_needs_recorded_claims_and_is_fleet_wide_now(world: World) -
         view.build(ViewFilter(as_of=T0))
 
 
+def test_a_roadmap_outside_its_contract_is_refused_by_the_build(world: World) -> None:
+    world.pqc.record_claims(claims(), PROVENANCE)
+
+    class Drifted:
+        """The recorded claims with a reviewer the contract refuses (unvalidated copies)."""
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(world.pqc, name)
+
+        def vendor_claims(self) -> Any:
+            latest = world.pqc.vendor_claims()
+            vendors = [v.model_copy(update={"reviewer": ""}) for v in latest.vendors]
+            return latest.model_copy(update={"vendors": tuple(vendors)})
+
+    view = PqcVendorsView(Drifted(), world.exposure, world.portfolio)  # type: ignore[arg-type]
+    with pytest.raises(DocumentError) as error:
+        view.build(ViewFilter())
+    assert "vendors/0/claim/reviewer" in {issue.path for issue in error.value.issues}
+
+
 def test_context_records_claims_and_serves_the_view(tmp_path: Path) -> None:
     services = Context(Config(home=tmp_path)).services()
     services.pqc.record_claims(claims(), PROVENANCE)

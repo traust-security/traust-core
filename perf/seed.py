@@ -1,7 +1,10 @@
 """A Postgres contracts database seeded at production volume, built once and reused.
 
 The database name carries a digest of the DDL and this seed, so a schema or seed change
-rebuilds it and an unchanged one is reused across runs.
+rebuilds it and an unchanged one is reused across runs. PERF_SCALE multiplies the fleet
+totals (2 runs the estate at twice the repositories, orders, decisions and findings);
+per-entity shape — a repository's revisions, a release's components, a year's weeks — keeps
+its production shape at any scale, and each scale gets its own database.
 """
 
 from __future__ import annotations
@@ -9,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import os
 from itertools import groupby
 
 import sqlalchemy as sa
@@ -21,8 +25,8 @@ from traust_ledger.integrity import (
 )
 
 from traust_core.v1 import contracts
-from traust_core.v1.repositories import apply_schema, create_database_engine
-from traust_core.v1.repositories.sql import Dialect
+from traust_core.v1.repositories import apply_schema, create_database_engine, on_driver_connection
+from traust_core.v1.repositories.sql import Dialect, contract_dialect
 
 # 1% of leases have lapsed; the rest never expire, so a reused database keeps that shape.
 # Past a year of continuous ops on a ~10k-repository estate; retention prunes finished orders
@@ -53,11 +57,45 @@ FINDINGS_PER_ASSESSMENT = 10
 ARTIFACTS_PER_ASSESSMENT = 10
 PACKAGES = 100_000
 ADVISORIES = 50_000
+ADVISORY_BACKED_EVERY = 5
+# A year of daily snapshots per feed: the whole-file feeds and the per-source document manifests
+# (`<source>-documents`), each for a run order. Per-feed shape: it doesn't scale with the estate.
+# Like every seeded artifact, their artifacts are rows with no bytes behind them: perf measures
+# query plans, never payload reads (no case reads a feed's bytes).
+FEEDS = ("epss", "kev", "rh-cve", "vex", "cve-list-documents", "nvd-documents",
+         "ghsa-documents", "rh-cve-documents")  # fmt: skip
+SNAPSHOT_DAYS = 365
 SBOMS = 20_000
 DEPENDENCIES_PER_SBOM = 150
 BASE_IMAGES = 200
 INTERNAL_LIBRARIES = 500
 IMAGES = 100_000  # a few platforms of a few releases per repository
+
+# Fleet totals scale with PERF_SCALE; shape constants (per-entity counts, the year's batches)
+# do not, so a scaled estate keeps production's distribution.
+SCALE = float(os.environ.get("PERF_SCALE", "1"))
+if SCALE <= 0:
+    raise ValueError(f"PERF_SCALE must be positive, not {SCALE}")
+_FLEET = (
+    "REPOSITORIES",
+    "RUN_ORDERS",
+    "OPEN_ORDERS",
+    "SPEND_EVENTS",
+    "DECISIONS",
+    "PRODUCTS",
+    "TEAMS",
+    "FINDINGS",
+    "PACKAGES",
+    "ADVISORIES",
+    "SBOMS",
+    "IMAGES",
+    "BASE_IMAGES",
+    "INTERNAL_LIBRARIES",
+)
+if SCALE != 1:
+    for _fleet in _FLEET:
+        globals()[_fleet] = max(1, round(globals()[_fleet] * SCALE))
+
 HOT_PACKAGE = "pkg-1"  # in every 10th SBOM: a blast radius of thousands of commits
 HOT_ADVISORY = "GHSA-perf-hot"
 
@@ -191,7 +229,8 @@ SEED = (
         'artifacts/' || repeat(md5(a.id::text || ':' || g), 2) || '.json'
     FROM traust.assessment a CROSS JOIN generate_series(1, {ARTIFACTS_PER_ASSESSMENT}) g""",
     """INSERT INTO traust.artifact (digest, kind, uri)
-    SELECT digest, kind, uri FROM traust.artifact WHERE assessment_id IS NOT NULL""",
+    SELECT digest, kind, uri
+    FROM traust.artifact WHERE assessment_id IS NOT NULL""",
     f"""INSERT INTO traust.occurrence (finding_id, assessment_id, severity, rule)
     SELECT f.id, a.id, 'high', 'rule-' || mod(f.n, 50)
     FROM (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.finding) f
@@ -270,10 +309,16 @@ SEED = (
     JOIN (SELECT id, row_number() OVER (ORDER BY digest) n FROM traust.sbom) s
         ON s.n = 1 + mod(g * 7, {SBOMS})""",
     f"""INSERT INTO traust.advisory (identifier, published_at)
-    SELECT 'CVE-2026-' || g, now() - make_interval(days => mod(g, 1000))
+    SELECT 'CVE-2026-' || lpad(g::text, greatest(5, length(g::text)), '0'),
+        now() - make_interval(days => mod(g, 1000))
     FROM generate_series(1, {ADVISORIES}) g""",
+    # aliases spelled as GitHub does (GHSA-xxxx-xxxx-xxxx in its id alphabet), so AdvisoryNames
+    # recognises them and the daily refresh routes them to the ghsa source
     """INSERT INTO traust.advisory (alias_of_id, identifier)
-    SELECT id, 'GHSA-' || substr(identifier, 10) FROM traust.advisory
+    SELECT id, 'GHSA-' || substr(g, 1, 4) || '-' || substr(g, 5, 4) || '-' || substr(g, 9, 4)
+    FROM (SELECT id, identifier,
+            translate(md5(identifier), '0123456789abcdef', '23456789cfghjmpq') g
+        FROM traust.advisory) a
     WHERE mod(abs(hashtext(identifier)), 2) = 0""",
     f"""INSERT INTO traust.advisory_package (advisory_id, package_id)
     SELECT a.id, p.id
@@ -286,11 +331,29 @@ SEED = (
     f"""INSERT INTO traust.advisory_package (advisory_id, package_id)
     SELECT a.id, p.id FROM traust.advisory a, traust.package p
     WHERE a.identifier = '{HOT_ADVISORY}' AND p.name = '{HOT_PACKAGE}'""",
+    # One in ADVISORY_BACKED_EVERY performance findings is advisory-backed (dependency, image or
+    # SBOM findings), spread over the advisories: canonical and alias rows alike, as
+    # _keep_advisory links them (a finding can name an alias). An assumption: the data model
+    # sets no figure for this share.
+    f"""UPDATE traust.finding f SET advisory_id = a.id, advisory_match = 'confirmed'
+    FROM (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.finding
+        WHERE fingerprint_algo = 'v3') pick
+    JOIN (SELECT id, row_number() OVER (ORDER BY md5(id::text)) n FROM traust.advisory) a
+        ON a.n = 1 + mod(pick.n * 3, {ADVISORIES})
+    WHERE f.id = pick.id AND mod(pick.n, {ADVISORY_BACKED_EVERY}) = 0""",
     """INSERT INTO traust.assessment (repository_ref_id, kind, status, assessor, assessor_version,
         occurred_at)
     SELECT id, 'repo-state', 'completed', 'forge', '1',
         now() - interval '1 year' + right(sha, 2)::int * interval '1 day'
     FROM traust.repository_ref WHERE is_default""",
+    f"""INSERT INTO traust_ops.feed_snapshot (run_order_id, artifact_id, feed, retrieved_at)
+    SELECT o.id, art.id, f.feed, now() - make_interval(days => d)
+    FROM unnest(ARRAY[{", ".join(f"'{feed}'" for feed in FEEDS)}]) WITH ORDINALITY f(feed, k)
+    CROSS JOIN generate_series(1, {SNAPSHOT_DAYS}) d
+    JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust_ops.run_order) o
+        ON o.n = d * {len(FEEDS)} + k
+    JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.artifact
+        WHERE assessment_id IS NULL) art ON art.n = d * {len(FEEDS)} + k""",
 )
 
 
@@ -327,6 +390,7 @@ STAMPED = ("merkle_root", "merkle_epoch", "merkle_size")
 
 ANALYZED = (
     "traust_ops.run_order",
+    "traust_ops.feed_snapshot",
     "traust_ops.spend_event",
     "traust.decision",
     "traust.finding_external_ref",
@@ -382,6 +446,7 @@ def seeded_database(url: str) -> Engine:
     if fresh:
         try:
             apply_schema(engine, contracts.database_ddl(Dialect.POSTGRES))
+            _upgrade(engine)  # the seed writes the shape the channel leaves, not the baseline
             apply_schema(engine, SEED)
             _stamp_layers(engine)
             with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
@@ -391,7 +456,17 @@ def seeded_database(url: str) -> Engine:
             engine.dispose()
             _drop(url, name)  # never leave a half-seeded database to be reused
             raise
+    else:
+        _upgrade(engine)  # a reused database gains any script it lacks; a current one, none
     return engine
+
+
+def _upgrade(engine: Engine) -> None:
+    """Run the db contract's upgrade channel, as core does for a store it manages: core refuses
+    a database without the channel's stamp, and the seed's shape includes its scripts."""
+    on_driver_connection(
+        engine, lambda dbapi: contracts.run_db_upgrades(dbapi, contract_dialect(engine))
+    )
 
 
 def _drop(url: str, name: str) -> None:

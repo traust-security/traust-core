@@ -480,3 +480,45 @@ def test_unrated_open_findings_remain_counted_without_inventing_risk(repo: Repo)
     (rated,) = findings.timeline(repo.filter, TimeBucket.MONTH)
     assert rated.open_by_severity == severities(high=1, critical=1)
     assert rated.risk_index == 17.5
+
+
+# the batched summary (a set of repositories, one rollup each)
+def test_summary_in_matches_each_repositorys_own_summary(engine: Engine) -> None:  # noqa: F811
+    first, second, empty = new_repo(engine), new_repo(engine), new_repo(engine)
+    first.reported(severity="high")
+    first.reported(severity="critical")
+    refuted = first.reported(severity="high")
+    first.judged(refuted, 1, validity="false_positive")
+    second.reported(severity="medium")
+
+    findings = service(engine)
+    assert first.repository.id is not None and second.repository.id is not None
+    assert empty.repository.id is not None
+    batch = findings.summary_in([first.repository.id, second.repository.id, empty.repository.id])
+    own = [
+        row
+        for repo in (first, second)
+        for row in findings.summary(repo.filter, FindingDimension.REPOSITORY)
+    ]
+    assert sorted(batch, key=lambda r: r.key or "") == sorted(own, key=lambda r: r.key or "")
+    # a repository with no findings has no row, exactly as the per-repository summary
+    keys = {r.key for r in batch}
+    assert keys == {str(first.repository.id), str(second.repository.id)}
+    assert str(empty.repository.id) not in keys
+
+
+def test_summary_in_folds_more_than_one_batch_of_facts(engine: Engine) -> None:  # noqa: F811
+    # the fold's own batching bound (1_000 findings per facts load) pinched to cross
+    # it with three repositories: the grouping must survive the batch boundaries
+    from traust_core.v1.services.findings import service as service_module
+
+    repos = [new_repo(engine) for _ in range(3)]
+    for repo in repos:
+        for _ in range(4):
+            repo.reported(severity="high")
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(service_module, "_FACTS_BATCH", 3)
+        batch = service(engine).summary_in([r.repository.id for r in repos])  # type: ignore[list-item]
+    grouped = by_key(batch)
+    assert set(grouped) == {str(r.repository.id) for r in repos}
+    assert all(rollup.open == 4 for rollup in grouped.values())

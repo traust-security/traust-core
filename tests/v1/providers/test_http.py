@@ -9,11 +9,11 @@ from typing import Any
 
 import pytest
 
-from traust_core.v1.errors import ServiceError
+from traust_core.v1.errors import ConfigError, ServiceError, ValidationError
 from traust_core.v1.providers import http
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.correlation import correlation_scope
-from traust_core.v1.providers.http import HttpFetcher, RetryPolicy
+from traust_core.v1.providers.http import HttpFetcher, RetryPolicy, failure_status
 
 
 class _Resp:
@@ -26,8 +26,9 @@ class _Resp:
     def __exit__(self, *a: object) -> None:
         return None
 
-    def read(self) -> bytes:
-        return self._body
+    def read(self, n: int = -1) -> bytes:
+        self.asked = n
+        return self._body if n < 0 else self._body[:n]
 
 
 def _urlopen(actions: list[Any], calls: list[int]) -> Callable[..., _Resp]:
@@ -328,3 +329,78 @@ def test_a_refused_page_is_a_typed_error(monkeypatch: pytest.MonkeyPatch) -> Non
     with pytest.raises(ServiceError) as raised:
         list(_fetcher([]).pages("https://forge.test/items"))
     assert raised.value.status == 401
+
+
+def test_secret_headers_go_to_the_url_only_never_onto_a_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sent: list[urllib.request.Request] = []
+
+    def _open(req: urllib.request.Request, timeout: float) -> _Resp:
+        sent.append(req)
+        return _Resp(b"ok")
+
+    monkeypatch.setattr(http.urllib.request, "urlopen", _open)
+    fetcher = http.HttpFetcher("t", http.RetryPolicy(max_attempts=1))
+    fetcher.get("https://nvd.test/a", headers={"X-Plain": "p"}, secret_headers={"apiKey": "k"})
+    [req] = sent
+    assert req.get_header("Apikey") == "k" and req.get_header("X-plain") == "p"
+    # urllib's redirect handler copies `headers`, never `unredirected_hdrs`
+    assert "Apikey" in req.unredirected_hdrs and "Apikey" not in req.headers
+    redirected = urllib.request.HTTPRedirectHandler().redirect_request(
+        req, None, 302, "Found", {}, "https://elsewhere.test/b"
+    )
+    assert redirected is not None
+    assert redirected.get_header("Apikey") is None and redirected.get_header("X-plain") == "p"
+
+
+def test_a_body_within_its_limit_comes_back_whole(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch(monkeypatch, [b"12345"])
+    assert _fetcher([]).get("http://feed.test/doc", limit=5) == b"12345"
+
+
+def test_a_body_over_its_limit_is_a_bad_answer_read_one_byte_past_it_and_logged_refused(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    body = _Resp(b"x" * 1000)
+    calls: list[int] = []
+
+    def _open(req: object, timeout: float | None = None) -> _Resp:
+        calls.append(1)
+        return body
+
+    monkeypatch.setattr(http.urllib.request, "urlopen", _open)
+    with (
+        caplog.at_level(logging.INFO, logger="traust_core.v1.providers.http"),
+        pytest.raises(ValidationError, match=r"^feed\.test: response over 5 bytes, refused$"),
+    ):
+        _fetcher([]).get("http://user:secret@feed.test/doc?id=1", limit=5)
+    assert body.asked == 6 and calls == [1]  # never retried
+    (record,) = caplog.records
+    assert record.outcome == "refused" and "secret" not in caplog.text
+    assert failure_status(ValidationError("x")) == "error"  # a healthy source, a bad answer
+
+
+def test_a_negative_limit_is_refused_before_any_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _patch(monkeypatch, [b"never"])
+    with pytest.raises(ConfigError, match="never negative"):
+        _fetcher([]).get("http://feed.test/doc", limit=-2)
+    assert calls == []
+
+
+def test_a_refusals_body_is_read_only_up_to_its_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    asked: list[int] = []
+
+    class _Body:
+        def read(self, n: int = -1) -> bytes:
+            asked.append(n)
+            return b"{}"
+
+        def close(self) -> None:
+            return None
+
+    error = urllib.error.HTTPError("http://feed.test", 404, "err", Message(), _Body())  # type: ignore[arg-type]
+    _patch(monkeypatch, [error])
+    with pytest.raises(ServiceError):
+        _fetcher([]).get("http://feed.test/doc", limit=5)
+    assert asked == [http._ERROR_BODY_BYTES]

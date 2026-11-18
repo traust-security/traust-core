@@ -4,6 +4,7 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 from uuid import UUID
@@ -224,3 +225,13 @@ class LocalRepoUrl:
 
 # Where a checkout reads a repository from: a forge over https, or a repository on this machine.
 RepoOrigin = HttpsRepoUrl | LocalRepoUrl
+
+
+def canonical_decimal(value: Decimal | None) -> str | None:
+    """An exact decimal's shortest fixed-point form, the same whichever backend read it: SQLite
+    hands back 7.5000000000 and 0E-10 where PostgreSQL has 7.5 and 0. Only trailing zeros go;
+    no digit is rounded (Decimal.normalize would round under the context's precision)."""
+    if value is None:
+        return None
+    text = format(value, "f")
+    return text.rstrip("0").rstrip(".") if "." in text else text

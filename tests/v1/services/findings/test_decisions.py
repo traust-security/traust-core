@@ -23,7 +23,12 @@ from traust_core.v1.models.findings import (
     Restatement,
 )
 from traust_core.v1.models.identity import IdentitySource, Principal, Role
-from traust_core.v1.models.vocabulary import ActorKind, ReviewReason, Validity
+from traust_core.v1.models.vocabulary import (
+    ActorKind,
+    DispositionResolution,
+    ReviewReason,
+    Validity,
+)
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -125,6 +130,65 @@ def test_replayed_assessed_and_resolution_decisions_emit_no_new_outcome(
             assert "finding decisions recorded" not in caplog.text
         finally:
             logger.removeHandler(caplog.handler)
+
+
+@pytest.mark.parametrize("default_resolution", [None, DispositionResolution.OPEN])
+def test_per_finding_resolutions_override_the_default_and_replay_without_duplicates(
+    engine: Engine, default_resolution: DispositionResolution | None
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repo = seed.repository()
+        assessment = seed.assessment(seed.repository_ref(repo))
+        findings = [seed.finding(repo) for _ in range(3)]
+        uow.commit()
+    assert assessment.id is not None
+    finding_ids = [f.id for f in findings if f.id is not None]
+    assert len(finding_ids) == 3
+    resolutions = {finding_ids[0]: None, finding_ids[1]: DispositionResolution.OPEN}
+    decisions = service(engine)
+    recorded = decisions.record_resolution(
+        assessment.id, finding_ids, default_resolution, "merged", resolutions=resolutions
+    )
+    assert [d.resolution for d in recorded] == [
+        None,
+        DispositionResolution.OPEN,
+        default_resolution,
+    ]
+    assert all(d.reason == "merged" for d in recorded)
+    assert (
+        decisions.record_resolution(
+            assessment.id, finding_ids, default_resolution, "merged", resolutions=resolutions
+        )
+        == recorded
+    )
+    with SqlTraustUnitOfWork(engine) as uow:
+        for finding_id in finding_ids:
+            assert len(uow.decisions.list_for_finding(finding_id)) == 1
+
+
+def test_per_finding_resolutions_cannot_mix_with_validity_or_leave_partial_writes(
+    engine: Engine,
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repo = seed.repository()
+        assessment = seed.assessment(seed.repository_ref(repo))
+        first, second = seed.finding(repo), seed.finding(repo)
+        uow.commit()
+    assert assessment.id is not None and first.id is not None and second.id is not None
+    with pytest.raises(ValidationError, match="never both"):
+        service(engine).record_resolution(
+            assessment.id,
+            [first.id, second.id],
+            None,
+            "candidate",
+            resolutions={first.id: None, second.id: DispositionResolution.OPEN},
+            validity=Validity.CONFIRMED,
+        )
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.decisions.list_for_finding(first.id) == []
+        assert uow.decisions.list_for_finding(second.id) == []
 
 
 def test_a_restatement_replaces_the_decision_with_its_authority(engine: Engine) -> None:

@@ -115,11 +115,14 @@ sources:
     # components would save ~3.7 MB/yr and go blind on every repo audited
     # afterwards; the component join belongs in the consumer.
     project: [CVE, public_date, bugzilla_description, severity, cvss3_score, CWE]
+    # The per-CVE record, with the CVSS 3 vector the list's projection drops.
+    doc_url_template: https://access.redhat.com/hydra/rest/securitydata/cve/{ident_upper}.json
+    ident: cve
     probe:
       ident: none
-      expect_status: 200
     consumers:
       - traust.cli.reconcile_cve_provenance
+      - traust-core ExposureService.refresh_documents (CVSS, per CVE)
     license:
       id: CC-BY-4.0
       terms: Attribute Red Hat when redistributing. Public endpoint, no VPN.
@@ -138,20 +141,21 @@ sources:
     # and the full corpus is a 293 MB zstd archive whose products are
     # mostly ones we do not ship. a `--mirror` mode would opt into the
     # complete local mirror when an offline fleet-wide query is needed.
+    # Not read yet, so not declared: Red Hat's deletions.csv (withdrawn
+    # documents) and archive_latest.txt (the full-archive pointer).
     index_url: https://access.redhat.com/security/data/csaf/v2/vex/changes.csv
     index_file: vex/changes.csv
-    deletions_url: https://access.redhat.com/security/data/csaf/v2/vex/deletions.csv
-    archive_pointer_url: https://access.redhat.com/security/data/csaf/v2/vex/archive_latest.txt
     doc_url_template: https://access.redhat.com/security/data/csaf/v2/vex/{year}/{ident_lower}.json
-    doc_cache_dir: vex
     # changes.csv is a rolling 12-month window ("path","timestamp"),
     # newest-first; median 117 changed docs/day, bursting to ~950.
+    # A VEX document lists every affected product stream: the kernel's and
+    # Log4Shell's were 2-4 MB (2026-11-17), so this cap leaves room to grow.
+    max_document_bytes: 134217728
     max_age_hours: 24
     cadence: daily
     ident: cve
     probe:
       ident: CVE-2021-44228
-      expect_status: 200
     consumers:
       - traust impact document (traust-core ExposureService.source_document)
       - harnessing/4-triage/triage
@@ -197,7 +201,6 @@ sources:
     probe:
       ident: lodash
       ecosystem: npm
-      expect_status: 200
     consumers:
       - traust.cli adapters fork-lag (traust-core CodeFactsService.fork_lag)
       - traust.cli.impact
@@ -234,7 +237,6 @@ sources:
     access: api
     probe:
       ident: npm/packages/express/versions/4.17.1:dependencies
-      expect_status: 200
     consumers:
       - traust.cli adapters osv (traust-core providers.tools.osv resolve_transitive)
       - traust impact below-range (dependency source in packets, traust-core BelowRangeService)
@@ -450,10 +452,12 @@ sources:
     ident: cve
     probe:
       ident: CVE-2021-44228
-      expect_status: 200
-    # Keyless is rate-limited; an NVD API key is a quality-of-service
-    # upgrade, never a correctness requirement.
-    api_key_env: NVD_API_KEY
+    # An API key is optional: keyless works at NVD's lower rate limit (about
+    # 5 requests per 30 s; 50 with a key). A deployment that has one names
+    # the variable holding it in traust.yaml (`feeds.api_keys: {nvd:
+    # NVD_API_KEY}`), never in this file; it is sent in NVD's `apiKey` header
+    # to NVD only.
+    api_key_header: apiKey
     consumers:
       - traust impact document (traust-core ExposureService.source_document)
     license:
@@ -463,6 +467,48 @@ sources:
         but is not endorsed or certified by the NVD."
       url: https://nvd.nist.gov/developers/terms-of-use
       verified: 2026-07-18
+
+  cve-list:
+    tier: live
+    summary: >-
+      The CVE List record (CVE JSON 5) from the CVE Services API: the CNA's
+      container and each ADP's, with the scores each states.
+    url_template: https://cveawg.mitre.org/api/cve/{ident_upper}
+    ident: cve
+    probe:
+      ident: CVE-2021-44228
+    consumers:
+      - traust impact document (traust-core ExposureService.source_document)
+      - traust-core ExposureService.refresh_documents (CVSS, per CVE)
+    license:
+      id: cve-terms-of-use
+      terms: >-
+        MITRE grants a perpetual, worldwide, no-charge, royalty-free,
+        irrevocable copyright license to reproduce, prepare derivative works
+        of, display, sublicense and distribute CVE, provided copies reproduce
+        MITRE's copyright designation and the license.
+      url: https://www.cve.org/Legal/TermsOfUse
+      verified: 2026-11-16
+
+  ghsa:
+    tier: live
+    summary: >-
+      One OSV record by id from OSV.dev, for GitHub Security Advisories: a
+      GitHub-reviewed GHSA states GitHub's CVSS.
+    url_template: https://api.osv.dev/v1/vulns/{ident}
+    ident: ghsa
+    probe:
+      ident: GHSA-jfh8-c2jp-5v3q
+    consumers:
+      - traust impact document (traust-core ExposureService.source_document)
+      - traust-core ExposureService.refresh_documents (CVSS, per GHSA)
+    license:
+      id: CC-BY-4.0
+      terms: >-
+        The GitHub Advisory Database is CC-BY-4.0; attribute GitHub when
+        redistributing. OSV.dev serves it unchanged.
+      url: https://github.com/github/advisory-database/blob/main/LICENSE.md
+      verified: 2026-11-17
 
   redhat-csaf:
     tier: live
@@ -474,7 +520,6 @@ sources:
     ident: rhsa
     probe:
       ident: RHSA-2024:6493
-      expect_status: 200
     consumers:
       - harnessing/3-audit/secure-rpm-audit
       - harnessing/3-audit/secure-container-audit
@@ -491,7 +536,6 @@ sources:
     ident: repo
     probe:
       ident: github.com/kubernetes/kubernetes
-      expect_status: 200
     consumers:
       - harnessing/3-audit/secure-code-audit
       - harnessing/3-audit/secure-rpm-audit

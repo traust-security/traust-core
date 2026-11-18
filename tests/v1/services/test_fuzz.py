@@ -16,12 +16,13 @@ from tests.v1.repositories.tables.conftest import Seed
 from tests.v1.services import test_assessment_record as recording
 from tests.v1.services.test_assessment_record import WHEN, fixture
 from traust_core.v1.context import Context
-from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
+from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError, ViewContractError
 from traust_core.v1.models.artifacts import FuzzReportArtifact, IsolationReviewArtifact
 from traust_core.v1.models.assessment import Assessment, AssessmentKind
 from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.findings import AssessedJudgment, Decision
 from traust_core.v1.models.insight import ValidationFuzz, ViewFilter, ViewName
+from traust_core.v1.models.validation import ValidationRollup
 from traust_core.v1.models.vocabulary import DispositionAssurance, SourceType, Validity
 from traust_core.v1.rendering.markdown import MarkdownRenderer
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -29,6 +30,7 @@ from traust_core.v1.services.artifact_publishing import PublishSpec, PublishSpec
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.fuzz import FuzzHarnessReferences
 from traust_core.v1.services.lint import LintContext
+from traust_core.v1.services.validation import ValidationService
 
 engine, context = recording.engine, recording.context
 
@@ -378,3 +380,18 @@ def test_recording_a_fuzz_run_needs_decisions(context: Context, ref: UUID) -> No
             "0.1.0",
             Provenance(run_id=uuid4(), source=SourceType.INTERACTIVE, occurred_at=WHEN),
         )
+
+
+def test_a_campaign_outside_its_contract_is_refused_by_the_build(
+    context: Context, ref: UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record(context, report(crasher("C-1")), ref)
+
+    def drifted(self: object, filter: Any, group_by: Any) -> list[ValidationRollup]:
+        return [ValidationRollup(key=str(repository_id), findings=0, by_verdict={})
+                for repository_id in filter.repository_ids]  # fmt: skip
+
+    monkeypatch.setattr(ValidationService, "summary", drifted)
+    with pytest.raises(ViewContractError) as error:
+        view(context)
+    assert "validation/0/findings" in {issue.path for issue in error.value.issues}

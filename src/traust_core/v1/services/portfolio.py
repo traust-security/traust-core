@@ -17,6 +17,7 @@ from traust_core.v1.errors import ConfigError, ConflictError, NotFoundError, Val
 from traust_core.v1.models.artifacts import (
     CorpusRegistryArtifact,
     ProductDefinitionsMapArtifact,
+    RepoLivenessArtifact,
     RepoStateArtifact,
 )
 from traust_core.v1.models.assessment import (
@@ -38,9 +39,11 @@ from traust_core.v1.models.corpus import CorpusRegistry, CorpusSubject
 from traust_core.v1.models.findings import SubjectRef
 from traust_core.v1.models.inventory import (
     DEFAULT_FORGE_HOSTS,
+    CensusRef,
     Component,
     ComponentFilter,
     ExposureClass,
+    GoneReason,
     InventoryExportRow,
     LinesReport,
     Liveness,
@@ -54,7 +57,9 @@ from traust_core.v1.models.inventory import (
     ReleaseBump,
     ReleaseChange,
     ReleaseCommit,
+    RepoLiveness,
     Repository,
+    RepositoryDisposition,
     RepositoryFilter,
     RepositoryRef,
     RepoState,
@@ -69,6 +74,7 @@ from traust_core.v1.models.observation import (
     ObservationTarget,
     SeenHead,
 )
+from traust_core.v1.models.operations import AssetName, OrderFilter, OrderManifest, OrderState
 from traust_core.v1.models.product_definitions import (
     ProductDefinitions,
     ProductDefinitionsSnapshot,
@@ -87,7 +93,13 @@ from traust_core.v1.models.values import (
     require_nonblank,
     require_uuid,
 )
-from traust_core.v1.models.vocabulary import ComparisonStatus, OwnershipClass, RefKind, Severity
+from traust_core.v1.models.vocabulary import (
+    ComparisonStatus,
+    LivenessStatus,
+    OwnershipClass,
+    RefKind,
+    Severity,
+)
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.product_definitions import ProductDefinitionsCache
@@ -106,6 +118,7 @@ from traust_core.v1.services.observation import (
 if TYPE_CHECKING:
     from traust_core.v1.services.assessment import AssessmentService
     from traust_core.v1.services.findings.service import FindingService
+    from traust_core.v1.services.operations import OpsService
 
 log = logging.getLogger(__name__)
 
@@ -113,6 +126,11 @@ DORMANT_DAYS = 365
 _RELEASE_VERSION = re.compile(r"v?(\d+)\.(\d+)(?:\.(\d+))?")
 
 P0_MIN_LIVE = 5
+
+#: Two consecutive gone-class observation failures flip the unreachable disposition
+#: (foundry plan repo-unreachable). One is a blip; the count resets on any success, and
+#: the transient classes (timeouts, 5xx, rate limits) never count at all.
+GONE_STREAK_THRESHOLD = 2
 
 
 class PortfolioPolicy:
@@ -226,6 +244,12 @@ class Inventory:
         with self._uow as uow:
             return uow.repository_refs.list_by_ids(repository_ref_ids)
 
+    def census_refs_of(self, repository_ids: Collection[UUID]) -> list[CensusRef]:
+        """The refs' census columns of the repositories, (created_at, id) order: the door
+        a findings-domain census folds default lines through, without a model per ref."""
+        with self._uow as uow:
+            return uow.repository_refs.census_for_repositories(repository_ids)
+
     def list_repositories(self, repository_ids: Collection[UUID]) -> list[Repository]:
         with self._uow as uow:
             return uow.repositories.list_by_ids(repository_ids)
@@ -245,6 +269,27 @@ class Inventory:
                 f"commit {sha} has {len(refs)} registered refs: name the patched ref (patched_ref)"
             )
         return refs[0]
+
+    def prior_urls(self, repository_id: UUID) -> tuple[str, ...]:
+        """The URLs this repository previously carried: its vacated-URL rows — the ones
+        the URL correction left pointing upstream at it, recognized by the correction's
+        own signature (dispositioned gone with the "url corrected to" evidence), not the
+        forks and mirrors that share the edge. Findings stamped under those URLs still
+        belong to the repository, so the finding intake matches a candidate against
+        them before taking a new identity (foundry plan repo-unreachable, resolved
+        decision 4: the fingerprints survive the move through the edge)."""
+        require_uuid(repository_id, "repository.id")
+        with self._uow as uow:
+            # Any dispositioned row behind the edge qualifies: the correction's own
+            # tombstones certainly, and a dispositioned fork or mirror's URL simply
+            # matches nothing. Recognizing more than the correction's signature keeps
+            # the alias set working even if a tombstone's evidence was rewritten
+            # before this rule (Qodo #474 round 3).
+            return tuple(
+                row.url
+                for row in uow.repositories.list_by_upstream(repository_id)
+                if row.id is not None and row.disposition is not None
+            )
 
     def private_mirror(self, repository_id: UUID) -> Repository | None:
         with self._uow as uow:
@@ -319,9 +364,11 @@ class PortfolioService:
         publisher: ArtifactPublisher | None = None,
         tools: ProviderRegistry[ToolProvider[Any]] | None = None,
         product_definitions: ProductDefinitionsCache | None = None,
+        ops: OpsService | None = None,
     ) -> None:
         self._uow, self._policy = uow, policy
         self._tools = tools
+        self._ops = ops
         self._hosts = dict(hosts or DEFAULT_FORGE_HOSTS)
         self.inventory = Inventory(uow, self._hosts)
         self._publisher = publisher
@@ -361,6 +408,26 @@ class PortfolioService:
             seen=self._seen_head(target.repository_id),
             tools=self._tools,
         )
+        self._count_toward_disposition(target.repository_id, facts, observed_url=target.repo_url)
+        if facts.availability_queried:
+            unknown = facts.liveness_status == LivenessStatus.UNKNOWN
+            self.record_liveness(
+                Liveness(
+                    repository_id=target.repository_id,
+                    url=self.get_repository(target.repository_id).url,
+                    status=facts.liveness_status,
+                    observed_at=facts.observed_at,
+                    canonical_url=facts.canonical_url,
+                    archived=facts.archived,
+                    pushed_at=facts.pushed_at,
+                    unobserved=facts.status if unknown and facts.status not in OBSERVED else None,
+                    reason=(facts.error or "forge did not report repository availability")
+                    if unknown
+                    else facts.error
+                    if facts.liveness_status == LivenessStatus.MISSING
+                    else None,
+                )
+            )
         if facts.head is not None:
             self._keep(target, facts, started)
         return facts
@@ -408,7 +475,7 @@ class PortfolioService:
             uow.commit()
         if metadata_changed:
             self._log_metadata_change(current, started)
-        # Failed and deferred observations belong to the order's outcome, not a document.
+        # Availability is recorded separately; a failed comparison is never a repo-state document.
         if not observed:
             return
         assert ref.id is not None
@@ -464,6 +531,189 @@ class PortfolioService:
             )
         )
 
+    def _count_toward_disposition(
+        self, repository_id: UUID, facts: ForgeFacts, *, observed_url: str | None
+    ) -> None:
+        """The gone-class failure counting (foundry plan repo-unreachable), in the
+        observation's result processing — every path that lands an observation counts
+        the same way: the engine's cadence, the operator's record, the verify door.
+
+        Two consecutive gone-class failures flip the repository's disposition to
+        repo_unreachable: it leaves the planner's universe (the subject gate refuses
+        every order for it) until a person's verify succeeds. A successful observation
+        — one that *completed*: the forge answered for the repository and no later read
+        failed (a successful repository read followed by a failed branch read is a
+        failed observation, never a success — Qodo #474) — resets the streak and clears
+        the disposition, the only way it clears. The transient classes (timeouts, 5xx,
+        rate limits) never count and never reset: they say nothing about the repository.
+        An observation started at a URL the row no longer carries (a correction landed
+        mid-flight) counts for neither: its answer belongs to the vacated URL."""
+        changed: Repository | None = None
+        with self._uow.write() as uow:
+            repository = uow.repositories.get_for_update(repository_id)
+            if _is_vacated(repository):
+                return  # a correction's record, not observation state: nothing here rewrites it
+            if observed_url is not None and repository.url != observed_url:
+                return  # the row moved on: this observation answered for the vacated URL
+            update: dict[str, object] = {}
+            if facts.gone_reason is not None:
+                streak = repository.gone_streak + 1
+                update["gone_streak"] = streak
+                if streak >= GONE_STREAK_THRESHOLD or repository.disposition is not None:
+                    # the flip at two consecutive; an already-dispositioned repository
+                    # holds, its reason and evidence refreshed by what this observation
+                    # saw — the flip's own timestamp survives the refresh (it records
+                    # when the repository left, not when it was last seen gone)
+                    update.update(
+                        disposition=RepositoryDisposition.REPO_UNREACHABLE,
+                        disposition_reason=facts.gone_reason,
+                        disposition_evidence=facts.error
+                        or f"forge reports repository {facts.liveness_status.value}",
+                        disposition_at=repository.disposition_at or self._clock.now(),
+                    )
+            elif (
+                facts.error is None
+                and facts.availability_queried
+                and facts.liveness_status in (LivenessStatus.ACTIVE, LivenessStatus.ARCHIVED)
+            ):
+                update["gone_streak"] = 0
+                if repository.disposition is not None:
+                    update.update(
+                        disposition=None,
+                        disposition_reason=None,
+                        disposition_evidence=None,
+                        disposition_at=None,
+                    )
+            else:
+                return  # a transient, skipped or failed outcome: neutral, the streak stands
+            if any(getattr(repository, field) != value for field, value in update.items()):
+                repository = uow.repositories.update(repository.model_copy(update=update))
+                uow.commit()
+                changed = repository
+        if changed is not None:
+            # Outside the write block: after_commit registered inside it is queued
+            # and dropped when the block's exit rolls the unit of work back — the
+            # flip and the clear would never log (Qodo #474 round 4).
+            self._uow.after_commit(
+                lambda: log.info(
+                    "portfolio repository %s disposition=%s reason=%s gone_streak=%s",
+                    repository_id,
+                    changed.disposition,
+                    changed.disposition_reason,
+                    changed.gone_streak,
+                )
+            )
+
+    def correct_repository_url(self, repository_id: UUID, url: HttpsRepoUrl) -> Repository:
+        """The URL correction (foundry plan repo-unreachable): the repository moved, and a
+        person names where it went. The row keeps its identity — every finding, occurrence
+        and decision stays attached, so the finding fingerprints survive the move — and the
+        change is recorded as the upstream link the fork resolution reads
+        (`repository.upstream_id`): the vacated URL's row (the one registered there, else a
+        new one) carries upstream_id = this repository, so anything still holding the old
+        URL follows the edge to the repository. The disposition, if any, holds: the verify
+        is the deliberate act that clears it; the streak restarts, because the failures
+        counted against the old URL say nothing about the new one."""
+        require_uuid(repository_id, "repository.id")
+        if not isinstance(url, HttpsRepoUrl):
+            raise ValidationError("repository.url must be an HttpsRepoUrl")
+        new = str(url)
+        with self._uow.write() as uow:
+            repository = uow.repositories.get_for_update(repository_id)
+            if _is_vacated(repository):
+                # A correction's vacated-URL record, not a repository: moving it would
+                # point its replacement upstream at the record instead of the
+                # repository that moved away, orphaning the alias chain (Qodo #474
+                # round 4). Correct the repository itself - the SCI join follows the
+                # record to it.
+                raise ValidationError(
+                    f"{repository_id} is a URL correction's vacated-URL record, not the "
+                    "repository: correct the repository it records the move of"
+                )
+            if repository.url == new:
+                return repository
+            uow.repositories.lock_url(new)
+            existing = _registered_repository(uow, new, self._hosts)
+            move_back = (
+                existing is not None
+                and existing.id != repository.id
+                and existing.upstream_id == repository.id
+                and _is_vacated(existing)
+            )
+            if existing is not None and existing.id != repository.id and not move_back:
+                raise ConflictError(
+                    f"{new} is already {existing.id}'s URL; correct that registration instead"
+                )
+            # A move back reclaims the repository's own vacated-URL row: the destination
+            # is the tombstone this repository's earlier correction left, so the
+            # correction is the undo of that one (a typo, a move home) rather than a
+            # conflict. The tombstone follows the URL being left now.
+            case_only = existing is not None and not move_back
+            old = repository.url
+            tombstone: Repository | None = None
+            if move_back:
+                # A move back is a URL swap: the tombstone holds the destination, the
+                # repository holds the URL being left, and each must take the other's.
+                # A unique URL cannot swap in two statements, so the tombstone steps
+                # aside to a value that never leaves the transaction before the
+                # repository takes the destination (Qodo #474: the undo).
+                assert existing is not None
+                tombstone = existing
+                aside = f"{old}#vacated:{repository_id}"
+                uow.repositories.update(tombstone.model_copy(update={"url": aside}))
+                repository = uow.repositories.update(
+                    repository.model_copy(update={"url": new, "gone_streak": 0})
+                )
+            else:
+                repository = uow.repositories.update(
+                    repository.model_copy(update={"url": new, "gone_streak": 0})
+                )
+                if not case_only:
+                    # The vacated URL's row: the move's record, the same edge the
+                    # fork resolution reads. Public, so the private-mirror resolution
+                    # never mistakes the vacated self for a push target; and
+                    # dispositioned at creation — the vacated URL is known gone (the
+                    # person just corrected away from it), so it never re-enters the
+                    # planner's universe to burn two observations proving it (Qodo
+                    # #474).
+                    uow.repositories.lock_url(old)
+                    tombstone = uow.repositories.find_by_url(old) or uow.repositories.get_or_add(
+                        Repository(url=old, public=True)
+                    )
+            if tombstone is not None and tombstone.id != repository.id:
+                uow.repositories.update(
+                    tombstone.model_copy(
+                        update={
+                            "url": old,
+                            "upstream_id": repository.id,
+                            "disposition": RepositoryDisposition.REPO_UNREACHABLE,
+                            "disposition_reason": GoneReason.GONE,
+                            "disposition_evidence": f"url corrected to {new}",
+                            "disposition_at": self._clock.now(),
+                        }
+                    )
+                )
+            uow.commit()
+        self._uow.after_commit(
+            lambda: log.info(
+                "portfolio repository %s url corrected: %s -> %s", repository_id, old, new
+            )
+        )
+        return repository
+
+    def verify_repository(self, repository_id: UUID) -> ForgeFacts:
+        """The on-demand observation (foundry plan repo-unreachable): the same observation
+        path the repo_state asset runs — the operator's `traust-engine record repo_state
+        --repo ...` and the engine's cadence land in `record_forge_facts` too — exposed as
+        the door the SCI API calls for the console's verify button. On success the
+        disposition clears and the repository re-enters the planner's universe; on a
+        gone-class failure it holds with the new evidence; on a transient failure it holds
+        untouched (the transient classes never count)."""
+        require_uuid(repository_id, "repository.id")
+        with self._uow as uow:
+            uow.repositories.get(repository_id)  # NotFoundError for an unknown id
+        return self.record_forge_facts(repository_id=repository_id)
+
     def forge_facts(self, repository_id: UUID) -> ForgeFacts | None:
         """The latest observation of the default-branch head; NotFoundError when it was measured
         against an audit that has since been replaced."""
@@ -496,7 +746,7 @@ class PortfolioService:
         )
 
     def liveness(self, filter: RepositoryFilter, page: PageRequest) -> Page[Liveness]:
-        """Each listed repository's archived flag and default-branch push as last observed."""
+        """Availability history from its owner; unqueried repositories remain unknown."""
         listed = self.list_repositories(filter, page)
         return Page(items=tuple(self._liveness_of(listed.items)), next=listed.next)
 
@@ -516,19 +766,8 @@ class PortfolioService:
             return []
         ids = [repository.id for repository in repositories if repository.id]
         now = self._clock.now()
-        observations = self._assessment.population(
-            now, AssessmentFilter(kind=AssessmentKind.REPO_STATE), ids
-        ).rows
-        latest = {row.latest.id: row for row in observations if row.latest}
-        pushes = {
-            latest[assessment.id].repository_id: (
-                assessment.occurred_at,
-                json.loads(document.payload).get("pushed_at"),
-            )
-            for assessment, document in self._require_publisher().documents(
-                (row.latest for row in latest.values() if row.latest), RepoStateArtifact
-            )
-        }
+        snapshot = self._require_publisher().latest(RepoLivenessArtifact)
+        recorded = RepoLiveness.of(snapshot).repositories if snapshot is not None else {}
         unaudited = set(
             self._assessment.population(
                 now,
@@ -536,29 +775,164 @@ class PortfolioService:
                 ids,
             ).never_assessed_repository_ids
         )
-        return [
-            self._liveness(repository, pushes, unaudited, now.date()) for repository in repositories
-        ]
-
-    def _liveness(
-        self,
-        repository: Repository,
-        pushes: Mapping[UUID, tuple[datetime, str | None]],
-        unaudited: Collection[UUID],
-        today: date,
-    ) -> Liveness:
-        assert repository.id is not None
-        row = Liveness(repository_id=repository.id, url=repository.url)
-        if repository.id in pushes:
-            observed_at, pushed_at = pushes[repository.id]
-            return row.model_copy(
-                update=dict(
-                    observed_at=observed_at,
-                    archived=repository.archived,
-                    pushed_at=pushed_at,
-                    dormant=self._policy.is_dormant(parse_audit_date(pushed_at), today),
+        completed = self._completed_orders(ids, now)
+        # one batched manifest read for the whole scope's completed orders — the fold once
+        # read a manifest (an order and an artifact) per order, a per-order N+1 at an
+        # estate's scale
+        manifests = (
+            self._ops.manifests_of([o for orders in completed.values() for o in orders])
+            if completed
+            else {}
+        )
+        rows = []
+        for repository in repositories:
+            assert repository.id is not None
+            row = recorded.get(repository.id) or self._unqueried_liveness(repository, unaudited)
+            row = self._fold_completed(row, completed.get(repository.id, ()), now, manifests)
+            rows.append(
+                row.model_copy(
+                    update={
+                        "dormant": self._policy.is_dormant(
+                            parse_audit_date(row.pushed_at), now.date()
+                        )
+                        if row.pushed_at is not None
+                        else None
+                    }
                 )
             )
+        return rows
+
+    def liveness_reference(self) -> RepoLiveness:
+        """The complete reference snapshot, excluding repositories never queried."""
+        rows = every_item(lambda page: self.liveness(RepositoryFilter(), page))
+        return RepoLiveness(
+            generated=self._clock.now(),
+            repositories={row.repository_id: row for row in rows if row.observed_at is not None},
+        )
+
+    def record_liveness(self, row: Liveness) -> PublishResult:
+        """Record explicit availability evidence, carrying the start of an unchanged status."""
+        require_uuid(row.repository_id, "liveness.repository_id")
+        repository = self.get_repository(row.repository_id)
+        if row.url != repository.url:
+            raise ValidationError("liveness URL must match the registered repository")
+        now = self._clock.now()
+        if row.observed_at is None or row.observed_at > now:
+            raise ValidationError("liveness needs an observation time no later than Core's clock")
+        if row.canonical_url is not None:
+            HttpsRepoUrl.parse(row.canonical_url, self._hosts)
+        if row.status == LivenessStatus.MOVED and (
+            row.canonical_url is None or row.canonical_url == row.url
+        ):
+            raise ValidationError("moved liveness needs a distinct canonical repository URL")
+        publisher = self._require_publisher()
+        while True:
+            latest = publisher.latest_imported(RepoLivenessArtifact)
+            recorded = {} if latest is None else dict(RepoLiveness.of(latest.document).repositories)
+            previous = recorded.get(row.repository_id)
+            if (
+                previous is not None
+                and previous.observed_at is not None
+                and previous.observed_at > row.observed_at
+            ):
+                raise ValidationError(
+                    "liveness observation predates the repository's recorded history"
+                )
+            orders = self._completed_orders((row.repository_id,), row.observed_at).get(
+                row.repository_id, ()
+            )
+            previous = self._fold_completed(
+                previous or Liveness(repository_id=row.repository_id, url=repository.url),
+                orders,
+                row.observed_at,
+                self._ops.manifests_of(orders) if orders else {},
+            )
+            saved = row.model_copy(
+                update={
+                    "status_since": previous.status_since
+                    if previous.status == row.status and previous.status_since is not None
+                    else row.observed_at,
+                    "dormant": None,
+                }
+            )
+            if recorded.get(row.repository_id) == saved:
+                assert latest is not None
+                return PublishResult(
+                    artifact=RepoLivenessArtifact.name, artifact_id=latest.artifact_id, written=()
+                )
+            recorded[row.repository_id] = saved
+            snapshot = RepoLiveness(generated=self._clock.now(), repositories=recorded)
+            try:
+                return publisher.publish_successor(
+                    snapshot.to_artifact(), None if latest is None else latest.artifact_id
+                )
+            except ConflictError:
+                continue
+
+    def _completed_orders(self, repository_ids: Sequence[UUID], now: datetime) -> dict[UUID, list]:
+        """The finished degraded/failed/refused repo_state orders of several repositories,
+        one indexed query for the whole page instead of one per repository — a liveness
+        page render used to run (and manifest-parse) per repository."""
+        ops = self._ops
+        if ops is None or not repository_ids:
+            return {}
+        filter = OrderFilter(
+            repository_ids=tuple(repository_ids),
+            asset=AssetName("repo_state"),
+            states=(OrderState.DEGRADED, OrderState.FAILED, OrderState.REFUSED),
+        )
+        grouped: dict[UUID, list] = {}
+        for order in every_item(lambda page: ops.list(filter, page)):
+            if order.finished_at is not None and order.finished_at <= now:
+                grouped.setdefault(order.repository_id, []).append(order)
+        return grouped
+
+    def _fold_completed(
+        self,
+        row: Liveness,
+        orders: Sequence,
+        now: datetime,
+        manifests: Mapping[UUID, OrderManifest],
+    ) -> Liveness:
+        failures = set(ComparisonStatus) - OBSERVED - {ComparisonStatus.NO_PINNED_SHA}
+        orders = sorted(
+            (
+                order
+                for order in orders
+                if row.observed_at is None
+                or (
+                    order.finished_at > row.observed_at
+                    and (order.started_at is None or order.started_at > row.observed_at)
+                )
+            ),
+            key=lambda order: (order.finished_at, str(order.id)),
+        )
+        for order in orders:
+            assert order.id is not None
+            assert self._ops is not None  # the fold only runs with an ops service
+            manifest = manifests[order.id]
+            statuses = sorted(
+                (status for status in failures if manifest.degraded.get(status.value, 0) > 0),
+                key=lambda status: status.value,
+            )
+            if not statuses:
+                continue
+            row = Liveness(
+                repository_id=row.repository_id,
+                url=row.url,
+                observed_at=order.finished_at,
+                status_since=row.status_since
+                if row.status == LivenessStatus.UNKNOWN and row.status_since is not None
+                else order.finished_at,
+                unobserved=statuses[0] if len(statuses) == 1 else ComparisonStatus.ERROR,
+                reason="completed repo_state observation: "
+                + ", ".join(status.value for status in statuses),
+            )
+        return row
+
+    def _unqueried_liveness(self, repository: Repository, unaudited: Collection[UUID]) -> Liveness:
+        assert repository.id is not None
+        row = Liveness(repository_id=repository.id, url=repository.url)
         if observation_url(repository.url, self._hosts) is None:
             status, reason = ComparisonStatus.UNSUPPORTED_HOST, "no forge observes this host"
         elif repository.id in unaudited:
@@ -807,6 +1181,26 @@ class PortfolioService:
             products = {r.product_id for r in uow.releases.list_by_ids(releases)}
             return sorted(uow.products.list_by_ids(products), key=lambda p: p.slug)
 
+    def list_products_of_all(self, repository_ids: Collection[UUID]) -> dict[UUID, list[Product]]:
+        """Each repository's shipping products, by slug, keyed by repository id: the batched
+        `list_products_of` for a scope."""
+        with self._uow as uow:
+            listed = uow.repository_refs.list_for_repositories(repository_ids)
+            owner = {r.id: r.repository_id for r in listed if r.id}
+            shipped: defaultdict[UUID, set[UUID]] = defaultdict(set)
+            for component in uow.components.list_for_refs(list(owner)):
+                shipped[owner[component.repository_ref_id]].add(component.release_id)
+            release_ids = {i for found in shipped.values() for i in found}
+            product_of = {r.id: r.product_id for r in uow.releases.list_by_ids(release_ids)}
+            products = {p.id: p for p in uow.products.list_by_ids(set(product_of.values()))}
+            return {
+                repository_id: sorted(
+                    (products[product_of[i]] for i in found if product_of[i] in products),
+                    key=lambda p: p.slug,
+                )
+                for repository_id, found in shipped.items()
+            }
+
     def inventory_export(self, *, max_records: int = 10_000) -> tuple[InventoryExportRow, ...]:
         """Registered repositories with current owners, shipping products and cached contacts."""
         if self._product_definitions is None:
@@ -964,6 +1358,26 @@ class PortfolioService:
             ref_id: tuple(sorted({slugs[releases[rid]] for rid in rids if rid in releases}))
             for ref_id, rids in linked.items()
         }
+
+    def list_product_refs_of(
+        self, product_ids: Collection[UUID]
+    ) -> dict[UUID, list[RepositoryRef]]:
+        """Each product's shipped commits, once each, keyed by product id: the batched
+        `list_product_refs` for a scope."""
+        with self._uow as uow:
+            release_of: dict[UUID, UUID] = {}
+            for release in uow.releases.list_for_products(product_ids):
+                if release.id is not None:
+                    release_of[release.id] = release.product_id
+            shipped: defaultdict[UUID, set[UUID]] = defaultdict(set)
+            for component in uow.components.list_for_releases(list(release_of)):
+                shipped[release_of[component.release_id]].add(component.repository_ref_id)
+            ids = {i for found in shipped.values() for i in found}
+            refs = {r.id: r for r in uow.repository_refs.list_by_ids(ids) if r.id}
+            return {
+                product_id: sorted((refs[i] for i in found), key=lambda r: str(r.id))
+                for product_id, found in shipped.items()
+            }
 
     def list_refs_by_manifest(self, sbom_ids: Collection[UUID]) -> list[RepositoryRef]:
         with self._uow as uow:
@@ -1300,10 +1714,20 @@ class PortfolioService:
     def list_repositories(self, filter: RepositoryFilter, page: PageRequest) -> Page[Repository]:
         if filter.url is not None:
             found = self.find_repository(filter.url)
+            if (
+                found is not None
+                and filter.dispositioned is not None
+                and (found.disposition is not None) != filter.dispositioned
+            ):
+                found = None  # the URL branch answers the same predicate as the page (Qodo #474)
             return Page(items=(found,) if found else ())
         after = page.position()
         with self._uow as uow:
-            rows = uow.repositories.search(limit=page.limit + 1, after=after)
+            rows = uow.repositories.search(
+                limit=page.limit + 1,
+                after=after,
+                dispositioned=filter.dispositioned,
+            )
         return Page.of(rows, page.limit, lambda r: (r.created_at, r.id))
 
     def list_owned_repositories(self, team_id: UUID, as_of: datetime | None = None) -> list[UUID]:
@@ -1334,6 +1758,29 @@ class PortfolioService:
             )
             teams = [uow.teams.get(t) for t in dict.fromkeys(o.team_id for o in rows)]
         return sorted(teams, key=lambda t: t.name)
+
+    def list_owners_of(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> dict[UUID, list[Team]]:
+        """Each repository's owning teams now, or at `as_of`, by name, keyed by repository
+        id: the batched `list_owners` for a scope."""
+        with self._uow as uow:
+            rows = (
+                uow.ownerships.current_for_repositories(repository_ids)
+                if as_of is None
+                else uow.ownerships.as_of_for_repositories(repository_ids, as_of)
+            )
+            team_ids = {o.team_id for o in rows}
+            teams = {t.id: t for t in uow.teams.list_by_ids(team_ids)}
+            owners: defaultdict[UUID, list[Team]] = defaultdict(list)
+            for o in rows:
+                found = teams.get(o.team_id)
+                if found is not None:
+                    owners[o.repository_id].append(found)
+        return {
+            repository_id: sorted(found, key=lambda t: t.name)
+            for repository_id, found in owners.items()
+        }
 
     def get_product(self, product_id: UUID) -> Product:
         require_uuid(product_id, "product.id")
@@ -1448,6 +1895,15 @@ def _subject_of(
 
 def _owned(subject: CorpusSubject | None) -> tuple[OwnershipClass | None, str | None]:
     return (None, None) if subject is None else (subject.ownership, subject.business_unit)
+
+
+def _is_vacated(row: Repository) -> bool:
+    """Whether the row is a URL correction's vacated-URL record: dispositioned gone by
+    the correction's own hand (the "url corrected to ..." evidence), not a fork or a
+    mirror that merely shares the upstream edge."""
+    return row.disposition == RepositoryDisposition.REPO_UNREACHABLE and (
+        row.disposition_evidence or ""
+    ).startswith("url corrected to")
 
 
 def _registered_repository(

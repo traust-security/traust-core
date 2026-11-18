@@ -17,6 +17,8 @@ from pydantic import BaseModel
 
 from traust_core.v1.errors import (
     ConfigError,
+    ConflictError,
+    ForbiddenError,
     NotFoundError,
     ServiceError,
     TraustError,
@@ -25,9 +27,15 @@ from traust_core.v1.errors import (
 from traust_core.v1.models.artifacts import (
     BenchmarkTargetArtifact,
     ComplianceAssessmentArtifact,
+    CveReplayArtifact,
     ReportArtifact,
 )
-from traust_core.v1.models.assessment import ASSESSMENT_COMPLETED, Assessment, AssessmentKind
+from traust_core.v1.models.assessment import (
+    ASSESSMENT_COMPLETED,
+    Artifact,
+    Assessment,
+    AssessmentKind,
+)
 from traust_core.v1.models.code_facts import CodeFactKind, ConfigFact, SanitizerFact, SymbolFact
 from traust_core.v1.models.common import (
     Page,
@@ -37,6 +45,17 @@ from traust_core.v1.models.common import (
     TimeWindow,
     ToolRequest,
 )
+from traust_core.v1.models.cve_replay import (
+    CveReplayAudit,
+    CveReplayCandidate,
+    CveReplayCandidates,
+    CveReplayRun,
+    CveReplaySnapshot,
+    CveReplayState,
+    CveReplayTrends,
+    CveReplayWatermark,
+)
+from traust_core.v1.models.dependencies import AdvisoryIdentifier, AdvisoryRecord
 from traust_core.v1.models.detection_quality import (
     COMPLIANCE_PRECISION_GATE,
     RULEABLE_LANGS,
@@ -87,6 +106,7 @@ from traust_core.v1.models.detection_quality import (
     guess_language,
 )
 from traust_core.v1.models.findings import FindingFilter, FindingFix, FindingState
+from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import FingerprintInput, FingerprintLocation, sha256_hex
 from traust_core.v1.models.inventory import RepositoryRef, default_line
 from traust_core.v1.models.rule_mining import (
@@ -127,7 +147,12 @@ from traust_core.v1.models.validation_benchmark import (
     ValidationBenchmark,
     ValidationRun,
 )
-from traust_core.v1.models.values import GitSha, HttpsRepoUrl
+from traust_core.v1.models.values import (
+    GitSha,
+    HttpsRepoUrl,
+    require_aware_datetime,
+    require_nonblank,
+)
 from traust_core.v1.models.vocabulary import ComplianceFramework, Severity, Validity
 from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.clock import Clock, SystemClock
@@ -148,6 +173,7 @@ from traust_core.v1.services.artifact_publishing import (
     PublishResult,
 )
 from traust_core.v1.services.code_facts import CodeFactsService
+from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings.identity import (
     IdentityPolicy,
     canon_path,
@@ -201,6 +227,7 @@ class DetectionQualityService:
         sweeper: RuleSweeper | None = None,
         git: GitCheckout | None = None,
         checkouts: RepoCheckoutService | None = None,
+        exposure: ExposureService | None = None,
     ) -> None:
         self._uow = uow
         self._log = AssessmentLog(uow)
@@ -216,6 +243,7 @@ class DetectionQualityService:
         self._sweeper = sweeper
         self._git = git
         self._checkouts = checkouts
+        self._exposure = exposure
 
     def record(self, doc: BenchmarkTargetArtifact, provenance: Provenance) -> PublishResult:
         """Record a new version of the answer key; the newest version is the one scored."""
@@ -518,6 +546,304 @@ class DetectionQualityService:
             failed=tuple(failed),
             reachability=_reachability(truth, {c for r in pack.rules for c in r.cwes}),
             novel_sample=_novel_sample(hits, truth),
+        )
+
+    def cve_replay(self, since: datetime | None = None) -> CveReplayRun:
+        """Discover advisories on the exact recorded audits, without admitting their presence."""
+        now = self._clock.now()
+        if since is not None:
+            require_aware_datetime(since, "CVE replay source watermark")
+            if since > now:
+                raise ValidationError("CVE replay source watermark must not be in the future")
+        exposure = self._require(self._exposure, "CVE replay advisory source")
+        exposure.require_commit_advisories()
+        audits = self._cve_audits()
+        records = self._cve_records()
+        snapshots = self._cve_snapshots(records, audits)
+        answers: dict[str, tuple[AdvisoryRecord, ...]] = {}
+        pending: list[tuple[CveReplayAudit, tuple[CveReplayCandidate, ...]]] = []
+        fresh: list[CveReplayCandidate] = []
+        for audit, report in audits:
+            prior = snapshots.get(audit.audit_id)
+            lower = max(audit.audited_at, since or audit.audited_at)
+            if lower > now or (prior and prior.watermark is not None and prior.watermark > now):
+                raise ValidationError(f"CVE replay audit {audit.audit_id}: future watermark")
+            if audit.audited_commit not in answers:
+                answers[audit.audited_commit] = exposure.advisories_for_commit(
+                    GitSha.parse(audit.audited_commit)
+                )
+            if any(row.published_at is None for row in answers[audit.audited_commit]):
+                raise ValidationError(
+                    f"CVE replay audit {audit.audit_id}: advisory publication is unknown"
+                )
+            text = "\n".join(report.text_fragments(sections=("findings", "negative_results")))
+            checks: list[CveReplayCandidate] = []
+            for advisory in answers[audit.audited_commit]:
+                published = advisory.published_at
+                if (
+                    published is None
+                    or published <= audit.audited_at
+                    or not lower <= published <= now
+                ):
+                    continue
+                check = CveReplayCandidate.classify(audit, text, advisory, now)
+                if (
+                    prior
+                    and prior.watermark is not None
+                    and published < prior.watermark
+                    and any(old.same_advisory(check) for old in prior.checks)
+                ):
+                    continue
+                checks.append(check)
+            fresh.extend(checks)
+            pending.append((audit, tuple(checks)))
+        changed: list[CveReplaySnapshot] = []
+        for audit, checks in pending:
+            prior = snapshots.get(audit.audit_id)
+            state = CveReplayState(checks=prior.checks if prior else ()).merged(checks)
+            # A snapshot republishes only when its checks changed. The run's
+            # watermark is always `now` (a later prior watermark is refused
+            # above, so the max collapses to now), and requiring it to equal
+            # the prior one meant the skip fired only on a same-instant retry:
+            # every run republished a snapshot per audit — one new artifact and
+            # CVE_REPLAY assessment each, embedding the full accumulated checks
+            # list. The same_advisory merge already prevents re-checking; a
+            # no-change run leaves the stored watermark where it last published,
+            # and the per-advisory `published < prior.watermark` fast path
+            # narrows to what the dedup then covers.
+            if prior and state.checks == prior.checks:
+                continue
+            watermark = max(now, prior.watermark) if prior and prior.watermark else now
+            snapshot = CveReplaySnapshot(
+                audit=audit,
+                revision=prior.revision + 1 if prior else 1,
+                watermark=watermark,
+                checks=state.checks,
+            )
+            changed.append(snapshot)
+            snapshots[audit.audit_id] = snapshot
+        self._cve_commit(changed, records, now)
+        state = self._cve_state(snapshots)
+        return CveReplayRun(
+            checked_at=now,
+            audited_reports=len(audits),
+            queried_commits=len(answers),
+            checks=tuple(fresh),
+            watermarks=state.watermarks,
+            candidates=state.candidates(),
+            trends=state.trends(),
+        )
+
+    def cve_replay_candidates(self) -> CveReplayCandidates:
+        return self._cve_state(self._cve_snapshots()).candidates()
+
+    def cve_replay_trends(self) -> CveReplayTrends:
+        return self._cve_state(self._cve_snapshots()).trends()
+
+    def cve_replay_oracle(
+        self,
+        assessment_id: UUID,
+        advisory: str,
+        *,
+        present_at_audit: bool | None = None,
+        principal: Principal | None = None,
+        presence_evidence: str | None = None,
+    ) -> CveReplayCandidate:
+        """Replay one source advisory, optionally recording a verified person's adjudication."""
+        if present_at_audit is not None:
+            if principal is None or not principal.is_verified_human():
+                raise ForbiddenError("CVE replay presence requires a verified human caller")
+            if presence_evidence is None:
+                raise ValidationError("CVE replay presence requires supporting evidence")
+            require_nonblank(presence_evidence, "CVE replay presence evidence")
+        elif presence_evidence is not None:
+            raise ValidationError("CVE replay presence evidence requires a presence verdict")
+        audits = self._cve_audits()
+        bound = next((row for row in audits if row[0].audit_id == assessment_id), None)
+        if bound is None:
+            raise NotFoundError(f"CVE replay recorded audit {assessment_id}")
+        exposure = self._require(self._exposure, "CVE replay advisory source")
+        record = exposure.find_advisory(AdvisoryIdentifier(advisory))
+        if record is None:
+            raise NotFoundError(f"CVE replay advisory {advisory}")
+        audit, report = bound
+        now = self._clock.now()
+        published = record.published_at
+        if published is None or not audit.audited_at < published <= now:
+            raise ValidationError(
+                f"CVE replay advisory {advisory}: publication must be known, strictly after "
+                f"the audit ({audit.audited_at.isoformat()}) and no later than now"
+            )
+        check = CveReplayCandidate.classify(
+            audit,
+            "\n".join(report.text_fragments(sections=("findings", "negative_results"))),
+            record,
+            now,
+            present_at_audit=present_at_audit,
+            reviewer=principal.ref if principal and present_at_audit is not None else None,
+            presence_identity_source=(
+                principal.verified_by if principal and present_at_audit is not None else None
+            ),
+            presence_evidence=presence_evidence,
+        )
+        records = self._cve_records()
+        prior = self._cve_snapshots(records, audits).get(audit.audit_id)
+        state = CveReplayState(checks=prior.checks if prior else ()).merged((check,))
+        if prior is None or state.checks != prior.checks:
+            self._cve_commit(
+                (
+                    CveReplaySnapshot(
+                        audit=audit,
+                        revision=prior.revision + 1 if prior else 1,
+                        watermark=prior.watermark if prior else None,
+                        checks=state.checks,
+                    ),
+                ),
+                records,
+                now,
+            )
+        return check
+
+    def _cve_audits(self) -> list[tuple[CveReplayAudit, ReportArtifact]]:
+        records = self._log.documents(
+            (a for kind in _AUDITS for a in self._log.list_of(kind)),
+            [ReportArtifact.schema],
+        )
+        result = []
+        seen = set()
+        for assessment, artifact in records:
+            if assessment.status != ASSESSMENT_COMPLETED or assessment.repository_ref_id is None:
+                continue
+            if assessment.id in seen:
+                raise ValidationError(
+                    f"CVE replay audit {assessment.id}: ambiguous recorded reports"
+                )
+            seen.add(assessment.id)
+            ref = self._inventory.get_ref(assessment.repository_ref_id)
+            repository = self._inventory.get_repository(ref.repository_id)
+            assert assessment.id is not None and ref.id is not None and artifact.id is not None
+            report = self._publisher.read(artifact.id, ReportArtifact)
+            if report.metadata.repository != repository.url or report.metadata.commit != ref.sha:
+                raise ValidationError(
+                    f"CVE replay audit {assessment.id}: original report repository and commit "
+                    "do not match its recorded ref"
+                )
+            result.append(
+                (
+                    CveReplayAudit(
+                        repository_id=ref.repository_id,
+                        repository_ref_id=ref.id,
+                        repository=repository.url,
+                        audited_commit=ref.sha,
+                        audit_id=assessment.id,
+                        report_artifact_id=artifact.id,
+                        audited_at=assessment.occurred_at,
+                    ),
+                    report,
+                )
+            )
+        return result
+
+    def _cve_records(self) -> list[tuple[Assessment, Artifact]]:
+        return self._log.documents(
+            self._log.list_of(AssessmentKind.CVE_REPLAY), [CveReplayArtifact.schema]
+        )
+
+    def _cve_snapshots(
+        self,
+        records: Sequence[tuple[Assessment, Artifact]] | None = None,
+        audits: Sequence[tuple[CveReplayAudit, ReportArtifact]] | None = None,
+    ) -> dict[UUID, CveReplaySnapshot]:
+        """The recorded snapshots, keyed by audit. `records` and `audits` thread in
+        copies a caller already fetched — `_cve_audits()` reads and parses every
+        SECURE_CODE report payload from the object store, so a caller that holds
+        them must not pay for them twice."""
+        snapshots: dict[UUID, CveReplaySnapshot] = {}
+        audit_rows = self._cve_audits() if audits is None else audits
+        audits = {audit.audit_id: audit for audit, _ in audit_rows}
+        for assessment, artifact in self._cve_records() if records is None else records:
+            assert artifact.id is not None
+            document = self._publisher.read(artifact.id, CveReplayArtifact)
+            snapshot = CveReplaySnapshot.model_validate_json(document.payload)
+            audit = snapshot.audit
+            if (
+                audits.get(audit.audit_id) != audit
+                or assessment.repository_ref_id != audit.repository_ref_id
+                or assessment.baseline_assessment_id != audit.audit_id
+            ):
+                raise ValidationError(
+                    "CVE replay snapshot does not bind its original recorded audit"
+                )
+            prior = snapshots.get(audit.audit_id)
+            if prior is None or snapshot.revision > prior.revision:
+                snapshots[audit.audit_id] = snapshot
+            elif snapshot.revision == prior.revision and snapshot != prior:
+                raise ValidationError(f"CVE replay audit {audit.audit_id}: conflicting revisions")
+        return snapshots
+
+    def _cve_commit(
+        self,
+        snapshots: Sequence[CveReplaySnapshot],
+        prior: Sequence[tuple[Assessment, Artifact]],
+        now: datetime,
+    ) -> None:
+        if not snapshots:
+            return
+        prepared: list[tuple[CveReplaySnapshot, PublishResult, str]] = []
+        for snapshot in snapshots:
+            doc = CveReplayArtifact.from_document(snapshot.model_dump(mode="json"))
+            published = self._publisher.publish_artifact(doc)
+            prepared.append((snapshot, published, sha256_hex(doc.payload)))
+        audit_ids = {snapshot.audit.audit_id for snapshot in snapshots}
+        expected = {
+            (assessment.id, artifact.id)
+            for assessment, artifact in prior
+            if assessment.baseline_assessment_id in audit_ids
+        }
+        version = core_version()
+        with self._uow.write() as uow:
+            for audit_id in sorted(audit_ids, key=str):
+                self._log.lock(audit_id)
+            current = {
+                (assessment.id, artifact.id)
+                for assessment, artifact in self._cve_records()
+                if assessment.baseline_assessment_id in audit_ids
+            }
+            if current != expected:
+                raise ConflictError(
+                    "CVE replay audits changed; read their latest snapshots and retry"
+                )
+            for snapshot, published, digest in prepared:
+                self._log.add(
+                    Assessment(
+                        repository_ref_id=snapshot.audit.repository_ref_id,
+                        baseline_assessment_id=snapshot.audit.audit_id,
+                        kind=AssessmentKind.CVE_REPLAY,
+                        status=ASSESSMENT_COMPLETED,
+                        assessor="cve-replay",
+                        assessor_version=version,
+                        occurred_at=now,
+                    ),
+                    published.artifact_id,
+                    digest,
+                )
+            uow.commit()
+
+    @staticmethod
+    def _cve_state(snapshots: Mapping[UUID, CveReplaySnapshot]) -> CveReplayState:
+        ordered = sorted(snapshots.values(), key=lambda row: str(row.audit.audit_id))
+        return CveReplayState(
+            checks=tuple(check for snapshot in ordered for check in snapshot.checks),
+            watermarks=tuple(
+                CveReplayWatermark(
+                    repository_id=snapshot.audit.repository_id,
+                    repository_ref_id=snapshot.audit.repository_ref_id,
+                    audit_id=snapshot.audit.audit_id,
+                    checked_at=snapshot.watermark,
+                )
+                for snapshot in ordered
+                if snapshot.watermark is not None
+            ),
         )
 
     def critical_misses(

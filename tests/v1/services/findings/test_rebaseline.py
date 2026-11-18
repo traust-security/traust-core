@@ -269,3 +269,34 @@ def test_moves_compare_one_repository(engine: Engine, services: Any) -> None:
     other, _ = audited(engine, services, ("a/db.go",))
     with pytest.raises(ValidationError, match="one repository"):
         services.findings.intake.moves([], [reaudit(repo, ("x",)), reaudit(other, ("y",))])
+
+
+def test_baseline_mapping_decisions_are_not_retained_claim_corrections(
+    engine: Engine, services: Any
+) -> None:
+    repo, finding_id = audited(engine, services, ("a/db.go", "a/h.go"))
+    (move,) = services.findings.moves(repo, [reaudit(repo, ("a/db.go", "a/h.go", "a/q.go"))])
+    proposal = services.findings.decisions.decide(
+        RecordDecision(
+            finding_id=finding_id,
+            severity=Severity.HIGH,
+            reason="baseline_rewrite",
+            rationale="The verified human proposes the handler identity mapping.",
+        ),
+        PERSON,
+    )
+    item = services.findings.review.request_signoff(
+        finding_id, "rebaseline_mapping", decision_id=proposal.id
+    )
+    accepted = services.findings.review.resolve(
+        item.id,
+        RecordDecision(
+            finding_id=finding_id,
+            severity=Severity.HIGH,
+            reason="baseline_rewrite",
+            rationale=proposal.rationale,
+        ),
+        PERSON,
+    )
+    (moved,) = services.findings.intake.rebaseline([move], accepted.id)
+    assert moved.id == finding_id and moved.fingerprint == move.fingerprint

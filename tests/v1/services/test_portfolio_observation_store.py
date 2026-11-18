@@ -18,7 +18,7 @@ from tests.v1.observation_support import (
 )
 from tests.v1.repositories.tables import conftest as table_fixtures
 from tests.v1.repositories.tables.conftest import Seed
-from traust_core.v1.models.artifacts import ReportArtifact, RepoStateArtifact
+from traust_core.v1.models.artifacts import RepoLivenessArtifact, ReportArtifact, RepoStateArtifact
 from traust_core.v1.models.assessment import AssessmentKind
 from traust_core.v1.models.common import PageRequest
 from traust_core.v1.models.inventory import RefName, Repository, RepositoryFilter
@@ -61,7 +61,9 @@ class Observed:
             clock=FixedClock(NOW),
             hosts=HOSTS,
             publisher=ArtifactPublisher(
-                PublishSpecs(PublishSpec(RepoStateArtifact)), self.store, uow
+                PublishSpecs(PublishSpec(RepoStateArtifact), PublishSpec(RepoLivenessArtifact)),
+                self.store,
+                uow,
             ),
             tools=default_tools(),
         )

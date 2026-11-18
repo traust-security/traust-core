@@ -7,6 +7,7 @@ from tests.v1.observation_support import HOSTS, NOW
 from traust_core.v1.context.observation import command_source
 from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.values import HttpsRepoUrl
+from traust_core.v1.models.vocabulary import LivenessStatus
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.forge import TRIPWIRE_PATCH_CAP, CommandSourceProvider
 from traust_core.v1.providers.sources import SourceError
@@ -422,3 +423,100 @@ def test_a_failed_compare_patch_is_a_source_error():
     with pytest.raises(SourceError) as error:
         provider.compare_patch(HttpsRepoUrl("github.com", "o/r"), "abc1234")
     assert error.value.observation_status == "error"
+
+
+@pytest.mark.parametrize(
+    ("host", "payload", "expected", "canonical"),
+    [
+        (
+            "github.com",
+            {"archived": False, "html_url": "https://github.com/o/r"},
+            LivenessStatus.ACTIVE,
+            None,
+        ),
+        ("github.com", {"archived": True}, LivenessStatus.ARCHIVED, None),
+        ("github.com", {"archived": False, "disabled": True}, LivenessStatus.DISABLED, None),
+        (
+            "github.com",
+            {"archived": False, "html_url": "https://github.com/o/new"},
+            LivenessStatus.MOVED,
+            "https://github.com/o/new",
+        ),
+        (
+            "gitlab.com",
+            {"archived": False, "web_url": "https://gitlab.com/group/new"},
+            LivenessStatus.MOVED,
+            "https://gitlab.com/group/new",
+        ),
+        ("gitlab.com", {}, LivenessStatus.UNKNOWN, None),
+        (
+            "github.com",
+            {"archived": False, "html_url": "https://github.com/O/R"},
+            LivenessStatus.ACTIVE,
+            None,
+        ),
+    ],
+)
+def test_availability_comes_from_explicit_metadata_not_missing_flags(
+    host, payload, expected, canonical
+):
+    provider, _ = source(json.dumps(payload))
+
+    result = provider.info(HttpsRepoUrl(host, "o/r"))
+
+    assert result.data.liveness_status == expected
+    assert result.data.canonical_url == canonical
+    assert result.acquisition.acquired_at == NOW
+
+
+@pytest.mark.parametrize("http_status", [403, 500, None])
+def test_an_ambiguous_forge_failure_never_proves_a_repository_is_missing(http_status):
+    """The statuses that could mean anything (forbidden, sick, unreachable) never assert
+    liveness: a repository's word about itself must be positive evidence, never an
+    inference from a refusal the repository did not make."""
+    provider, _ = source("not found", status=http_status)
+
+    with pytest.raises(SourceError) as error:
+        provider.info(HttpsRepoUrl("github.com", "o/r"))
+
+    assert error.value.liveness_status == LivenessStatus.UNKNOWN
+
+
+@pytest.mark.parametrize("gone_status", [404, 410], ids=["not-found", "gone"])
+def test_the_repository_reads_404_and_410_are_the_forge_reports_missing(gone_status):
+    """The gone word (foundry plan repo-unreachable): a repository read answering 404
+    (no such repository) or 410 (gone) both carry liveness missing — the plan counts
+    the forge's 404/10 word (Qodo #474 round on the 410)."""
+    provider, _ = source("not found", status=gone_status)
+
+    with pytest.raises(SourceError) as error:
+        provider.info(HttpsRepoUrl("github.com", "o/r"))
+
+    assert error.value.liveness_status == LivenessStatus.MISSING
+
+
+def test_the_default_branch_read_of_an_empty_repository_marks_it_empty():
+    """A repository whose own read answers but whose default branch names no commit
+    reads 404/409 - the empty repository's signature (GitHub reports a default branch
+    for a repository with no commits; Qodo #474)."""
+    provider, _ = source("Git Repository is empty", status=409)
+
+    with pytest.raises(SourceError) as error:
+        provider.head(HttpsRepoUrl("github.com", "o/r"), "main")
+
+    assert error.value.empty_repository is True
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"disabled": "true"},
+        {"html_url": "https://unconfigured.example/o/new"},
+        {"html_url": "http://github.com/o/new"},
+    ],
+)
+def test_malformed_availability_metadata_is_refused_instead_of_recorded(payload):
+    provider, _ = source(json.dumps(payload))
+
+    with pytest.raises((SourceError, ValidationError)):
+        provider.info(HttpsRepoUrl("github.com", "o/r"))

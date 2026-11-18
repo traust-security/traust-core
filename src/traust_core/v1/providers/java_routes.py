@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 
 from traust_core.v1.models.code_facts import RouteFamily
 from traust_core.v1.models.common import CodeSpan, RepoPath
-from traust_core.v1.providers.route_guards import _guards_in, _mark, _Row, _row, _unique
+from traust_core.v1.providers.route_guards import _mark, _Row, _row, _unique
 from traust_core.v1.providers.route_ownership import (
     OWNER_CHECK_RX,
     OWNER_FIELD_RX,
@@ -19,6 +19,7 @@ from traust_core.v1.providers.route_ownership import (
     Lookup,
     owner_field,
 )
+from traust_core.v1.providers.route_plumbing import _guards_in
 from traust_core.v1.providers.syntax import Node, Parsed, walk
 from traust_core.v1.providers.syntax import java_parser as parser
 from traust_core.v1.providers.tree import TreeFile

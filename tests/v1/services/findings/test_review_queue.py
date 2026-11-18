@@ -149,3 +149,71 @@ def test_an_empty_queue(repo: Repo) -> None:
 def test_queue_rejects_a_non_positive_limit(repo: Repo) -> None:
     with pytest.raises(ValidationError):
         review(repo.engine).queue(ALL, PageRequest(limit=0))
+
+
+def test_queue_by_repositories_reads_the_set_in_one_filter(repo: Repo) -> None:
+    mine = repo.reported()
+    static_refutation(repo, mine)
+    other = new_repo(repo.engine)
+    theirs = other.reported()
+    static_refutation(other, theirs)
+    item(other, theirs)
+    third = new_repo(repo.engine)
+    theirs_three = third.reported()
+    static_refutation(third, theirs_three)
+
+    # the set filter keeps exactly the set's repositories' cases, like the single
+    # repository filter keeps one
+    two = ReviewFilter(repository_ids=(repo.repository.id, other.repository.id))  # type: ignore[arg-type]
+    assert set(kinds(repo, two)) == {mine.id, theirs.id}
+    # one repository's worth of the set
+    one = ReviewFilter(repository_ids=(other.repository.id,))  # type: ignore[arg-type]
+    assert set(kinds(repo, one)) == {theirs.id}
+    # an empty set is no filter, the orders filter's own convention: the whole scope
+    assert set(kinds(repo, ReviewFilter(repository_ids=()))) == {
+        mine.id,
+        theirs.id,
+        theirs_three.id,
+    }
+    # one repository or several, never both: the same refusal the remediations
+    # listing raises
+    with pytest.raises(ValidationError):
+        review(repo.engine).queue(
+            ReviewFilter(
+                repository_id=repo.repository.id,
+                repository_ids=(other.repository.id,),  # type: ignore[arg-type]
+            ),
+            PageRequest(),
+        )
+
+
+def test_the_queue_carries_the_case_findings_display_view(repo: Repo) -> None:
+    """The case's view carries the display fields a queue row renders — the fold's own
+    facts, not a per-case finding-detail call — and matches what the finding door serves."""
+    finding = repo.reported(cwes=("CWE-79",))
+    static_refutation(repo, finding)  # a machine FP: a fold state needing a person
+    from tests.v1.repositories.tables.conftest import Seed
+
+    with SqlTraustUnitOfWork(repo.engine) as uow:
+        occurrence = uow.occurrences.list_for_findings([finding.id])[0]  # type: ignore[list-item]
+        Seed(uow).location(occurrence, path="pkg/api/handler.go", line_start=12, line_end=40)
+        uow.commit()
+    served = review(repo.engine).queue(ALL, PageRequest())
+    case = next(c for c in served.items if c.finding_id == finding.id)
+    assert case.view is not None
+    assert case.view.finding.title == finding.title
+    assert case.view.effective_severity is not None
+    assert case.view.cwes == ("CWE-79",)
+    assert [loc.path for loc in case.view.locations] == ["pkg/api/handler.go"]
+    # The view is the finding door's own shape, so a consumer maps it exactly as it
+    # mapped the detail it used to fetch per case.
+    assert case.view == service(repo.engine).get(finding.id)
+
+
+def test_the_scoped_queue_carries_the_view_too(repo: Repo) -> None:
+    finding = repo.reported()
+    static_refutation(repo, finding)
+    scoped = ReviewFilter(repository_id=repo.repository.id)
+    served = review(repo.engine).queue(scoped, PageRequest())
+    case = next(c for c in served.items if c.finding_id == finding.id)
+    assert case.view is not None and case.view.finding.id == finding.id

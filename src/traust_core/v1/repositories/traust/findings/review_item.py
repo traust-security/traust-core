@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import datetime
 from types import EllipsisType
 from typing import Protocol
@@ -9,6 +9,7 @@ from uuid import UUID
 import sqlalchemy as sa
 
 from traust_core.v1.errors import NotFoundError
+from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.models.findings import ReviewFilter, ReviewItem
 from traust_core.v1.models.vocabulary import ReviewItemStatus
 from traust_core.v1.repositories.tables import (
@@ -39,8 +40,16 @@ class ReviewItemRepository(MutableRecordRepository[ReviewItem], Protocol):
     def get_for_update(self, review_item_id: UUID) -> ReviewItem: ...
 
     def list_for_finding(self, finding_id: UUID) -> list[ReviewItem]: ...
+    def list_for_findings(
+        self, finding_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[ReviewItem]: ...
     def pending(self, limit: int | None = None) -> list[ReviewItem]:
         """Pending items oldest first; every one of them when `limit` is None."""
+        ...
+
+    def pending_for_findings(self, finding_ids: Collection[UUID]) -> list[ReviewItem]:
+        """The pending items of these findings, oldest first: bounded by the id batches,
+        never the whole queue."""
         ...
 
     def page(
@@ -70,10 +79,34 @@ class SqlReviewItemRepository(SqlMutableRepository[ReviewItem]):
     def list_for_finding(self, finding_id: UUID) -> list[ReviewItem]:
         return self._many(f"list for {finding_id}", self.table.c.finding_id == finding_id)
 
+    def list_for_findings(
+        self, finding_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[ReviewItem]:
+        return self._many_in(
+            f"list for {len(finding_ids)} findings",
+            self.table.c.finding_id,
+            finding_ids,
+            read_budget=read_budget,
+        )
+
     def pending(self, limit: int | None = None) -> list[ReviewItem]:
         c = self.table.c
         stmt = self._select().where(c.status == PENDING).order_by(c.created_at).limit(limit)
         return [self._to_record(r) for r in self._execute("pending", stmt).mappings()]
+
+    def pending_for_findings(self, finding_ids: Collection[UUID]) -> list[ReviewItem]:
+        c = self.table.c
+        rows: list[ReviewItem] = []
+        for batch in self._batches(finding_ids):
+            stmt = (
+                self._select()
+                .where(c.status == PENDING, c.finding_id.in_(batch))
+                .order_by(c.created_at)
+            )
+            rows += [
+                self._to_record(r) for r in self._execute("pending for findings", stmt).mappings()
+            ]
+        return sorted(rows, key=lambda r: (r.created_at, r.id))
 
     def page(
         self,

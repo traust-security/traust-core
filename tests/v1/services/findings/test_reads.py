@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections import Counter
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -15,8 +16,15 @@ from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
-from traust_core.v1.errors import ConflictError, NotFoundError
-from traust_core.v1.models.findings import Finding, FindingState, RecordDecision
+from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
+from traust_core.v1.models.common import PageRequest, RecordBudget
+from traust_core.v1.models.findings import (
+    Finding,
+    FindingFilter,
+    FindingSetFilter,
+    FindingState,
+    RecordDecision,
+)
 from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.inventory import Repository, RepositoryRef
 from traust_core.v1.models.vocabulary import (
@@ -29,6 +37,7 @@ from traust_core.v1.models.vocabulary import (
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.repositories.tables import SqlTableRepository
 from traust_core.v1.services.findings import (
     FindingDecisions,
     FindingIntake,
@@ -42,6 +51,7 @@ from traust_core.v1.services.findings import (
     TaxonomyPolicy,
 )
 from traust_core.v1.services.findings.rating import RatingConfig
+from traust_core.v1.services.findings.windows import WindowMemo
 from traust_core.v1.services.lint import Lint
 
 T0 = datetime(2026, 10, 1, tzinfo=UTC)
@@ -60,7 +70,7 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
         yield eng
 
 
-def service(engine: Engine) -> FindingService:
+def service(engine: Engine, *, windows: WindowMemo | None = None) -> FindingService:
     uow = SqlTraustUnitOfWork(engine)
     precedents = FindingPrecedents(uow)
     decisions = FindingDecisions(
@@ -82,6 +92,7 @@ def service(engine: Engine) -> FindingService:
         precedents,
         rating,
         InMemoryObjectStore(),
+        windows=windows,
     )
 
 
@@ -139,6 +150,67 @@ def test_get_undecided_finding_is_rated_by_its_report_with_a_deadline(engine: En
 def test_get_unknown_finding_is_not_found(engine: Engine) -> None:
     with pytest.raises(NotFoundError):
         service(engine).get(uuid4())
+
+
+@pytest.mark.parametrize("closed", [False, True])
+def test_report_times_follow_assessments_not_insertion_or_decision_times(
+    engine: Engine, closed: bool
+) -> None:
+    """The view's first/last report times — the occurrence→assessment join the census
+    reads for its SLA `first` — so a listing can show a date per finding (the item
+    findings page's datetime column); an `as_of` before the later report still sees
+    only the earlier one, on the single-repository listing and on the set listing."""
+    a = audited(engine)
+    earlier = T0 - timedelta(days=5)
+    later = T0 + timedelta(days=10)
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        for at in (later, earlier, T0 + timedelta(days=2)):
+            seed.occurrence(a.finding, seed.assessment(a.ref, occurred_at=at), severity="high")
+        uow.commit()
+    findings = service(engine)
+    if closed:
+        findings.decisions.decide(said(a.finding, 20, validity="false_positive"), ALICE)
+    view = findings.get(a.finding.id)
+    assert (view.first_reported_at, view.last_reported_at) == (earlier, later)
+    assert a.finding.created_at not in (earlier, later)
+    for cutoff, expected in (
+        (None, (earlier, later)),
+        (earlier, (earlier, earlier)),
+        (T0 + timedelta(days=5), (earlier, T0 + timedelta(days=2))),
+        (later, (earlier, later)),
+    ):
+        pages = (
+            findings.list(
+                FindingFilter(repository_id=a.repository.id, as_of=cutoff), PageRequest()
+            ),
+            findings.list_in(
+                FindingSetFilter(repository_ids=(a.repository.id,), as_of=cutoff), PageRequest()
+            ),
+        )
+        for page in pages:
+            assert len(page.items) == 1
+            listed = page.items[0]
+            assert (listed.first_reported_at, listed.last_reported_at) == expected
+    before = FindingFilter(repository_id=a.repository.id, as_of=earlier - timedelta(seconds=1))
+    assert findings.list(before, PageRequest()).items == ()
+
+
+def test_a_finding_without_reports_has_no_report_times(engine: Engine) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repo = seed.repository()
+        seed.repository_ref(repo)
+        finding = seed.finding(repo)
+        uow.commit()
+    findings = service(engine)
+    views = [
+        findings.get(finding.id),
+        *findings.list(FindingFilter(repository_id=repo.id), PageRequest()).items,
+        *findings.list_in(FindingSetFilter(repository_ids=(repo.id,)), PageRequest()).items,
+    ]
+    assert len(views) == 3
+    assert all((v.first_reported_at, v.last_reported_at) == (None, None) for v in views)
 
 
 @pytest.mark.parametrize("with_algorithm", [False, True])
@@ -313,6 +385,34 @@ def test_baseline_of_a_repository_without_findings_is_empty(engine: Engine) -> N
         repo = Seed(uow).repository()
         uow.commit()
     assert service(engine).baseline(repo.id, NOW) == []  # type: ignore[arg-type]
+
+
+def test_views_charge_the_read_budget_only_for_decisions_made_by_as_of(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    a = audited(engine)
+    findings = service(engine)
+    findings.decisions.decide(said(a.finding, 3, validity="confirmed"), ALICE)
+    findings.decisions.decide(said(a.finding, 10, resolution="resolved"), ALICE)
+    findings.decisions.decide(said(a.finding, 20, resolution="resolved", severity="high"), ALICE)
+    with SqlTraustUnitOfWork(engine) as uow:
+        rows = uow.decisions.list_for_findings([a.finding.id])  # type: ignore[list-item]
+        assert len(rows) == 3
+    counts: Counter[str] = Counter()
+    original = SqlTableRepository._to_record
+
+    def counted(
+        repository: SqlTableRepository[object], row: Mapping[str, object] | object
+    ) -> object:
+        counts[repository.spec.name] += 1
+        return original(repository, row)  # type: ignore[arg-type, return-value]
+
+    monkeypatch.setattr(SqlTableRepository, "_to_record", counted)
+    with SqlTraustUnitOfWork(engine) as uow, pytest.raises(ValidationError):
+        FindingViewQuery(RatingPolicy(RatingConfig())).views(
+            uow, [a.finding], T0 + timedelta(days=5), read_budget=RecordBudget(1, "as-of view")
+        )
+    assert counts["decision"] == 1  # the one made by as_of, not the two after it
 
 
 def test_open_count_counts_open_findings_by_effective_severity(engine: Engine) -> None:

@@ -41,7 +41,9 @@ def scheduled(engine: sa.Engine) -> dict[str, object]:
         findings = [
             row
             for row in uow.connection.execute(
-                sa.select(uow.findings.table.c.id).limit(EFFORTS)
+                sa.select(uow.findings.table.c.id)
+                .where(uow.findings.table.c.repository_id == repo)
+                .limit(EFFORTS)
             ).scalars()
         ]
         items: list[str] = []

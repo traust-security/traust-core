@@ -10,15 +10,16 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import NewType
+from typing import NamedTuple, NewType
 from uuid import UUID
 
-from pydantic import AwareDatetime, ConfigDict, Field, field_serializer
+from pydantic import AwareDatetime, ConfigDict, Field, field_serializer, model_validator
 
+from traust_core.v1.models.artifacts import RepoLivenessArtifact
 from traust_core.v1.models.base import Entity, Model
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.models.values import ProductSlug as ProductSlug
-from traust_core.v1.models.vocabulary import ComparisonStatus, RefKind
+from traust_core.v1.models.vocabulary import ComparisonStatus, LivenessStatus, RefKind
 
 RefName = NewType("RefName", str)
 VersionLabel = NewType("VersionLabel", str)
@@ -46,6 +47,36 @@ class Repository(Entity):
     url: str
     public: bool
     archived: bool | None = None
+    # The unreachable disposition (foundry plan repo-unreachable). None = active: the
+    # repository stays in the planner's universe. `repo_unreachable` leaves it - no work is
+    # planned for the repository until a person's verify succeeds - with the gone-class
+    # reason, the last error as evidence and the moment the disposition flipped. The
+    # streak counts consecutive gone-class observation failures (two flip it); any
+    # successful observation resets it, and the transient classes (timeouts, 5xx, rate
+    # limits) never touch it.
+    disposition: RepositoryDisposition | None = None
+    disposition_reason: GoneReason | None = None
+    disposition_evidence: str | None = None
+    disposition_at: datetime | None = None
+    gone_streak: int = 0
+
+
+class RepositoryDisposition(StrEnum):
+    """A repository's standing in the planner's universe. The unreachable disposition is
+    user-removable only: no automatic recovery, ever - the re-verification is a deliberate
+    act (the verify door, the operator's record path)."""
+
+    REPO_UNREACHABLE = "repo_unreachable"
+
+
+class GoneReason(StrEnum):
+    """Why a repository left: the gone-class taxonomy. The remediation differs - update the
+    URL (gone), wait (empty), check the network or token (unreachable) - so the UI carries
+    the reason, not just the disposition."""
+
+    GONE = "gone"
+    EMPTY = "empty"
+    UNREACHABLE = "unreachable"
 
 
 class InventoryExportRow(Model):
@@ -128,6 +159,18 @@ def ref_line(ref: RepositoryRef, refs: Iterable[RepositoryRef]) -> set[UUID]:
     }
 
 
+class CensusRef(NamedTuple):
+    """One ref's census columns — what the default-line and disposition-line rules read,
+    without a model."""
+
+    id: UUID | None
+    repository_id: UUID
+    name: str | None
+    kind: str | None
+    sha: str
+    is_default: bool
+
+
 class Team(Entity):
     name: str
 
@@ -195,9 +238,15 @@ class LinesReport(Model):
 
 
 class RepositoryFilter(Model):
-    """Every repository, or the one registered at `url`."""
+    """Every repository, or the one registered at `url`.
+
+    `dispositioned` narrows the universe: None (the default) answers every repository,
+    False only the active ones (the planner's universe - the engine's tick asks this
+    way, so a dispositioned repository costs no roundtrip), True only the ones carrying
+    the unreachable disposition (a remediation worklist)."""
 
     url: str | None = None
+    dispositioned: bool | None = None
 
 
 # Shapes land with their implementation slice.
@@ -257,20 +306,53 @@ class RecordedRelease(Model):
 class CrownJewelTier(Model): ...
 
 
-# NEED(model: liveness moved/missing): a failed observation (a redirect, a 404) is the order's
-# outcome, not a stored document, so liveness can't say a repository moved or is gone.
 class Liveness(Model):
-    """A repository's archived flag and default-branch push as last observed; `unobserved` and
-    `reason` say why there is no observation."""
+    """Availability evidence for a registered repository; unmeasured facts remain unknown."""
 
     repository_id: UUID
     url: str
+    status: LivenessStatus = LivenessStatus.UNKNOWN
+    status_since: AwareDatetime | None = None
+    canonical_url: str | None = None
     observed_at: AwareDatetime | None = None
     archived: bool | None = None
     pushed_at: str | None = None
     dormant: bool | None = None
     unobserved: ComparisonStatus | None = None
     reason: str | None = None
+
+
+class RepoLiveness(Model):
+    """Portfolio's durable availability snapshot; only attempted observations have entries."""
+
+    generated: AwareDatetime
+    repositories: Mapping[UUID, Liveness] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _recorded_history(self) -> RepoLiveness:
+        for repository_id, row in self.repositories.items():
+            if row.repository_id != repository_id:
+                raise ValueError("liveness repository_id must match its snapshot key")
+            if row.observed_at is None or row.status_since is None:
+                raise ValueError("recorded liveness requires observed_at and status_since")
+            if row.status_since > row.observed_at or row.observed_at > self.generated:
+                raise ValueError("liveness timestamps must be ordered within their snapshot")
+            if row.status == LivenessStatus.MOVED and row.canonical_url is None:
+                raise ValueError("moved liveness requires the forge's canonical_url")
+        return self
+
+    @classmethod
+    def of(cls, artifact: RepoLivenessArtifact) -> RepoLiveness:
+        return cls.model_validate_json(artifact.payload)
+
+    def to_artifact(self) -> RepoLivenessArtifact:
+        return RepoLivenessArtifact.from_document(
+            self.model_dump(
+                mode="json",
+                exclude_none=True,
+                exclude={"repositories": {"__all__": {"dormant"}}},
+            )
+        )
 
 
 class RepoState(Model):

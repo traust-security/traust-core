@@ -38,6 +38,13 @@ class OwnershipRepository(MutableRecordRepository[Ownership], Protocol):
         self, repository_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
     ) -> list[Ownership]: ...
     def as_of(self, repository_id: UUID, at: datetime) -> list[Ownership]: ...
+    def as_of_for_repositories(
+        self,
+        repository_ids: Collection[UUID],
+        at: datetime,
+        *,
+        read_budget: RecordBudget | None = None,
+    ) -> list[Ownership]: ...
     def list_for_team(self, team_id: UUID) -> list[Ownership]: ...
 
 
@@ -92,6 +99,27 @@ class SqlOwnershipRepository(SqlMutableRepository[Ownership]):
             c.valid_from <= at,
             sa.or_(c.valid_to.is_(None), c.valid_to > at),
         )
+
+    def as_of_for_repositories(
+        self,
+        repository_ids: Collection[UUID],
+        at: datetime,
+        *,
+        read_budget: RecordBudget | None = None,
+    ) -> list[Ownership]:
+        c = self.table.c
+        rows = [
+            row
+            for batch in self._batches(repository_ids)
+            for row in self._many(
+                f"as of {at} for {len(batch)} repositories",
+                c.repository_id.in_(batch),
+                c.valid_from <= at,
+                sa.or_(c.valid_to.is_(None), c.valid_to > at),
+                read_budget=read_budget,
+            )
+        ]
+        return sorted(rows, key=lambda row: (row.created_at, row.id))
 
     def list_for_team(self, team_id: UUID) -> list[Ownership]:
         return self._many(f"list for team {team_id}", self.table.c.team_id == team_id)

@@ -46,6 +46,10 @@ from traust_core.v1.models.operations import (
     OrderFilter,
     OrderManifest,
     OrderProgress,
+    OrderQueryItem,
+    OrderQueryPage,
+    OrderQueryPosition,
+    OrderQueryRequest,
     OrderReason,
     OrderRequest,
     OrderState,
@@ -147,6 +151,13 @@ def _classifiers(
 _OPEN = frozenset(
     {OrderState.PLANNED, OrderState.AWAITING_APPROVAL, OrderState.QUEUED, OrderState.LEASED}
 )
+
+
+def _recording_principal(principal: Principal) -> Principal:
+    principal = Principal.model_validate(dict(principal))
+    if principal.kind != ActorKind.MACHINE or principal.verified_by is None:
+        raise ForbiddenError("recording requires a verified machine identity")
+    return principal
 
 
 class Materializer(Protocol):
@@ -348,14 +359,27 @@ class OpsService:
     def _subject_issues(self, repository_id: UUID) -> tuple[DenyIssue, ...]:
         """The subject gate, shared by every door that starts a run: the repository must be
         registered and onboarded (an imported default line — registered alone is not a
-        subject, for preflight, submit and recording start alike)."""
+        subject, for preflight, submit and recording start alike), and it must be in the
+        planner's universe — a repository carrying the unreachable disposition (foundry
+        plan repo-unreachable) is planned nothing until a person's verify clears it."""
         if self._inventory is None:
             raise ConfigError("subject checks need the inventory door")
         try:
-            self._inventory.get_repository(repository_id)
+            repository = self._inventory.get_repository(repository_id)
         except NotFoundError:
             return (
                 DenyIssue(code=DenyCode.SUBJECT_UNKNOWN, detail=f"no repository {repository_id}"),
+            )
+        if repository.disposition is not None:
+            return (
+                DenyIssue(
+                    code=DenyCode.SUBJECT_UNREACHABLE,
+                    detail=(
+                        f"repository {repository_id} is {repository.disposition.value}"
+                        f" ({repository.disposition_reason or 'unknown reason'}):"
+                        " verify it to return it to the planner's universe"
+                    ),
+                ),
             )
         if self._inventory.default_line(repository_id) is None:
             return (
@@ -373,8 +397,7 @@ class OpsService:
         `recording.start` grant for this asset and repository. `authorize_request` enforces this
         rule; the policy gates report it as a typed issue — one rule, two doors."""
         return principal.is_verified_human() or (
-            principal.kind == ActorKind.MACHINE
-            and principal.verified_by is not None
+            principal.is_verified_machine()
             and repository_id is not None
             and self._in_start_scope(principal, asset, repository_id)
         )
@@ -523,9 +546,21 @@ class OpsService:
         assets: Collection[AssetName] | None = None,
         *,
         order_id: UUID | None = None,
+        mirror_affinity: bool = False,
     ) -> RunOrder | None:
         """Lease the next queued order, or only the selected queued ID; an empty `assets`
-        claims nothing."""
+        claims nothing.
+
+        `mirror_affinity` bounds the next-order selection to what the claiming worker
+        can take right now: a queued order whose repository another worker's live
+        lease holds (its node already fetched the repository's mirror) is skipped for
+        a later free one, and so is one whose (asset, repository) pair an open order
+        still gates (planned or awaiting approval: a pair at its budget gate keeps
+        its queued sibling waiting). A leased sibling is no gate — the holder's own
+        lease never blocks it. That rule is what the engine's runner once read every
+        open order to apply — the pre-walk that materialized ~10⁸ rows a day on
+        production — now answered inside the claim. A named `order_id` is claimed as
+        asked, affinity or not: the caller picked it."""
         if assets is not None and not assets:
             return None
         with self._uow as uow:
@@ -534,7 +569,12 @@ class OpsService:
             # needs no separate reaper loop for a dead runner's orders.
             expired = uow.run_orders.requeue_expired(self._clock.now())
             order = uow.run_orders.claim(
-                worker, self._clock.now(), lease_for, assets, order_id=order_id
+                worker,
+                self._clock.now(),
+                lease_for,
+                assets,
+                order_id=order_id,
+                mirror_affinity=mirror_affinity,
             )
             uow.commit()
         if expired:
@@ -632,11 +672,42 @@ class OpsService:
                 "person, or a machine granted it in recording.start, may"
             )
 
+    def authorize_write(self, asset: AssetName, repository_id: UUID, principal: Principal) -> None:
+        """Who may record an operational write outside a run (a remediation outcome reported
+        from filing): the same principals that may ask for the run. The record doors bind a
+        lease; filing happens outside order leases, so the `recording.start` grant alone is
+        the machine's scope."""
+        if not self._may_request(asset, repository_id, principal):
+            raise ForbiddenError(
+                f"recording {asset} progress on repository {repository_id} requires a "
+                "verified person, or a machine granted it in recording.start"
+            )
+
+    def authorize_recorder(self, asset: AssetName, principal: Principal) -> None:
+        """The write doors' gate before their subject is read: a verified person, or a
+        verified machine holding a `recording.start` grant for the asset somewhere. The
+        repository scope needs the subject, so it follows the read (`authorize_write`); a
+        caller refused here learns nothing about whether the subject exists."""
+        if not (
+            principal.is_verified_human()
+            or (
+                principal.is_verified_machine()
+                and any(
+                    scope.principal == principal.ref and asset in scope.assets
+                    for scope in self._recording_starts
+                )
+            )
+        ):
+            raise ForbiddenError(
+                f"recording {asset} progress requires a verified person, or a machine "
+                "granted it in recording.start"
+            )
+
     def _in_start_scope(self, principal: Principal, asset: AssetName, repository_id: UUID) -> bool:
         return any(
             scope.principal == principal.ref
             and asset in scope.assets
-            and repository_id in scope.repository_ids
+            and (scope.all_repositories or repository_id in scope.repository_ids)
             for scope in self._recording_starts
         )
 
@@ -653,6 +724,21 @@ class OpsService:
             uow.commit()
         return saved
 
+    def check_recording(
+        self,
+        order_id: UUID,
+        principal: Principal,
+        kind: RecordKind,
+        repository_id: UUID,
+        provenance: Provenance,
+    ) -> RunOrder:
+        """Authorize before staging bytes; recording repeats the checks under its lease lock."""
+        principal = _recording_principal(principal)
+        with self._uow as uow:
+            order = uow.run_orders.get(order_id)
+            self._check_recording(order, principal, kind, repository_id, provenance)
+        return order
+
     @contextmanager
     def recording(
         self,
@@ -663,23 +749,10 @@ class OpsService:
         provenance: Provenance,
     ) -> Iterator[RunOrder]:
         """Authorize and serialize one leased runner's report with its domain writes."""
-        principal = Principal.model_validate(dict(principal))
-        if principal.kind != ActorKind.MACHINE or principal.verified_by is None:
-            raise ForbiddenError("recording requires a verified machine identity")
+        principal = _recording_principal(principal)
         with self._uow.write() as uow:
             order = uow.run_orders.get_for_update(order_id)
-            _require(order, OrderState.LEASED)
-            if order.lease_holder != principal.ref:
-                raise ForbiddenError(f"order {order_id}: recording lease belongs to another runner")
-            self._require_lease(order, repository_id)
-            if order.asset not in self._recording_assets.get(kind, ()):
-                raise ForbiddenError(
-                    f"order {order_id}: asset is not authorized for {kind} recording"
-                )
-            if provenance.run_id != order_id:
-                raise ValidationError("recording provenance.run_id must equal run_order_id")
-            if provenance.source != _RECORDING_SOURCES.get(kind):
-                raise ValidationError("recording provenance source does not match the report kind")
+            self._check_recording(order, principal, kind, repository_id, provenance)
             yield order
             if order.lease_expires_at <= self._clock.now():
                 raise ConflictError(f"order {order_id}: recording lease expired before commit")
@@ -699,6 +772,25 @@ class OpsService:
             if order.lease_expires_at <= self._clock.now():
                 raise ConflictError(f"order {order_id}: recording lease expired before commit")
             uow.commit()
+
+    def _check_recording(
+        self,
+        order: RunOrder,
+        principal: Principal,
+        kind: RecordKind,
+        repository_id: UUID,
+        provenance: Provenance,
+    ) -> None:
+        _require(order, OrderState.LEASED)
+        if order.lease_holder != principal.ref:
+            raise ForbiddenError(f"order {order.id}: recording lease belongs to another runner")
+        self._require_lease(order, repository_id)
+        if order.asset not in self._recording_assets.get(kind, ()):
+            raise ForbiddenError(f"order {order.id}: asset is not authorized for {kind} recording")
+        if provenance.run_id != order.id:
+            raise ValidationError("recording provenance.run_id must equal run_order_id")
+        if provenance.source != _RECORDING_SOURCES.get(kind):
+            raise ValidationError("recording provenance source does not match the report kind")
 
     def _require_lease(self, order: RunOrder, repository_id: UUID) -> None:
         """A leased order's lease is live and its scope is this one repository (a fleet-wide
@@ -789,11 +881,36 @@ class OpsService:
         return {**manifest, "degraded": {**degraded, **gaps}}
 
     def approve(self, order_id: UUID, principal: Principal) -> RunOrder:
-        """Queue an order awaiting approval; only a verified person approves, never a machine."""
-        if not principal.is_verified_human():
+        """Queue an order awaiting approval. A verified person approves anything; a verified
+        ServiceAccount approves what a `recording.start` grant of its covers — the same
+        scope its recording authority names, so the service identity trusted to run an
+        asset's work on a repository may also release that asset's held order on it. The
+        approval record carries the principal's ref — a person's or the ServiceAccount's —
+        so the release is always attributable."""
+        # before the read: a caller refused here learns nothing about whether the order exists
+        if not principal.is_verified_human() and not (
+            principal.is_verified_machine()
+            and any(scope.principal == principal.ref for scope in self._recording_starts)
+        ):
             raise ForbiddenError(
-                f"order {order_id}: approval needs a verified human, not {principal.ref}"
+                f"order {order_id}: approval needs a verified person, or a ServiceAccount"
+                " granted it in recording.start"
             )
+        if principal.is_verified_machine():
+            order = self.get(order_id)
+            # a repository grant covers registered repositories only: a fleet-wide order
+            # (repository_id None) is a person's release, all_repositories or not
+            if not any(
+                scope.principal == principal.ref
+                and order.asset in scope.assets
+                and order.repository_id is not None
+                and (scope.all_repositories or order.repository_id in scope.repository_ids)
+                for scope in self._recording_starts
+            ):
+                raise ForbiddenError(
+                    f"order {order_id}: approval needs a verified person, or a ServiceAccount"
+                    f" granted {order.asset} on this repository in recording.start"
+                )
         approval = {"approver": principal.ref, "approved_at": self._clock.now().isoformat()}
         saved = self._move(
             order_id,
@@ -949,13 +1066,16 @@ class OpsService:
         repository_id: UUID | None,
         after: tuple[datetime, UUID] | None,
         limit: int,
+        repository_ids: Collection[UUID] = (),
     ) -> list[RunOrder]:
-        """One bounded batch of `asset`'s orders, optionally one repository's, oldest first after
-        a (created_at, id) position."""
+        """One bounded batch of `asset`'s orders, one repository's or several repositories'
+        (`repository_ids`, one indexed query over the set), oldest first after a
+        (created_at, id) position."""
         with self._uow as uow:
             return uow.run_orders.search(
                 asset=str(asset),
                 repository_id=repository_id,
+                repository_ids=repository_ids,
                 work_item=True,
                 limit=limit,
                 after=after,
@@ -964,17 +1084,36 @@ class OpsService:
 
     def manifest(self, order_id: UUID) -> OrderManifest:
         """The config an order was planned with and its approval, from its run manifest."""
-        artifact_id = self.get(order_id).artifact_id
-        if artifact_id is None:
-            return OrderManifest()
-        doc = json.loads(self._manifests.get(artifact_id).payload)
-        return OrderManifest.model_validate(
-            {k: doc[k] for k in ("config", "approval", "sessions") if k in doc}
-        )
+        return self.manifests_of([self.get(order_id)])[order_id]
+
+    def manifests_of(self, orders: Sequence[RunOrder]) -> dict[UUID, OrderManifest]:
+        """The run manifests of these orders, keyed by order id — the orders already in
+        hand, their artifacts one batched read: a fleet's liveness fold reads every
+        completed repo_state order, never one order and one artifact per manifest."""
+        rows = {
+            row.id: row
+            for row in AssessmentLog(self._uow).list_artifacts_by_ids(
+                [o.artifact_id for o in orders if o.artifact_id is not None]
+            )
+        }
+        manifests: dict[UUID, OrderManifest] = {}
+        for order in orders:
+            if order.id is None:
+                continue
+            row = rows.get(order.artifact_id) if order.artifact_id is not None else None
+            if order.artifact_id is not None and row is None:
+                raise NotFoundError(f"artifact {order.artifact_id} of order {order.id} not found")
+            doc = json.loads(self._manifests.payload_of(row)) if row is not None else {}
+            manifests[order.id] = OrderManifest.model_validate(
+                {k: doc[k] for k in ("config", "approval", "sessions", "degraded") if k in doc}
+            )
+        return manifests
 
     def list(self, filter: OrderFilter, page: PageRequest) -> Page[RunOrder]:
         after = page.position()
-        if not (filter.states or filter.repository_id or filter.run_batch_id):
+        if not (
+            filter.states or filter.repository_id or filter.repository_ids or filter.run_batch_id
+        ):
             raise ValidationError("list needs states, a repository_id or a run_batch_id (indexed)")
         if filter.window is not None:
             raise ValidationError("list pages by created_at; a window bounds a timeline")
@@ -982,6 +1121,25 @@ class OpsService:
         with self._uow as uow:
             rows = uow.run_orders.search(**query, limit=page.limit + 1, after=after)
         return Page.of(rows, page.limit, lambda o: (o.created_at, o.id))
+
+    def query(self, query: OrderQueryRequest) -> OrderQueryPage:
+        after = query.position()
+        with self._uow as uow:
+            rows = uow.order_reads.query(query, after)
+        fingerprint = query.fingerprint()
+        items = [
+            OrderQueryItem(
+                order=order,
+                repository_url=url,
+                cursor=OrderQueryPosition(
+                    fingerprint=fingerprint, value=value, order_id=order.id
+                ).encode(),
+            )
+            for order, url, value in rows[: query.limit]
+        ]
+        return OrderQueryPage(
+            items=items, next=items[-1].cursor if len(rows) > query.limit else None
+        )
 
     def feed_after(self, after: tuple[datetime, UUID] | None, limit: int) -> list[RunOrder]:
         """Orders that reached a `FEED_ORDER_STATES` state after a feed position, oldest change
@@ -1145,10 +1303,13 @@ class SpendService:
         clock: Clock,
         budgets: Sequence[Budget],
         models: ModelCatalog | None = None,
+        *,
+        inventory: Inventory | None = None,
     ) -> None:
         self._uow = uow
         self._clock = clock
         self._views = SpendViews(models)
+        self._inventory = inventory
         self._budgets = {b.lane: b for b in budgets}
         if len(self._budgets) != len(budgets):
             raise ConfigError(f"more than one budget per lane: {[b.lane for b in budgets]}")
@@ -1157,12 +1318,57 @@ class SpendService:
         # NEED(model-registry): check provider and model against ModelCatalog once it lands.
         with self._uow as uow:
             order = None if event.run_order_id is None else uow.run_orders.get(event.run_order_id)
-            saved = uow.spend_events.add(event.model_copy(update={"lane": order and order.lane}))
+            repository_id = None
+            if order is None:
+                repository_id = self._repository_id(event)
+            else:
+                # An ordered row stores no repository of its own (the schema's
+                # `run_order_id IS NULL OR repository_id IS NULL`), so any
+                # repository the event attests must agree with the order's —
+                # including a fleet-wide order, which names none: an attested
+                # identity there disagrees with the order's scope, and the
+                # schema leaves no room to preserve it, so refuse rather than
+                # silently drop the attestation. An unresolvable label is
+                # supplied metadata, not identity: it rides along unchanged.
+                supplied_repository_id = self._repository_id(event)
+                if (
+                    supplied_repository_id is not None
+                    and supplied_repository_id != order.repository_id
+                ):
+                    raise ValidationError("spend repository disagrees with its run order")
+            saved = uow.spend_events.add(
+                event.model_copy(
+                    update={"lane": order and order.lane, "repository_id": repository_id}
+                )
+            )
             uow.commit()
         self._uow.after_commit(
             lambda: log.info("spend %s recorded cost_usd=%s", saved.id, saved.cost_usd)
         )
         return saved
+
+    def _repository_id(self, event: SpendEvent) -> UUID | None:
+        if (
+            event.repository_id is not None
+            or event.repository_label is None
+            or self._inventory is None
+        ):
+            return event.repository_id
+        label = event.repository_label.strip()
+        try:
+            repository_id = UUID(label)
+        except ValueError:
+            if not label.startswith("https://"):
+                return None
+            try:
+                repository = self._inventory.find_repository(label)
+            except ValidationError:
+                return None
+            return None if repository is None else repository.id
+        try:
+            return self._inventory.get_repository(repository_id).id
+        except NotFoundError:
+            return None
 
     def collect(self, source: SpendSource, window: TimeWindow) -> int:
         """Record a source's usage as one event per UTC day, provider, model and skill, priced per

@@ -34,7 +34,7 @@ from traust_core.v1.models.findings import (
 from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.operations import RunOrder
 from traust_core.v1.models.validation import ValidationAttempt
-from traust_core.v1.models.values import HttpsRepoUrl
+from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.models.vocabulary import (
     CrossRepoPropagation,
     DispositionResolution,
@@ -313,6 +313,12 @@ class WorkItem(Model):
     tracker: ExternalRef | None = None
     evidence: tuple[EvidenceItem, ...] = ()
     report: ArtifactRef | None = None
+    patch: ArtifactRef | None = None
+    patch_refusal: str | None = pydantic.Field(
+        default=None,
+        description="Secret categories when recording withholds a patch for removed/context-line "
+        "secrets; null on report-only calls and subsequent reads. Not persisted.",
+    )
     reported_by: UUID | None = None  # the order whose run recorded the report, if one did
     fix_branch: str | None = None
     fix_commit: str | None = None  # the remediation report's fork.fix_commit
@@ -334,6 +340,45 @@ class WorkItem(Model):
 
     def is_done(self) -> bool:
         return self.report is not None
+
+
+# rides the append-only decisions' rationale, so it takes the verification rationale's bound
+ACTOR_CAP = 500
+
+
+class ProgressReport(Model):
+    """An attempt's end reported from outside a run: merged (the commit it merged as) or
+    abandoned — a run's own statuses come from its report, never this door."""
+
+    status: RemediationStatus
+    merge_sha: str | None = None
+    actor: str | None = None
+
+    @pydantic.model_validator(mode="after")
+    def _ends_the_attempt(self) -> Self:
+        if self.status not in _FINAL:
+            raise ValueError(f"{self.status} is a run's own progress; this door ends an attempt")
+        if self.merge_sha is not None:
+            if self.status is not RemediationStatus.MERGED:
+                raise ValueError("merge_sha rides a merged report only")
+            GitSha.parse(self.merge_sha)
+        if self.actor is not None and not self.actor.strip():
+            raise ValueError("actor must be nonblank text")
+        if self.actor is not None and len(self.actor) > ACTOR_CAP:
+            raise ValueError(f"actor must be at most {ACTOR_CAP} characters")
+        return self
+
+    @property
+    def rationale(self) -> str | None:
+        """The ending decisions' attribution: the commit a merge landed as, who ended it."""
+        if self.merge_sha is None and self.actor is None:
+            return None
+        said = [f"{self.status.value}"]
+        if self.merge_sha is not None:
+            said.append(f"as {self.merge_sha}")
+        if self.actor is not None:
+            said.append(f"by {self.actor}")
+        return " ".join(said)
 
 
 # The SKILL.md's preferred strategy per weakness class; anything else is the agent's call.
@@ -423,8 +468,7 @@ class PatchNarrative(Model):
 
 @dataclass(frozen=True, slots=True)
 class RemediationDraft:
-    """An assembled, schema-valid report not yet recorded, and the diff its `patch.diff_path`
-    names (the caller writes it beside the report)."""
+    """An assembled report and patch bytes to pass to `record(report, provenance, diff=diff)`."""
 
     report: RemediationArtifact
     diff: bytes

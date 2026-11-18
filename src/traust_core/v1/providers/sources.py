@@ -11,6 +11,7 @@ from traust_core.v1.models.code_facts import LanguageStats
 from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.observation import ComparisonStatus
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl, RepoOrigin, RepoPath
+from traust_core.v1.models.vocabulary import LivenessStatus
 from traust_core.v1.providers.base import Readiness, Result
 
 
@@ -79,6 +80,8 @@ class RepoInfo(Dto):
     visibility: str | None = None
     fork: bool | None = None
     parent: str | None = None
+    liveness_status: LivenessStatus | None = None
+    canonical_url: str | None = None
 
 
 class OwnerOrigin(StrEnum):
@@ -132,11 +135,24 @@ class SourceError(ServiceError):
         self,
         message: str,
         observation_status: ComparisonStatus,
-        http_status: int | None = None,
+        *,
+        liveness_status: LivenessStatus = LivenessStatus.UNKNOWN,
+        canonical_url: str | None = None,
+        endpoint_unreachable: bool = False,
+        empty_repository: bool = False,
     ) -> None:
-        super().__init__(message)
+        super().__init__(message, endpoint_unreachable=endpoint_unreachable)
         self.observation_status = observation_status
-        self.http_status = http_status  # the forge's own answer, when there was one
+        self.liveness_status = liveness_status
+        self.canonical_url = canonical_url
+        self.empty_repository = empty_repository
+        # The transport's positive word the repository's host is not there (NXDOMAIN,
+        # refused, TLS) — unlike a timeout, gone-class evidence the unreachable
+        # disposition counts with reason `unreachable`, never "gone" (foundry plan
+        # repo-unreachable: unreachable-from-here, not gone).
+        # empty_repository: the repository read answered, but its default branch names
+        # no commit (an empty repository — GitHub answers 404/409 for the ref while the
+        # repository itself reports a default branch); the gone-class reason `empty`.
 
 
 class SourceProvider(Protocol):

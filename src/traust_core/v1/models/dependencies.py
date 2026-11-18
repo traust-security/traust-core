@@ -217,6 +217,32 @@ class Advisory(Entity):
     published_at: datetime | None = None
 
 
+class AdvisoryNames(Model):
+    """One vulnerability's names: its canonical advisory, then every alias. The canonical one
+    is whichever name core saw first, so it can be a GHSA or GO id with the CVE an alias."""
+
+    advisory_id: UUID  # the canonical advisory
+    identifiers: tuple[str, ...]
+
+    @property
+    def cves(self) -> tuple[str, ...]:
+        """The CVE ids among the names, upper-cased, once each."""
+        return tuple(dict.fromkeys(i.upper() for i in self.identifiers if _CVE_NAME.fullmatch(i)))
+
+    @property
+    def ghsas(self) -> tuple[str, ...]:
+        """The GitHub advisory ids among the names, in GitHub's spelling (OSV's key), once each."""
+        return tuple(
+            dict.fromkeys(
+                f"GHSA-{i[5:].lower()}" for i in self.identifiers if _GHSA_NAME.fullmatch(i)
+            )
+        )
+
+
+_CVE_NAME = re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE)
+_GHSA_NAME = re.compile(r"GHSA(-[23456789cfghjmpqrvwx]{4}){3}", re.IGNORECASE)
+
+
 class AdvisoryPackage(Entity):
     advisory_id: UUID
     package_id: UUID
@@ -352,11 +378,14 @@ def _cvss_roundup(value: float) -> float:
 
 
 def cvss_base_score(vector: str) -> float | None:
-    """A `CVSS:3.0/` or `CVSS:3.1/` vector's base score (FIRST CVSS v3.1); None for any other."""
+    """A `CVSS:3.0/` or `CVSS:3.1/` vector's base score, rounded as its version specifies;
+    None for any other, or for a scope that is neither U nor C."""
     if not vector.startswith(("CVSS:3.0/", "CVSS:3.1/")):
         return None
     try:
         m = dict(part.split(":", 1) for part in vector.split("/")[1:])
+        if m["S"] not in ("U", "C"):
+            return None
         changed = m["S"] == "C"
         pr = (_CVSS_PR_CHANGED if changed else _CVSS_PR_UNCHANGED)[m["PR"]]
         iss = 1 - (1 - _CVSS_CIA[m["C"]]) * (1 - _CVSS_CIA[m["I"]]) * (1 - _CVSS_CIA[m["A"]])
@@ -367,6 +396,8 @@ def cvss_base_score(vector: str) -> float | None:
     if impact <= 0:
         return 0.0
     total = 1.08 * (impact + exploitability) if changed else impact + exploitability
+    if vector.startswith("CVSS:3.0/"):  # 3.0's Roundup is a plain ceiling to one decimal
+        return math.ceil(min(total, 10) * 10) / 10
     return _cvss_roundup(min(total, 10))
 
 
@@ -391,7 +422,7 @@ class AdvisoryRecord(Model):
     fix_references: tuple[str, ...] = ()
     fixed_commits: tuple[str, ...] = ()  # commit URLs of GIT ranges' `fixed` events
     source: str
-    package_sources: tuple[str, ...] = ()  # alias records that filled an empty `affected`
+    package_sources: tuple[str, ...] = ()  # source records contributing affected packages
 
     @property
     def severity(self) -> ScannerSeverity:
@@ -609,6 +640,7 @@ class SweptAdvisory(Model):
     malicious: bool
     severity: ScannerSeverity
     summary: str
+    fix_available: bool | None  # None when a touched package has no source detail
     packages: tuple[str, ...]
     commits: int
     scan: bool

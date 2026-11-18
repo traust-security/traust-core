@@ -15,6 +15,7 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
 from traust_core.v1.context import Config, Context
+from traust_core.v1.errors import DocumentError
 from traust_core.v1.models.insight import (
     InsecurePattern,
     InsecurePatternCut,
@@ -27,7 +28,9 @@ from traust_core.v1.models.insight import (
 from traust_core.v1.models.values import ProductSlug
 from traust_core.v1.models.vocabulary import OwnershipClass
 from traust_core.v1.providers.clock import FixedClock
+from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services import insight as insight_module
 
 DAY = timedelta(days=1)
 HUMAN = "human:analyst@example.com"
@@ -188,3 +191,41 @@ def test_the_report_lists_each_class_with_its_top_patterns(
     assert "| CWE-89 | - | 2 | 3 | 1 | 2 | 0 | 0 | 0 | 0 |" in md
     assert f"{API} · q.go:3 · handler" in md
     assert "## upstream: top 25 patterns" in md
+
+
+def test_patterns_outside_their_contract_are_refused_by_the_build(
+    context: Context, engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    corpus(context, engine)
+    real = insight_module._insecure_pattern
+
+    def drifted(cwe: str, hits: insight_module._Hits) -> InsecurePattern:
+        return real(cwe, hits).model_copy(update={"occurrences": 0})
+
+    monkeypatch.setattr(insight_module, "_insecure_pattern", drifted)
+    with pytest.raises(DocumentError) as error:
+        patterns(context)
+    assert "cuts/0/patterns/0/occurrences" in {issue.path for issue in error.value.issues}
+
+
+def test_a_claim_location_with_one_line_builds(
+    context: Context, engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a finding claim's location may give line_end without line_start; Core serves it as is
+    corpus(context, engine)
+    real = insight_module._insecure_pattern
+
+    def claimed(cwe: str, hits: insight_module._Hits) -> InsecurePattern:
+        pattern = real(cwe, hits)
+        examples = tuple(e.model_copy(update={"line_start": None}) for e in pattern.examples)
+        return pattern.model_copy(update={"examples": examples})
+
+    monkeypatch.setattr(insight_module, "_insecure_pattern", claimed)
+    model = patterns(context)
+    owned = model.cuts[0]
+    assert owned.patterns[0].examples[0].line_start is None
+    assert owned.patterns[0].examples[0].line_end == 3
+    # the report keeps the end line it was given: start unknown, not "no lines"
+    view = context.services().insight._view(ViewName.INSECURE_PATTERNS)
+    text = MarkdownRenderer().render(view.report(model, T0)).decode()
+    assert f"{API} · q.go:?-3 · handler" in text

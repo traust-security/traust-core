@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol
+from contextlib import AbstractContextManager
+from typing import TYPE_CHECKING, Protocol, Self
 
 from traust_core.v1.repositories.traust.assessments.artifact import (
     ARTIFACT,
@@ -33,6 +34,8 @@ TABLES = (ASSESSMENT, ARTIFACT, OCCURRENCE, LOCATION)
 
 
 class AssessmentsUnitOfWork(UnitOfWork, Protocol):
+    def write(self) -> AbstractContextManager[Self]: ...
+
     assessments: AssessmentRepository
     assessment_reads: AssessmentReads
     artifacts: ArtifactRepository

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 from collections.abc import Mapping
 from datetime import date, datetime
 from decimal import Decimal
@@ -237,11 +240,16 @@ class StartRecordingRequest(Model):
 
 
 class RecordingStartScope(Model):
-    """Server-owned explicit-start capability for one verified machine principal."""
+    """Server-owned explicit-start capability for one verified ServiceAccount principal."""
 
     principal: str = Field(min_length=1)
     assets: tuple[AssetName, ...] = ()
     repository_ids: tuple[UUID, ...] = ()
+    # The scope covers every registered repository, not only repository_ids: the platform's
+    # own identity, whose recording (and approval) authority is the estate it runs. A
+    # deployment grants this to no one but the ServiceAccount it trusts with the whole
+    # portfolio.
+    all_repositories: bool = False
 
 
 # Shapes land with their implementation slice.
@@ -301,12 +309,15 @@ class OrderManifest(Model):
     config: tuple[ConfigDigest, ...] = ()
     approval: OrderApproval | None = None
     sessions: tuple[SessionRecord, ...] = ()
+    degraded: Mapping[str, int] = Field(default_factory=dict)
 
     @model_serializer(mode="wrap")
     def serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         document = handler(self)
         if not self.sessions:
             document.pop("sessions", None)
+        if not self.degraded:
+            document.pop("degraded", None)
         return document
 
 
@@ -321,13 +332,127 @@ class SchedulePlan(Model):
 
 
 class OrderFilter(Model):
-    """`window` bounds a timeline by finished_at; `list` pages by created_at and refuses it."""
+    """`window` bounds a timeline by finished_at; `list` pages by created_at and refuses it.
+    `repository_ids` selects several repositories in one indexed query (a page's worth)."""
 
     states: tuple[OrderState, ...] = ()
     asset: AssetName | None = None
     repository_id: UUID | None = None
+    repository_ids: tuple[UUID, ...] = ()
     run_batch_id: UUID | None = None
     window: TimeWindow | None = None
+
+
+class OrderSortBy(StrEnum):
+    CREATED_AT = "created_at"
+    STARTED_AT = "started_at"
+    FINISHED_AT = "finished_at"
+    ASSET = "asset"
+    STATE = "state"
+    REPOSITORY = "repository"
+    REASON = "reason"
+    ID = "id"
+    IDS = "ids"
+
+
+class OrderSortOrder(StrEnum):
+    ASC = "asc"
+    DESC = "desc"
+
+
+class OrderQueryPosition(Model):
+    fingerprint: str
+    value: str | pydantic.StrictInt | None
+    order_id: UUID
+
+    def encode(self) -> str:
+        return base64.urlsafe_b64encode(self.model_dump_json().encode()).decode()
+
+
+# Match the REST set-filter convention; each selector expands SQL binds (and ids sorting
+# also expands CASE branches). This bounds a request's scope, never the order history.
+MAX_ORDER_QUERY_IDS = 500
+
+
+class OrderQueryRequest(Model):
+    """Page all matching history; explicit ID selectors carry at most 500 entries each."""
+
+    states: tuple[OrderState, ...] = Field(default=(), max_length=len(OrderState))
+    repository_id: UUID | None = None
+    repository_ids: tuple[UUID, ...] = Field(default=(), max_length=MAX_ORDER_QUERY_IDS)
+    run_batch_id: UUID | None = None
+    asset: AssetName | None = None
+    q: str = ""
+    sort_by: OrderSortBy = OrderSortBy.CREATED_AT
+    sort_order: OrderSortOrder = OrderSortOrder.DESC
+    ids: tuple[UUID, ...] | None = Field(default=None, max_length=MAX_ORDER_QUERY_IDS)
+    exclude_ids: tuple[UUID, ...] = Field(default=(), max_length=MAX_ORDER_QUERY_IDS)
+    limit: int = Field(default=100, ge=1, le=1000)
+    cursor: str | None = None
+
+    def fingerprint(self) -> str:
+        document = self.model_dump(mode="json", exclude={"limit", "cursor"})
+        return hashlib.sha256(json.dumps(document, sort_keys=True).encode()).hexdigest()
+
+    def position(self) -> OrderQueryPosition | None:
+        # model_copy/model_construct deliberately bypass Pydantic validation. Refuse those
+        # oversized in-process requests here too, before the query owner opens its UoW.
+        for name, maximum in (
+            ("states", len(OrderState)),
+            ("repository_ids", MAX_ORDER_QUERY_IDS),
+            ("ids", MAX_ORDER_QUERY_IDS),
+            ("exclude_ids", MAX_ORDER_QUERY_IDS),
+        ):
+            values = getattr(self, name)
+            if values is not None and len(values) > maximum:
+                raise ValidationError(f"{name} must contain at most {maximum} entries")
+        if self.sort_by is OrderSortBy.IDS:
+            if self.ids is None:
+                raise ValidationError("sort_by=ids requires ids")
+            if len(set(self.ids)) != len(self.ids):
+                raise ValidationError("sort_by=ids requires distinct ids")
+        if self.cursor is None:
+            return None
+        try:
+            raw = base64.b64decode(self.cursor, altchars=b"-_", validate=True)
+            position = OrderQueryPosition.model_validate_json(raw)
+            if position.fingerprint != self.fingerprint():
+                raise ValueError("query mismatch")
+            value = position.value
+            if self.sort_by is OrderSortBy.IDS:
+                if type(value) is not int or not 0 <= value < len(self.ids):
+                    raise ValueError("invalid sequence position")
+                if self.ids[value] != position.order_id:
+                    raise ValueError("invalid sequence id")
+            elif value is not None and not isinstance(value, str):
+                raise ValueError("invalid sort value")
+            elif (
+                self.sort_by
+                in {
+                    OrderSortBy.CREATED_AT,
+                    OrderSortBy.STARTED_AT,
+                    OrderSortBy.FINISHED_AT,
+                }
+                and value is not None
+            ):
+                datetime.fromisoformat(value)
+            elif self.sort_by is OrderSortBy.ID:
+                if value is None or UUID(value) != position.order_id:
+                    raise ValueError("invalid id position")
+            return position
+        except (ValueError, TypeError) as error:
+            raise ValidationError("invalid or mismatched order query cursor") from error
+
+
+class OrderQueryItem(Model):
+    order: RunOrder
+    repository_url: str | None
+    cursor: str
+
+
+class OrderQueryPage(Model):
+    items: list[OrderQueryItem]
+    next: str | None
 
 
 FINISHED_ORDER_STATES = (
@@ -593,6 +718,11 @@ class FeedEvent(Model):
 
 class SpendEvent(AppendOnly):
     run_order_id: UUID | None = None
+    repository_id: UUID | None = None
+    repository_label: str | None = None
+    loc: int | None = Field(default=None, ge=0, strict=True)
+    batch: str | None = None
+    note: str | None = None
     provider: str
     model: str
     skill: str | None = None

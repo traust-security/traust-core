@@ -14,7 +14,7 @@ LOCAL_CONFIG ?= $(LOCAL)/traust.yaml
 K6_VERSION ?= v0.54.0
 K6 ?= .perf/bin/k6
 
-.PHONY: help setup sync hooks lint lint-fix test test-integration test-repositories coverage coverage-html coverage-all perf perf-api perf-api-baseline perf-api-breakpoint k6 api-check openapi serve local-config serve-local token db-up db-down
+.PHONY: help setup sync hooks lint lint-fix test test-changed test-integration test-repositories coverage coverage-html coverage-all perf perf-api perf-api-baseline perf-api-breakpoint k6 api-check openapi serve local-config serve-local token db-up db-down
 
 help:
 	@echo "Targets ($(notdir $(CURDIR))):"
@@ -22,6 +22,7 @@ help:
 	@echo "  make lint             — ruff check + format --check"
 	@echo "  make lint-fix         — ruff --fix + format"
 	@echo "  make test             — unit tests, no integration (parallel via pytest-xdist)"
+	@echo "  make test-changed     — testmon-selected unit tests (first run builds .testmondata)"
 	@echo "  make test-integration — integration tests against Postgres (make db-up first)"
 	@echo "  make test-repositories — repository layer on SQLite and Postgres (make db-up first)"
 	@echo "  make coverage         — unit tests with coverage (term), fails under 80%"
@@ -40,7 +41,7 @@ help:
 	@echo "  make db-up / db-down  — shared Postgres container ($(DB_CONTAINER)), same as contracts and ledger"
 
 setup: sync hooks
-	@echo "ready — git hooks enabled (.githooks): lint on commit, conventional subject, lint + coverage on push"
+	@echo "ready — git hooks enabled (.githooks): lint on commit, conventional subject, lint + testmon-selected tests on push (FULL=1 for the complete suite; coverage gate in CI)"
 
 hooks:
 	git config core.hooksPath .githooks
@@ -59,6 +60,9 @@ lint-fix:
 
 test:
 	uv run pytest tests/ -q -n auto -m "not integration"
+
+test-changed:
+	uv run pytest tests/ -q -n auto -m "not integration" --testmon-forceselect
 
 test-integration:
 	uv run --extra postgres pytest tests/ -q -n auto -m integration
@@ -136,14 +140,14 @@ openapi: api-check
 	@echo "Swagger UI: 'make serve', then http://127.0.0.1:$${PORT:-8080}/docs (ReDoc /redoc, raw /openapi.json)"
 
 serve:
-	uv run traust-server $(if $(CONFIG),--config $(CONFIG))
+	uv run traust-server $(if $(CONFIG),--config $(CONFIG)) $(if $(WORKERS),--workers $(WORKERS))
 
 # Development only: SQLite under $(LOCAL)/home and this machine's local issuer trusted.
 local-config:
 	@test -f $(LOCAL_CONFIG) || { mkdir -p $(LOCAL) && printf 'home: %s\nidentity: { trust_local: true }\n' "$(abspath $(LOCAL))/home" > $(LOCAL_CONFIG) && echo "wrote $(LOCAL_CONFIG)"; }
 
 serve-local: local-config
-	uv run traust-server --config $(LOCAL_CONFIG)
+	uv run traust-server --config $(LOCAL_CONFIG) $(if $(WORKERS),--workers $(WORKERS))
 
 token: local-config
 	@test -n "$(NAME)" || { echo "usage: make token NAME=me@example.com (a person) | NAME=runner-1 MACHINE=1 (a runner)" >&2; exit 2; }

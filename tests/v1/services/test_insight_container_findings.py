@@ -13,15 +13,16 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.services.test_assessment_record import authored_report
 from traust_core.v1.context import Config, Context
-from traust_core.v1.errors import ValidationError
+from traust_core.v1.errors import ValidationError, ViewContractError
 from traust_core.v1.models.artifacts import SecurityAuditArtifact
 from traust_core.v1.models.assessment import AssessmentKind
 from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.findings import FindingState
-from traust_core.v1.models.insight import ContainerFindings, ViewFilter, ViewName
+from traust_core.v1.models.insight import ContainerFindings, FindingTally, ViewFilter, ViewName
 from traust_core.v1.models.vocabulary import SourceType
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services import insight as insight_module
 
 DAY = timedelta(days=1)
 
@@ -209,3 +210,18 @@ def test_container_image_provenance_is_literal_in_published_report_bodies(
     assert "\n## forged" not in published.markdown
     stored = context.services().assessment.report(assessment_id)
     assert stored is not None and stored.metadata.repository == image + "@sha256:aaa"
+
+
+def test_container_findings_outside_their_contract_are_refused_by_the_build(
+    context: Context, engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        ref = Seed(uow).repository_ref()
+        uow.commit()
+    assert ref.id is not None
+    anchor = record_container(context, ref.id, "registry.example:5000/apps/widget@sha256:aaa", 0)
+    monkeypatch.setattr(insight_module, "_tally", lambda views: FindingTally(hardening=-1))
+    scope = ViewFilter(assessment_id=anchor, report_stem="widget-container-audit")
+    with pytest.raises(ViewContractError) as error:
+        context.services().insight.build(ViewName.CONTAINER_FINDINGS, scope)
+    assert "total/hardening" in {issue.path for issue in error.value.issues}

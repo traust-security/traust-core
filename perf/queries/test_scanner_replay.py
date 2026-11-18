@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from uuid import uuid4
 
 import sqlalchemy as sa
 
@@ -22,7 +23,9 @@ def test_scanner_replay_uses_ref_kind_and_native_timestamp_index(
                 repository_ref_id=ref,
                 kind=AssessmentKind.SCANNER,
                 status="completed",
-                assessor="scanner-replay-fixture",
+                # unique per run: the seeded database is reused, and a fixed assessor would
+                # collide with the row a previous run committed
+                assessor=f"scanner-replay-{uuid4().hex[:8]}",
                 assessor_version="1",
                 occurred_at=datetime(2026, 10, 23, 12, 1, 2, 123456, tzinfo=UTC),
             )

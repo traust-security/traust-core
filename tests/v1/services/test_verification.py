@@ -787,6 +787,52 @@ def test_a_merged_fix_is_a_claim_until_a_verification_resolves_it(
     assert not context.services().findings.get(world.ids[0]).is_open()
 
 
+def test_mixed_work_item_progress_preserves_closed_findings_and_open_claims(
+    service: VerificationService,
+    remediation: RemediationService,
+    context: Context,
+    engine: Engine,
+) -> None:
+    world = World(engine, findings=2)
+    audited(engine, world, world.base)
+    item = opened(remediation, world)
+    closed_id, open_id = world.ids
+    with SqlTraustUnitOfWork(engine) as uow:
+        Seed(uow).decision(
+            world.findings[0],
+            validity=None,
+            resolution="resolved",
+            repository_ref_id=world.base.id,
+            actor="human:analyst@example.com",
+            occurred_at=context.clock.now(),
+        )
+        uow.commit()
+
+    progressed = remediation.record_progress(item.work_item_id, RemediationStatus.MERGED)
+    assert progressed.status == "merged"
+    (closed_progress,) = [
+        d
+        for d in decisions(engine, closed_id)
+        if d.assessment_id == item.work_item_id and d.reason == "merged"
+    ]
+    (open_progress,) = [
+        d
+        for d in decisions(engine, open_id)
+        if d.assessment_id == item.work_item_id and d.reason == "merged"
+    ]
+    assert closed_progress.resolution is None
+    assert open_progress.resolution == "open"
+    closed = context.services().findings.get(closed_id)
+    still_open = context.services().findings.get(open_id)
+    assert not closed.is_open()
+    assert closed.disposition is not None and closed.disposition.resolution == "resolved"
+    assert still_open.is_open()
+    assert still_open.disposition is not None and still_open.disposition.resolution == "open"
+    assert world.repo.id is not None
+    (entry,) = service.sweep([world.repo.id]).queued
+    assert (entry.open_findings, entry.claims, entry.tier) == (1, 1, "T1")
+
+
 def test_a_verified_fix_outranks_later_ungraded_progress(
     service: VerificationService,
     remediation: RemediationService,

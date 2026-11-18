@@ -7,7 +7,7 @@ import logging
 import re
 from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -41,6 +41,7 @@ from traust_core.v1.models.dependencies import (
     Advisory,
     AdvisoryIdentifier,
     AdvisoryMatch,
+    AdvisoryNames,
     AdvisoryPackage,
     AdvisoryRecord,
     AdvisorySweep,
@@ -99,6 +100,14 @@ from traust_core.v1.models.dependencies import (
     parse_advisory_identifier,
     repo_label,
     version_key,
+)
+from traust_core.v1.models.feed_documents import (
+    AdvisoryDocumentsRefresh,
+    DocumentFailure,
+    DocumentRefresh,
+    FeedDocument,
+    FeedDocumentManifest,
+    StoredDocument,
 )
 from traust_core.v1.models.findings import (
     Category,
@@ -169,7 +178,15 @@ if TYPE_CHECKING:
     from traust_core.v1.services.findings.service import FindingService
 
 FEED_ARTIFACT_KIND = "feed"
+# the per-identifier sources an advisory's names are kept from, and which names each takes
+_ADVISORY_DOCUMENT_SOURCES = {"cve-list": "cve", "nvd": "cve", "rh-cve": "cve", "ghsa": "ghsa"}
 EPSS, KEV, RH_CVE = FeedName("epss"), FeedName("kev"), FeedName("rh-cve")
+# identifiers a source matches case-insensitively, kept in one spelling (`_canonical`)
+_CVE_ID = re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE)
+_RH_ADVISORY_ID = re.compile(r"RH[SBE]A-\d{4}[:_]\d{4,}", re.IGNORECASE)
+_USERINFO = re.compile(r"(\b[a-z][a-z0-9+.-]*://)[^/@\s]*@", re.IGNORECASE)
+# a URL's query: up to its fragment, or an optional `:` before whitespace ("<url>: HTTP 404")
+_QUERY = re.compile(r"(\b[a-z][a-z0-9+.-]*://[^\s?#]+)\?[^\s#]*?(?=#|:?(?:\s|$))", re.IGNORECASE)
 # Title likeness that stamps a CVE on a finding: 53 hand-adjudicated matches at >= 0.55 held no
 # false one. A shared CWE promotes probable to confirmed; it never blocks (sibling CWEs are common).
 AUTO_CONFIRM, AUTO_PROBABLE = 0.75, 0.55
@@ -1041,20 +1058,22 @@ class ExposureService:
             for raw in found or ():
                 hit[raw].add(query)
         records, missing, rejected = self._sweep_records(lookup, sorted(hit))
-        best: dict[str, tuple[AdvisoryRecord, set[PackageVersion]]] = {}
+        best: dict[UUID, tuple[AdvisoryRecord, set[PackageVersion]]] = {}
         for record in records:
-            touched = hit[record.identifier]
-            kept = best.get(record.display_id)
+            assert record.advisory_id is not None
+            names = (record.identifier, *record.aliases)
+            # A fetched advisory can name aliases the package query never returned as hits.
+            touched = set().union(*(hit[name] for name in names if name in hit))
+            kept = best.get(record.advisory_id)
             if kept is None:
-                best[record.display_id] = (record, touched)
+                best[record.advisory_id] = (record, touched)
             else:
                 top = max(kept[0], record, key=lambda r: SEVERITY_RANK[r.severity])
-                best[record.display_id] = (top, kept[1] | touched)
+                best[record.advisory_id] = (top, kept[1] | touched)
         rows = [
             self._swept(record, touched, scan_cap)
             for record, touched in best.values()
             if SEVERITY_RANK[record.severity] >= SEVERITY_RANK[min_severity]
-            and (record.malicious or _fix_stated(record, touched))
         ]
         rows.sort(key=lambda r: (not r.malicious, -SEVERITY_RANK[r.severity], -r.commits))
         degraded = unanswered or missing
@@ -1114,7 +1133,23 @@ class ExposureService:
                 advisory = self._keep_advisory(uow, record)
                 uow.commit()
             records.append(record.model_copy(update={"advisory_id": advisory.id}))
-        return records, missing, rejected
+        expanded = []
+        for record in records:
+            try:
+                combined = record if record.withdrawn else self._with_alias_packages(record)
+            except (ServiceError, ValidationError) as e:
+                log.warning(
+                    "advisory %s aliases not fetched error_type=%s",
+                    record.identifier,
+                    type(e).__name__,
+                )
+                missing += 1
+                continue
+            with self._uow as uow:
+                advisory = self._keep_advisory(uow, combined)
+                uow.commit()
+            expanded.append(combined.model_copy(update={"advisory_id": advisory.id}))
+        return expanded, missing, rejected
 
     def _swept(
         self, record: AdvisoryRecord, held: set[PackageVersion], scan_cap: int
@@ -1134,6 +1169,7 @@ class ExposureService:
             malicious=record.malicious,
             severity=record.severity,
             summary=record.summary,
+            fix_available=_fix_stated(record, held),
             packages=tuple(sorted({f"{q.package.ecosystem}/{q.package.name}" for q in held})),
             commits=len(commits),
             scan=len(commits) <= scan_cap,
@@ -1200,13 +1236,29 @@ class ExposureService:
         with self._uow as uow:
             return uow.advisories.get(advisory_id)
 
+    def require_commit_advisories(self) -> None:
+        if not self._require_lookup().supports_commit_queries:
+            raise ConfigError("the advisory source does not support commit queries")
+
+    def advisories_for_commit(self, commit: GitSha) -> tuple[AdvisoryRecord, ...]:
+        """The advisory source's complete commit answer; failures never become a clean result."""
+        self.require_commit_advisories()
+        records = self._require_lookup().for_commit(commit).data
+        with self._uow as uow:
+            kept = tuple(
+                record.model_copy(update={"advisory_id": self._keep_advisory(uow, record).id})
+                for record in records
+            )
+            uow.commit()
+        return kept
+
     def find_advisory(self, identifier: AdvisoryIdentifier) -> AdvisoryRecord | None:
         """The advisory as its source states it now (ranges are never taken from memory);
         its identity, aliases and affected packages are kept on the way through."""
         record = self._require_lookup().record(parse_advisory_identifier(identifier)).data
         if record is None:
             return None
-        if not record.affected and not record.withdrawn:
+        if not record.withdrawn:
             record = self._with_alias_packages(record)
         with self._uow as uow:
             advisory = self._keep_advisory(uow, record)
@@ -1214,34 +1266,70 @@ class ExposureService:
         return record.model_copy(update={"advisory_id": advisory.id})
 
     def _with_alias_packages(self, record: AdvisoryRecord) -> AdvisoryRecord:
-        # OSV's CVE records name no package; their GHSA / GO- / PYSEC- aliases state the same
-        # vulnerability per ecosystem. Without this, which id is asked first decides the analysis.
-        # Only ids the impact schema admits are asked: the rest (BIT-, distro ids) name packages
-        # in ecosystems core doesn't model.
         lookup = self._require_lookup()
-        named = [
-            alias
-            for name in record.aliases
-            if is_advisory_identifier(name)
-            and (alias := lookup.record(name).data)
-            and alias.identifier.upper() == name.upper()
-            and alias.affected
-            and not alias.withdrawn
-        ]
-        # Two aliases may state one package with different spans: keep every span, so a version
-        # only one of them covers is still in range.
+        records = [record, *lookup.related(record).data]
+        with self._uow as uow:
+            known = [
+                found
+                for name in (record.identifier, *record.aliases)
+                if (found := uow.advisories.find_by_identifier(name)) is not None
+            ]
+            canonical_ids = {found.alias_of_id or found.id for found in known}
+            identifiers = {
+                alias.identifier
+                for advisory_id in canonical_ids
+                if advisory_id is not None
+                for alias in (
+                    uow.advisories.get(advisory_id),
+                    *uow.advisories.list_aliases(advisory_id),
+                )
+            }
+        seen = {r.identifier: r for r in records}
+        queried = {name for r in records for name in (r.identifier, *r.aliases)}
+        for identifier in sorted(identifiers - queried):
+            if not is_advisory_identifier(identifier):
+                continue
+            found = lookup.record(AdvisoryIdentifier(identifier)).data
+            if found is None:
+                continue
+            for candidate in (found, *lookup.related(found).data):
+                prior = seen.get(candidate.identifier)
+                if prior is not None:
+                    excluded = {"source", "advisory_id"}
+                    if prior.model_dump(exclude=excluded) != candidate.model_dump(exclude=excluded):
+                        raise ValidationError(
+                            f"{prior.source} and {candidate.source}: conflicting advisory records"
+                        )
+                    continue
+                records.append(candidate)
+                seen[candidate.identifier] = candidate
+        named = [r for r in records if r.affected and not r.withdrawn]
         packages: dict[tuple[Ecosystem, str], AffectedPackage] = {}
         for alias in named:
             for p in alias.affected:
-                cited = p.model_copy(
-                    update={"symbol_sources": dict.fromkeys(p.symbols, alias.source)}
+                cited = (
+                    p
+                    if alias == record
+                    else p.model_copy(
+                        update={"symbol_sources": dict.fromkeys(p.symbols, alias.source)}
+                    )
                 )
                 kept = packages.get((p.ecosystem, p.name))
                 packages[(p.ecosystem, p.name)] = cited if kept is None else _joined(kept, cited)
         return record.model_copy(
             update={
+                "aliases": tuple(
+                    dict.fromkeys(
+                        name
+                        for alias in records
+                        for name in (alias.identifier, *alias.aliases)
+                        if name != record.identifier
+                    )
+                ),
                 "affected": tuple(packages.values()),
-                "package_sources": tuple(alias.source for alias in named),
+                "package_sources": tuple(
+                    dict.fromkeys(alias.source for alias in named if alias != record)
+                ),
             }
         )
 
@@ -1271,6 +1359,89 @@ class ExposureService:
                 AdvisoryPackage(advisory_id=canonical.id, package_id=package.id)
             )
         return canonical
+
+    def advisory_names(self, finding_ids: Collection[UUID]) -> dict[UUID, AdvisoryNames]:
+        """Each finding's advisory names, canonical first, then every alias, in batched reads:
+        the one door every advisory join goes through (a canonical id can be a GHSA or GO id with
+        the CVE an alias). A finding that names no advisory is absent."""
+        named = {
+            f.id: f.advisory_id
+            for f in self._findings.list_by_ids(finding_ids)
+            if f.id is not None and f.advisory_id is not None
+        }
+        names = self._names_of(set(named.values()))
+        return {finding_id: names[advisory_id] for finding_id, advisory_id in named.items()}
+
+    def _names_of(self, advisory_ids: Collection[UUID]) -> dict[UUID, AdvisoryNames]:
+        """Each advisory's names, keyed by the id asked for (canonical or alias)."""
+        with self._uow as uow:
+            asked = {a.id: a for a in uow.advisories.list_by_ids(advisory_ids) if a.id}
+            canonical_of = {i: a.alias_of_id or i for i, a in asked.items()}
+            known = {i: a for i, a in asked.items() if a.alias_of_id is None}
+            missing = set(canonical_of.values()) - set(known)
+            known |= {a.id: a for a in uow.advisories.list_by_ids(missing) if a.id}
+            aliases = uow.advisories.list_aliases_of(list(known))
+        by_canonical: dict[UUID, list[str]] = {i: [] for i in known}
+        for alias in sorted(aliases, key=lambda a: a.identifier):
+            if alias.alias_of_id in by_canonical:
+                by_canonical[alias.alias_of_id].append(alias.identifier)
+        names = {
+            i: AdvisoryNames(advisory_id=i, identifiers=(a.identifier, *by_canonical[i]))
+            for i, a in known.items()
+        }
+        return {i: names[c] for i, c in canonical_of.items()}
+
+    def refresh_advisory_documents(
+        self, run_order_id: UUID | None = None
+    ) -> list[AdvisoryDocumentsRefresh]:
+        """Keep the documents for every advisory a finding names, from each registered source:
+        CVE ids to the CVE List, NVD and Red Hat, GHSA ids to `ghsa`. A failed source keeps its
+        last manifest and says why (`ok` false); when every source asked fails, it raises."""
+        names = self._names_of(self._findings.linked_advisory_ids()).values()
+        cves = sorted({c for n in names for c in n.cves})
+        ghsas = sorted({g for n in names for g in n.ghsas})
+        outcomes = []
+        for source, kind in _ADVISORY_DOCUMENT_SOURCES.items():
+            if source not in self._feed_sources.names():
+                continue  # not registered, or `access: disabled`
+            identifiers = cves if kind == "cve" else ghsas
+            if not identifiers:
+                outcomes.append(AdvisoryDocumentsRefresh(source=source, requested=0))
+                continue
+            try:
+                refresh = self.refresh_documents(source, identifiers, run_order_id)
+            except (ServiceError, ValidationError) as e:
+                error = _redacted(str(e))
+                log.warning("%s documents not refreshed; keeping the last: %s", source, error)
+                outcomes.append(
+                    AdvisoryDocumentsRefresh(source=source, requested=len(identifiers), error=error)
+                )
+                continue
+            except (NotFoundError, IntegrityError, RepositoryError) as e:
+                # its last manifest, or the store it writes to, is unreadable: a person acts
+                cause = type(e.__cause__).__name__ if e.__cause__ is not None else None
+                operation = getattr(e, "operation", None)
+                log.error(
+                    "%s documents not refreshed error_type=%s cause=%s operation=%s",
+                    source, type(e).__name__, cause, operation,
+                )  # fmt: skip
+                parts = (("cause", cause), ("in", operation))
+                detail = ", ".join(f"{k} {v}" for k, v in parts if v)
+                error = f"{type(e).__name__}: {_redacted(str(e))}"
+                error += f" ({detail})" if detail else ""
+                outcomes.append(
+                    AdvisoryDocumentsRefresh(source=source, requested=len(identifiers), error=error)
+                )
+                continue
+            outcomes.append(
+                AdvisoryDocumentsRefresh(source=source, requested=len(identifiers), refresh=refresh)
+            )
+        attempted = [o for o in outcomes if o.requested]
+        if attempted and not any(o.ok for o in attempted):
+            # nothing refreshed anywhere: an outage, never a result a caller could take as done
+            reasons = "; ".join(f"{o.source}: {o.error}" for o in attempted)
+            raise ServiceError(f"no advisory documents refreshed ({reasons})")
+        return outcomes
 
     def advisories_for(self, finding_id: UUID) -> list[Advisory]:
         """The advisory a finding is about, canonical first, then every alias (CVE, GHSA, OSV
@@ -1946,16 +2117,29 @@ class ExposureService:
             named = None if filter.advisory_id is None else uow.advisories.get(filter.advisory_id)
             wanted = None if named is None else named.alias_of_id or named.id
             canonical = {}
+            unkept = set()
             for cve in {doc.metadata.cve for _, _, doc in held}:
                 known = uow.advisories.find_by_identifier(cve)
                 if known is None:
-                    raise IntegrityError(f"an impact analysis names {cve}, never kept")
+                    # The partial-seed state: analyses name CVEs the registry has not
+                    # kept yet. Skipping them (with the warning) keeps every other
+                    # analysis readable instead of failing the whole section.
+                    unkept.add(cve)
+                    continue
                 canonical[cve] = (
                     uow.advisories.get(known.alias_of_id) if known.alias_of_id else known
                 )
+        if unkept:
+            log.warning(
+                "impact analyses name %d advisories the registry never kept, skipped: %s",
+                len(unkept),
+                ", ".join(sorted(unkept)),
+            )
         rows = []
         for assessment, artifact, doc in held:
-            advisory = canonical[doc.metadata.cve]
+            advisory = canonical.get(doc.metadata.cve)
+            if advisory is None:
+                continue
             classification = ImpactClassification(doc.repos[0].classification)
             if wanted not in (None, advisory.id) or filter.classification not in (
                 None,
@@ -2089,12 +2273,139 @@ class ExposureService:
     def source_document(self, source: str, identifier: str) -> bytes:
         """A registered feed source's document for one identifier, as it serves it now; nothing
         is kept (`find_advisory` is the OSV record analysis works from)."""
+        return self._feed_source(source).document(identifier).data
+
+    def _feed_source(self, source: str) -> FeedSource:
         if source not in self._feed_sources.names():
             raise NotFoundError(
                 f"feed source {source}: not registered "
                 f"({', '.join(self._feed_sources.names()) or 'none registered'})"
             )
-        return self._feed_sources.get(source).document(identifier).data
+        return self._feed_sources.get(source)
+
+    def refresh_documents(
+        self, source: str, identifiers: Sequence[str], run_order_id: UUID | None = None
+    ) -> DocumentRefresh:
+        """Snapshot a manifest of exactly these identifiers' documents, a failed fetch keeping the
+        last one; nothing fetched (or nothing asked) raises and writes nothing."""
+        provider = self._feed_source(source)
+        wanted = list(dict.fromkeys(map(_canonical, identifiers)))
+        if not wanted:
+            raise ValidationError(f"{source}: no identifiers to refresh documents for")
+        previous = self.document_manifest(source)
+        held = {} if previous is None else previous.documents
+        documents: dict[str, FeedDocument] = {}
+        fetched: list[str] = []
+        failed: list[DocumentFailure] = []
+        carried: list[str] = []
+        for identifier in wanted:
+            last = held.get(identifier)
+            try:
+                entry = self._fetch_document(source, provider, identifier)
+            except (ServiceError, ValidationError) as e:
+                error = _redacted(str(e))
+                log.warning("%s: %s not fetched: %s", source, identifier, error)
+                failed.append(DocumentFailure(identifier=identifier, error=error))
+                if last is not None and self._still_held(source, last):
+                    documents[identifier] = last
+                    carried.append(identifier)
+                continue
+            # unchanged content keeps its first fetch time, so an unchanged refresh is the same
+            # manifest bytes (one artifact, and a retry the snapshot check recognizes)
+            unchanged = last is not None and last.digest == entry.digest
+            documents[identifier] = last if unchanged and last is not None else entry
+            fetched.append(identifier)
+        if not fetched:
+            raise ServiceError(
+                f"{source}: no document fetched ({len(failed)} failed, each logged; "
+                f"first: {failed[0].error})"
+            )
+        manifest = FeedDocumentManifest(source=source, documents=documents)
+        self._snapshot_documents(source, manifest.to_bytes(), run_order_id)
+        return DocumentRefresh(
+            source=source, fetched=tuple(fetched), failed=tuple(failed), carried=tuple(carried)
+        )
+
+    def document_manifest(self, source: str) -> FeedDocumentManifest | None:
+        """The source's latest document manifest; None before its first refresh."""
+        with self._uow as uow:
+            latest = uow.feed_snapshots.latest(_documents_feed(source))
+        if latest is None:
+            return None
+        artifact = self._log.get_artifact(latest.artifact_id)
+        manifest = FeedDocumentManifest.from_bytes(stored_bytes(self._objects, artifact))
+        if manifest.source != source:
+            feed = _documents_feed(source)
+            raise ValidationError(f"{feed}: its manifest is {manifest.source}'s")
+        return manifest
+
+    def stored_document(self, source: str, identifier: str) -> StoredDocument | None:
+        """The identifier's document as the source's latest refresh kept it, checked against its
+        digest; None when that manifest doesn't name it. Never fetched."""
+        key = _canonical(identifier)
+        manifest = self.document_manifest(source)
+        entry = None if manifest is None else manifest.documents.get(key)
+        if entry is None:
+            return None
+        ref = self._objects.stat(_document_object(source, entry.digest))
+        return StoredDocument(
+            source=source,
+            identifier=key,
+            digest=entry.digest,
+            acquired_at=entry.acquired_at,
+            data=self._objects.get(replace(ref, sha256=entry.digest)),
+        )
+
+    def _still_held(self, source: str, entry: FeedDocument) -> bool:
+        """Whether the store still holds the entry's exact bytes, so it may be carried forward."""
+        try:
+            ref = self._objects.stat(_document_object(source, entry.digest))
+            self._objects.get(replace(ref, sha256=entry.digest))
+        except (NotFoundError, IntegrityError):
+            return False
+        return True
+
+    def _fetch_document(self, source: str, provider: FeedSource, identifier: str) -> FeedDocument:
+        result = provider.document(identifier)
+        try:
+            body = json.loads(result.data)
+        except ValueError as e:
+            raise ValidationError(f"{source}: {identifier}: not a JSON document") from e
+        if not isinstance(body, dict):
+            raise ValidationError(f"{source}: {identifier}: not a JSON object")
+        ref = self._objects.put(_document_object(source, sha256_hex(result.data)), result.data)
+        return FeedDocument(digest=ref.sha256, acquired_at=result.acquisition.acquired_at)
+
+    def _snapshot_documents(self, source: str, raw: bytes, run_order_id: UUID | None) -> None:
+        """Record the manifest and its snapshot; the retry checks run after the artifact insert,
+        which serializes writers of the kind, so concurrent refreshes see each other."""
+        ref = self._objects.put(
+            ObjectKey.parse(f"feeds/{source}/manifests/{sha256_hex(raw)}.json"), raw
+        )
+        feed = _documents_feed(source)
+        with self._uow as uow:
+            artifact = record_artifact(
+                uow, Artifact(digest=ref.sha256, kind=FEED_ARTIFACT_KIND, uri=str(ref.key))
+            )
+            assert artifact.id is not None
+            latest = uow.feed_snapshots.latest(feed)
+            if run_order_id is not None and latest is not None:
+                if latest.run_order_id == run_order_id and latest.artifact_id == artifact.id:
+                    return  # a retry that kept the same documents
+                if latest.run_order_id != run_order_id and uow.feed_snapshots.for_run_order(
+                    feed, run_order_id
+                ):
+                    return  # a late retry of an order a newer one has superseded
+            now = self._clock.now()
+            # strictly after the latest, so a clock that stepped back can't hide this manifest
+            if latest is not None and now <= latest.retrieved_at:
+                now = latest.retrieved_at + timedelta(milliseconds=1)  # SQLite keeps milliseconds
+            uow.feed_snapshots.add(
+                FeedSnapshot(
+                    run_order_id=run_order_id, artifact_id=artifact.id, feed=feed, retrieved_at=now
+                )
+            )
+            uow.commit()
 
     def _required_payload(self, feed: FeedName) -> bytes:
         payload = self.feed_payload(feed)
@@ -2266,13 +2577,11 @@ def _title_score(a: str, b: str) -> float:
     return max(jaccard, difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio())
 
 
-def _fix_stated(record: AdvisoryRecord, held: set[PackageVersion]) -> bool:
-    return any(
-        span.fixed
-        for q in held
-        if (named := record.package(Ecosystem(q.package.ecosystem), q.package.name)) is not None
-        for span in named.spans
-    )
+def _fix_stated(record: AdvisoryRecord, held: set[PackageVersion]) -> bool | None:
+    packages = [record.package(Ecosystem(q.package.ecosystem), q.package.name) for q in held]
+    if any(span.fixed for package in packages if package is not None for span in package.spans):
+        return True
+    return None if any(package is None for package in packages) else False
 
 
 def _sbom_packages(uow: TraustUnitOfWork, sbom_id: UUID) -> list[RefDependency]:
@@ -2291,7 +2600,14 @@ def _joined(a: AffectedPackage, b: AffectedPackage) -> AffectedPackage:
                 field: tuple(dict.fromkeys((*getattr(a, field), *getattr(b, field))))
                 for field in ("spans", "versions", "imports", "symbols")
             },
-            "symbol_sources": {**b.symbol_sources, **a.symbol_sources},
+            "symbol_sources": {
+                **{
+                    symbol: source
+                    for symbol, source in b.symbol_sources.items()
+                    if symbol not in a.symbols
+                },
+                **a.symbol_sources,
+            },
         }
     )
 
@@ -2395,3 +2711,27 @@ def _with_judged(found: SymbolResolution | None, judged: Sequence[str]) -> Symbo
     return found.model_copy(
         update={"status": SymbolStatus.RESOLVED, "symbols": (*found.symbols, *extra)}
     )
+
+
+def _documents_feed(source: str) -> str:
+    """The `feed_snapshot.feed` a source's document manifests are recorded under."""
+    return f"{source}-documents"
+
+
+def _document_object(source: str, digest: str) -> ObjectKey:
+    return ObjectKey.parse(f"feeds/{source}/documents/{digest}.json")
+
+
+def _redacted(text: str) -> str:
+    """An error's text with any URL's credentials and query removed: either can carry a secret
+    (`https://user:pass@host`, `?token=…`)."""
+    return _QUERY.sub(r"\1?…", _USERINFO.sub(r"\1", text))
+
+
+def _canonical(identifier: str) -> str:
+    """A CVE or Red Hat advisory id in upper case (an advisory's `_` as `:`); others as given."""
+    if _CVE_ID.fullmatch(identifier):
+        return identifier.upper()
+    if _RH_ADVISORY_ID.fullmatch(identifier):
+        return identifier.upper().replace("_", ":")
+    return identifier

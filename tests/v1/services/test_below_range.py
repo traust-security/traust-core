@@ -137,6 +137,15 @@ class Lookup:
             raise ServiceError(f"{identifier}: gave up")
         return Result(self.records.get(identifier), Acquisition(provider="osv", acquired_at=AT))
 
+    def related(self, record: AdvisoryRecord) -> Result[tuple[AdvisoryRecord, ...]]:
+        names = {record.identifier, *record.aliases}
+        related = tuple(
+            other
+            for other in self.records.values()
+            if other != record and names.intersection((other.identifier, *other.aliases))
+        )
+        return Result(related, Acquisition(provider="osv", acquired_at=AT))
+
 
 class Http:
     def __init__(self, pages: Mapping[str, bytes]) -> None:

@@ -4,9 +4,9 @@ derived from its findings' categories through the pack's category map, never ble
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -19,7 +19,7 @@ from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.services.test_insight import FakePortfolio
 from traust_core.v1.context import Config, Context
 from traust_core.v1.context.attack import load_attack_catalog
-from traust_core.v1.errors import NotFoundError
+from traust_core.v1.errors import DocumentError, NotFoundError
 from traust_core.v1.models.artifacts import ThreatModelArtifact
 from traust_core.v1.models.assessment import AssessmentKind, AttackTechnique, Threat
 from traust_core.v1.models.common import Page
@@ -29,6 +29,7 @@ from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services import insight as insight_module
 from traust_core.v1.services.artifact_publishing import (
     ArtifactPublisher,
     AssessmentLog,
@@ -84,14 +85,27 @@ class FakeAssessment:
 
 
 @dataclass
+class SummaryAsk:
+    repository_ids: tuple[UUID, ...]
+    as_of: datetime | None
+
+
+@dataclass
 class FakeFindings:
     groups: dict[UUID, list[FindingRollup]]
     asked: list[Any] = field(default_factory=list)
 
-    def summary(self, filter: Any, group_by: FindingDimension) -> list[FindingRollup]:
+    def summaries_in(
+        self,
+        repository_ids: Collection[UUID],
+        group_by: FindingDimension,
+        as_of: datetime | None = None,
+    ) -> dict[UUID, list[FindingRollup]]:
         assert group_by is FindingDimension.CATEGORY
-        self.asked.append(filter)
-        return self.groups.get(filter.repository_id, [])
+        self.asked.append(SummaryAsk(repository_ids=tuple(repository_ids), as_of=as_of))
+        return {
+            repository_id: self.groups.get(repository_id, []) for repository_id in repository_ids
+        }
 
 
 def coverage(
@@ -131,6 +145,7 @@ def test_findings_categories_imply_candidate_techniques() -> None:
     as_of = T0 + timedelta(days=3)
     model, _, findings = coverage([], groups, ViewFilter(as_of=as_of))
     assert {f.as_of for f in findings.asked} == {as_of}
+    assert all(len(f.repository_ids) == len(set(f.repository_ids)) for f in findings.asked)
     assert model.findings_mapped == 5
     assert {t.technique_id: t.derived for t in model.techniques} == {
         "T1059": 4,
@@ -237,3 +252,17 @@ def test_the_view_renders_through_context(engine: Engine, tmp_path: Path) -> Non
     assert model.dropped == {"T1562": 1}
     before = insight.build(ViewName.ATTACK_COVERAGE, ViewFilter(as_of=T0 - timedelta(days=1)))
     assert before.techniques == ()  # type: ignore[attr-defined]
+
+
+def test_a_coverage_view_outside_its_contract_is_refused_by_the_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = insight_module._navigator_layer
+
+    def drifted(model: AttackCoverage) -> dict[str, Any]:
+        return {**real(model), "domain": "mobile-attack"}
+
+    monkeypatch.setattr(insight_module, "_navigator_layer", drifted)
+    with pytest.raises(DocumentError) as error:
+        coverage([threat(MODEL_A, A, "T1078")], {}, ViewFilter())
+    assert "navigator_layer/domain" in {issue.path for issue in error.value.issues}

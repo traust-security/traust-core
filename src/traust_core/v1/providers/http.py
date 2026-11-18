@@ -6,6 +6,8 @@ import json
 import logging
 import random
 import re
+import socket
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -16,7 +18,7 @@ from datetime import UTC
 from email.utils import parsedate_to_datetime
 from typing import Any, BinaryIO, TypeVar
 
-from traust_core.v1.errors import ServiceError, ValidationError
+from traust_core.v1.errors import ConfigError, ServiceError, ValidationError
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.correlation import REQUEST_ID_HEADER, current_correlation
 
@@ -25,8 +27,54 @@ _NEXT = re.compile(r'<([^>]+)>\s*;\s*rel="?next"?')
 log = logging.getLogger(__name__)
 
 
+# An HTTP header name: an RFC 9110 token.
+_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+
+
+def is_header_name(name: str) -> bool:
+    """Whether `name` can be sent as an HTTP header name."""
+    return _HEADER_NAME.fullmatch(name) is not None
+
+
+def is_header_value(value: str) -> bool:
+    """Whether `value` can travel as a secret header (an API key): non-empty and visible ASCII
+    only, since a control, a space or a non-ASCII character can't be sent as-is."""
+    return bool(value) and all(0x21 <= ord(c) <= 0x7E for c in value)
+
+
+# a refusal's body is read for its message only (a form endpoint's error JSON): never unbounded
+_ERROR_BODY_BYTES = 1024 * 1024
+
+
 def _target_hash(url: str) -> str:
     return hashlib.sha256(url.encode()).hexdigest()[:16]
+
+
+def _positively_unreachable(error: BaseException) -> bool:
+    """Whether the transport positively established the endpoint is not there: name
+    resolution answered no such name (EAI_NONAME/EAI_NODATA - not EAI_AGAIN, a resolver
+    that is merely busy), the connection was refused, or TLS refused the certificate.
+    A timeout, a reset, a busy resolver or an interrupted handshake said nothing - the
+    endpoint might be there - so those are never gone-class evidence (foundry plan
+    repo-unreachable: the transient classes never count toward the disposition, only
+    the positive word does; Qodo #474)."""
+    reason = getattr(error, "reason", error)  # URLError reports its cause as `reason`
+    if isinstance(reason, urllib.error.URLError):
+        reason = getattr(reason, "reason", reason)
+    if isinstance(reason, socket.gaierror):
+        return reason.errno in _NO_SUCH_NAME
+    # SSLCertVerificationError is the positive word (this certificate is not valid);
+    # SSLEOFError/SSLZeroReturnError are interrupted handshakes - transient, never counted.
+    return isinstance(reason, (ConnectionRefusedError, ssl.SSLCertVerificationError))
+
+
+#: The resolver's definitive no-such-name answers. EAI_AGAIN (a busy resolver) and
+#: EAI_FAIL are excluded: they say nothing about the name.
+_NO_SUCH_NAME = frozenset(
+    code
+    for code in (getattr(socket, "EAI_NONAME", None), getattr(socket, "EAI_NODATA", None))
+    if code is not None
+)
 
 
 def _refused(url: str, status: int, operation: str) -> ServiceError:
@@ -92,11 +140,25 @@ class HttpFetcher:
         self._clock = clock or SystemClock()
         self._sleep = sleep
 
-    def get(self, url: str, headers: Mapping[str, str] | None = None) -> bytes:
+    def get(
+        self,
+        url: str,
+        headers: Mapping[str, str] | None = None,
+        *,
+        secret_headers: Mapping[str, str] | None = None,
+        limit: int | None = None,
+    ) -> bytes:
+        """`secret_headers` (an API key) go to `url` only: never onto a redirected request, so a
+        redirect to another host can't carry them. A body over `limit` bytes is a bad answer."""
+        if limit is not None and limit < 0:
+            raise ConfigError("an HTTP read limit is a byte count, never negative")
         try:
-            return self._send(url, None, headers=headers)
+            body: bytes = self._send(
+                url, None, headers=headers, secret_headers=secret_headers, limit=limit
+            )
         except _Refused as e:
             raise _refused(url, e.status, "http.get") from e
+        return body
 
     def pages(self, url: str, headers: Mapping[str, str] | None = None) -> Iterator[bytes]:
         """Each page's body, following the `Link: <…>; rel="next"` header (RFC 8288)."""
@@ -152,12 +214,16 @@ class HttpFetcher:
         *,
         read: Callable[[Any], Any] = lambda r: r.read(),
         headers: Mapping[str, str] | None = None,
+        secret_headers: Mapping[str, str] | None = None,
+        limit: int | None = None,
     ) -> Any:
+        """`limit` bounds a body read with the default `read`: one over it is refused, unread
+        past `limit` + 1 bytes and logged as refused."""
         policy = self._policy
         method = "POST" if data is not None else "GET"
         target_hash = _target_hash(url)
         started = time.perf_counter()
-        last, throttled = "", False
+        last, throttled, unreachable = "", False, False
         headers = {**(headers or {}), "User-Agent": self._user_agent}
         if correlation := current_correlation():
             headers[REQUEST_ID_HEADER] = correlation.request_id
@@ -165,17 +231,24 @@ class HttpFetcher:
             headers["Content-Type"] = content_type
         for attempt in range(policy.max_attempts):
             req = urllib.request.Request(url, data, headers=headers)
+            for name, value in (secret_headers or {}).items():
+                # urllib copies a request's headers onto a redirect, but not unredirected ones
+                req.add_unredirected_header(name, value)
             try:
                 with urllib.request.urlopen(req, timeout=policy.timeout_seconds) as r:
-                    result = read(r)
+                    result = read(r) if limit is None else r.read(limit + 1)
+                if limit is not None and len(result) > limit:
+                    _log_http(method, target_hash, "refused", attempt + 1, started)
+                    host = urllib.parse.urlsplit(url).hostname or ""
+                    raise ValidationError(f"{host}: response over {limit} bytes, refused")
                 _log_http(method, target_hash, "completed", attempt + 1, started)
                 return result
             except urllib.error.HTTPError as e:
                 # retrying a 403/404 just burns the rate-limit window
                 if e.code != 429 and not 500 <= e.code < 600:
                     _log_http(method, target_hash, "refused", attempt + 1, started, e.code)
-                    raise _Refused(e.code, e.read() if e.fp else b"") from e
-                last, throttled = f"HTTP {e.code}", e.code == 429
+                    raise _Refused(e.code, e.read(_ERROR_BODY_BYTES) if e.fp else b"") from e
+                last, throttled, unreachable = f"HTTP {e.code}", e.code == 429, False
                 after = self._retry_after(e.headers.get("Retry-After") if e.headers else None)
                 delay = (
                     self._backoff(attempt) if after is None else min(after, policy.max_wait_seconds)
@@ -187,6 +260,7 @@ class HttpFetcher:
                 http.client.IncompleteRead,
             ) as e:
                 last, throttled = str(e), False
+                unreachable = _positively_unreachable(e)
                 delay = self._backoff(attempt)
             if attempt + 1 < policy.max_attempts:
                 self._sleep(delay)
@@ -196,6 +270,7 @@ class HttpFetcher:
             status=429 if throttled else None,
             operation=f"http.{method.lower()}",
             target_hash=target_hash,
+            endpoint_unreachable=unreachable and not throttled,
         )
 
     def _backoff(self, attempt: int) -> float:

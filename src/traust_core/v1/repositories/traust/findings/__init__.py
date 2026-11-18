@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager
-from typing import Protocol, Self
+from typing import TYPE_CHECKING, Protocol, Self
 
 from traust_core.v1.repositories.traust.findings.cwe import CWE, CweRepository, SqlCweRepository
 from traust_core.v1.repositories.traust.findings.decision import (
@@ -48,6 +48,9 @@ from traust_core.v1.repositories.traust.findings.review_item import (
 )
 from traust_core.v1.repositories.unit_of_work import UnitOfWork
 
+if TYPE_CHECKING:
+    from traust_core.v1.repositories.contract import CensusReads
+
 TABLES = (
     FINDING,
     CWE,
@@ -65,6 +68,7 @@ class FindingsUnitOfWork(UnitOfWork, Protocol):
     def write(self) -> AbstractContextManager[Self]: ...
 
     findings: FindingRepository
+    census_reads: CensusReads
     cwes: CweRepository
     finding_cwes: FindingCweRepository
     finding_labels: FindingLabelRepository

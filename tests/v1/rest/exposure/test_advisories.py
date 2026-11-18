@@ -59,6 +59,15 @@ class Lookup:
         found = self.records.get(identifier)
         return Result(found, Acquisition(provider="osv", acquired_at=AT))
 
+    def related(self, record: AdvisoryRecord) -> Result[tuple[AdvisoryRecord, ...]]:
+        names = {record.identifier, *record.aliases}
+        related = tuple(
+            other
+            for other in self.records.values()
+            if other != record and names.intersection((other.identifier, *other.aliases))
+        )
+        return Result(related, Acquisition(provider="osv", acquired_at=AT))
+
 
 def osv(identifier: str) -> AdvisoryRecord:
     raw = (Path(__file__).parents[3] / f"fixtures/dependencies/osv-{identifier}.json").read_bytes()

@@ -22,7 +22,11 @@ DECISION_APPROVER = TableSpec(
 
 
 class DecisionApproverRepository(RecordRepository[DecisionApprover], Protocol):
-    def list_for_decision(self, decision_id: UUID) -> list[DecisionApprover]: ...
+    def list_for_decision(self, decision_id: UUID) -> list[DecisionApprover]:
+        """A decision's approvers. No production reader yet — the decisions write path's own
+        verification reads it (tests/v1/services/findings/test_decisions.py); an audit read
+        (who approved this) goes here when one lands."""
+        ...
 
 
 class SqlDecisionApproverRepository(SqlAppendOnlyRepository[DecisionApprover]):

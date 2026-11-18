@@ -5,18 +5,21 @@ from traust fabdb13 (build_trends.py, build_executive_summary.py, generate-team-
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import timedelta
+from datetime import datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.services.test_insight import FakeFindings, FakePortfolio, view
 from traust_core.v1.context import Config, Context
+from traust_core.v1.errors import DocumentError
 from traust_core.v1.models.assessment import AttackScenario
 from traust_core.v1.models.common import TimeBucket
 from traust_core.v1.models.insight import (
@@ -29,7 +32,8 @@ from traust_core.v1.models.vocabulary import Severity
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
-from traust_core.v1.services.insight import FindingsRollupView, _direction
+from traust_core.v1.services import insight as insight_module
+from traust_core.v1.services.insight import FindingsRollupView, _direction, _tally
 
 HUMAN = "human:analyst@example.com"
 DAY = timedelta(days=1)
@@ -240,6 +244,28 @@ def test_the_team_report_lifts_attack_scenarios_verbatim_for_a_scope() -> None:
     assert "_From the repository's latest threat model (T3)._" in md
 
 
+def test_imported_scenario_steps_cannot_form_links_or_html() -> None:
+    repo, product = uuid4(), uuid4()
+    portfolio = FakePortfolio(
+        repositories={repo: "https://github.com/example-org/svc"},
+        products={product: ("alpha", {repo})},
+    )
+    scenario = AttackScenario(
+        assessment_id=uuid4(),
+        repository_id=repo,
+        label="T4",
+        threat=None,
+        steps=("Open [click](https://attacker.example) then <img src=x onerror=alert(1)>.",),
+    )
+    rollup_view = FindingsRollupView(
+        FakeFindings([view(repository_id=repo)]), portfolio, ThreatModels(scenario)
+    )  # type: ignore[arg-type]
+    model = rollup_view.build(ViewFilter(product_ids=(product,)))
+    md = MarkdownRenderer().render(rollup_view.report(model, T0)).decode()
+    assert "[click](" not in md and "<img" not in md
+    assert r"\[click\]\(https://attacker.example\)" in md and "&lt;img" in md
+
+
 def test_the_fleet_rollup_reads_no_threat_models() -> None:
     repo = uuid4()
     assessment = ThreatModels()
@@ -294,3 +320,124 @@ def test_a_category_scope_keeps_only_matching_findings() -> None:
 
     assert [c.key for c in model.categories] == ["authorization"]
     assert model.total.open.total == 1
+
+
+def test_the_rollup_tallies_the_same_through_the_census_fold(
+    context: Context, engine: Engine
+) -> None:
+    """The census fold skips the locations and cwes a tally never reads; the counted rollup
+    must equal the tallies over the full views anyway."""
+    with SqlTraustUnitOfWork(engine) as uow:
+        s = Seed(uow)
+        svc = s.repository(url="https://github.com/example-org/svc")
+        api = s.repository(url="https://github.com/example-org/api")
+        audit = s.assessment(s.repository_ref(svc), occurred_at=T0)
+        for n, (title, severity, decided) in enumerate(
+            (
+                ("Open", "critical", None),
+                ("Accepted", "low", {"validity": "confirmed", "resolution": "risk_accepted"}),
+                ("Refuted", "medium", {"validity": "false_positive"}),
+            )
+        ):
+            finding = s.finding(svc, title=title)
+            s.occurrence(finding, audit, severity=severity)
+            s.finding_cwe(finding, s.cwe(identifier=f"CWE-{n}"))
+            s.finding_label(finding, taxonomy="category", label="xss")
+            if decided:
+                s.decision(finding, actor=HUMAN, occurred_at=T0 + DAY, **decided)
+        s.occurrence(s.finding(api, title="Found later"), s.assessment(s.repository_ref(api)))
+        uow.commit()
+    services = context.services()
+    rollup = services.insight.build(ViewName.FINDINGS_ROLLUP, ViewFilter())
+    full = services.findings.all_in([r.repository_id for r in rollup.repositories])  # type: ignore[arg-type]
+    everything = [v for rows in full.values() for v in rows]
+    assert rollup.total == _tally(everything)
+    by_repository = {r.repository_id: r.tally for r in rollup.repositories}
+    for repository_id, rows in full.items():
+        assert by_repository[repository_id] == _tally(rows)  # type: ignore[index]
+    assert {c.key for c in rollup.categories} == {"xss", None}
+
+
+def _accepted_and_open(engine: Engine) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        s = Seed(uow)
+        svc = s.repository(url="https://github.com/example-org/svc")
+        audit = s.assessment(s.repository_ref(svc), occurred_at=T0)
+        s.occurrence(s.finding(svc, title="Open unrated"), audit, severity="unrated")
+        for title, severity, cvss in (
+            ("High unscored", "high", None),
+            ("Unrated", "unrated", None),
+            ("High scored zero", "high", Decimal("0.0")),
+        ):
+            accepted = s.finding(svc, title=title)
+            s.occurrence(accepted, audit, severity=severity, cvss_score=cvss)
+            s.decision(
+                accepted,
+                validity="confirmed",
+                resolution="risk_accepted",
+                actor=HUMAN,
+                occurred_at=T0 + DAY,
+            )
+        uow.commit()
+
+
+def test_an_unweighable_finding_leaves_its_risk_index_unknown_without_a_direction(
+    context: Context, engine: Engine
+) -> None:
+    _accepted_and_open(engine)
+    trend = context.services().insight.build(
+        ViewName.FINDINGS_TREND, ViewFilter(bucket=TimeBucket.WEEK)
+    )
+    assert isinstance(trend, FindingsTrend)
+    assert {(p.risk_index, p.accepted_risk_index) for p in trend.points} == {(None, None)}
+    metrics = {d.metric for d in trend.directions}
+    assert {"risk_index", "accepted_risk_index"}.isdisjoint(metrics)
+    assert {"open", "accepted", "coverage"} <= metrics
+
+
+def test_the_register_ranks_unrated_last_and_a_zero_score_above_an_unscored_one(
+    context: Context, engine: Engine
+) -> None:
+    _accepted_and_open(engine)
+    trend = context.services().insight.build(ViewName.FINDINGS_TREND, ViewFilter())
+    assert [(a.title, a.severity) for a in trend.accepted] == [  # type: ignore[attr-defined]
+        ("High scored zero", Severity.HIGH),
+        ("High unscored", Severity.HIGH),
+        ("Unrated", None),
+    ]
+    md = context.services().insight.publish(ViewName.FINDINGS_TREND, ViewFilter()).markdown
+    assert "| Unrated | unrated |" in md
+    assert "accepted risk index —" in md
+    assert "| High scored zero | high | 0 |" in md  # canonical, never 0E-10
+    assert "| High unscored | high | — |" in md
+
+
+def test_a_trend_outside_its_contract_is_refused_by_the_build(
+    context: Context, engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed(engine)
+    real = insight_module._summed
+    monkeypatch.setattr(
+        insight_module,
+        "_summed",
+        lambda *args: real(*args).model_copy(update={"regressions": -1}),
+    )
+    with pytest.raises(DocumentError) as error:
+        context.services().insight.build(ViewName.FINDINGS_TREND, ViewFilter())
+    assert any(issue.path.endswith("/regressions") for issue in error.value.issues)
+
+
+def test_the_canonical_decimal_drops_only_trailing_zeros_and_never_rounds() -> None:
+    long = Decimal("9.87654321098765432109876543210987")  # beyond the default 28-digit context
+    assert insight_module.canonical_decimal(long) == "9.87654321098765432109876543210987"
+    assert [
+        insight_module.canonical_decimal(Decimal(v))
+        for v in ("0E-10", "7.5000000000", "10", "1E+1", "10.0", "9.8")
+    ] == ["0", "7.5", "10", "10", "10", "9.8"]
+
+
+def test_a_timezone_naive_as_of_is_refused_at_the_filter() -> None:
+    with pytest.raises(PydanticValidationError):
+        ViewFilter(as_of=datetime(2026, 10, 1))
+    with pytest.raises(PydanticValidationError):
+        ViewFilter(compare_as_of=datetime(2026, 10, 1))

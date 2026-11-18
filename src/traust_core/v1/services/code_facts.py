@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import re
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import datetime
 from typing import TypeVar
 from uuid import UUID
@@ -78,7 +78,6 @@ T = TypeVar("T")
 _K8S_EXEC = ValidationAction(kind=ValidationActionKind.K8S, verb="exec")
 _CALLABLE_KINDS = frozenset({"func", "function", "method"})
 _HANDLER_NAME = re.compile(r"\w+")
-
 
 # The pre-scan that enumerates each entry-point kind; a kind with none is uncovered by design.
 COVERING_PRE_SCAN = {
@@ -520,3 +519,51 @@ class CodeFactsService:
         stats = result.facts[0].detail
         assert isinstance(stats, LanguageStats)
         return stats
+
+    def language_stats_of(
+        self, repository_ref_ids: Collection[UUID], *, as_of: datetime | None = None
+    ) -> dict[UUID, LanguageStats | str]:
+        """Each ref's latest measured languages, keyed by ref id, or the reason it has none:
+        the batched `language_stats`. A ref without a completed tool scan that holds exactly
+        one code-facts artifact with measured languages is absent-or-reasoned, never
+        silently defaulted."""
+        latest = self._assessments.latest_completed_for_refs(
+            repository_ref_ids, AssessmentKind.TOOL_SCAN, as_of
+        )
+        reasons: dict[UUID, LanguageStats | str] = {
+            ref: f"no tool_scan assessment for ref {ref}" for ref in repository_ref_ids
+        }
+        refs = {a.id: a.repository_ref_id for a in latest if a.id is not None}  # type: ignore[union-attr]
+        seen: set[UUID] = set()
+        for assessment, doc in self._artifacts.documents(latest, CodeFactsArtifact):
+            assert assessment.id is not None
+            if assessment.id in seen:
+                raise IntegrityError(
+                    f"assessment {assessment.id} has multiple code-facts artifacts"
+                )
+            seen.add(assessment.id)
+            ref = refs[assessment.id]
+            if doc.languages is None:
+                reasons[ref] = f"artifact {assessment.id}: languages were not measured"
+                continue
+            names = [language.name for language in doc.languages]
+            if len(names) != len(set(names)):
+                raise IntegrityError(
+                    f"artifact {assessment.id} has duplicate language measurements"
+                )
+            reasons[ref] = LanguageStats(
+                languages=tuple(
+                    LanguageCount(
+                        name=language.name,
+                        files=language.files,
+                        code=language.code,
+                        comments=language.comments,
+                        blanks=language.blanks,
+                    )
+                    for language in sorted(doc.languages, key=lambda language: language.name)
+                )
+            )
+        for assessment_id, ref in refs.items():
+            if assessment_id not in seen:
+                reasons[ref] = f"assessment {assessment_id} has no code-facts artifact"
+        return reasons
