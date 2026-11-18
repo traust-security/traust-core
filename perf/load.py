@@ -206,5 +206,3 @@ def run_duress(
         readers=readers,
         seconds=seconds,
     )
-
-
