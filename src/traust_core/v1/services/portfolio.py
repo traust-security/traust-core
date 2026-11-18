@@ -13,7 +13,13 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 from traust_core.v1 import contracts
-from traust_core.v1.errors import ConfigError, ConflictError, NotFoundError, ValidationError
+from traust_core.v1.errors import (
+    ConfigError,
+    ConflictError,
+    NotFoundError,
+    ServiceError,
+    ValidationError,
+)
 from traust_core.v1.models.artifacts import (
     CorpusRegistryArtifact,
     ProductDefinitionsMapArtifact,
@@ -2030,7 +2036,8 @@ class PortfolioSync:
         try:
             return self.import_branch(repository_id, url, branch)
         except SourceError as e:
-            if e.http_status != 404:
+            cause = e.__cause__
+            if not (isinstance(cause, ServiceError) and cause.status == 404):
                 raise
             raise NotFoundError(f"branch {branch} of {url}: the forge has no such branch") from e
 

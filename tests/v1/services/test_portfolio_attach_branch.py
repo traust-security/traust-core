@@ -11,7 +11,7 @@ from sqlalchemy.engine import Engine
 from tests.v1.repositories.tables import conftest as table_fixtures
 from tests.v1.repositories.tables.conftest import SHA, Seed
 from tests.v1.services.test_portfolio_sync import Forge
-from traust_core.v1.errors import ConflictError, NotFoundError
+from traust_core.v1.errors import ConflictError, NotFoundError, ServiceError
 from traust_core.v1.models.inventory import RefName
 from traust_core.v1.models.observation import ComparisonStatus
 from traust_core.v1.models.values import HttpsRepoUrl
@@ -126,7 +126,11 @@ def test_a_name_already_recorded_as_a_tag_refuses_the_branch(engine: Engine, see
 def test_a_branch_the_forge_answers_404_for_is_not_found(engine: Engine, seed: Seed) -> None:
     repo = seed.repository(url="https://github.com/org/tooling")
     seed.uow.commit()
-    gone = SourceError("HTTP 404", ComparisonStatus.ERROR, http_status=404)
+    try:
+        raise ServiceError("HTTP 404", 404)
+    except ServiceError as exc:
+        gone = SourceError("HTTP 404", ComparisonStatus.ERROR)
+        gone.__cause__ = exc
     with pytest.raises(NotFoundError):
         PortfolioSync(
             PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy()),
