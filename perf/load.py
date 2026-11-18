@@ -145,13 +145,17 @@ class DashboardReader:
     def run(self, stop: threading.Event) -> None:
         from traust_core.v1.rest.app import create_app
 
-        minted = self._context.local_issuer.mint("load@example.com").token.get_secret_value()
-        token = {"Authorization": f"Bearer {minted}"}
+        def token() -> dict[str, str]:
+            # a fresh mint per request: a held token fails verification mid-run, and a
+            # 401 storm reads as a duress failure it is not
+            minted = self._context.local_issuer.mint("load@example.com").token.get_secret_value()
+            return {"Authorization": f"Bearer {minted}"}
+
         with TestClient(create_app(self._context), raise_server_exceptions=False) as client:
             while not stop.is_set():
                 started = time.perf_counter()
                 try:
-                    response = client.get(f"/v1/insights/{self._view}", headers=token)
+                    response = client.get(f"/v1/insights/{self._view}", headers=token())
                     if response.status_code == 200:
                         self.latencies.append(time.perf_counter() - started)
                     else:
@@ -159,6 +163,19 @@ class DashboardReader:
                         self.problems.setdefault(response.status_code, response.text[:200])
                 except Exception:
                     self.failures += 1
+
+
+def _warm_identity(context: Context, view: str) -> None:
+    """One request before the threads: the local issuer generates its signing key
+    lazily, and concurrent first mints race the key under the verifier — every
+    request after a lost race 401s with a signature failure that is not duress."""
+    from traust_core.v1.rest.app import create_app
+
+    minted = context.local_issuer.mint("load@example.com").token.get_secret_value()
+    with TestClient(create_app(context), raise_server_exceptions=False) as client:
+        response = client.get(f"/v1/insights/{view}", headers={"Authorization": f"Bearer {minted}"})
+    if response.status_code != 200:
+        raise RuntimeError(f"the apparatus cannot serve one request: {response.text[:200]}")
 
 
 def run_duress(
@@ -175,6 +192,7 @@ def run_duress(
     targets = write_targets(engine)
     if not targets:
         raise RuntimeError("the rig has no open findings to write against")
+    _warm_identity(context, view)
     writer = StampedWriter(engine, targets)
     clients = [DashboardReader(context, view) for _ in range(readers)]
 
