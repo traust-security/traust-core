@@ -21,6 +21,7 @@ SERVICES = SRC / "services"
 # The section each service writes. A service imports only its own section's unit of work.
 SERVICE_SECTION = {
     "portfolio": "traust.inventory",
+    "dashboards": "traust.findings",
     "onboarding": "traust.inventory",
     "assessment": "traust.assessments",
     "artifact_publishing": "traust.assessments",
@@ -35,6 +36,7 @@ SERVICE_SECTION = {
 }
 # Use cases that write several sections in one transaction declare TraustUnitOfWork.
 SPANS_SECTIONS = {
+    "dashboards",
     "findings",
     "exposure",
     "validation",

@@ -7,6 +7,7 @@ from types import ModuleType
 from traust_core.v1.rest import (
     artifacts,
     assessments,
+    dashboards,
     exposure,
     findings,
     health,
@@ -22,6 +23,7 @@ from traust_core.v1.rest import (
 
 DOMAINS: tuple[ModuleType, ...] = (
     health,
+    dashboards,
     identity,
     ledger,
     ops,

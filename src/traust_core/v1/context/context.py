@@ -177,6 +177,7 @@ from traust_core.v1.services.attestation import AttestationService, StatementPol
 from traust_core.v1.services.below_range import BelowRangeService
 from traust_core.v1.services.code_facts import CodeFactsService
 from traust_core.v1.services.compliance import GATE, ComplianceService
+from traust_core.v1.services.dashboards import DashboardService
 from traust_core.v1.services.detection_quality import DetectionQualityService
 from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings import (
@@ -320,6 +321,7 @@ class Services:
     detection_quality: DetectionQualityService
     remediation: RemediationService
     insight: InsightService
+    dashboards: DashboardService
     pqc: PqcService
     remediation_scheduling: RemediationSchedulingService
     verification: VerificationService
@@ -1360,6 +1362,7 @@ class Context:
                 decisions=findings.decisions,
                 parsed=self.parsed_builds,
             ),
+            dashboards=DashboardService(uow, portfolio),
         )
 
     @contextmanager
