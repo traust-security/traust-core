@@ -154,3 +154,6 @@ token: local-config
 	@uv run traust-server --config $(LOCAL_CONFIG) token "$(NAME)" $(if $(MACHINE),--machine) > $(LOCAL)/$(NAME).token
 	@echo "$(LOCAL)/$(NAME).token"
 
+
+perf-load:
+	TRAUST_PERF_LOAD=1 uv run --extra postgres --extra rest pytest perf/test_load.py -q -s

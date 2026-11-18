@@ -15,6 +15,7 @@ from perf.seed import seeded_database
 from traust_core.v1.context import Config, Context
 from traust_core.v1.context.config import DatabaseConfig
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services.identity import IdentityConfig
 
 REPORT = Path(__file__).resolve().parent.parent / ".perf" / "report.md"
 
@@ -44,6 +45,7 @@ def context(engine: Engine) -> Iterator[Context]:
             Config(
                 home=Path(home),
                 database=DatabaseConfig(url=engine.url.render_as_string(hide_password=False)),
+                identity=IdentityConfig(trust_local=True),  # the load apparatus mints callers
             )
         )
         found.register_model_catalog(REGISTRY)
