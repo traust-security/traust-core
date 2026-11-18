@@ -140,14 +140,14 @@ openapi: api-check
 	@echo "Swagger UI: 'make serve', then http://127.0.0.1:$${PORT:-8080}/docs (ReDoc /redoc, raw /openapi.json)"
 
 serve:
-	uv run traust-server $(if $(CONFIG),--config $(CONFIG))
+	uv run traust-server $(if $(CONFIG),--config $(CONFIG)) $(if $(WORKERS),--workers $(WORKERS))
 
 # Development only: SQLite under $(LOCAL)/home and this machine's local issuer trusted.
 local-config:
 	@test -f $(LOCAL_CONFIG) || { mkdir -p $(LOCAL) && printf 'home: %s\nidentity: { trust_local: true }\n' "$(abspath $(LOCAL))/home" > $(LOCAL_CONFIG) && echo "wrote $(LOCAL_CONFIG)"; }
 
 serve-local: local-config
-	uv run traust-server --config $(LOCAL_CONFIG)
+	uv run traust-server --config $(LOCAL_CONFIG) $(if $(WORKERS),--workers $(WORKERS))
 
 token: local-config
 	@test -n "$(NAME)" || { echo "usage: make token NAME=me@example.com (a person) | NAME=runner-1 MACHINE=1 (a runner)" >&2; exit 2; }
