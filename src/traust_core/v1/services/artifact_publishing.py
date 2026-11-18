@@ -194,6 +194,13 @@ class AssessmentLog:
         with self._uow as uow:
             return uow.artifacts.get(artifact_id)
 
+    def list_artifacts(self, assessment_id: UUID, kind: str | None = None) -> list[Artifact]:
+        """The assessment's documents, oldest first; an unknown assessment is a 404,
+        never an empty listing (the door's semantics, not the query's)."""
+        with self._uow as uow:
+            uow.assessments.get(assessment_id)
+            return uow.artifacts.list_for_assessment(assessment_id, kind=kind)
+
     def list_artifacts_by_ids(self, artifact_ids: Collection[UUID]) -> list[Artifact]:
         ids = tuple(artifact_ids)
         with self._uow as uow:
