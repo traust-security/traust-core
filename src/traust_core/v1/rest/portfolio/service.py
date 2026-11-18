@@ -8,11 +8,15 @@ from traust_core.v1.errors import ForbiddenError
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.rest.common.deps import Caller, CoreServices
 from traust_core.v1.services.onboarding import OnboardingService
-from traust_core.v1.services.portfolio import PortfolioService
+from traust_core.v1.services.portfolio import PortfolioService, PortfolioSync
 
 
 def portfolio(services: CoreServices) -> PortfolioService:
     return services.portfolio
+
+
+def sync(services: CoreServices) -> PortfolioSync:
+    return services.sync
 
 
 def onboarding(services: CoreServices) -> OnboardingService:
@@ -29,5 +33,6 @@ def person(caller: Caller) -> Principal:
 
 
 Portfolio = Annotated[PortfolioService, Depends(portfolio)]
+Sync = Annotated[PortfolioSync, Depends(sync)]
 Onboarding = Annotated[OnboardingService, Depends(onboarding)]
 Person = Annotated[Principal, Depends(person)]

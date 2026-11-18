@@ -3,15 +3,17 @@
 
 from __future__ import annotations
 
+import json
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
-from traust_core.v1.errors import ServiceError
+from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.candidate_formats import govulncheck_records
 from traust_core.v1.models.dependencies import ImpactEvidence, ImpactQuery
 from traust_core.v1.models.vocabulary import (
+    DependencyEvidenceLevel,
     Ecosystem,
     ImpactGovulncheck,
     ImpactSourceImportScan,
@@ -53,6 +55,7 @@ class GovulncheckAnalyzer:
     name = "govulncheck"
     tier = ImpactTier.GOVULNCHECK
     ecosystems = frozenset({Ecosystem.GO})
+    level = DependencyEvidenceLevel.SYMBOL
 
     def __init__(self, process: ProcessRunner, clock: Clock) -> None:
         self._process = process
@@ -142,6 +145,7 @@ class SourceScanAnalyzer:
     name = "source-scan"
     tier = ImpactTier.SOURCE_SCAN
     ecosystems = frozenset(_IMPORTS) | frozenset(_SYMBOLS_ONLY)
+    level = DependencyEvidenceLevel.SYMBOL_USAGE
 
     def __init__(self, clock: Clock) -> None:
         self._clock = clock
@@ -173,3 +177,59 @@ class SourceScanAnalyzer:
             )
         evidence = ImpactEvidence(source_import_scan=imports, symbol_usage_scan=usage)
         return Result(evidence, Acquisition(provider=self.name, acquired_at=self._clock.now()))
+
+
+class CommandAnalyzer:
+    """A deployment-declared plug-in behind the same interface: a command that prints one
+    impact-evidence document for one query, capped at its declared level. Reachability is the
+    ladder's top, so a plug-in declaring below `symbol` may not emit it — no plug-in can forge
+    an `affected` verdict. The only plug-in code in core."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        ecosystem: Ecosystem,
+        level: DependencyEvidenceLevel,
+        tier: ImpactTier,
+        run: Sequence[str],
+        process: ProcessRunner,
+        clock: Clock,
+    ) -> None:
+        self.name = name
+        self.tier = tier
+        self.ecosystems = frozenset({ecosystem})
+        self.level = level
+        self._run = tuple(run)
+        self._process = process
+        self._clock = clock
+
+    def check(self) -> Readiness:
+        return self._process.readiness(self._run[0])
+
+    def evidence(self, query: ImpactQuery, request: ToolRequest) -> Result[ImpactEvidence]:
+        argv = [
+            *self._run,
+            query.package.ecosystem.value,
+            query.package.name,
+            str(request.checkout()),
+        ]
+        run = self._process.run(argv, check=False)
+        if run.returncode != 0:
+            tail = run.stderr.decode(errors="replace").strip()[-300:] or "no stderr"
+            raise ServiceError(f"{self.name} exited {run.returncode}: {tail}")
+        try:
+            doc = ImpactEvidence.model_validate(json.loads(run.stdout.decode(errors="replace")))
+        except ValueError as e:
+            raise ValidationError(f"{self.name} printed no impact evidence: {e}") from e
+        if doc.govulncheck is not None and self.level is not DependencyEvidenceLevel.SYMBOL:
+            raise ValidationError(
+                f"plug-in {self.name} declares {self.level.value} evidence but emitted "
+                "reachability: a sub-symbol plug-in can never claim `affected`"
+            )
+        acquisition = Acquisition(
+            provider=self.name,
+            acquired_at=self._clock.now(),
+            argv_sha256=argv_digest(run.argv),
+        )
+        return Result(doc, acquisition)

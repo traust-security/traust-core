@@ -144,3 +144,19 @@ def test_the_product_and_version_are_checked(
     uow.commit()
     with pytest.raises(error):
         portfolio.import_release(product_id, version, PAYLOAD)  # type: ignore[arg-type]
+
+
+def test_a_name_recorded_as_a_tag_refuses_the_release_import(
+    uow: SqlTraustUnitOfWork, seed: Seed, portfolio: PortfolioService
+) -> None:
+    product = seed.product()
+    url = "https://github.com/example-org/tagged-line"
+    repo = seed.repository(url=url)
+    seed.repository_ref(repository=repo, name="release-4.20", kind="tag", sha="a" * 40)
+    uow.commit()
+    with pytest.raises(ConflictError):
+        portfolio.import_release(
+            product.id,
+            V,
+            (commit(url, "a", "release-4.20"),),  # type: ignore[arg-type]
+        )
