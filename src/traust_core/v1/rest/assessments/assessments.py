@@ -8,6 +8,7 @@ from fastapi import APIRouter, Query
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.artifacts import SecurityAuditArtifact
 from traust_core.v1.models.assessment import (
+    Artifact,
     Assessment,
     AssessmentFilter,
     AssessmentIntakeBindings,
@@ -68,6 +69,23 @@ def list_assessments(
 @router.get("/v1/assessments/{assessment_id}", responses=PROBLEMS(401, 404))
 def get_assessment(assessment_id: UUID, assessments: Assessments, _: Caller) -> Assessment:
     return assessments.get(assessment_id)
+
+
+@router.get(
+    "/v1/assessments/{assessment_id}/artifacts",
+    responses=PROBLEMS(401, 404, 422),
+)
+def list_assessment_artifacts(
+    assessment_id: UUID,
+    assessments: Assessments,
+    _: Caller,
+    kind: Annotated[str | None, Query(max_length=64)] = None,
+) -> list[Artifact]:
+    """An assessment's documents, oldest first: the metadata (id, kind, uri, digest,
+    created_at), never the bytes — the content door serves those. Every verified
+    caller reads them (a machine principal reads as freely as a person); an unknown
+    assessment is a 404, and a known one that holds no document answers []."""
+    return assessments.list_artifacts(assessment_id, kind)
 
 
 @router.get(

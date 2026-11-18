@@ -912,6 +912,11 @@ class AssessmentService:
     def get(self, assessment_id: UUID) -> Assessment:
         return self._read(self._log.get(assessment_id))
 
+    def list_artifacts(self, assessment_id: UUID, kind: str | None = None) -> list[Artifact]:
+        """An assessment's documents, oldest first: metadata only (the content door serves
+        the bytes). An unknown assessment is a 404; a known one with none answers []."""
+        return self._log.list_artifacts(assessment_id, kind)
+
     def latest(
         self,
         repository_ref_id: UUID,
