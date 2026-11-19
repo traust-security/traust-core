@@ -5,6 +5,7 @@ flows to the SDK through the OpenAPI document generated from these models."""
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Annotated
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -57,6 +58,11 @@ class DashboardOrder(BaseModel):
     desc: bool = False
 
 
+# The request's list bounds: a whole-estate grant (366 repositories) clears the id cap.
+_ID_CAP = 1000
+_WhereValues = Annotated[tuple[str, ...], Field(max_length=100)]
+
+
 class DashboardQuery(BaseModel):
     """One metrics query: a subject, the repository filter that trims the answer
     to a caller's access, and an allow-listed combination of measures and
@@ -65,12 +71,12 @@ class DashboardQuery(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     subject: Subject
-    repository_ids: tuple[UUID, ...] = ()
-    product_ids: tuple[UUID, ...] = ()
-    team_ids: tuple[UUID, ...] = ()
+    repository_ids: tuple[UUID, ...] = Field(default=(), max_length=_ID_CAP)
+    product_ids: tuple[UUID, ...] = Field(default=(), max_length=_ID_CAP)
+    team_ids: tuple[UUID, ...] = Field(default=(), max_length=_ID_CAP)
     measures: tuple[Measure, ...] = Field(min_length=1)
     group_by: tuple[Dimension, ...] = Field(default=(), max_length=3)
-    where: dict[Dimension, tuple[str, ...]] = Field(default={}, max_length=8)
+    where: dict[Dimension, _WhereValues] = Field(default={}, max_length=8)
     order: tuple[DashboardOrder, ...] = Field(default=(), max_length=3)
     limit: int = Field(default=50, ge=1, le=1000)
 
