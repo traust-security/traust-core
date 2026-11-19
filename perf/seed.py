@@ -442,7 +442,10 @@ ANALYZED = (
 
 def _name() -> str:
     ddl = contracts.database_ddl(Dialect.POSTGRES)
-    steps = [*ddl, *SEED, *ANALYZED, inspect.getsource(_stamp_layers)]
+    # the upgrade channel's scripts too: a changed script must rebuild the rig, never be
+    # refused against one that applied its earlier text
+    channel = [u.sha256 for u in contracts.shipped_db_upgrades(Dialect.POSTGRES)]
+    steps = [*ddl, *channel, *SEED, *ANALYZED, inspect.getsource(_stamp_layers)]
     digest = hashlib.sha256("\n".join(steps).encode()).hexdigest()[:12]
     return f"traust_perf_{digest}"
 

@@ -1,6 +1,6 @@
 """The dashboard facts, one statement per card: the probe the dashboard service's
-budget rests on. Each fact derives at read time except state, which reads the
-stamped fold (phase 1); a finding with no decision is open by rule."""
+budget rests on. Every fact is the finding's current answer, kept by the contracts'
+triggers at write; a finding with no decision is open by rule."""
 
 from __future__ import annotations
 
@@ -12,32 +12,18 @@ from sqlalchemy.engine import Engine
 
 from perf.seed import REPOSITORIES
 
-# seconds, whole rig (350k findings): the raw facts SQL measured 45-106 ms at
-# the migrated estate's 51k; the guard is a regression bound, not the budget
+# seconds, whole rig (350k findings): a regression bound, not the budget
 BUDGET_SECONDS = 2.0
 GRANT = 366
 
 FACTS = sa.text(
     """
-    WITH latest_occ AS (
-      SELECT DISTINCT ON (o.finding_id) o.finding_id, o.severity, o.cvss_score
-      FROM traust.occurrence o JOIN traust.assessment a ON a.id = o.assessment_id
-      ORDER BY o.finding_id, a.occurred_at DESC, o.created_at DESC, o.id DESC),
-    first_cat AS (
-      SELECT DISTINCT ON (finding_id) finding_id, label FROM traust.finding_label
-      WHERE taxonomy = 'category' ORDER BY finding_id, created_at, id),
-    latest_dec AS (
-      SELECT DISTINCT ON (finding_id) finding_id, folded_state, folded_severity
-      FROM traust.decision ORDER BY finding_id, created_at DESC, id DESC),
-    facts AS (
+    WITH facts AS (
       SELECT f.id, f.repository_id,
-        coalesce(d.folded_state, 'open') AS state,
-        coalesce(d.folded_severity, nullif(o.severity, 'unrated')) AS severity,
-        c.label AS category
-      FROM traust.finding f
-      LEFT JOIN latest_occ o ON o.finding_id = f.id
-      LEFT JOIN first_cat c ON c.finding_id = f.id
-      LEFT JOIN latest_dec d ON d.finding_id = f.id)
+        coalesce(f.current_state, 'open') AS state,
+        f.current_severity AS severity,
+        f.category
+      FROM traust.finding f)
     """
 )
 
