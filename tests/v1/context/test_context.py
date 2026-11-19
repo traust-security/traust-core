@@ -5,6 +5,7 @@ import pytest
 import sqlalchemy as sa
 
 from tests.v1.example.repository import SqlTaskUnitOfWork, metadata
+from traust_core.v1 import contracts
 from traust_core.v1.context import Config, Context, StoreState
 from traust_core.v1.context.config import DatabaseConfig
 from traust_core.v1.errors import ConfigError
@@ -318,7 +319,10 @@ def test_the_control_surface_brings_a_pre_channel_store_on_at_the_head(tmp_path:
     context = Context(Config(home=tmp_path))
     assert context.pending_db_upgrades() == []  # nothing pending: nothing has run yet
     stamped = context.apply_db_upgrades()  # the first apply brings it on, nothing runs
-    assert [upgrade.name for upgrade in stamped] == ["0001_repository_disposition"]
+    # everything shipped, whatever the channel holds today - the test follows
+    # the channel rather than naming its entries
+    shipped = [upgrade.name for upgrade in contracts.shipped_db_upgrades("sqlite")]
+    assert [upgrade.name for upgrade in stamped] == shipped
     assert Context(Config(home=tmp_path)).store_status().state is StoreState.CURRENT
 
 
