@@ -24,7 +24,7 @@ from traust_ledger.integrity import (
     stamp_merkle_metadata,
 )
 
-from traust_core.v1 import contracts
+from traust_core.v1 import contracts, data_migrations
 from traust_core.v1.repositories import apply_schema, create_database_engine, on_driver_connection
 from traust_core.v1.repositories.sql import Dialect, contract_dialect
 
@@ -258,10 +258,25 @@ SEED = (
     FROM generate_series(1, {FINDINGS}) g
     JOIN traust.repository r
         ON r.url = 'https://forge.example/org/r' || (1 + mod(g, {REPOSITORIES}))""",
+    # Every tenth finding stays undecided: it folds open with its occurrence's
+    # severity — the open critical/high cut needs that combination, and a real
+    # estate always has undecided high-severity findings.
     """INSERT INTO traust.decision
         (finding_id, statement_key, validity, evidence_grade, actor, occurred_at)
     SELECT id, fingerprint, 'confirmed', 'E0', 'human:perf@example.com', now()
-    FROM traust.finding WHERE fingerprint_algo = 'v3'""",
+    FROM (SELECT id, fingerprint, row_number() OVER (ORDER BY id) n
+          FROM traust.finding WHERE fingerprint_algo = 'v3') ranked
+    WHERE mod(ranked.n, 10) <> 0""",
+    # The undecided tenth gets scanned too, on existing assessments: an
+    # undecided finding with a critical occurrence is the dashboard's open
+    # critical/high cut, and a real estate always has them.
+    f"""INSERT INTO traust.occurrence (finding_id, assessment_id, severity, rule)
+    SELECT f.id, a.id, 'critical', 'rule-' || mod(f.n, 50)
+    FROM (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.finding
+          WHERE fingerprint_algo = 'v3') f
+    JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.assessment) a
+        ON a.n = 1 + mod(f.n - 1, {DECISIONS // FINDINGS_PER_ASSESSMENT})
+    WHERE mod(f.n, 10) = 0""",
     """INSERT INTO traust.review_item (finding_id, decision_id, reason, status)
     SELECT d.finding_id, d.id, 'needs_manual_test',
         CASE WHEN mod(row_number() OVER (ORDER BY d.id), 100) = 0
@@ -454,6 +469,7 @@ def seeded_database(url: str) -> Engine:
             _upgrade(engine)  # the seed writes the shape the channel leaves, not the baseline
             apply_schema(engine, SEED)
             _stamp_layers(engine)
+            data_migrations.run(engine)  # the seeded decisions get their stamped state
             with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
                 for table in ANALYZED:
                     conn.exec_driver_sql(f"VACUUM (ANALYZE) {table}")
@@ -463,6 +479,7 @@ def seeded_database(url: str) -> Engine:
             raise
     else:
         _upgrade(engine)  # a reused database gains any script it lacks; a current one, none
+        data_migrations.run(engine)  # and any data entry it lacks, the same way
     return engine
 
 

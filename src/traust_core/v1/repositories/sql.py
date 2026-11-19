@@ -37,15 +37,19 @@ def _compact_json(value: Any) -> str:
 
 
 def create_database_engine(url: str | sa.URL) -> Engine:
-    engine = sa.create_engine(url, json_serializer=_compact_json, hide_parameters=True)
-    if engine.dialect.name != "sqlite":
-
-        @sa.event.listens_for(engine, "connect")
-        def _work_mem(dbapi_conn: Any, _: Any) -> None:
-            # the audit's 1.24 GB sort spill guard: session-level, application-owned
-            # (ALTER ROLE IN DATABASE cannot be a portable migration)
-            dbapi_conn.execute("SET work_mem = '64MB'")
-
+    postgres = sa.make_url(url).get_backend_name() == "postgresql"
+    engine = sa.create_engine(
+        url,
+        json_serializer=_compact_json,
+        hide_parameters=True,
+        # The audit's 1.24 GB sort spill guard: session-level, application-owned
+        # (ALTER ROLE IN DATABASE cannot be a portable migration). Set through
+        # libpq options, not a connect-time statement — a statement leaves the
+        # connection in a transaction, and the upgrade runner needs to reach
+        # autocommit on a freshly checked-out connection.
+        connect_args={"options": "-c work_mem=64MB"} if postgres else {},
+    )
+    if postgres:
         return engine
 
     @sa.event.listens_for(engine, "connect")
