@@ -6,13 +6,19 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from traust_core.v1.models.dashboard import DashboardQuery, DashboardResults, DashboardRow
+from traust_core.v1.models.dashboard import (
+    DashboardPreset,
+    DashboardPresetQuery,
+    DashboardQuery,
+    DashboardResults,
+    DashboardRow,
+)
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.traust.findings.dashboard_facts import (
     DashboardFacts,
     SqlDashboardFacts,
 )
-from traust_core.v1.services.dashboards import catalog
+from traust_core.v1.services.dashboards import catalog, presets
 from traust_core.v1.services.portfolio import PortfolioService
 
 _ROW_CAP = 1000
@@ -59,6 +65,22 @@ class DashboardService:
             ),
         )
         return results
+
+    def presets(self) -> tuple[DashboardPreset, ...]:
+        """The named, code-defined queries: code, not storage — the registry
+        itself is the answer."""
+        return presets.PRESETS
+
+    def query_preset(self, preset_id: str, query: DashboardPresetQuery) -> DashboardResults:
+        saved = presets.resolve(preset_id).query
+        scoped = saved.model_copy(
+            update={
+                "repository_ids": query.repository_ids,
+                "product_ids": query.product_ids,
+                "team_ids": query.team_ids,
+            }
+        )
+        return self.query(scoped)
 
     def _resolve(self, query: DashboardQuery) -> frozenset[UUID] | None:
         """The repository filter: the caller's ids, expanded through products

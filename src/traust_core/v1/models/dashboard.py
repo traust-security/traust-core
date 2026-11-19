@@ -87,3 +87,25 @@ class DashboardResults(BaseModel):
 
     subject: Subject
     rows: tuple[DashboardRow, ...] = Field(max_length=1000)
+
+
+class DashboardPreset(BaseModel):
+    """A named, code-defined query a card references by id. The query's
+    repository filter stays empty — the caller's grant fills it at run time."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=r"^[a-z0-9]+(-[a-z0-9]+)*$")
+    description: str
+    query: DashboardQuery
+
+
+class DashboardPresetQuery(BaseModel):
+    """The access trim for running a preset: the caller's repositories,
+    expanded through products and teams exactly like an ad-hoc query."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    repository_ids: tuple[UUID, ...] = ()
+    product_ids: tuple[UUID, ...] = ()
+    team_ids: tuple[UUID, ...] = ()
