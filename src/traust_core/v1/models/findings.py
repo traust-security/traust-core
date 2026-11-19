@@ -685,7 +685,6 @@ class Finding(Entity):
     fingerprint: str
     kind: FindingKind | str | None = Field(default=None, union_mode="left_to_right")
     title: str
-    first_seen: datetime | None = None
 
 
 # A report's claims can't change after the fact: occurrence and location rows are append-only and

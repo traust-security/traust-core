@@ -35,6 +35,24 @@ BASELINE = HERE / "baseline.json"
 SUMMARY = HERE.parent.parent / ".perf" / "api-summary.json"
 BREAKPOINT_SUMMARY = HERE.parent.parent / ".perf" / "api-breakpoint.json"
 HERD_SUMMARY = HERE.parent.parent / ".perf" / "api-herd.json"
+SWEEP_SUMMARY = HERE.parent.parent / ".perf" / "api-sweep.json"
+# Every read SCI calls, herded one at a time over one server (herd.js READS).
+SWEEP_TARGETS = (
+    "dashboard",
+    "findings_page",
+    "findings_count",
+    "findings_summaries",
+    "review_queue",
+    "repo_findings",
+    "repo_summary",
+    "repo_timeline",
+    "feed",
+    "orders",
+    "insight_rollup",
+    "insight_trend",
+    "insight_coverage",
+    "insight_remediation",
+)
 API_DATABASE = "traust_perf_api"
 REGRESSION = 1.20  # a run more than 20% slower, or more than 20% lower throughput, fails
 LATENCY_KEYS = (
@@ -212,6 +230,27 @@ def gate(summary: dict[str, float | None], update: bool, keys: tuple[str, ...] =
     return 0
 
 
+def sweep(k6: str, port: int, runner: str, reader: str, duration: str) -> int:
+    """Herd each SCI read in turn; print one row per read and keep them all."""
+    rows = []
+    chosen = os.environ.get("TARGETS")
+    targets = tuple(chosen.split(",")) if chosen else SWEEP_TARGETS
+    for target in targets:
+        os.environ["TARGET"] = target
+        run_k6(k6, port, runner, reader, duration, HERD_SCRIPT, HERD_SUMMARY)
+        row = json.loads(HERD_SUMMARY.read_text())
+        rows.append(row)
+        p50, p95 = row["herd_p50_ms"] or 0, row["herd_p95_ms"] or 0
+        failed = row["herd_failed_rate"] or 0
+        print(
+            f"{target:20s} p50 {p50:8.0f} ms  p95 {p95:8.0f} ms"
+            f"  failed {failed:6.1%}  n={row['herd_requests']}",
+            flush=True,
+        )
+    SWEEP_SUMMARY.write_text(json.dumps(rows, indent=2))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="perf-api", description=__doc__)
     parser.add_argument(
@@ -226,6 +265,11 @@ def main(argv: list[str] | None = None) -> int:
         "--herd",
         action="store_true",
         help="HERD users (env, default 50) hit the landing card at once; reports, doesn't gate",
+    )
+    parser.add_argument(
+        "--sweep",
+        action="store_true",
+        help="herd every read SCI calls, one at a time over one server; reports, no gate",
     )
     parser.add_argument(
         "--dashboard-only",
@@ -264,6 +308,8 @@ def main(argv: list[str] | None = None) -> int:
             config = config_file(Path(tmp), database_url)
             runner, reader = tokens(config)
             server = serve(config, args.port)
+            if args.sweep:
+                return sweep(k6, args.port, runner, reader, args.duration)
             code = run_k6(k6, args.port, runner, reader, args.duration, script, summary_path)
     finally:
         if server is not None:

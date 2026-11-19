@@ -177,15 +177,5 @@ def test_check_catches_a_corrupted_column(engine: Engine) -> None:
         assert drift.drifted_findings == (finding,)
 
 
-def test_first_seen_keeps_the_earliest_occurrence(engine: Engine) -> None:
-    """First seen keeps the earliest occurrence."""
-    _repository, finding = seeded_finding(engine)
-    with SqlTraustUnitOfWork(engine) as uow:
-        state_history.note_first_seen(uow, finding, NOW)
-        state_history.note_first_seen(uow, finding, NOW.replace(year=2025))
-        stored = uow.findings.get(finding).first_seen
-        assert stored is not None and stored.year == 2025
-
-
 def _say(finding: UUID, **kw: Any) -> Any:
     return RecordDecision(finding_id=finding, **{"rationale": "parity of the stored fold", **kw})

@@ -12,50 +12,22 @@ from sqlalchemy.engine import Connection
 
 from traust_core.v1.models.dashboard import Subject
 
-# The findings subject's facts: the latest stamped decision per finding (state
-# is stored, never recomputed), the latest occurrence, the first category label.
-# A finding with no decision is open by rule; unrated severity is null.
+# The findings subject's facts: one indexed row per finding. State, severity and
+# category are the finding's current answer, kept by the contracts' triggers at
+# write (the stamped fold, the latest occurrence's band, the first category
+# label). A finding with no decision is open by rule; unrated severity is null.
 _FACTS = sa.text(
     """
-    WITH latest_decision AS (
-        SELECT finding_id, folded_state, folded_severity FROM (
-            SELECT d.finding_id, d.folded_state, d.folded_severity,
-                row_number() OVER (PARTITION BY d.finding_id
-                    ORDER BY d.created_at DESC, d.id DESC) AS rn
-            FROM decision d
-        ) ranked WHERE rn = 1
-    ),
-    latest_occurrence AS (
-        SELECT finding_id, severity, cvss_score FROM (
-            SELECT o.finding_id, o.severity, o.cvss_score,
-                row_number() OVER (PARTITION BY o.finding_id
-                    ORDER BY o.created_at DESC, o.id DESC) AS rn
-            FROM occurrence o
-        ) ranked WHERE rn = 1
-    ),
-    first_category AS (
-        SELECT finding_id, label FROM (
-            SELECT l.finding_id, l.label,
-                row_number() OVER (PARTITION BY l.finding_id
-                    ORDER BY l.created_at, l.id) AS rn
-            FROM finding_label l
-            WHERE l.taxonomy = 'category'
-        ) ranked WHERE rn = 1
-    ),
-    facts AS (
-        SELECT f.id, f.repository_id, f.first_seen,
-            coalesce(d.folded_state, 'open') AS state,
-            coalesce(d.folded_severity, nullif(o.severity, 'unrated')) AS severity,
-            c.label AS category,
-            (d.finding_id IS NOT NULL) AS decided, o.cvss_score
+    WITH facts AS (
+        SELECT f.id, f.repository_id, f.created_at,
+            coalesce(f.current_state, 'open') AS state,
+            f.current_severity AS severity,
+            f.category,
+            (f.current_state IS NOT NULL) AS decided
         FROM finding f
-        LEFT JOIN latest_decision d ON d.finding_id = f.id
-        LEFT JOIN latest_occurrence o ON o.finding_id = f.id
-        LEFT JOIN first_category c ON c.finding_id = f.id
     )
     """
 )
-
 _ROW_CAP = 1000
 
 

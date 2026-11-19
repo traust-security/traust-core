@@ -80,7 +80,7 @@ def _adversarial() -> list[DashboardQuery]:
         DashboardQuery(subject="findings", measures=("findings",), repository_ids=(uuid4(),)),
         DashboardQuery(
             subject="findings",
-            measures=("findings", "repositories", "cvss_sum", "oldest_open_age"),
+            measures=("findings", "repositories", "oldest_open_age"),
             group_by=("repository", "state", "severity"),
             where={"category": _PAYLOADS, "state": ("open",), "severity": ("critical'",)},
             order=({"by": "findings", "desc": True}, {"by": "severity"}),

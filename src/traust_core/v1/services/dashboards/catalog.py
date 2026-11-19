@@ -18,8 +18,8 @@ _COLUMNS: dict[Dimension, str] = {
 }
 
 _AGE_DAYS = {
-    "postgresql": "extract(epoch from (current_timestamp - min(first_seen))) / 86400",
-    "sqlite": "(julianday(current_timestamp) - julianday(min(first_seen)))",
+    "postgresql": "extract(epoch from (current_timestamp - min(created_at))) / 86400",
+    "sqlite": "(julianday(current_timestamp) - julianday(min(created_at)))",
 }
 
 
@@ -27,16 +27,13 @@ def _aggregates(dialect: str) -> dict[Measure, str]:
     return {
         Measure.FINDINGS: "count(*)",
         Measure.REPOSITORIES: "count(distinct repository_id)",
-        Measure.CVSS_SUM: "sum(cvss_score)",
         Measure.OLDEST_OPEN_AGE: _AGE_DAYS.get(dialect, _AGE_DAYS["postgresql"]),
     }
 
 
 # What this build serves; the query schema states the intent, the catalog the
 # present. Subjects and vocabulary beyond these refuse until their facts land.
-_SERVED_MEASURES = frozenset(
-    {Measure.FINDINGS, Measure.REPOSITORIES, Measure.CVSS_SUM, Measure.OLDEST_OPEN_AGE}
-)
+_SERVED_MEASURES = frozenset({Measure.FINDINGS, Measure.REPOSITORIES, Measure.OLDEST_OPEN_AGE})
 SERVED: dict[Subject, tuple[frozenset[Dimension], frozenset[Measure]]] = {
     Subject.FINDINGS: (frozenset(_COLUMNS), _SERVED_MEASURES),
 }

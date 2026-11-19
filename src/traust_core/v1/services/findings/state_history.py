@@ -12,7 +12,6 @@ from __future__ import annotations
 import logging
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
-from datetime import datetime
 from uuid import UUID
 
 from traust_core.v1.models.findings import Decision, Disposition, finding_state, kind_of
@@ -106,13 +105,6 @@ def stamp(
     history = uow.decisions.list_for_finding(draft.finding_id) if history is None else history
     finding = uow.findings.get(draft.finding_id)
     return fold(uow, rating, draft.finding_id, finding.kind, [*history, draft]).onto(draft)
-
-
-def note_first_seen(uow: TraustUnitOfWork, finding_id: UUID, at: datetime) -> None:
-    """The earliest occurrence time, kept as a minimum."""
-    finding = uow.findings.get(finding_id)
-    if finding.first_seen is None or at < finding.first_seen:
-        uow.findings.update(finding.model_copy(update={"first_seen": at}))
 
 
 @dataclass(frozen=True, slots=True)

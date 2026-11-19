@@ -101,7 +101,9 @@ def test_a_ninth_where_key_is_refused() -> None:
 
 
 def test_a_fourth_order_entry_is_refused() -> None:
-    order = [{"by": measure} for measure in ("findings", "repositories", "cvss_sum", "state")]
+    order = [
+        {"by": measure} for measure in ("findings", "repositories", "oldest_open_age", "state")
+    ]
     with pytest.raises(Refusal):
         DashboardQuery.model_validate({**QUERY, "order": order})
 

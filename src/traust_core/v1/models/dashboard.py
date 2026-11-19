@@ -44,7 +44,6 @@ class Measure(StrEnum):
 
     FINDINGS = "findings"
     REPOSITORIES = "repositories"
-    CVSS_SUM = "cvss_sum"
     OLDEST_OPEN_AGE = "oldest_open_age"
     REVIEW_ITEMS = "review_items"
     WORK_ITEMS = "work_items"
