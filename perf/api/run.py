@@ -35,8 +35,23 @@ SUMMARY = HERE.parent.parent / ".perf" / "api-summary.json"
 BREAKPOINT_SUMMARY = HERE.parent.parent / ".perf" / "api-breakpoint.json"
 API_DATABASE = "traust_perf_api"
 REGRESSION = 1.20  # a run more than 20% slower, or more than 20% lower throughput, fails
-LATENCY_KEYS = ("claim_p95_ms", "list_p95_ms", "feed_p95_ms", "insight_p95_ms", "consumer_p95_ms")
-RATE_KEYS = ("claim_rps", "list_rps", "feed_rps", "insight_rps", "consumer_rps", "http_reqs_rate")
+LATENCY_KEYS = (
+    "claim_p95_ms",
+    "list_p95_ms",
+    "feed_p95_ms",
+    "insight_p95_ms",
+    "consumer_p95_ms",
+    "dashboard_p95_ms",
+)
+RATE_KEYS = (
+    "claim_rps",
+    "list_rps",
+    "feed_rps",
+    "insight_rps",
+    "consumer_rps",
+    "dashboard_rps",
+    "http_reqs_rate",
+)
 GATE_KEYS = LATENCY_KEYS + RATE_KEYS
 QUEUE_DEPTH = 70_000  # the breakpoint ramp must claim against a queue, not an empty pool
 
@@ -146,30 +161,42 @@ def reset_queue(url: sa.URL) -> int:
     return queued
 
 
-def gate(summary: dict[str, float], update: bool) -> int:
+def persona_rows(summary: dict[str, float | None]) -> tuple[str, ...]:
+    """The per-persona rows ops.js emits (persona_<name>_p95_ms / _rps), gated the same
+    20% way once a baseline carries them; a run that never reached a persona emits none."""
+    return tuple(sorted(k for k in summary if k.startswith("persona_") and summary[k] is not None))
+
+
+def gate(summary: dict[str, float | None], update: bool) -> int:
+    personas = persona_rows(summary)
     if update:
-        BASELINE.write_text(json.dumps({k: round(summary[k], 2) for k in GATE_KEYS}, indent=2))
+        rows = {
+            k: round(summary[k], 2) for k in (*GATE_KEYS, *personas) if summary.get(k) is not None
+        }
+        BASELINE.write_text(json.dumps(rows, indent=2))
         print(f"baseline written: {BASELINE}")
         return 0
     if not BASELINE.exists():
         sys.exit(f"no baseline at {BASELINE}; create one with --update-baseline")
     baseline = json.loads(BASELINE.read_text())
+    latency_keys = (*LATENCY_KEYS, *(k for k in personas if k.endswith("_p95_ms")))
+    rate_keys = (*RATE_KEYS, *(k for k in personas if k.endswith("_rps")))
     regressions = [
         f"  {k}: {summary[k]:.1f} ms vs baseline {baseline[k]:.1f} ms (> {REGRESSION:.0%})"
-        for k in LATENCY_KEYS
+        for k in latency_keys
         if k in baseline and summary[k] > baseline[k] * REGRESSION
     ] + [
         f"  {k}: {summary[k]:.1f} vs baseline {baseline[k]:.1f} req/s (< {1 / REGRESSION:.0%})"
-        for k in RATE_KEYS
+        for k in rate_keys
         if k in baseline and summary[k] < baseline[k] / REGRESSION
     ]
-    for key in LATENCY_KEYS:
+    for key in latency_keys:
         if key in baseline:
             print(f"  {key}: {summary[key]:.1f} ms (baseline {baseline[key]:.1f} ms)")
-    for key in RATE_KEYS:
+    for key in rate_keys:
         if key in baseline:
             print(f"  {key}: {summary[key]:.1f} req/s (baseline {baseline[key]:.1f})")
-    stale = [k for k in GATE_KEYS if k not in baseline]
+    stale = [k for k in (*GATE_KEYS, *personas) if k not in baseline]
     if stale:
         print(f"baseline predates {', '.join(stale)}; refresh it with --update-baseline")
     if regressions:

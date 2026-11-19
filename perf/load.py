@@ -20,12 +20,20 @@ from fastapi.testclient import TestClient
 from sqlalchemy.engine import Engine
 
 from traust_core.v1.context import Context
+from traust_core.v1.models.dashboard import (
+    DashboardOrder,
+    DashboardQuery,
+    Dimension,
+    Measure,
+    Subject,
+)
 from traust_core.v1.models.findings import Decision
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
 from traust_core.v1.services.findings.state_history import stamp
 
 DAY = timedelta(days=1)
+GRANT_SIZE = 366  # the migrated estate's largest real grant; the rig has 10,000 repositories
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +94,49 @@ def write_targets(engine: Engine, limit: int = 500) -> list[UUID]:
         )
 
 
+def cards(small: tuple[UUID, ...], granted: tuple[UUID, ...]) -> tuple[DashboardQuery, ...]:
+    """The reader population: every card shape over every grant size — a few
+    repositories, the 366-repository grant, no ids (the whole estate)."""
+
+    def card(ids: tuple[UUID, ...], **shape: object) -> DashboardQuery:
+        return DashboardQuery(subject=Subject.FINDINGS, repository_ids=ids, **shape)
+
+    shapes = (
+        lambda ids: card(ids, measures=(Measure.FINDINGS,)),
+        lambda ids: card(ids, measures=(Measure.FINDINGS,), group_by=(Dimension.SEVERITY,)),
+        lambda ids: card(ids, measures=(Measure.FINDINGS,), group_by=(Dimension.CATEGORY,)),
+        lambda ids: card(
+            ids,
+            measures=(Measure.FINDINGS,),
+            group_by=(Dimension.REPOSITORY,),
+            order=(DashboardOrder(by=Measure.FINDINGS, desc=True),),
+            limit=10,
+        ),
+        lambda ids: card(
+            ids,
+            measures=(Measure.FINDINGS,),
+            group_by=(Dimension.SEVERITY,),
+            where={Dimension.STATE: ("open",), Dimension.SEVERITY: ("critical", "high")},
+        ),
+    )
+    return tuple(shape(ids) for ids in (small, granted, ()) for shape in shapes)
+
+
+def reader_cards(engine: Engine) -> tuple[DashboardQuery, ...]:
+    """The card population, granted from the rig's own repositories."""
+    with engine.connect() as conn:
+        granted = tuple(
+            conn.execute(
+                sa.text("SELECT id FROM traust.repository LIMIT :n"), {"n": GRANT_SIZE}
+            ).scalars()
+        )
+    if len(granted) < GRANT_SIZE:
+        raise RuntimeError(
+            f"the rig has {len(granted)} repositories; the {GRANT_SIZE}-repository grant needs more"
+        )
+    return cards(small=granted[:3], granted=granted)
+
+
 class StampedWriter:
     """The write door's own shape: each decision stamped before insert — the
     read-modify-write (history, occurrences) the raw inserts of the first
@@ -130,11 +181,14 @@ class StampedWriter:
 
 
 class DashboardReader:
-    """One dashboard client: the real HTTP route, auth and payload included."""
+    """One dashboard client: the real query route, auth and body included."""
 
-    def __init__(self, context: Context, view: str) -> None:
+    def __init__(
+        self, context: Context, population: Sequence[DashboardQuery], offset: int = 0
+    ) -> None:
         self._context = context
-        self._view = view
+        self._population = tuple(population)
+        self._next = offset
         self.latencies: list[float] = []
         self.failures = 0
         self.problems: dict[int, str] = {}
@@ -153,9 +207,13 @@ class DashboardReader:
 
         with TestClient(create_app(self._context), raise_server_exceptions=False) as client:
             while not stop.is_set():
+                card = self._population[self._next % len(self._population)]
+                self._next += 1
                 started = time.perf_counter()
                 try:
-                    response = client.get(f"/v1/insights/{self._view}", headers=token())
+                    response = client.post(
+                        "/v1/dashboards:query", json=card.model_dump(mode="json"), headers=token()
+                    )
                     if response.status_code == 200:
                         self.latencies.append(time.perf_counter() - started)
                     else:
@@ -165,7 +223,7 @@ class DashboardReader:
                     self.failures += 1
 
 
-def _warm_identity(context: Context, view: str) -> None:
+def _warm_identity(context: Context, card: DashboardQuery) -> None:
     """One request before the threads: the local issuer generates its signing key
     lazily, and concurrent first mints race the key under the verifier — every
     request after a lost race 401s with a signature failure that is not duress."""
@@ -173,7 +231,11 @@ def _warm_identity(context: Context, view: str) -> None:
 
     minted = context.local_issuer.mint("load@example.com").token.get_secret_value()
     with TestClient(create_app(context), raise_server_exceptions=False) as client:
-        response = client.get(f"/v1/insights/{view}", headers={"Authorization": f"Bearer {minted}"})
+        response = client.post(
+            "/v1/dashboards:query",
+            json=card.model_dump(mode="json"),
+            headers={"Authorization": f"Bearer {minted}"},
+        )
     if response.status_code != 200:
         raise RuntimeError(f"the apparatus cannot serve one request: {response.text[:200]}")
 
@@ -181,7 +243,6 @@ def _warm_identity(context: Context, view: str) -> None:
 def run_duress(
     engine: Engine,
     context: Context,
-    view: str = "findings-rollup",
     *,
     readers: int = 7,
     seconds: int = 60,
@@ -192,9 +253,10 @@ def run_duress(
     targets = write_targets(engine)
     if not targets:
         raise RuntimeError("the rig has no open findings to write against")
-    _warm_identity(context, view)
+    population = reader_cards(engine)
+    _warm_identity(context, population[0])
     writer = StampedWriter(engine, targets)
-    clients = [DashboardReader(context, view) for _ in range(readers)]
+    clients = [DashboardReader(context, population, offset=i) for i in range(readers)]
 
     # the baseline: the write door alone
     stop = threading.Event()

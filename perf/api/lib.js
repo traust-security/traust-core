@@ -6,6 +6,9 @@ import { Counter, Rate, Trend } from 'k6/metrics';
 export const BASE = __ENV.BASE_URL || 'http://127.0.0.1:8080';
 export const RUNNER = { headers: { Authorization: `Bearer ${__ENV.RUNNER_TOKEN}`, 'Content-Type': 'application/json' } };
 export const READER = { headers: { Authorization: `Bearer ${__ENV.READER_TOKEN}` } };
+export const READER_JSON = {
+  headers: { Authorization: `Bearer ${__ENV.READER_TOKEN}`, 'Content-Type': 'application/json' },
+};
 
 export const claimOk = new Rate('claim_ok');
 export const claimLatency = new Trend('claim_latency', true);
@@ -19,6 +22,45 @@ export const insightLatency = new Trend('insight_latency', true);
 export const insightReqs = new Counter('insight_requests');
 export const consumerLatency = new Trend('consumer_latency', true);
 export const consumerReqs = new Counter('consumer_requests');
+export const dashboardLatency = new Trend('dashboard_latency', true);
+export const dashboardReqs = new Counter('dashboard_requests');
+
+// Per-persona metrics are created on first use: the persona table lives in ops.js, this
+// module only knows the name each dashboard scenario group passes in its env.
+const personaMetrics = {};
+function metricsFor(name) {
+  if (!personaMetrics[name]) {
+    personaMetrics[name] = {
+      latency: new Trend(`persona_${name}_latency`, true),
+      requests: new Counter(`persona_${name}_requests`),
+    };
+  }
+  return personaMetrics[name];
+}
+
+// One dashboard persona's request: the body setup built for the persona this scenario group
+// names in its PERSONA env, POSTed to the metrics query route. The aggregate pair gates the
+// run; the per-persona pair gives baseline.json a row per persona.
+export function queryDashboard(data) {
+  const name = __ENV.PERSONA;
+  const res = http.post(`${BASE}/v1/dashboards:query`, JSON.stringify(data.bodies[name]), READER_JSON);
+  dashboardLatency.add(res.timings.duration);
+  dashboardReqs.add(1);
+  const persona = metricsFor(name);
+  persona.latency.add(res.timings.duration);
+  persona.requests.add(1);
+  if (res.status !== 200) {
+    console.log(`dashboard ${name} ${res.status} ${String(res.body).slice(0, 200)}`);
+  }
+  check(res, { 'dashboard is 200': (r) => r.status === 200 });
+}
+
+// The fleet's repository ids, fetched once per run: the persona grants are slices of these.
+export function repositoryIds() {
+  const res = http.get(`${BASE}/v1/repositories?limit=1000`, READER);
+  check(res, { 'repositories page is 200': (r) => r.status === 200 });
+  return (res.json('items') || []).map((r) => r.id);
+}
 
 // The consumer read family: a hot repository's findings paged by cursor, its summary and
 // timeline, and the review queue — the shapes SCI and the CLI read under load.
@@ -130,20 +172,25 @@ export function readInsight(data) {
 
 // Latency plus per-scenario request rates, so a run that collapsed to near-zero throughput
 // cannot pass on flat latency alone.
+export const p95Of = (data, metric) => (data.metrics[metric] ? data.metrics[metric].values['p(95)'] : null);
+export const rateOf = (data, metric) => (data.metrics[metric] ? data.metrics[metric].values.rate : null);
+
 export function summary(data, extra = {}) {
-  const p95 = (m) => (data.metrics[m] ? data.metrics[m].values['p(95)'] : null);
-  const rate = (m) => (data.metrics[m] ? data.metrics[m].values.rate : null);
+  const p95 = (m) => p95Of(data, m);
+  const rate = (m) => rateOf(data, m);
   return {
     claim_p95_ms: p95('claim_latency'),
     list_p95_ms: p95('list_latency'),
     feed_p95_ms: p95('feed_latency'),
     insight_p95_ms: p95('insight_latency'),
     consumer_p95_ms: p95('consumer_latency'),
+    dashboard_p95_ms: p95('dashboard_latency'),
     claim_rps: rate('claim_requests'),
     list_rps: rate('list_requests'),
     feed_rps: rate('feed_requests'),
     insight_rps: rate('insight_requests'),
     consumer_rps: rate('consumer_requests'),
+    dashboard_rps: rate('dashboard_requests'),
     http_reqs_rate: rate('http_reqs'),
     ...extra,
   };
