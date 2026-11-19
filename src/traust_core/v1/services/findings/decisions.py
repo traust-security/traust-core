@@ -381,6 +381,46 @@ class FindingDecisions:
                 self._ledger.append_decision(saved, finding.repository_id)
             return saved
 
+    def append_occurrence_claim(
+        self,
+        finding_id: UUID,
+        principal: Principal,
+        *,
+        ticket: str,
+        rationale: str,
+    ) -> tuple[Decision, bool]:
+        """Append a recorded occurrence claim's audit record: a data_error statement
+        under the person's authority, judging no validity, resolution or severity (the
+        disposition fold reads none of it). Returns the decision and whether this call
+        appended it (False: the same statement already stood — idempotent)."""
+        if not principal.is_verified_human():
+            raise ForbiddenError("an occurrence claim needs a verified human")
+        if not ticket.strip() or len(rationale.strip()) < RATIONALE_MIN_LENGTH:
+            raise ValidationError("an occurrence claim requires a ticket and meaningful rationale")
+        with self._uow as uow:
+            finding = uow.findings.get_for_update(finding_id)
+            if self._ledger is not None:
+                self._ledger.require_intact(finding.repository_id)
+            draft = Decision(
+                finding_id=finding_id,
+                statement_key="pending",
+                reason=DecisionReason.DATA_ERROR,
+                actor=principal.ref,
+                ticket=ticket.strip(),
+                rationale=rationale.strip(),
+                source_channel=SourceChannel.INTERACTIVE,
+                occurred_at=self._clock.now(),
+            )
+            draft = draft.model_copy(update={"statement_key": self.statement_key(draft)})
+            same = self._same(draft)
+            if same is not None:
+                return same, False
+            saved = uow.decisions.add_statement(draft)
+            if self._ledger is not None:
+                self._ledger.append_decision(saved, finding.repository_id)
+            uow.commit()
+            return saved, True
+
     def restate(self, restatement: Restatement, principal: Principal) -> Decision:
         """An administrator's correction: a new decision that replaces the one it restates."""
         restatement = Restatement.model_validate(dict(restatement))

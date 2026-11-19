@@ -154,6 +154,50 @@ class RecordDecision(Model):
     occurred_at: datetime | None = None
 
 
+class OccurrenceClaim(Model):
+    """A CVSS claim one occurrence's report stated, declared for recording: the finding
+    by its fingerprint, the assessment whose report stated the claim, and the claim
+    itself — the vector and the score, both present."""
+
+    repository_id: UUID
+    fingerprint_algo: str = Field(min_length=1, max_length=64)
+    fingerprint: str = Field(min_length=1, max_length=512)
+    assessment_id: UUID
+    cvss_vector: str = Field(min_length=1, max_length=512)
+    cvss_score: Decimal = Field(ge=0, le=10)
+
+
+class OccurrenceClaimOutcome(StrEnum):
+    """What the claim door did with one declared claim."""
+
+    RECORDED = "recorded"  # the governed statement is appended
+    ALREADY_RECORDED = "already_recorded"  # the same claim statement exists (idempotent)
+    ALREADY_CARRIED = "already_carried"  # the occurrence's own columns state it
+    CONFLICTING = "conflicting"  # the occurrence carries a different claim
+    UNKNOWN_FINDING = "unknown_finding"  # no finding under the declared fingerprint
+    UNREPORTED = "unreported"  # the assessment did not report the finding
+    INVALID = "invalid"  # the claim fails core's CVSS discipline
+
+
+class OccurrenceClaimResult(Model):
+    """One declared claim's answer: the outcome, the finding and occurrence it bound to,
+    and the decision that recorded it (the audit trail, none when nothing was written)."""
+
+    claim: OccurrenceClaim
+    outcome: OccurrenceClaimOutcome
+    finding_id: UUID | None = None
+    occurrence_id: UUID | None = None
+    decision_id: UUID | None = None
+
+
+class OccurrenceClaimReport(Model):
+    """The batch's answers, one row per declared claim in declaration order, with the
+    count per outcome."""
+
+    results: tuple[OccurrenceClaimResult, ...]
+    counts: Mapping[OccurrenceClaimOutcome, int]
+
+
 class ReviewCaseKind(StrEnum):
     """Why a person must look, worst first: the fold's states, then a pending review item."""
 

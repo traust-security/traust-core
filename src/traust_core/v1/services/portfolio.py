@@ -61,6 +61,7 @@ from traust_core.v1.models.inventory import (
     RepositoryDisposition,
     RepositoryFilter,
     RepositoryRef,
+    RepositoryResolution,
     RepoState,
     RiskTier,
     SyncReport,
@@ -1644,6 +1645,56 @@ class PortfolioService:
     def find_repository(self, url: HttpsRepoUrl) -> Repository | None:
         return self.inventory.find_repository(url)
 
+    def resolve_repositories(self, urls: Sequence[str]) -> list[RepositoryResolution]:
+        """Every asked-for spelling's answer in one call: the repository core knows
+        under it, with the upstream edge as the hint when the matched row carries one,
+        and a URL correction's vacated spelling followed to the repository that moved.
+        The first tier folds whitespace, trailing slash and .git, git@ ssh spellings
+        and host case (scheme and www preserved); a case-folded spelling several rows
+        share answers as candidates; an unregistered or unparseable spelling answers
+        the honest absence."""
+        asked = list(dict.fromkeys(urls))
+        canonical = {url: _canonical_repo_url(url) for url in asked}
+        wanted = {folded for folded in canonical.values() if folded is not None}
+        answers: list[RepositoryResolution] = []
+        if not wanted:
+            return [RepositoryResolution(url=url) for url in asked]
+        github = {folded for folded in wanted if _forge_host(folded, self._hosts) == "github"}
+        with self._uow as uow:
+            exact = {row.url: row for row in uow.repositories.find_by_urls(wanted)}
+            folded_rows: dict[str, list[Repository]] = {}
+            for row in uow.repositories.find_by_urls_casefold(github):
+                folded_rows.setdefault(row.url.lower(), []).append(row)
+            for url in asked:
+                spelling = canonical[url]
+                if spelling is None:
+                    answers.append(RepositoryResolution(url=url))
+                    continue
+                row = exact.get(spelling)
+                if row is None and spelling in github:
+                    candidates = sorted(
+                        folded_rows.get(spelling.lower(), ()),
+                        key=lambda r: (r.created_at, r.id),
+                    )
+                    if len(candidates) > 1:
+                        # one folded spelling, several repositories: never this method's
+                        # pick (the oldest would be a guess)
+                        answers.append(RepositoryResolution(url=url, candidates=tuple(candidates)))
+                        continue
+                    row = candidates[0] if candidates else None
+                if row is not None and _is_vacated(row) and row.upstream_id is not None:
+                    # the correction's own record: the old spelling answers the
+                    # repository that moved, not the record of its leaving
+                    row = uow.repositories.get(row.upstream_id)
+                answers.append(
+                    RepositoryResolution(
+                        url=url,
+                        repository=row,
+                        alias_of=row.upstream_id if row is not None else None,
+                    )
+                )
+        return answers
+
     def list_repositories(self, filter: RepositoryFilter, page: PageRequest) -> Page[Repository]:
         if filter.url is not None:
             found = self.find_repository(filter.url)
@@ -1853,6 +1904,29 @@ def _registered_repository(
     if hosts.get(host) == "github":
         return uow.repositories.find_by_url_casefold(url)
     return None
+
+
+def _canonical_repo_url(raw: str) -> str | None:
+    """The spelling core joins by: whitespace stripped, trailing slash and .git suffix
+    removed, git@ ssh spellings folded to https, the host lowercased; scheme and www
+    preserved. None when the spelling is no https repository URL."""
+    folded = raw.strip()
+    if folded.startswith("git@"):
+        host, _, path = folded.removeprefix("git@").partition(":")
+        if path:
+            folded = f"https://{host}/{path}"
+    try:
+        return str(HttpsRepoUrl._parse(folded))
+    except ValidationError:
+        return None
+
+
+def _forge_host(url: str, hosts: Mapping[str, str]) -> str | None:
+    """The forge kind a canonical URL's host maps to, None when it maps to none."""
+    try:
+        return hosts.get((urlsplit(url).hostname or "").lower())
+    except ValueError:
+        return None
 
 
 def _registered(doc: CorpusRegistryArtifact, product: Product) -> CorpusSubject:

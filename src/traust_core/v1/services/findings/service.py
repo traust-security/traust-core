@@ -57,6 +57,8 @@ from traust_core.v1.models.findings import (
     Label,
     Location,
     Occurrence,
+    OccurrenceClaim,
+    OccurrenceClaimReport,
     ReviewItem,
     SortDirection,
     SurfaceCoverage,
@@ -102,6 +104,7 @@ from traust_core.v1.services.findings.intake import (
     REBASELINE_MAPPING,
     FindingIntake,
 )
+from traust_core.v1.services.findings.occurrence_claims import OccurrenceClaims
 from traust_core.v1.services.findings.precedents import FindingPrecedents
 from traust_core.v1.services.findings.rating import RatingPolicy
 from traust_core.v1.services.findings.records import FindingRecords
@@ -289,6 +292,21 @@ class FindingService:
         self.review = review
         self.precedents = precedents
         self._claims = FindingClaims(uow, objects, self.artifacts, intake, decisions)
+        self._occurrence_claims = OccurrenceClaims(uow, decisions)
+
+    def record_occurrence_claims(
+        self,
+        claims: Sequence[OccurrenceClaim],
+        *,
+        ticket: str,
+        rationale: str,
+        principal: Principal,
+    ) -> OccurrenceClaimReport:
+        """A batch of declared CVSS claims, validated and recorded as governed
+        statements."""
+        return self._occurrence_claims.record(
+            claims, ticket=ticket, rationale=rationale, principal=principal
+        )
 
     def request_claim_correction(
         self,

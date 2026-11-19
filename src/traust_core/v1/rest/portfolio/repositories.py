@@ -15,6 +15,7 @@ from traust_core.v1.models.inventory import (
     Repository,
     RepositoryFilter,
     RepositoryRef,
+    RepositoryResolution,
     SyncReport,
     Team,
     TeamName,
@@ -40,6 +41,19 @@ class RefRegistration(Model):
     sha: Sha
     name: Annotated[RefName, Field(min_length=1, max_length=256)] | None = None
     kind: RefKind | None = None
+
+
+class DefaultRefNaming(Model):
+    """The forge's default-branch answer for a repository: the branch and its head."""
+
+    branch: Annotated[RefName, Field(min_length=1, max_length=256)]
+    sha: Sha
+
+
+class RepositoryResolutionRequest(Model):
+    """A set of repository URL spellings, any fold core's canonicalizer performs."""
+
+    urls: tuple[Annotated[str, Field(min_length=1, max_length=2048)], ...]
 
 
 class Owners(Model):
@@ -84,6 +98,26 @@ def get_repository(repository_id: UUID, portfolio: Portfolio, _: Caller) -> Repo
     return portfolio.get_repository(repository_id)
 
 
+# The batch identity resolution: the repository universe answered per URL spelling
+# in one call, a page's worth of spellings per request (no set is a refusal).
+@router.post("/v1/repositories:resolve", responses=PROBLEMS(401, 422))
+def resolve_repositories(
+    body: RepositoryResolutionRequest, portfolio: Portfolio, _: Caller
+) -> list[RepositoryResolution]:
+    """Resolve repository URL spellings to the repositories core knows: each answer
+    carries the repository's own id with the upstream edge as the hint when the matched
+    row carries one, and a URL correction's vacated spelling follows its edge to the
+    repository that moved. Drifted spellings (trailing slash, .git, git@ ssh, host
+    case) fold through core's own canonicalizer; several rows under one case-folded
+    spelling answer as candidates; an unregistered or unparseable spelling answers
+    the honest absence."""
+    if not body.urls:
+        raise ValidationError("resolve named repository urls; the set is required")
+    if len(body.urls) > MAX_REPOSITORY_IDS:
+        raise ValidationError(f"resolve at most {MAX_REPOSITORY_IDS} repository urls per request")
+    return portfolio.resolve_repositories(body.urls)
+
+
 @router.get("/v1/repositories/{repository_id}/refs", responses=PROBLEMS(401, 422))
 def list_refs(
     repository_id: UUID, portfolio: Portfolio, _: Caller, sha: Sha | None = None
@@ -106,6 +140,17 @@ def register_ref(
 ) -> RepositoryRef:
     """Register a commit (and its branch or tag) of the repository; re-registering returns it."""
     return portfolio.register_ref(repository_id, GitSha.parse(body.sha), body.name, body.kind)
+
+
+@router.post("/v1/repositories/{repository_id}/refs/default", responses=PROBLEMS(401, 409, 422))
+def mark_default_branch(
+    repository_id: UUID, body: DefaultRefNaming, portfolio: Portfolio, _: Caller
+) -> RepositoryRef:
+    """Name the repository's default branch: the forge's answer (the branch and its
+    head commit) recorded the way the repo_state observation records it — the line
+    added when absent, the default flag named anew when the answer moves (a named
+    line is immutable once recorded). Every verified caller names one."""
+    return portfolio.mark_default_branch(repository_id, GitSha.parse(body.sha), body.branch)
 
 
 @router.get("/v1/repositories/{repository_id}/owners", responses=PROBLEMS(401, 404))

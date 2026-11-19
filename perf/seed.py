@@ -336,11 +336,13 @@ SEED = (
     # _keep_advisory links them (a finding can name an alias). An assumption: the data model
     # sets no figure for this share.
     f"""UPDATE traust.finding f SET advisory_id = a.id, advisory_match = 'confirmed'
-    FROM (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.finding
-        WHERE fingerprint_algo = 'v3') pick
+    FROM (SELECT id, row_number() OVER (ORDER BY id) k
+        FROM (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.finding
+            WHERE fingerprint_algo = 'v3') v3
+        WHERE mod(n, {ADVISORY_BACKED_EVERY}) = 0) pick
     JOIN (SELECT id, row_number() OVER (ORDER BY md5(id::text)) n FROM traust.advisory) a
-        ON a.n = 1 + mod(pick.n * 3, {ADVISORIES})
-    WHERE f.id = pick.id AND mod(pick.n, {ADVISORY_BACKED_EVERY}) = 0""",
+        ON a.n = 1 + mod(pick.k - 1, {ADVISORIES})
+    WHERE f.id = pick.id""",
     """INSERT INTO traust.assessment (repository_ref_id, kind, status, assessor, assessor_version,
         occurred_at)
     SELECT id, 'repo-state', 'completed', 'forge', '1',
@@ -350,10 +352,13 @@ SEED = (
     SELECT o.id, art.id, f.feed, now() - make_interval(days => d)
     FROM unnest(ARRAY[{", ".join(f"'{feed}'" for feed in FEEDS)}]) WITH ORDINALITY f(feed, k)
     CROSS JOIN generate_series(1, {SNAPSHOT_DAYS}) d
+    CROSS JOIN (SELECT (SELECT count(*) FROM traust_ops.run_order) orders,
+        (SELECT count(*) FROM traust.artifact WHERE assessment_id IS NULL) artifacts) total
     JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust_ops.run_order) o
-        ON o.n = d * {len(FEEDS)} + k
+        ON o.n = 1 + mod(d * {len(FEEDS)} + k, total.orders)
     JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.artifact
-        WHERE assessment_id IS NULL) art ON art.n = d * {len(FEEDS)} + k""",
+        WHERE assessment_id IS NULL) art
+        ON art.n = 1 + mod(d * {len(FEEDS)} + k, total.artifacts)""",
 )
 
 
