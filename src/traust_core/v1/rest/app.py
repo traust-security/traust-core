@@ -10,7 +10,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 
 from traust_core.v1.context import Context
-from traust_core.v1.errors import TraustError
+from traust_core.v1.errors import TraustError, ValidationError
 from traust_core.v1.providers.correlation import (
     REQUEST_ID_HEADER,
     correlation_scope,
@@ -23,6 +23,17 @@ from traust_core.v1.rest.domains import DOMAINS
 access = logging.getLogger("traust_core.rest.access")
 
 _TRACEPARENT = re.compile(r"^[0-9a-f]{2}-(?P<trace>[0-9a-f]{32})-[0-9a-f]{16}-[0-9a-f]{2}$")
+
+# The request-body cap: over it, the body refuses before parsing (a 422 problem).
+_MAX_BODY = 1_048_576
+
+
+def _oversized(request: Request) -> bool:
+    """True when Content-Length announces more than the request-body cap."""
+    try:
+        return int(request.headers.get("content-length", "")) > _MAX_BODY
+    except ValueError:
+        return False
 
 
 def request_id(request: Request) -> str:
@@ -60,7 +71,10 @@ def create_app(context: Context) -> FastAPI:
         with correlation_scope(request.state.request_id):
             start = time.perf_counter()
             try:
-                response = await call_next(request)
+                if _oversized(request):
+                    response = problem(request, ValidationError("the request body exceeds 1 MiB"))
+                else:
+                    response = await call_next(request)
             except Exception as e:  # unhandled: still one problem body and one access line
                 response = problem(request, e)
             response.headers[REQUEST_ID_HEADER] = request.state.request_id
