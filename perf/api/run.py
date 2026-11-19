@@ -30,9 +30,11 @@ from traust_core.v1.context import Config, Context
 HERE = Path(__file__).resolve().parent
 SCRIPT = HERE / "ops.js"
 BREAKPOINT_SCRIPT = HERE / "breakpoint.js"
+HERD_SCRIPT = HERE / "herd.js"
 BASELINE = HERE / "baseline.json"
 SUMMARY = HERE.parent.parent / ".perf" / "api-summary.json"
 BREAKPOINT_SUMMARY = HERE.parent.parent / ".perf" / "api-breakpoint.json"
+HERD_SUMMARY = HERE.parent.parent / ".perf" / "api-herd.json"
 API_DATABASE = "traust_perf_api"
 REGRESSION = 1.20  # a run more than 20% slower, or more than 20% lower throughput, fails
 LATENCY_KEYS = (
@@ -53,6 +55,8 @@ RATE_KEYS = (
     "http_reqs_rate",
 )
 GATE_KEYS = LATENCY_KEYS + RATE_KEYS
+# --dashboard-only: the personas alone, without the ops load on the same process
+DASHBOARD_KEYS = ("dashboard_p95_ms", "dashboard_rps")
 QUEUE_DEPTH = 70_000  # the breakpoint ramp must claim against a queue, not an empty pool
 
 
@@ -167,20 +171,23 @@ def persona_rows(summary: dict[str, float | None]) -> tuple[str, ...]:
     return tuple(sorted(k for k in summary if k.startswith("persona_") and summary[k] is not None))
 
 
-def gate(summary: dict[str, float | None], update: bool) -> int:
+def gate(summary: dict[str, float | None], update: bool, keys: tuple[str, ...] = GATE_KEYS) -> int:
     personas = persona_rows(summary)
     if update:
-        rows = {
-            k: round(summary[k], 2) for k in (*GATE_KEYS, *personas) if summary.get(k) is not None
-        }
+        rows = {k: round(summary[k], 2) for k in (*keys, *personas) if summary.get(k) is not None}
+        if keys != GATE_KEYS and BASELINE.exists():  # a subset run merges, never drops rows
+            rows = {**json.loads(BASELINE.read_text()), **rows}
         BASELINE.write_text(json.dumps(rows, indent=2))
         print(f"baseline written: {BASELINE}")
         return 0
     if not BASELINE.exists():
         sys.exit(f"no baseline at {BASELINE}; create one with --update-baseline")
     baseline = json.loads(BASELINE.read_text())
-    latency_keys = (*LATENCY_KEYS, *(k for k in personas if k.endswith("_p95_ms")))
-    rate_keys = (*RATE_KEYS, *(k for k in personas if k.endswith("_rps")))
+    latency_keys = (
+        *(k for k in LATENCY_KEYS if k in keys),
+        *(k for k in personas if k.endswith("_p95_ms")),
+    )
+    rate_keys = (*(k for k in RATE_KEYS if k in keys), *(k for k in personas if k.endswith("_rps")))
     regressions = [
         f"  {k}: {summary[k]:.1f} ms vs baseline {baseline[k]:.1f} ms (> {REGRESSION:.0%})"
         for k in latency_keys
@@ -196,7 +203,7 @@ def gate(summary: dict[str, float | None], update: bool) -> int:
     for key in rate_keys:
         if key in baseline:
             print(f"  {key}: {summary[key]:.1f} req/s (baseline {baseline[key]:.1f})")
-    stale = [k for k in (*GATE_KEYS, *personas) if k not in baseline]
+    stale = [k for k in (*keys, *personas) if k not in baseline]
     if stale:
         print(f"baseline predates {', '.join(stale)}; refresh it with --update-baseline")
     if regressions:
@@ -215,6 +222,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="run the reader ramp instead of the gate; reports the edge, doesn't gate",
     )
+    parser.add_argument(
+        "--herd",
+        action="store_true",
+        help="HERD users (env, default 50) hit the landing card at once; reports, doesn't gate",
+    )
+    parser.add_argument(
+        "--dashboard-only",
+        action="store_true",
+        help="run the dashboard personas alone and gate only their rows",
+    )
     parser.add_argument("--port", type=int, default=8099)
     parser.add_argument("--duration", default="20s")
     parser.add_argument("--k6", help="path to the k6 binary (default: .perf/bin/k6 or $PATH)")
@@ -224,6 +241,9 @@ def main(argv: list[str] | None = None) -> int:
     if not url:
         sys.exit("TRAUST_TEST_DATABASE_URL not set (run `make db-up`)")
     k6 = k6_binary(args.k6)
+    keys = DASHBOARD_KEYS if args.dashboard_only else GATE_KEYS
+    if args.dashboard_only:
+        os.environ["ONLY"] = "dashboard"
 
     seeded = seeded_database(url)
     template = seeded.url.database
@@ -231,8 +251,13 @@ def main(argv: list[str] | None = None) -> int:
     database_url = fresh_copy(url, template)
     if args.breakpoint:
         print(f"queued orders: {reset_queue(database_url)}")
-    script = BREAKPOINT_SCRIPT if args.breakpoint else SCRIPT
-    summary_path = BREAKPOINT_SUMMARY if args.breakpoint else SUMMARY
+    script, summary_path = (
+        (BREAKPOINT_SCRIPT, BREAKPOINT_SUMMARY)
+        if args.breakpoint
+        else (HERD_SCRIPT, HERD_SUMMARY)
+        if args.herd
+        else (SCRIPT, SUMMARY)
+    )
     server = None
     try:
         with tempfile.TemporaryDirectory() as tmp:
@@ -247,13 +272,13 @@ def main(argv: list[str] | None = None) -> int:
         drop_copy(url)
 
     summary = json.loads(summary_path.read_text())
-    if args.breakpoint:
-        # the ramp's scenarios are the gate's subset; its summary prints what it measured
+    if args.breakpoint or args.herd:
+        # discovery runs: their summary prints what they measured, no gate
         print(json.dumps(summary, indent=2))
         return code
-    if any(summary.get(k) is None for k in LATENCY_KEYS):
+    if any(summary.get(k) is None for k in LATENCY_KEYS if k in keys):
         sys.exit(f"k6 produced no latencies: {summary}")
-    return code or gate(summary, args.update_baseline)
+    return code or gate(summary, args.update_baseline, keys)
 
 
 if __name__ == "__main__":

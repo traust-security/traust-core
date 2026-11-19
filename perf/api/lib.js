@@ -25,17 +25,20 @@ export const consumerReqs = new Counter('consumer_requests');
 export const dashboardLatency = new Trend('dashboard_latency', true);
 export const dashboardReqs = new Counter('dashboard_requests');
 
-// Per-persona metrics are created on first use: the persona table lives in ops.js, this
-// module only knows the name each dashboard scenario group passes in its env.
+// Per-persona metrics: k6 only accepts metrics declared in the init context, so ops.js
+// declares its personas' pairs at load time; this module only knows the names it is given.
+// Metric names allow only letters, digits and underscores; persona names are kebab-case.
+export function personaKey(name) {
+  return `persona_${name.replace(/-/g, '_')}`;
+}
 const personaMetrics = {};
-function metricsFor(name) {
-  if (!personaMetrics[name]) {
+export function declarePersonaMetrics(names) {
+  for (const name of names) {
     personaMetrics[name] = {
-      latency: new Trend(`persona_${name}_latency`, true),
-      requests: new Counter(`persona_${name}_requests`),
+      latency: new Trend(`${personaKey(name)}_latency`, true),
+      requests: new Counter(`${personaKey(name)}_requests`),
     };
   }
-  return personaMetrics[name];
 }
 
 // One dashboard persona's request: the body setup built for the persona this scenario group
@@ -46,7 +49,7 @@ export function queryDashboard(data) {
   const res = http.post(`${BASE}/v1/dashboards:query`, JSON.stringify(data.bodies[name]), READER_JSON);
   dashboardLatency.add(res.timings.duration);
   dashboardReqs.add(1);
-  const persona = metricsFor(name);
+  const persona = personaMetrics[name];
   persona.latency.add(res.timings.duration);
   persona.requests.add(1);
   if (res.status !== 200) {

@@ -7,6 +7,8 @@
 // mints tokens, compares the result to perf/api/baseline.json).
 import {
   claim,
+  declarePersonaMetrics,
+  personaKey,
   listOrders,
   pageFindings,
   p95Of,
@@ -74,6 +76,8 @@ const PERSONAS = [
   { name: 'estate-severity-visit', grant: null, card: 'severity', once: true },
 ];
 
+declarePersonaMetrics(PERSONAS.map((p) => p.name));
+
 // A persona's scenario group: a staggered start (requests land at different times, like users
 // spread across an app), each at its own cadence — one request per cadence for a tab, a
 // single read for a visit. The scenario's env names the persona to queryDashboard.
@@ -100,23 +104,30 @@ function personaScenario(persona, index) {
   };
 }
 
+const OPS_SCENARIOS = {
+  claim_contention: { executor: 'constant-vus', vus: 50, duration: DURATION, exec: 'claim' },
+  order_reads: { executor: 'constant-vus', vus: 10, duration: DURATION, exec: 'listOrders' },
+  feed_reads: { executor: 'constant-vus', vus: 10, duration: DURATION, exec: 'readFeed' },
+  insight_reads: { executor: 'constant-vus', vus: 2, duration: DURATION, exec: 'readInsight' },
+  findings_paging: { executor: 'constant-vus', vus: 5, duration: DURATION, exec: 'pageFindings' },
+  findings_summary: { executor: 'constant-vus', vus: 3, duration: DURATION, exec: 'readSummary' },
+  findings_timeline: { executor: 'constant-vus', vus: 3, duration: DURATION, exec: 'readTimeline' },
+  review_queue: { executor: 'constant-vus', vus: 3, duration: DURATION, exec: 'readReviewQueue' },
+};
+const DASHBOARD_SCENARIOS = Object.fromEntries(
+  PERSONAS.map((p, i) => [`dashboard_${p.name}`, personaScenario(p, i)])
+);
+
+// ONLY=dashboard runs the personas alone (the query path without the ops load on the same
+// process); the default runs both, the shared-server picture.
 export const options = {
-  scenarios: {
-    claim_contention: { executor: 'constant-vus', vus: 50, duration: DURATION, exec: 'claim' },
-    order_reads: { executor: 'constant-vus', vus: 10, duration: DURATION, exec: 'listOrders' },
-    feed_reads: { executor: 'constant-vus', vus: 10, duration: DURATION, exec: 'readFeed' },
-    insight_reads: { executor: 'constant-vus', vus: 2, duration: DURATION, exec: 'readInsight' },
-    findings_paging: { executor: 'constant-vus', vus: 5, duration: DURATION, exec: 'pageFindings' },
-    findings_summary: { executor: 'constant-vus', vus: 3, duration: DURATION, exec: 'readSummary' },
-    findings_timeline: { executor: 'constant-vus', vus: 3, duration: DURATION, exec: 'readTimeline' },
-    review_queue: { executor: 'constant-vus', vus: 3, duration: DURATION, exec: 'readReviewQueue' },
-    ...Object.fromEntries(PERSONAS.map((p, i) => [`dashboard_${p.name}`, personaScenario(p, i)])),
-  },
+  scenarios:
+    __ENV.ONLY === 'dashboard' ? DASHBOARD_SCENARIOS : { ...OPS_SCENARIOS, ...DASHBOARD_SCENARIOS },
   // Correctness gates fail the run here; latency and throughput are gated against baseline.json
   // by run.py (a run more than 20% slower, or more than 20% lower throughput, fails), since
   // absolute p95 depends on the host.
   thresholds: {
-    claim_ok: ['rate>0.99'],
+    ...(__ENV.ONLY === 'dashboard' ? {} : { claim_ok: ['rate>0.99'] }),
     http_req_failed: ['rate<0.01'],
   },
 };
@@ -155,8 +166,9 @@ export function handleSummary(data) {
   // One row pair per persona, so baseline.json gates each persona's latency and cadence.
   const personas = {};
   for (const persona of PERSONAS) {
-    personas[`persona_${persona.name}_p95_ms`] = p95Of(data, `persona_${persona.name}_latency`);
-    personas[`persona_${persona.name}_rps`] = rateOf(data, `persona_${persona.name}_requests`);
+    const key = personaKey(persona.name);
+    personas[`${key}_p95_ms`] = p95Of(data, `${key}_latency`);
+    personas[`${key}_rps`] = rateOf(data, `${key}_requests`);
   }
   return { [__ENV.SUMMARY || '.perf/api-summary.json']: JSON.stringify(summary(data, personas), null, 2) };
 }
