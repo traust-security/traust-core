@@ -8,7 +8,7 @@ from enum import StrEnum
 from typing import Annotated
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class Subject(StrEnum):
@@ -79,6 +79,17 @@ class DashboardQuery(BaseModel):
     where: dict[Dimension, _WhereValues] = Field(default={}, max_length=8)
     order: tuple[DashboardOrder, ...] = Field(default=(), max_length=3)
     limit: int = Field(default=50, ge=1, le=1000)
+
+    @field_validator("where")
+    @classmethod
+    def _no_nul_in_values(
+        cls, where: dict[Dimension, tuple[str, ...]]
+    ) -> dict[Dimension, tuple[str, ...]]:
+        """Postgres text cannot carry NUL: refuse it here, not as a driver error."""
+        for dimension, values in where.items():
+            if any("\x00" in value for value in values):
+                raise ValueError(f"a where value for {dimension.value} contains a NUL byte")
+        return where
 
 
 class DashboardRow(BaseModel):

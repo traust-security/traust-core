@@ -77,11 +77,19 @@ def client(context: Context) -> Iterator[TestClient]:
 
 
 def payloads(fragments: tuple[str, ...] = FRAGMENTS) -> st.SearchStrategy[str]:
-    """A marker fragment wrapped in arbitrary text, sometimes padded oversized."""
+    """A marker fragment wrapped in arbitrary text, sometimes padded oversized.
+    The wrap excludes NUL so value payloads stay literals (the model refuses
+    NUL itself; the HTTP cases cover that refusal)."""
+    # The wrap excludes NUL (value payloads stay literals; the model refuses NUL)
+    # and surrogates (lone ones cannot ride UTF-8 JSON at all).
+    wrap = st.text(
+        alphabet=st.characters(exclude_characters="\x00", exclude_categories=("Cs",)),
+        max_size=6,
+    )
     return st.builds(
         lambda fragment, wrap, pad: f"{wrap[0]}{fragment}{wrap[1]}{'A' * pad}",
         st.sampled_from(fragments),
-        st.tuples(st.text(max_size=6), st.text(max_size=6)),
+        st.tuples(wrap, wrap),
         st.sampled_from((0, 0, 0, 10_000)),
     )
 
@@ -132,6 +140,17 @@ def test_a_payload_in_a_scalar_field_is_refused(payload: str) -> None:
     with pytest.raises(Refusal):
         DashboardQuery.model_validate(
             {"subject": "findings", "measures": ["findings"], "order": [{"desc": payload}]}
+        )
+
+
+def test_a_nul_where_value_is_refused_before_sql() -> None:
+    """NUL cannot ride a postgres text parameter: the model refuses it, so the
+    route answers 422 instead of a driver error."""
+    with pytest.raises(Refusal):
+        DashboardQuery(
+            subject="findings",
+            measures=("findings",),
+            where={"category": ("a\x00b",)},
         )
 
 
