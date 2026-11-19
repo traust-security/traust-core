@@ -1,5 +1,6 @@
-"""The dashboard query and results: the metrics-query shapes, typed from the
-contracts schema (nothing hand-copied — the vocabulary is the schema's)."""
+"""The dashboard query and results: the metrics-query shapes. The vocabulary
+(subjects, dimensions, measures) is defined here — the single source — and
+flows to the SDK through the OpenAPI document generated from these models."""
 
 from __future__ import annotations
 
@@ -8,20 +9,45 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from traust_core.v1 import contracts
+
+class Subject(StrEnum):
+    """What a query counts; each subject carries its own dimensions and measures."""
+
+    FINDINGS = "findings"
+    REVIEW_ITEMS = "review_items"
+    WORK_ITEMS = "work_items"
+    REPOSITORIES = "repositories"
 
 
-def _vocabulary(key: str) -> dict[str, str]:
-    """The query schema's inline enum as enum members: value -> value."""
-    schema = contracts.view_schema("dashboard-query")
-    node = schema["properties"][key]
-    values = node["enum"] if "enum" in node else node["items"]["enum"]
-    return {str(value).upper().replace("-", "_"): str(value) for value in values}
+class Dimension(StrEnum):
+    """The axes a query breaks its answer down by; the catalog serves a subset."""
+
+    REPOSITORY = "repository"
+    PRODUCT = "product"
+    TEAM = "team"
+    STATE = "state"
+    SEVERITY = "severity"
+    CATEGORY = "category"
+    DECIDED = "decided"
+    SLA_STATUS = "sla_status"
+    AGE_BUCKET = "age_bucket"
+    FIRST_SEEN_WEEK = "first_seen_week"
+    CHANGED_WEEK = "changed_week"
+    REASON = "reason"
+    STATUS = "status"
+    STRATEGY = "strategy"
 
 
-Subject = StrEnum("Subject", _vocabulary("subject"))
-Dimension = StrEnum("Dimension", _vocabulary("group_by"))
-Measure = StrEnum("Measure", _vocabulary("measures"))
+class Measure(StrEnum):
+    """What a query counts or sums; the catalog serves a subset."""
+
+    FINDINGS = "findings"
+    REPOSITORIES = "repositories"
+    CVSS_SUM = "cvss_sum"
+    OLDEST_OPEN_AGE = "oldest_open_age"
+    REVIEW_ITEMS = "review_items"
+    WORK_ITEMS = "work_items"
+    MEDIAN_OPEN_DAYS = "median_open_days"
 
 
 class DashboardOrder(BaseModel):

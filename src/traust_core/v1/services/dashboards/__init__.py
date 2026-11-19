@@ -6,7 +6,6 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from traust_core.v1 import contracts
 from traust_core.v1.models.dashboard import DashboardQuery, DashboardResults, DashboardRow
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.traust.findings.dashboard_facts import (
@@ -59,7 +58,6 @@ class DashboardService:
                 for row in rows[:_ROW_CAP]
             ),
         )
-        contracts.validate_view("dashboard-results", results.model_dump(mode="json"))
         return results
 
     def _resolve(self, query: DashboardQuery) -> frozenset[UUID] | None:
