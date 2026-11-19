@@ -9,6 +9,7 @@ license = "Apache-2.0"
 description = "traust platform API (v1): domain models, repositories, service interfaces, clients, config"
 requires-python = ">=3.11"
 dependencies = [
+    "cvss>=3.6",
     "jsonschema[format-nongpl]>=4.0",
     "pydantic>=2.11",
     "pyjwt[crypto]>=2.8",
