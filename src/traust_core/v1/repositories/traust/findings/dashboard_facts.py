@@ -15,7 +15,7 @@ from traust_core.v1.models.dashboard import Subject
 # The findings subject's facts: one indexed row per finding, read as stored. State,
 # severity and decided are the finding's current answer, stamped by core's write doors
 # from the fold; category is its first category label. NULL severity is unrated.
-_FACTS = sa.text(
+_FINDING_FACTS = sa.text(
     """
     WITH facts AS (
         SELECT f.id, f.repository_id, f.created_at,
@@ -27,6 +27,21 @@ _FACTS = sa.text(
     )
     """
 )
+
+# The review_items subject's facts: one row per review item, with its finding's
+# repository and current answer (state, severity) - one join, no fold.
+_REVIEW_FACTS = sa.text(
+    """
+    WITH facts AS (
+        SELECT r.id, f.repository_id, r.reason, r.status,
+            f.current_state AS state, f.current_severity AS severity
+        FROM review_item r
+        JOIN finding f ON f.id = r.finding_id
+    )
+    """
+)
+
+_FACTS = {Subject.FINDINGS: _FINDING_FACTS, Subject.REVIEW_ITEMS: _REVIEW_FACTS}
 
 
 _ROW_CAP = 1000
@@ -67,9 +82,9 @@ class SqlDashboardFacts:
         order: list[str],
         limit: int,
     ) -> list[tuple[object, ...]]:
-        assert subject is Subject.FINDINGS, subject  # require() refused the rest
+        facts = _FACTS[subject]  # require() refused the rest
         selected = [*columns, *aggregates]
-        stmt = _FACTS.text + f"SELECT {', '.join(selected)} FROM facts"
+        stmt = facts.text + f"SELECT {', '.join(selected)} FROM facts"
         conditions: list[str] = []
         binds: dict[str, object] = {}
         if repository_ids is not None:

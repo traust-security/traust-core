@@ -15,6 +15,8 @@ _COLUMNS: dict[Dimension, str] = {
     Dimension.SEVERITY: "severity",
     Dimension.CATEGORY: "category",
     Dimension.DECIDED: "decided",
+    Dimension.REASON: "reason",
+    Dimension.STATUS: "status",
 }
 
 _AGE_DAYS = {
@@ -28,18 +30,33 @@ def _aggregates(dialect: str) -> dict[Measure, str]:
         Measure.FINDINGS: "count(*)",
         Measure.REPOSITORIES: "count(distinct repository_id)",
         Measure.OLDEST_OPEN_AGE: _AGE_DAYS.get(dialect, _AGE_DAYS["postgresql"]),
+        Measure.REVIEW_ITEMS: "count(*)",
     }
 
 
 # What this build serves; the query schema states the intent, the catalog the
 # present. Subjects and vocabulary beyond these refuse until their facts land.
 _SERVED_MEASURES = frozenset({Measure.FINDINGS, Measure.REPOSITORIES, Measure.OLDEST_OPEN_AGE})
+_FINDING_DIMENSIONS = frozenset(_COLUMNS) - {Dimension.REASON, Dimension.STATUS}
 SERVED: dict[Subject, tuple[frozenset[Dimension], frozenset[Measure]]] = {
-    Subject.FINDINGS: (frozenset(_COLUMNS), _SERVED_MEASURES),
+    Subject.FINDINGS: (_FINDING_DIMENSIONS, _SERVED_MEASURES),
+    # a review item with its finding's current answer: the countersign queue's counts
+    Subject.REVIEW_ITEMS: (
+        frozenset(
+            {
+                Dimension.REPOSITORY,
+                Dimension.REASON,
+                Dimension.STATUS,
+                Dimension.STATE,
+                Dimension.SEVERITY,
+            }
+        ),
+        frozenset({Measure.REVIEW_ITEMS}),
+    ),
 }
 
-# The subjects that exist in the facts layer; review_items arrives with its own.
-_FACTS: frozenset[Subject] = frozenset({Subject.FINDINGS})
+# The subjects that exist in the facts layer; work_items waits on a stamped status.
+_FACTS: frozenset[Subject] = frozenset({Subject.FINDINGS, Subject.REVIEW_ITEMS})
 
 
 def require(

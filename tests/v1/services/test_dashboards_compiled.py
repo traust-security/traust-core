@@ -109,8 +109,9 @@ def _compiled(query: DashboardQuery, dialect: str) -> str:
 
 def _clause(sql: str) -> str:
     """The part the request produced: everything after the fixed facts CTE."""
-    assert sql.startswith(_FACTS.text)
-    return sql[len(_FACTS.text) :]
+    facts = _FACTS[Subject.FINDINGS].text
+    assert sql.startswith(facts)
+    return sql[len(facts) :]
 
 
 def _catalog_tokens(dialect: str) -> set[str]:
