@@ -110,7 +110,7 @@ SEED = (
     FROM generate_series(1, {RUN_BATCHES}) g""",
     f"""INSERT INTO traust_ops.run_order (run_batch_id, repository_id, asset, lane, state,
         priority, requested_by, lease_holder, lease_expires_at, started_at, finished_at, created_at,
-        updated_at)
+        updated_at, lease_generation, completed_by)
     SELECT b.id, CASE WHEN o.lane IS NULL AND o.asset <> 'repo_state' THEN NULL ELSE r.id END,
         o.asset, o.lane, o.state, mod(o.g, 100), 'machine:engine',
         CASE WHEN o.state = 'leased' THEN 'worker-' || mod(o.g, 50) END,
@@ -121,7 +121,11 @@ SEED = (
             THEN o.at + interval '10 minutes' END,
         o.at,
         CASE WHEN o.g > {OPEN_ORDERS} AND o.state <> 'withheld'
-            THEN o.at + interval '10 minutes' ELSE o.at END
+            THEN o.at + interval '10 minutes' ELSE o.at END,
+        CASE WHEN o.state IN ('leased', 'succeeded', 'degraded', 'refused', 'failed')
+            THEN 1 ELSE 0 END,
+        CASE WHEN o.state IN ('succeeded', 'degraded', 'refused', 'failed')
+            THEN 'worker-' || mod(o.g, 50) END
     FROM (
         SELECT g, now() - make_interval(secs => g * 15) AS at,
             CASE WHEN mod(g, 8) < 5 THEN replace(replace(w.lane, '-quarterly', ''), '-', '_')

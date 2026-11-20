@@ -129,11 +129,14 @@ def test_spend_by_lane_and_by_month(explained: Profile) -> None:
     assert by_month.execution_ms < 2000, by_month.plan
 
 
-def test_the_open_order_for_a_repositorys_asset_by_index(explained: Profile) -> None:
+@pytest.mark.parametrize("for_update", [False, True])
+def test_the_open_order_for_a_repositorys_asset_by_index(
+    explained: Profile, for_update: bool
+) -> None:
     def find(uow: SqlTraustUnitOfWork) -> None:
         repo = uow.repositories.find_by_url(TYPICAL_REPOSITORY)
         assert repo is not None and repo.id is not None
-        uow.run_orders.find_open("audit", repo.id)
+        uow.run_orders.find_open("audit", repo.id, for_update=for_update)
 
     *_, found = explained(find)
     indexes = ("idx_ops_run_order_repository_state", "idx_ops_run_order_asset_state")

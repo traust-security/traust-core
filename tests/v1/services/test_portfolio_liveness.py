@@ -254,17 +254,19 @@ def complete_attempt(
     started_at: datetime | None = None,
 ) -> OpsService:
     worker = WorkerId("liveness-fixture")
-    order = seed.run_order(
+    start = started_at or at - timedelta(seconds=1)
+    queued = seed.run_order(
         asset="repo_state",
         repository_id=repository_id,
-        state="leased",
-        started_at=started_at or at - timedelta(seconds=1),
-        lease_holder=worker,
-        lease_expires_at=at + timedelta(minutes=1),
+        state="queued",
     )
     publisher = ArtifactPublisher(PublishSpecs(PublishSpec(RunManifestArtifact)), STORE, uow)
+    order = OpsService(uow, FixedClock(start), publisher).claim(
+        worker, at - start + timedelta(minutes=1)
+    )
     ops = OpsService(uow, FixedClock(at), publisher, degraded_keys=lambda: ("spend-unpriced",))
-    ops.complete(order.id, worker, result)
+    assert order is not None and order.id == queued.id
+    ops.complete(order.id, worker, result, lease_generation=order.lease_generation)
     return ops
 
 

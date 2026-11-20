@@ -182,7 +182,12 @@ def test_a_later_change_to_an_order_is_a_new_event(engine: Engine) -> None:
     assert changes(engine, cursor=held.cursor) == []
     claimed = service.claim(W1, LEASE)
     assert claimed is not None and claimed.id == planned.id
-    service.complete(planned.id, W1, JobResult.refused("diff-too-large"))
+    service.complete(
+        claimed.id,
+        W1,
+        JobResult.refused("diff-too-large"),
+        lease_generation=claimed.lease_generation,
+    )
     (refused,) = changes(engine, cursor=held.cursor)
     assert refused.order is not None
     assert (refused.order.id, refused.order.state, refused.order.reason) == (

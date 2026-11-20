@@ -124,6 +124,27 @@ def test_a_failing_append_rolls_the_decision_back(
     assert counts(engine) == (before[0] + seeded, before[1])
 
 
+def test_a_required_seal_failure_rolls_back_unbound_triage_too(
+    engine: Engine, tmp_path: Path
+) -> None:
+    (tmp_path / "x").write_text("not a signing key")
+    service = decisions(engine, "failing", tmp_path)
+    scanned = scan(engine, 2)
+    doc = triage(
+        (scanned.findings[0], {"verdict": "true_positive", "kind": "vulnerability"}),
+        (scanned.findings[1], {"verdict": "undetermined"}),
+    )
+    with pytest.raises(ServiceError, match="not signed"):
+        service.record(scanned.assessment_id, doc, PROVENANCE, CHECKOUT)
+    assert counts(engine) == (0, 0)
+    with SqlTraustUnitOfWork(engine) as uow:
+        ref_id = uow.assessments.get(scanned.assessment_id).repository_ref_id
+        assert not uow.assessments.list_for_refs([ref_id], "triage")
+        assert not uow.layers.list_for_repository(scanned.findings[0].repository_id)
+        assert uow.findings.get(scanned.findings[0].id).kind is None
+        assert not uow.review_items.list_for_finding(scanned.findings[1].id)
+
+
 @WRITES
 def test_with_the_ledger_off_decisions_are_recorded_without_events(
     engine: Engine, tmp_path: Path, write: Write

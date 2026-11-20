@@ -43,6 +43,7 @@ def test_claim_records_the_lease(seed: Seed) -> None:
     claimed = seed.uow.run_orders.claim("worker-1", T0, LEASE)
     assert claimed is not None and claimed.id == order.id
     assert (claimed.state, claimed.lease_holder) == ("leased", "worker-1")
+    assert (order.lease_generation, claimed.lease_generation) == (0, 1)
     assert claimed.lease_expires_at == T0 + LEASE
     assert claimed.updated_at >= order.updated_at
 
@@ -78,13 +79,14 @@ def test_expired_leases_return_to_the_queue(seed: Seed) -> None:
     expired, live = seed.run_order(priority=1), seed.run_order(priority=2)
     orders.claim("w1", T0, LEASE)
     orders.claim("w2", T0 + LEASE, LEASE)
-    assert orders.requeue_expired(T0 + LEASE + timedelta(seconds=1)) == 1
+    assert orders.requeue_expired(T0 + LEASE) == 1
     released = orders.get(expired.id)
     assert (released.state, released.lease_holder, released.lease_expires_at) == (
         "queued",
         None,
         None,
     )
+    assert released.lease_generation == 1
     assert orders.get(live.id).state == "leased"
 
 
@@ -269,14 +271,23 @@ def test_concurrent_workers_never_claim_the_same_order(engine: Engine) -> None:
 
 
 @pytest.mark.integration
-def test_selected_id_claim_skips_a_locked_order_without_waiting(engine: Engine) -> None:
+@pytest.mark.parametrize("lock_by_subject", [False, True])
+def test_selected_id_claim_skips_a_locked_order_without_waiting(
+    engine: Engine, lock_by_subject: bool
+) -> None:
     if engine.dialect.name != "postgresql":
         pytest.skip("SQLite serialises writers; row locks are a Postgres property")
     with SqlTraustUnitOfWork(engine) as setup:
         order = Seed(setup).run_order()
         setup.commit()
     with SqlTraustUnitOfWork(engine) as holder, SqlTraustUnitOfWork(engine) as contender:
-        holder.run_orders.get_for_update(order.id)
+        if lock_by_subject:
+            assert (
+                holder.run_orders.find_open(order.asset, order.repository_id, for_update=True)
+                == order
+            )
+        else:
+            holder.run_orders.get_for_update(order.id)
         contender.connection.execute(sa.text("SET LOCAL lock_timeout = '250ms'"))
         assert contender.run_orders.claim("contender", T0, LEASE, order_id=order.id) is None
 

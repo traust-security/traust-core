@@ -3,12 +3,13 @@ fix; the same door the engine's start gate and `traust doctor` call."""
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
 
 import pydantic
 import pytest
 import yaml
-
 from traust_core.v1.context import Config, Context
 from traust_core.v1.context.home import TRAUST_CONFIG_HOME_ENV
 from traust_core.v1.errors import PreflightError
@@ -25,6 +26,8 @@ from traust_core.v1.services.artifact_publishing import (
 FIXTURES = Path(__file__).parents[2] / "fixtures"
 MODEL_REGISTRY = FIXTURES / "operations" / "model-registry.yaml"
 SLA_POLICY = FIXTURES / "insight" / "sla-policy.yaml"
+TRIAGE_REQUIREMENT = Requirement(config=("identity", "ledger", "review"))
+SBOM_REQUIREMENT = Requirement(tools=("syft",))
 
 TOOLS = """
 tools:
@@ -65,7 +68,7 @@ def context(
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
     if traust_yaml is not None:
-        (home / "traust.yaml").write_text(traust_yaml.format(store=tmp_path / "store"))
+        (home / "traust.yaml").write_text(traust_yaml.replace("{store}", str(tmp_path / "store")))
     if model_registry:
         (home / "model-registry.yaml").write_bytes(MODEL_REGISTRY.read_bytes())
     monkeypatch.setenv(TRAUST_CONFIG_HOME_ENV, str(home))
@@ -109,6 +112,7 @@ def test_a_complete_home_with_every_requirement_met_passes(
 
 def test_every_gap_is_listed_at_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     ctx = context(tmp_path, monkeypatch, traust_yaml=COMPLETE.replace("  workspace: ws\n", ""))
+    monkeypatch.delenv("NVD_API_KEY", raising=False)
     with pytest.raises(PreflightError) as caught:
         ctx.preflight(
             [
@@ -315,3 +319,195 @@ def test_a_typoed_requirement_kind_names_the_valid_ones() -> None:
     message = str(caught.value)
     assert "unknown requirement kind(s) ['feed']" in message
     assert "valid kinds: ['config', 'facts', 'feeds', 'secrets', 'tools']" in message
+
+
+@pytest.fixture
+def triage_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    prefix = tmp_path / "ledger"
+    monkeypatch.setenv("TEST_VALVE_SALT", "synthetic-test-salt")
+    ctx = context(tmp_path, monkeypatch)
+    ctx.local_issuer.mint("runner", machine=True)
+    return {
+        **yaml.safe_load(COMPLETE.replace("{store}", str(tmp_path / "store"))),
+        "identity": {"trust_local": True},
+        "review": {"valve_salt_env": "TEST_VALVE_SALT"},
+        "ledger": {
+            "key_path": str(prefix.with_suffix(".key")),
+            "public_key_path": str(prefix.with_suffix(".pub")),
+            "required": True,
+        },
+    }
+
+
+@pytest.fixture
+def signing_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, triage_home: dict[str, object]
+) -> dict[str, object]:
+    if not shutil.which("cosign"):
+        pytest.skip("cosign is needed for a real signing readiness probe")
+    monkeypatch.setenv("COSIGN_PASSWORD", "synthetic-ledger-password")
+    subprocess.run(
+        ["cosign", "generate-key-pair", "--output-key-prefix", str(tmp_path / "ledger")],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    return triage_home
+
+
+def _load_triage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, triage_home: dict[str, object]
+) -> Context:
+    return context(tmp_path, monkeypatch, traust_yaml=yaml.safe_dump(triage_home))
+
+
+def test_decision_writing_readiness_accepts_a_verified_local_issuer_and_signing_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, signing_home: dict[str, object]
+) -> None:
+    ctx = _load_triage(tmp_path, monkeypatch, signing_home)
+    ctx.preflight([TRIAGE_REQUIREMENT])
+    assert not (ctx.config.home / "traust.db").exists()
+
+
+@pytest.mark.parametrize(
+    ("section", "replacement", "message"),
+    [
+        ("identity", None, "`identity` is not set"),
+        ("identity", {}, "identity: no verified issuer"),
+        ("ledger", {}, "ledger: set ledger.key_path"),
+        ("ledger", {"key_path": "/nonexistent/key"}, "ledger: set ledger.key_path"),
+        ("review", {}, "audit-valve salt is missing or blank"),
+    ],
+)
+def test_decision_writing_refuses_each_unready_section(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    triage_home: dict[str, object],
+    section: str,
+    replacement: dict[str, object] | None,
+    message: str,
+) -> None:
+    if replacement is None:
+        del triage_home[section]
+    else:
+        triage_home[section] = replacement
+    with pytest.raises(PreflightError, match=message):
+        _load_triage(tmp_path, monkeypatch, triage_home).preflight([TRIAGE_REQUIREMENT])
+
+
+@pytest.mark.parametrize(
+    ("problem", "message"),
+    [
+        ("no-local-keys", "no usable local JWKS"),
+        ("malformed-local-keys", "no usable local JWKS"),
+        ("no-salt", "names unset variable TEST_VALVE_SALT"),
+        ("empty-salt", "is set but empty"),
+        ("blank-salt", "audit-valve salt is missing or blank"),
+    ],
+)
+def test_present_config_does_not_mask_runtime_prerequisite_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    triage_home: dict[str, object],
+    problem: str,
+    message: str,
+) -> None:
+    ctx = _load_triage(tmp_path, monkeypatch, triage_home)
+    if problem == "no-local-keys":
+        ctx.local_jwks.unlink()
+    elif problem == "malformed-local-keys":
+        ctx.local_jwks.write_text('{"keys": []}')
+    elif problem == "no-salt":
+        monkeypatch.delenv("TEST_VALVE_SALT")
+    elif problem in ("empty-salt", "blank-salt"):
+        monkeypatch.setenv("TEST_VALVE_SALT", "" if problem == "empty-salt" else " \t")
+    with pytest.raises(PreflightError, match=message):
+        ctx.preflight([TRIAGE_REQUIREMENT])
+
+
+def test_missing_cosign_needs_no_installed_signer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, triage_home: dict[str, object]
+) -> None:
+    (tmp_path / "ledger.key").touch()
+    (tmp_path / "ledger.pub").touch()
+    monkeypatch.setenv("PATH", str(tmp_path))
+    with pytest.raises(PreflightError, match="cosign not found on PATH"):
+        _load_triage(tmp_path, monkeypatch, triage_home).preflight([TRIAGE_REQUIREMENT])
+
+
+@pytest.mark.parametrize(
+    ("problem", "message"),
+    [("bad-password", "cosign could not sign"), ("bad-public-key", "cosign could not verify")],
+)
+def test_signing_probe_reports_a_bad_password_or_public_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    signing_home: dict[str, object],
+    problem: str,
+    message: str,
+) -> None:
+    ctx = _load_triage(tmp_path, monkeypatch, signing_home)
+    if problem == "bad-password":
+        monkeypatch.setenv("COSIGN_PASSWORD", "wrong-test-password")
+    elif problem == "bad-public-key":
+        (tmp_path / "ledger.pub").write_text("not a public key")
+    with pytest.raises(PreflightError, match=message) as exc:
+        ctx.preflight([TRIAGE_REQUIREMENT])
+    assert "synthetic-ledger-password" not in str(exc.value)
+    assert "wrong-test-password" not in str(exc.value)
+
+
+def test_unusable_identity_does_not_hide_other_decision_writing_gaps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, triage_home: dict[str, object]
+) -> None:
+    program = tmp_path / "lookup"
+    program.touch(mode=0o600)
+    triage_home["identity"] = {
+        "issuers": [{"issuer": "example", "jwks_url": "invalid"}],
+        "directory_command": [str(program)],
+    }
+    monkeypatch.delenv("TEST_VALVE_SALT")
+    ctx = _load_triage(tmp_path, monkeypatch, triage_home)
+    with pytest.raises(PreflightError) as exc:
+        ctx.preflight([TRIAGE_REQUIREMENT])
+    details = str(exc.value)
+    assert "identity.issuers[0]" in details and "jwks_url" in details
+    assert "identity.directory_command is not executable" in details
+    assert "ledger:" in details and "TEST_VALVE_SALT" in details
+
+
+def test_nonwriting_requirements_do_not_combine_into_decision_writing_readiness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = context(tmp_path, monkeypatch, traust_yaml=COMPLETE + "identity: {}\nreview: {}\n")
+    ctx.preflight(Requirement(config=(key,)) for key in TRIAGE_REQUIREMENT.config)
+
+
+@pytest.mark.parametrize(
+    ("installed", "allowed", "message"),
+    [
+        (False, True, "syft: not found on PATH"),
+        (True, False, "add syft to process.allowed_binaries"),
+        (True, True, None),
+    ],
+)
+def test_manifest_sbom_requires_syft_installed_and_allowed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    installed: bool,
+    allowed: bool,
+    message: str | None,
+) -> None:
+    traust_yaml = COMPLETE + ("process:\n  allowed_binaries: [syft]\n" if allowed else "")
+    ctx = context(tmp_path, monkeypatch, tools=False, traust_yaml=traust_yaml)
+    ctx.register_toolchain()
+    monkeypatch.setenv("PATH", str(tmp_path))
+    if installed:
+        pin = ctx.toolchain.pins["syft"]
+        syft = _write(tmp_path, "syft", f"#!/bin/sh\nprintf 'syft {pin.expected}\\n'\n")
+        syft.chmod(0o755)
+    if message is None:
+        ctx.preflight([SBOM_REQUIREMENT])
+    else:
+        with pytest.raises(PreflightError, match=message):
+            ctx.preflight([SBOM_REQUIREMENT])

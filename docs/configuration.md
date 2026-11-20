@@ -40,6 +40,12 @@ identity:                                 # absent: no caller can be verified (R
 | `identity.restatement_approvers` | how many approvers besides its author a correction must name |
 | `identity.login` | the provider `traust auth` logs in against; tokens are kept in `<home>/credentials.json` (owner-only) |
 
+A server with report-recording asset bindings probes its own identity verifier
+at startup; a planner passing preflight is not evidence that the writer is ready.
+Decision writers need a ledger. A triage writer also needs a working required
+signing pair and a nonblank secret in the variable named by `review.valve_salt_env`.
+A read-only server with no recording bindings does not require these credentials.
+
 ## From traust-ledger's service settings
 
 | traust-ledger (env) | traust-core |

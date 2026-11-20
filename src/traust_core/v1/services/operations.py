@@ -5,6 +5,7 @@ import logging
 from collections import Counter, defaultdict
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from statistics import median
@@ -151,6 +152,33 @@ def _recording_principal(principal: Principal) -> Principal:
     if principal.kind != ActorKind.MACHINE or principal.verified_by is None:
         raise ForbiddenError("recording requires a verified machine identity")
     return principal
+
+
+@dataclass(frozen=True, slots=True)
+class _Lease:
+    worker: WorkerId
+    generation: int
+
+    def __post_init__(self) -> None:
+        if not self.worker:
+            raise ValidationError("lease operation requires the lease holder")
+        if type(self.generation) is not int or self.generation <= 0:
+            raise ValidationError("lease_generation must be a positive integer")
+
+    def require(self, order: RunOrder, now: datetime) -> None:
+        _require(order, OrderState.LEASED)
+        if order.lease_holder != self.worker:
+            raise ConflictError(f"order {order.id}: lease belongs to another worker")
+        if order.lease_generation != self.generation:
+            raise ConflictError(f"order {order.id}: stale lease generation")
+        if order.lease_expires_at is None or order.lease_expires_at <= now:
+            raise ConflictError(f"order {order.id}: lease expired")
+
+    def replay(self, order: RunOrder, outcome: OrderState) -> RunOrder:
+        _require(order, outcome)
+        if order.lease_generation != self.generation or order.completed_by != self.worker:
+            raise ConflictError(f"order {order.id}: completion belongs to another lease")
+        return order
 
 
 class Materializer(Protocol):
@@ -469,8 +497,10 @@ class OpsService:
         _classifiers(lane=request.lane, event_source=request.event_source)
         self._check_work_item(request)
         manifest = self._config_manifest(tuple(config))
-        with self._uow as uow:
-            current = uow.run_orders.find_open(request.asset, request.repository_id)
+        with self._uow.write() as uow:
+            current = uow.run_orders.find_open(
+                request.asset, request.repository_id, for_update=True
+            )
             if current is None:
                 saved = uow.run_orders.add(
                     RunOrder(
@@ -585,21 +615,22 @@ class OpsService:
         `worker`: the subject's planned or queued order is taken over, else a new one is stored."""
         _classifiers(lane=request.lane, event_source=request.event_source)
         self._check_work_item(request)
-        now = self._clock.now()
-        lease = {
-            "state": OrderState.LEASED,
-            "lease_holder": worker,
-            "lease_expires_at": now + lease_for,
-            "started_at": now,
-        }
-        with self._uow as uow:
-            current = uow.run_orders.find_open(request.asset, request.repository_id)
+        with self._uow.write() as uow:
+            current = uow.run_orders.find_open(
+                request.asset, request.repository_id, for_update=True
+            )
+            now = self._clock.now()
+            lease = {
+                "state": OrderState.LEASED,
+                "lease_holder": worker,
+                "lease_generation": current.lease_generation + 1 if current else 1,
+                "lease_expires_at": now + lease_for,
+                "started_at": now,
+            }
             if current is None:
                 order = RunOrder(**request.model_dump(), **lease, requested_by=principal.ref)
                 saved = uow.run_orders.add(order)
             else:
-                assert current.id is not None
-                current = uow.run_orders.get_for_update(current.id)
                 if current.state not in (OrderState.PLANNED, OrderState.QUEUED):
                     raise ConflictError(
                         f"order {current.id}: {current.asset} is already {current.state}"
@@ -704,13 +735,14 @@ class OpsService:
             for scope in self._recording_starts
         )
 
-    def heartbeat(self, order_id: UUID, worker: WorkerId, lease_for: timedelta) -> RunOrder:
-        now = self._clock.now()
+    def heartbeat(
+        self, order_id: UUID, worker: WorkerId, lease_for: timedelta, *, lease_generation: int
+    ) -> RunOrder:
+        lease = _Lease(worker, lease_generation)
         with self._uow.write() as uow:
             order = uow.run_orders.get_for_update(order_id)
-            _require(order, OrderState.LEASED, worker)
-            if order.lease_expires_at is None or order.lease_expires_at < now:
-                raise ConflictError(f"order {order_id}: lease expired at {order.lease_expires_at}")
+            now = self._clock.now()
+            lease.require(order, now)
             saved = uow.run_orders.update(
                 order.model_copy(update={"lease_expires_at": now + lease_for})
             )
@@ -724,12 +756,16 @@ class OpsService:
         kind: RecordKind,
         repository_id: UUID,
         provenance: Provenance,
+        *,
+        lease_generation: int,
     ) -> RunOrder:
         """Authorize before staging bytes; recording repeats the checks under its lease lock."""
         principal = _recording_principal(principal)
-        with self._uow as uow:
-            order = uow.run_orders.get(order_id)
-            self._check_recording(order, principal, kind, repository_id, provenance)
+        with self._uow.write() as uow:
+            order = uow.run_orders.get_for_update(order_id)
+            self._check_recording(
+                order, principal, kind, repository_id, provenance, lease_generation
+            )
         return order
 
     @contextmanager
@@ -740,26 +776,42 @@ class OpsService:
         kind: RecordKind,
         repository_id: UUID,
         provenance: Provenance,
+        *,
+        lease_generation: int,
     ) -> Iterator[RunOrder]:
         """Authorize and serialize one leased runner's report with its domain writes."""
         principal = _recording_principal(principal)
         with self._uow.write() as uow:
             order = uow.run_orders.get_for_update(order_id)
-            self._check_recording(order, principal, kind, repository_id, provenance)
+            self._check_recording(
+                order, principal, kind, repository_id, provenance, lease_generation
+            )
             yield order
+            assert order.lease_expires_at is not None
             if order.lease_expires_at <= self._clock.now():
                 raise ConflictError(f"order {order_id}: recording lease expired before commit")
             uow.commit()
 
-    @contextmanager
-    def bound(self, order_id: UUID, repository_id: UUID) -> Iterator[RunOrder]:
-        """Serialize writes bound to a leased order with its lease, as `recording` does for a
-        runner's report: the order is locked, leased, unexpired and scoped to `repository_id`
-        from the check through the commit of the caller's writes, which commit here."""
+    def check_bound(
+        self, order_id: UUID, repository_id: UUID, *, worker: WorkerId, lease_generation: int
+    ) -> RunOrder:
+        """Check before staging; bound repeats the check around the writes."""
         with self._uow.write() as uow:
             order = uow.run_orders.get_for_update(order_id)
-            _require(order, OrderState.LEASED)
-            self._require_lease(order, repository_id)
+            _Lease(worker, lease_generation).require(order, self._clock.now())
+            self._require_repository(order, repository_id)
+            return order
+
+    @contextmanager
+    def bound(
+        self, order_id: UUID, repository_id: UUID, *, worker: WorkerId, lease_generation: int
+    ) -> Iterator[RunOrder]:
+        """Commit repository-scoped writes under the worker's original lease."""
+        lease = _Lease(worker, lease_generation)
+        with self._uow.write() as uow:
+            order = uow.run_orders.get_for_update(order_id)
+            lease.require(order, self._clock.now())
+            self._require_repository(order, repository_id)
             yield order
             assert order.lease_expires_at is not None
             if order.lease_expires_at <= self._clock.now():
@@ -773,11 +825,13 @@ class OpsService:
         kind: RecordKind,
         repository_id: UUID,
         provenance: Provenance,
+        lease_generation: int,
     ) -> None:
         _require(order, OrderState.LEASED)
         if order.lease_holder != principal.ref:
             raise ForbiddenError(f"order {order.id}: recording lease belongs to another runner")
-        self._require_lease(order, repository_id)
+        _Lease(WorkerId(principal.ref), lease_generation).require(order, self._clock.now())
+        self._require_repository(order, repository_id)
         if order.asset not in self._recording_assets.get(kind, ()):
             raise ForbiddenError(f"order {order.id}: asset is not authorized for {kind} recording")
         if provenance.run_id != order.id:
@@ -785,26 +839,34 @@ class OpsService:
         if provenance.source != _RECORDING_SOURCES.get(kind):
             raise ValidationError("recording provenance source does not match the report kind")
 
-    def _require_lease(self, order: RunOrder, repository_id: UUID) -> None:
-        """A leased order's lease is live and its scope is this one repository (a fleet-wide
-        order's scope is no repository's)."""
-        if order.lease_expires_at is None or order.lease_expires_at <= self._clock.now():
-            raise ConflictError(f"order {order.id}: recording lease expired")
+    @staticmethod
+    def _require_repository(order: RunOrder, repository_id: UUID) -> None:
         if order.repository_id is None or order.repository_id != repository_id:
             raise ForbiddenError(f"order {order.id}: report repository is outside its scope")
 
-    def save_progress(self, order_id: UUID, progress: OrderProgress) -> UUID:
+    def save_progress(
+        self, order_id: UUID, progress: OrderProgress, *, worker: WorkerId, lease_generation: int
+    ) -> UUID:
         """Record a leased order's progress in its run manifest; returns the manifest's id."""
         updated_at = self._clock.now().isoformat()
         entry = {**progress.model_dump(mode="json"), "updated_at": updated_at}
-        saved = self._move(order_id, OrderState.LEASED, {}, lambda m: {**m, "progress": entry})
+        saved = self._move(
+            order_id,
+            OrderState.LEASED,
+            {},
+            lambda m: {**m, "progress": entry},
+            lease=_Lease(worker, lease_generation),
+        )
         assert saved.artifact_id is not None
         return saved.artifact_id
 
-    def record_session(self, order_id: UUID, worker: WorkerId, session: SessionRecord) -> UUID:
+    def record_session(
+        self, order_id: UUID, worker: WorkerId, session: SessionRecord, *, lease_generation: int
+    ) -> UUID:
         """Append runner-computed session evidence under its current lease."""
-        if not worker:
-            raise ValidationError("record_session requires the lease holder")
+        lease = _Lease(worker, lease_generation)
+        if session.lease_generation != lease_generation:
+            raise ConflictError(f"order {order_id}: session evidence belongs to another lease")
         entry = session.model_dump(mode="json")
 
         def append(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -817,29 +879,58 @@ class OpsService:
                 raise ConflictError(f"order {order_id}: executor session evidence changed")
             return {**manifest, "sessions": [*sessions, entry]}
 
-        saved = self._move(order_id, OrderState.LEASED, {}, append, worker, live_lease=True)
+        saved = self._move(order_id, OrderState.LEASED, {}, append, lease=lease)
         assert saved.artifact_id is not None
         return saved.artifact_id
 
-    def complete(self, order_id: UUID, worker: WorkerId, result: JobResult) -> RunOrder:
+    def complete(
+        self, order_id: UUID, worker: WorkerId, result: JobResult, *, lease_generation: int
+    ) -> RunOrder:
         """Finish the order and settle its measured usage as its spend, in one transaction; degraded
         keys and unpriced usage (`spend-unpriced`) go to its run manifest."""
         outcome = OrderState(result.outcome)
-        order = self.get(order_id)
-        if order.state == outcome:
-            return order  # a retried complete
+        lease = _Lease(worker, lease_generation)
+        with self._uow.write() as uow:
+            prior = uow.run_orders.get_for_update(order_id)
+            if prior.state == outcome:
+                return lease.replay(prior, outcome)
+            lease.require(prior, self._clock.now())
         spend, unpriced = self._spend.settlement(order_id, result.usage)
-        update = {
+        _classifiers(reason=result.reason)
+        update: dict[str, object] = {
             "state": outcome,
             "reason": result.reason,
-            "finished_at": self._clock.now(),
             "lease_holder": None,
             "lease_expires_at": None,
+            "completed_by": worker,
         }
         degraded = dict(result.degraded)
         gaps = {SPEND_UNPRICED: len(unpriced)} if unpriced else {}
-        change = (lambda m: self._completion(m, degraded, gaps)) if degraded or gaps else None
-        saved = self._move(order_id, OrderState.LEASED, update, change, worker, spend)
+        if degraded or gaps:
+            update["artifact_id"] = self._publish(
+                prior.artifact_id, lambda m: self._completion(m, degraded, gaps)
+            )
+        with self._uow.write() as uow:
+            order = uow.run_orders.get_for_update(order_id)
+            if order.state == outcome:
+                return lease.replay(order, outcome)
+            now = self._clock.now()
+            lease.require(order, now)
+            update["finished_at"] = now
+            if "artifact_id" in update and order.artifact_id != prior.artifact_id:
+                raise ConflictError(f"order {order_id}: run manifest changed while writing")
+            uow.run_orders.update(order.model_copy(update=update))
+            for event in spend:
+                uow.spend_events.add(event.model_copy(update={"lane": order.lane}))
+            lease.require(order, self._clock.now())
+            # Return the stored timestamps (SQLite rounds them), just as a completion retry does.
+            saved = uow.run_orders.get(order_id)
+            uow.commit()
+        self._uow.after_commit(
+            lambda: log.info(
+                "order %s %s", saved.id, saved.state, extra={"order_id": str(saved.id)}
+            )
+        )
         if degraded:
             self._uow.after_commit(
                 lambda: log.warning(
@@ -920,30 +1011,32 @@ class OpsService:
         from_state: OrderState,
         update: dict[str, object],
         change: Change | None = None,
-        worker: WorkerId | None = None,
-        spend: Sequence[SpendEvent] = (),
+        *,
+        lease: _Lease | None = None,
         actor_kind: ActorKind | None = None,
-        live_lease: bool = False,
     ) -> RunOrder:
-        """Move an order on, with its spend (in its lane); a manifest change is published first (no
-        I/O inside the transaction) and lands unless another writer moved the manifest."""
+        """Publish changes before the transaction; attach them only to the manifest read."""
         if change is not None:
             prior = self.get(order_id)
-            _require(prior, from_state, worker, self._clock.now() if live_lease else None)
+            if lease is not None:
+                lease.require(prior, self._clock.now())
+            else:
+                _require(prior, from_state)
             _classifiers(reason=update.get("reason"))
             update = {**update, "artifact_id": self._publish(prior.artifact_id, change)}
         with self._uow.write() as uow:
             order = uow.run_orders.get_for_update(order_id)
-            _require(order, from_state, worker, self._clock.now() if live_lease else None)
+            if lease is not None:
+                lease.require(order, self._clock.now())
+            else:
+                _require(order, from_state)
             if change is None:
                 _classifiers(reason=update.get("reason"))
             if change is not None and order.artifact_id != prior.artifact_id:
                 raise ConflictError(f"order {order_id}: run manifest changed while writing")
             saved = uow.run_orders.update(order.model_copy(update=update))
-            for event in spend:
-                uow.spend_events.add(event.model_copy(update={"lane": order.lane}))
-            if live_lease:
-                _require(order, from_state, worker, self._clock.now())
+            if lease is not None:
+                lease.require(order, self._clock.now())
             uow.commit()
         if actor_kind is None:
             self._uow.after_commit(
@@ -1192,15 +1285,9 @@ def _budget(verdict: BudgetVerdict | None) -> Change | None:
     return lambda m: {**m, "budget": entry}
 
 
-def _require(
-    order: RunOrder, state: OrderState, worker: WorkerId | None = None, at: datetime | None = None
-) -> None:
+def _require(order: RunOrder, state: OrderState) -> None:
     if order.state != state:
         raise ConflictError(f"order {order.id} is {order.state}, not {state}")
-    if worker is not None and order.lease_holder != worker:
-        raise ConflictError(f"order {order.id} is leased to {order.lease_holder}, not {worker}")
-    if at is not None and (order.lease_expires_at is None or order.lease_expires_at <= at):
-        raise ConflictError(f"order {order.id}: lease expired")
 
 
 class SpendViews:

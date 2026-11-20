@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter
+from pydantic import Field
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.artifacts import VerificationArtifact
@@ -20,6 +22,7 @@ class VerificationRecordBody(Model):
     payload: str
     provenance: Provenance
     run_order_id: UUID
+    lease_generation: Annotated[int, Field(strict=True, gt=0)]
 
 
 @router.post("/v1/verification-records", responses=PROBLEMS(401, 403, 404, 409, 422))
@@ -31,4 +34,6 @@ def record_verification(
     except UnicodeEncodeError as e:
         raise ValidationError("verification payload must be UTF-8 text") from e
     doc = VerificationArtifact.parse(payload)
-    return verification.record_order(doc, body.provenance, body.run_order_id, caller)
+    return verification.record_order(
+        doc, body.provenance, body.run_order_id, caller, lease_generation=body.lease_generation
+    )

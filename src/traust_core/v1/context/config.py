@@ -380,7 +380,7 @@ class Config(_Model):
     logging: LoggingConfig = LoggingConfig()
     rating: RatingConfig = RatingConfig()
     review: ReviewConfig = ReviewConfig()
-    ledger: LedgerConfig | None = None  # absent: no proof chain; decisions are still recorded
+    ledger: LedgerConfig | None = None  # optional for standalone use, not decision-writing orders
     identity: IdentityConfig | None = None  # absent: no caller can be verified
     recording: RecordingConfig = RecordingConfig()
     allowed_repo_hosts: tuple[str, ...] = ()

@@ -5,6 +5,7 @@ import logging
 import re
 from collections import Counter, defaultdict
 from collections.abc import Collection, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -64,7 +65,6 @@ from traust_core.v1.models.operations import (
     OrderFilter,
     OrderReason,
     OrderRequest,
-    OrderState,
     RecordKind,
     RunOrder,
     WorkerId,
@@ -141,6 +141,7 @@ from traust_core.v1.services.artifact_publishing import (
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings.service import FindingService
+from traust_core.v1.services.order_binding import order_binding
 from traust_core.v1.services.portfolio import Inventory, PortfolioService
 from traust_core.v1.services.validation import ValidationService
 
@@ -294,6 +295,26 @@ class _RemediationRecording:
     report: StagedArtifact | ArtifactRef
     patch: StagedArtifact | None
     patch_refusal: str | None
+
+
+def _recording_ops(
+    ops: OpsService | None,
+    uow: TraustUnitOfWork,
+    findings: FindingService,
+    publisher: ArtifactPublisher,
+) -> OpsService:
+    if ops is None:
+        raise ConfigError("leased report recording requires operations authorization")
+    writers = (
+        ops._uow,
+        publisher._uow,
+        findings._uow,
+        findings.decisions._uow,
+        findings.intake._uow,
+    )
+    if any(writer is not uow for writer in writers):
+        raise ConfigError("recording, finding writers and operations must share a unit of work")
+    return ops
 
 
 class RemediationService:
@@ -830,22 +851,23 @@ class RemediationService:
         run_order_id: UUID,
         principal: Principal,
         *,
+        lease_generation: int,
         diff: bytes | None = None,
     ) -> WorkItem:
         """Record a leased remediation run, bound to its repository and any named work item."""
 
-        if self._recording is None:
-            raise ConfigError("remediation recording requires operations authorization")
+        ops = _recording_ops(self._recording, self._uow, self._findings, self._publisher)
         doc = RemediationArtifact.parse(doc.payload)
         repository = self._inventory.find_repository(doc.metadata.repository)
         if repository is None or repository.id is None:
             raise NotFoundError(f"repository {doc.metadata.repository}")
-        with self._recording.recording(
+        with ops.recording(
             order_id=run_order_id,
             principal=principal,
             kind=RecordKind.REMEDIATION,
             repository_id=repository.id,
             provenance=provenance,
+            lease_generation=lease_generation,
         ) as order:
             # NEED(contracts: remediation recording section): the door shares the triage
             # allowlist until contracts lands a remediation section, so the allowlist alone
@@ -866,13 +888,16 @@ class RemediationService:
                     f"order {run_order_id}: remediation report covers findings of another"
                     " repository"
                 )
-        staged = self._stage_remediation(doc, provenance, order.work_item_id, diff)
-        with self._recording.recording(
+        staged = self._stage_remediation(
+            doc, provenance, order.work_item_id, diff, run_order_id=run_order_id
+        )
+        with ops.recording(
             order_id=run_order_id,
             principal=principal,
             kind=RecordKind.REMEDIATION,
             repository_id=repository.id,
             provenance=provenance,
+            lease_generation=lease_generation,
         ) as current:
             if (current.asset, current.work_item_id) != (order.asset, order.work_item_id):
                 raise ConflictError(
@@ -889,7 +914,6 @@ class RemediationService:
         provenance: Provenance,
         *,
         work_item_id: UUID | None = None,
-        run_order_id: UUID | None = None,
         diff: bytes | None = None,
     ) -> WorkItem: ...
     @overload
@@ -900,20 +924,15 @@ class RemediationService:
         provenance: Provenance,
         *,
         work_item_id: UUID | None = None,
-        run_order_id: UUID | None = None,
         diff: bytes | None = None,
     ) -> WorkItem | FleetFix:
-        """A report on the open work item for exactly its findings (`finding_ref` = finding id),
-        the one the run prepared when it names it (`work_item_id`; the report itself doesn't):
-        attached by the order whose run recorded it, its Jira keys linked, the item moved to its
-        status; re-recording is a no-op."""
+        """Record a local report on its work item, or publish a fleet-fix spec."""
         if isinstance(doc, FleetFixArtifact):
             if diff is not None:
                 raise ValidationError("fleet-fix specs do not take remediation patch bytes")
             return self._record_fleet_fix(doc, provenance)
-        return self._record_remediation(
-            self._stage_remediation(doc, provenance, work_item_id, diff), run_order_id
-        )
+        staged = self._stage_remediation(doc, provenance, work_item_id, diff, run_order_id=None)
+        return self._record_remediation(staged, None)
 
     def _stage_remediation(
         self,
@@ -921,6 +940,8 @@ class RemediationService:
         provenance: Provenance,
         work_item_id: UUID | None,
         diff: bytes | None,
+        *,
+        run_order_id: UUID | None,
     ) -> _RemediationRecording:
         doc = RemediationArtifact.parse(doc.payload)
         if doc.fork.visibility == ForkVisibility.PUBLIC:
@@ -931,6 +952,10 @@ class RemediationService:
         status = RemediationStatus(doc.summary.status)
         digest = sha256_hex(doc.payload)
         item = self._reported_item(wanted, digest, work_item_id)
+        if item.reported_by is not None and item.reported_by != run_order_id:
+            raise ConflictError(
+                f"work item {item.work_item_id}: report belongs to order {item.reported_by}"
+            )
         pushed_to = str(_url(doc.fork.url))
         self.refuse_public(pushed_to)
         # a scheduled fix is pushed where it was scheduled: its commit is what verification of
@@ -960,6 +985,8 @@ class RemediationService:
                 raise IntegrityError(
                     f"artifact {published.id}: doc digest {digest} != published {published.digest}"
                 )
+        if run_order_id is not None:
+            self._findings.decisions.require_order_ledger()
         patch, refusal = None, None
         if diff is not None:
             try:
@@ -990,6 +1017,12 @@ class RemediationService:
         with self._uow.write() as uow:
             self._findings.lock_findings(item.finding_ids)
             held = self._log.documents([self._log.get(item.work_item_id)], (doc.schema,))
+            if any(
+                row.run_order_id is not None and row.run_order_id != run_order_id for _, row in held
+            ):
+                raise ConflictError(
+                    f"work item {item.work_item_id}: report belongs to another order"
+                )
             if any(row.digest != digest for _, row in held):
                 raise ConflictError(f"work item {item.work_item_id} already holds another report")
             patch = self._record_patch(staged)
@@ -1089,17 +1122,21 @@ class RemediationService:
         )
 
     def apply_fleet_fix(
-        self, fleet_fix_id: UUID, target_id: UUID, approval_id: UUID
+        self,
+        fleet_fix_id: UUID,
+        target_id: UUID,
+        approval_id: UUID,
+        *,
+        worker: WorkerId,
+        lease_generation: int,
     ) -> PatchResult:
         """Apply a recorded spec to the target repository's default-branch head, under the
         approved run order the engine is executing, through the engine's applier (diffs only);
         recorded as a `fleet_fix` assessment of that commit holding the spec."""
+        guard = order_binding(
+            self._ops, self._uow, approval_id, target_id, worker, lease_generation
+        )
         fix = self.get_fleet_fix(fleet_fix_id)
-        order = self._ops.get(approval_id)
-        if order.repository_id != target_id or order.state != OrderState.LEASED:
-            raise ForbiddenError(
-                f"run order {approval_id} is not a leased order for repository {target_id}"
-            )
         manifest = self._ops.manifest(approval_id)
         if _fleet_fix_of(manifest.config) != fleet_fix_id:
             raise ForbiddenError(f"run order {approval_id} is not for fleet fix {fleet_fix_id}")
@@ -1124,24 +1161,25 @@ class RemediationService:
             raise ValidationError(
                 f"guard: {len(diff.files_changed)} files changed exceeds max_files_changed={limit}"
             )
-        recorded = self._log.find_recorded(
-            [ref.id], FLEET_FIX, FleetFixArtifact.schema, fix.artifact.digest
-        )
-        if recorded:
-            assessment = recorded[0][0]
-        else:
-            assessment, _ = self._log.add(
-                Assessment(
-                    repository_ref_id=ref.id,
-                    kind=FLEET_FIX,
-                    status=ASSESSMENT_COMPLETED,
-                    assessor=FLEET_FIX_ASSESSOR,
-                    assessor_version="",
-                    occurred_at=self._clock.now(),
-                ),
-                fleet_fix_id,
-                fix.artifact.digest,
+        with guard:
+            recorded = self._log.find_recorded(
+                [ref.id], FLEET_FIX, FleetFixArtifact.schema, fix.artifact.digest
             )
+            if recorded:
+                assessment = recorded[0][0]
+            else:
+                assessment, _ = self._log.add(
+                    Assessment(
+                        repository_ref_id=ref.id,
+                        kind=FLEET_FIX,
+                        status=ASSESSMENT_COMPLETED,
+                        assessor=FLEET_FIX_ASSESSOR,
+                        assessor_version="",
+                        occurred_at=self._clock.now(),
+                    ),
+                    fleet_fix_id,
+                    fix.artifact.digest,
+                )
         assert assessment.id is not None
         if not recorded:
             self._uow.after_commit(
@@ -1222,11 +1260,21 @@ class RemediationService:
             fix_id = _fleet_fix_of(self._ops.manifest(order.id).config)
             if fix_id is None:
                 raise IntegrityError(f"order {order.id}: its run manifest names no fleet fix")
-            patch = self.apply_fleet_fix(fix_id, order.repository_id, order.id)
+            patch = self.apply_fleet_fix(
+                fix_id,
+                order.repository_id,
+                order.id,
+                worker=worker,
+                lease_generation=order.lease_generation,
+            )
         except Exception as error:
-            self._ops.complete(order.id, worker, _refusal(error))
+            self._ops.complete(
+                order.id, worker, _refusal(error), lease_generation=order.lease_generation
+            )
             raise
-        done = self._ops.complete(order.id, worker, JobResult.succeeded())
+        done = self._ops.complete(
+            order.id, worker, JobResult.succeeded(), lease_generation=order.lease_generation
+        )
         return FleetFixRun(order=done, patch=patch)
 
     def get(self, work_item_id: UUID) -> WorkItem:
@@ -1681,33 +1729,43 @@ class VerificationService:
         provenance: Provenance,
         run_order_id: UUID,
         principal: Principal,
+        *,
+        lease_generation: int,
     ) -> Verification:
-        if self._recording is None:
-            raise ConfigError("verification recording requires operations authorization")
+        ops = _recording_ops(self._recording, self._uow, self._findings, self._publisher)
+        doc = VerificationArtifact.parse(doc.payload)
         repository = self._inventory.find_repository(doc.metadata.repository)
         if repository is None or repository.id is None:
             raise NotFoundError(f"repository {doc.metadata.repository}")
-        with self._recording.recording(
-            order_id=run_order_id,
-            principal=principal,
-            kind=RecordKind.VERIFICATION,
-            repository_id=repository.id,
-            provenance=provenance,
-        ):
-            return self.record(doc, provenance, run_order_id=run_order_id)
+        ops.check_recording(
+            run_order_id,
+            principal,
+            RecordKind.VERIFICATION,
+            repository.id,
+            provenance,
+            lease_generation=lease_generation,
+        )
+        guard = ops.recording(
+            run_order_id,
+            principal,
+            RecordKind.VERIFICATION,
+            repository.id,
+            provenance,
+            lease_generation=lease_generation,
+        )
+        return self._record(doc, provenance, run_order_id, guard)
 
-    def record(
+    def record(self, doc: VerificationArtifact, provenance: Provenance) -> Verification:
+        """Record a local verification report and its findings and verdicts atomically."""
+        return self._record(doc, provenance, None, nullcontext())
+
+    def _record(
         self,
         doc: VerificationArtifact,
         provenance: Provenance,
-        *,
-        run_order_id: UUID | None = None,
+        run_order_id: UUID | None,
+        guard: AbstractContextManager[object],
     ) -> Verification:
-        """A verification report (`original_id` = finding id from prepare) as a `verification`
-        assessment of the patched commit: its verdicts as decisions, its regressions as findings.
-        The assessment, its report, the regressions, the verdicts and the revalidation of the
-        remediations scheduled on them are one transaction; only the published bytes precede it.
-        Re-recording a finished run changes nothing."""
         if warnings := check_verification(doc):
             log.warning("verification report has %d warnings", len(warnings))
         meta = doc.metadata
@@ -1736,10 +1794,12 @@ class VerificationService:
                 digest,
             )
 
-        # the bytes go first, outside the transaction: content-addressed, a copy is harmless
-        published = None
+        staged = None
         if not recorded():
-            published = (provenance.artifact or self._publisher.publish_ref(doc)).id
+            if run_order_id is not None:
+                self._findings.decisions.require_order_ledger()
+            if provenance.artifact is None:
+                staged = self._publisher.stage(doc)
         said: defaultdict[tuple[Any, ...], list[UUID]] = defaultdict(list)
         for finding_id, f in verdicts.items():
             propagation = f.cross_repo.propagation if f.cross_repo else None
@@ -1747,17 +1807,25 @@ class VerificationService:
         rationales = {
             i: " ".join(f.evidence.explanation.split())[:RATIONALE_CAP] for i, f in verdicts.items()
         }
-        with self._uow.write() as uow:
+        with guard, self._uow.write() as uow:
             # under the write lock: a delivery of the same report may have landed meanwhile
             if found := recorded():
                 assessment, report = found[0]
-                if run_order_id is not None and assessment.run_order_id != run_order_id:
+                if assessment.run_order_id != run_order_id:
                     raise ConflictError(
                         f"verification assessment {assessment.id} belongs to order "
                         f"{assessment.run_order_id}, not {run_order_id}"
                     )
+                if assessment.run_order_id is not None:
+                    self._findings.decisions.require_order_ledger()
+                    assert assessment.id is not None
+                    return self._recorded_verification(repository_id, assessment.id)
             else:
-                assert published is not None  # a recorded assessment is never removed
+                if staged is not None:
+                    published = self._publisher.publish_staged(staged).artifact_id
+                else:
+                    assert provenance.artifact is not None  # recorded assessments are never removed
+                    published = provenance.artifact.id
                 assessment, report = self._log.add(
                     Assessment(
                         repository_ref_id=ref.id,  # type: ignore[arg-type]
@@ -1798,10 +1866,13 @@ class VerificationService:
                     "verification %s: %d verdicts on ref %s", assessment.id, len(verdicts), ref.id
                 )
             )
-        (verification,) = (
-            v for v in self._verifications(repository_id) if v.verification_id == assessment.id
-        )
-        return verification
+        return self._recorded_verification(repository_id, assessment.id)
+
+    def _recorded_verification(self, repository_id: UUID, assessment_id: UUID) -> Verification:
+        for verification in self._verifications(repository_id):
+            if verification.verification_id == assessment_id:
+                return verification
+        raise IntegrityError(f"verification assessment {assessment_id} lacks its recorded result")
 
     def _audit_of(
         self, finding_ids: Sequence[UUID], original_commit: str, patched: RepositoryRef

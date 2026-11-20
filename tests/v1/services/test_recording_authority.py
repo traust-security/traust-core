@@ -47,6 +47,7 @@ HUMAN = Principal(
     verified_by=IdentitySource.OIDC,
 )
 LEASE = timedelta(minutes=5)
+WORKER = WorkerId(OWNER.ref)
 
 
 @dataclass
@@ -63,11 +64,21 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
         yield database
 
 
-def scoped(engine: Engine, tmp_path: Path, *, enabled: bool = True):
+def scoped(
+    engine: Engine,
+    tmp_path: Path,
+    *,
+    enabled: bool = True,
+    kind: RecordKind = RecordKind.VERIFICATION,
+):
     clock = MovingClock()
     context = Context(
         Config(
-            home=tmp_path, recording=RecordingConfig(verification=("verify",) if enabled else ())
+            home=tmp_path,
+            recording=RecordingConfig(
+                verification=("verify",) if enabled and kind == RecordKind.VERIFICATION else (),
+                validation=("verify",) if enabled and kind == RecordKind.VALIDATION else (),
+            ),
         ),
         clock=clock,
     )
@@ -82,7 +93,12 @@ def scoped(engine: Engine, tmp_path: Path, *, enabled: bool = True):
         WorkerId(OWNER.ref),
         LEASE,
     )
-    provenance = Provenance(run_id=order.id, source=SourceType.VERIFICATION_REPORT, occurred_at=T0)
+    source = (
+        SourceType.VALIDATION_REPORT
+        if kind == RecordKind.VALIDATION
+        else SourceType.VERIFICATION_REPORT
+    )
+    provenance = Provenance(run_id=order.id, source=source, occurred_at=T0 + timedelta(seconds=1))
     return context, ops, order, provenance, clock
 
 
@@ -90,8 +106,17 @@ def test_owned_live_lease_commits_record_work_without_extending_or_completing_it
     engine: Engine, tmp_path: Path
 ) -> None:
     context, ops, order, provenance, _ = scoped(engine, tmp_path)
-    with ops.recording(order.id, OWNER, RecordKind.VERIFICATION, order.repository_id, provenance):
-        ops.save_progress(order.id, OrderProgress(step=3))
+    with ops.recording(
+        order.id,
+        OWNER,
+        RecordKind.VERIFICATION,
+        order.repository_id,
+        provenance,
+        lease_generation=order.lease_generation,
+    ):
+        ops.save_progress(
+            order.id, OrderProgress(step=3), worker=WORKER, lease_generation=order.lease_generation
+        )
     saved = ops.get(order.id)
     assert saved.artifact_id is not None
     assert (saved.state, saved.lease_holder, saved.lease_expires_at) == (
@@ -101,6 +126,82 @@ def test_owned_live_lease_commits_record_work_without_extending_or_completing_it
     )
     publisher = context.artifact_publisher(PublishSpecs(PublishSpec(RunManifestArtifact)))
     assert json.loads(publisher.get(saved.artifact_id).payload)["progress"]["step"] == 3
+
+
+@pytest.mark.parametrize("kind", [RecordKind.VALIDATION, RecordKind.VERIFICATION])
+def test_reclaimed_order_rejects_old_attempt_from_same_runner(
+    engine: Engine, tmp_path: Path, kind: RecordKind
+) -> None:
+    _, ops, order, provenance, clock = scoped(engine, tmp_path, kind=kind)
+    clock.at = T0 + LEASE
+    assert ops.requeue_expired() == 1
+    clock.at = T0
+    reclaimed = ops.claim(WORKER, LEASE, order_id=order.id)
+    assert reclaimed is not None and reclaimed.started_at == order.started_at
+    assert reclaimed.lease_generation == order.lease_generation + 1
+
+    args = order.id, OWNER, kind, order.repository_id, provenance
+    with pytest.raises(ConflictError, match="stale lease generation"):
+        ops.check_recording(*args, lease_generation=order.lease_generation)
+    with (
+        pytest.raises(ConflictError, match="stale lease generation"),
+        ops.recording(*args, lease_generation=order.lease_generation),
+    ):
+        pytest.fail("stale lease entered the recording transaction")
+    assert ops.get(order.id) == reclaimed
+
+    assert provenance.occurred_at != reclaimed.started_at
+    ops.check_recording(*args, lease_generation=reclaimed.lease_generation)
+    with ops.recording(*args, lease_generation=reclaimed.lease_generation):
+        ops.save_progress(
+            order.id,
+            OrderProgress(step=2),
+            worker=WORKER,
+            lease_generation=reclaimed.lease_generation,
+        )
+    assert ops.get(order.id).artifact_id is not None
+
+
+def test_bound_writes_and_their_precheck_require_the_original_live_lease(
+    engine: Engine, tmp_path: Path
+) -> None:
+    _, ops, order, _, clock = scoped(engine, tmp_path)
+    clock.at = T0 + LEASE
+    reclaimed = ops.claim(WORKER, LEASE, order_id=order.id)
+    assert reclaimed is not None
+    args = order.id, order.repository_id
+    for worker, generation in (
+        (WORKER, order.lease_generation),
+        (WorkerId(OTHER.ref), reclaimed.lease_generation),
+    ):
+        with pytest.raises(ConflictError):
+            ops.check_bound(*args, worker=worker, lease_generation=generation)
+        with (
+            pytest.raises(ConflictError),
+            ops.bound(*args, worker=worker, lease_generation=generation),
+        ):
+            pytest.fail("unauthorized bound writer entered the transaction")
+    with pytest.raises(ForbiddenError):
+        ops.check_bound(
+            order.id, uuid4(), worker=WORKER, lease_generation=reclaimed.lease_generation
+        )
+
+    assert (
+        ops.check_bound(*args, worker=WORKER, lease_generation=reclaimed.lease_generation)
+        == reclaimed
+    )
+    with (
+        pytest.raises(ConflictError, match="expired"),
+        ops.bound(*args, worker=WORKER, lease_generation=reclaimed.lease_generation),
+    ):
+        ops.save_progress(
+            order.id,
+            OrderProgress(step=2),
+            worker=WORKER,
+            lease_generation=reclaimed.lease_generation,
+        )
+        clock.at += LEASE
+    assert ops.get(order.id) == reclaimed
 
 
 @pytest.mark.parametrize(
@@ -131,8 +232,18 @@ def test_record_authority_denies_before_work_or_progress_is_written(
         provenance = provenance.model_copy(update={"source": SourceType.TRIAGE_REPORT})
     error = ValidationError if fault in {"provenance", "source"} else ForbiddenError
     before = ops.get(order.id)
-    with pytest.raises(error), ops.recording(order.id, principal, kind, repository_id, provenance):
-        ops.save_progress(order.id, OrderProgress(step=1))
+    with (
+        pytest.raises(error),
+        ops.recording(
+            order.id,
+            principal,
+            kind,
+            repository_id,
+            provenance,
+            lease_generation=order.lease_generation,
+        ),
+    ):
+        pytest.fail("unauthorized recorder entered the transaction")
     assert ops.get(order.id) == before
     with SqlTraustUnitOfWork(engine) as uow:
         assert (
@@ -148,9 +259,16 @@ def test_expired_or_boundary_lease_cannot_authorize_recording(
     clock.at = T0 + elapsed
     with (
         pytest.raises(ConflictError),
-        ops.recording(order.id, OWNER, RecordKind.VERIFICATION, order.repository_id, provenance),
+        ops.recording(
+            order.id,
+            OWNER,
+            RecordKind.VERIFICATION,
+            order.repository_id,
+            provenance,
+            lease_generation=order.lease_generation,
+        ),
     ):
-        ops.save_progress(order.id, OrderProgress(step=1))
+        pytest.fail("expired lease entered the transaction")
     assert ops.get(order.id).artifact_id is None
 
 
@@ -159,9 +277,18 @@ def test_expiry_during_recording_rolls_back_nested_commits(engine: Engine, tmp_p
     before = ops.get(order.id)
     with (
         pytest.raises(ConflictError),
-        ops.recording(order.id, OWNER, RecordKind.VERIFICATION, order.repository_id, provenance),
+        ops.recording(
+            order.id,
+            OWNER,
+            RecordKind.VERIFICATION,
+            order.repository_id,
+            provenance,
+            lease_generation=order.lease_generation,
+        ),
     ):
-        ops.save_progress(order.id, OrderProgress(step=2))
+        ops.save_progress(
+            order.id, OrderProgress(step=2), worker=WORKER, lease_generation=order.lease_generation
+        )
         clock.at = T0 + LEASE
     assert ops.get(order.id) == before
     with SqlTraustUnitOfWork(engine) as uow:
@@ -172,12 +299,21 @@ def test_expiry_during_recording_rolls_back_nested_commits(engine: Engine, tmp_p
 
 def test_finished_order_is_not_recording_authority(engine: Engine, tmp_path: Path) -> None:
     _, ops, order, provenance, _ = scoped(engine, tmp_path)
-    finished = ops.complete(order.id, WorkerId(OWNER.ref), JobResult.succeeded())
+    finished = ops.complete(
+        order.id, WORKER, JobResult.succeeded(), lease_generation=order.lease_generation
+    )
     with (
         pytest.raises(ConflictError),
-        ops.recording(order.id, OWNER, RecordKind.VERIFICATION, order.repository_id, provenance),
+        ops.recording(
+            order.id,
+            OWNER,
+            RecordKind.VERIFICATION,
+            order.repository_id,
+            provenance,
+            lease_generation=order.lease_generation,
+        ),
     ):
-        ops.save_progress(order.id, OrderProgress(step=1))
+        pytest.fail("finished order entered the transaction")
     assert ops.get(order.id) == finished
 
 
@@ -192,9 +328,10 @@ def test_unknown_order_does_not_authorize_recording(engine: Engine, tmp_path: Pa
             RecordKind.VERIFICATION,
             order.repository_id,
             provenance.model_copy(update={"run_id": missing}),
+            lease_generation=order.lease_generation,
         ),
     ):
-        ops.save_progress(order.id, OrderProgress(step=1))
+        pytest.fail("unknown order entered the transaction")
 
 
 def test_an_asset_on_two_report_kinds_allowlists_is_refused() -> None:

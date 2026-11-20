@@ -3,6 +3,7 @@ from __future__ import annotations
 from uuid import UUID
 
 from fastapi import APIRouter
+from pydantic import Field
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.artifacts import ValidationArtifact
@@ -18,6 +19,7 @@ router = APIRouter()
 
 class RecordValidation(Model):
     run_order_id: UUID
+    lease_generation: int = Field(strict=True, gt=0)
     payload: str
     provenance: Provenance
     bindings: ValidationRecordInput
@@ -37,4 +39,5 @@ def record_validation(
         body.bindings,
         body.run_order_id,
         caller,
+        lease_generation=body.lease_generation,
     )

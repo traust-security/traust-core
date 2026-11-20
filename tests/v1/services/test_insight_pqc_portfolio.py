@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy.engine import Engine
 
 from tests.v1.repositories.tables.conftest import T0, Seed
+from tests.v1.services.test_exposure_coverage import legacy_scan
 from tests.v1.services.test_pqc import (
     PROVENANCE,
     REPORT,
@@ -211,6 +212,52 @@ def test_an_empty_portfolio_says_so(engine: Engine) -> None:  # noqa: F811
     assert model.scopes[0].repositories == () and model.products == ()
     text = MarkdownRenderer().render(view.report(model, T0)).decode()
     assert "_No readiness recorded._" in text and "Without a manifest SBOM" not in text
+
+
+def test_crypto_package_report_distinguishes_unbacked_sboms_from_observed_packages(
+    engine: Engine,  # noqa: F811
+) -> None:
+    world = World(engine, None)
+    positive = world.ref()
+    empty = world.ref(
+        url=f"{URL}-unbacked", sbom=b'{"bomFormat":"CycloneDX","components":[]}'
+    )
+    world.pqc.record(positive, report(), PROVENANCE)
+    world.pqc.record(empty, report(metadata=meta(f"{URL}-unbacked")), PROVENANCE)
+    view = PqcPortfolioView(world.pqc, world.code_facts, world.portfolio)
+    model, report_output = view.build_report(ViewFilter(), T0)
+    [scope] = model.scopes
+
+    assert scope.without_sbom == 0
+    assert scope.packages and all(p.repositories == 1 for p in scope.packages)
+    text = MarkdownRenderer().render(report_output).decode()
+    assert "Observed crypto packages (manifest SBOMs)" in text
+    assert "Commits without scan-backed manifest coverage: 2" in text
+
+
+def test_crypto_package_report_uses_legacy_gaps_but_keeps_docker_unknown(
+    engine: Engine,  # noqa: F811
+) -> None:
+    world = World(engine, None)
+    legacy = world.ref()
+    unrecognized = world.ref(url=f"{URL}-unknown")
+    document = world.ref(url=f"{URL}-document")
+    legacy_scan(engine, world.exposure, legacy, {"pypi": {"requirements.in": "no-lockfile"}})
+    legacy_scan(engine, world.exposure, unrecognized, {}, assessor="unrecognized-probe")
+    for ref, url in (
+        (legacy, URL),
+        (unrecognized, f"{URL}-unknown"),
+        (document, f"{URL}-document"),
+    ):
+        world.pqc.record(ref, report(metadata=meta(url)), PROVENANCE)
+    view = PqcPortfolioView(world.pqc, world.code_facts, world.portfolio)
+    model, rendered = view.build_report(ViewFilter(), T0)
+    assert len(model.scopes[0].repositories) == 3
+    text = MarkdownRenderer().render(rendered).decode()
+    assert "Commits without scan-backed manifest coverage: 1" in text
+    assert "Commits with an unrecognized manifest coverage probe: 1" in text
+    assert "docker: coverage unknown in 1 commit with a legacy scan." in text
+    assert "pypi: unresolved manifests in 1 commit." in text
 
 
 @pytest.mark.parametrize(

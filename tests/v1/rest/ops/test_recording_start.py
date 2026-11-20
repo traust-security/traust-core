@@ -30,6 +30,7 @@ from traust_core.v1.models.operations import (
 from traust_core.v1.models.vocabulary import SourceType
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.identity import IdentityConfig
+from traust_core.v1.services.ledger import LedgerConfig
 
 URL = "/v1/orders/start"
 
@@ -51,6 +52,7 @@ def context(engine: Engine, tmp_path: Path) -> Context:
         Config(
             home=tmp_path,
             identity=IdentityConfig(trust_local=True),
+            ledger=LedgerConfig(),
             recording=RecordingConfig(
                 verification=("verify",),
                 start=(
@@ -63,6 +65,7 @@ def context(engine: Engine, tmp_path: Path) -> Context:
             ),
         )
     )
+    context.local_issuer.mint("runner-7", machine=True)
     context.__dict__["database"] = engine
     return context
 
@@ -145,7 +148,12 @@ def test_verified_machine_starts_its_scoped_run_and_can_record(
         occurred_at=order.started_at,
     )
     with context.services().ops.recording(
-        order.id, principal(context), RecordKind.VERIFICATION, order.repository_id, provenance
+        order.id,
+        principal(context),
+        RecordKind.VERIFICATION,
+        order.repository_id,
+        provenance,
+        lease_generation=response.json()["lease_generation"],
     ):
         pass
     assert context.services().ops.get(order.id) == order

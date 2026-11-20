@@ -100,11 +100,22 @@ def test_historical_order_text_reads_without_permitting_new_unregistered_writes(
         service.submit(OrderRequest(asset="repo_state", priority=1, lane=historical.lane), OPERATOR)
     claimed = service.claim(W1, LEASE)
     assert claimed is not None and claimed.id == historical.id
-    completed = service.complete(claimed.id, W1, JobResult.failed(OrderReason.RUNNER_CRASHED))
+    completed = service.complete(
+        claimed.id,
+        W1,
+        JobResult.failed(OrderReason.RUNNER_CRASHED),
+        lease_generation=claimed.lease_generation,
+    )
     assert (completed.state, completed.reason) == (OrderState.FAILED, "runner-crashed")
     assert (completed.lane, completed.event_source) == (historical.lane, historical.event_source)
     assert (
-        service.complete(claimed.id, W1, JobResult.failed(OrderReason.RUNNER_CRASHED)) == completed
+        service.complete(
+            claimed.id,
+            W1,
+            JobResult.failed(OrderReason.RUNNER_CRASHED),
+            lease_generation=claimed.lease_generation,
+        )
+        == completed
     )
 
 
@@ -126,7 +137,7 @@ def test_invalid_degraded_completion_preserves_the_lease_and_artifact_history(
     before = rows(engine)
     result = JobResult.partly({"unreachable": 1}).model_copy(update={"degraded": degraded})
     with pytest.raises(ValidationError):
-        ops(engine).complete(order.id, W1, result)
+        ops(engine).complete(order.id, W1, result, lease_generation=order.lease_generation)
     assert stored(engine, order) == order
     assert rows(engine) == before
 
@@ -136,11 +147,18 @@ def test_registered_cause_and_ledger_counts_are_retained_on_completion_and_repla
 ) -> None:
     order = leased(engine)
     counts = {"unreachable": 2, "db-stale": 1, "failed": 1, "unverified": 3}
-    completed = ops(engine).complete(order.id, W1, JobResult.partly(counts))
+    completed = ops(engine).complete(
+        order.id, W1, JobResult.partly(counts), lease_generation=order.lease_generation
+    )
     assert completed.state == OrderState.DEGRADED
     assert manifest(engine, completed)["degraded"] == counts
     before = rows(engine)
-    assert ops(engine).complete(order.id, W1, JobResult.partly(counts)) == completed
+    assert (
+        ops(engine).complete(
+            order.id, W1, JobResult.partly(counts), lease_generation=order.lease_generation
+        )
+        == completed
+    )
     assert rows(engine) == before
 
 
@@ -159,7 +177,9 @@ def test_registered_feed_and_view_keys_preserve_their_domain_identifiers(
     claimed = services.ops.claim(W1, LEASE)
     assert claimed is not None and claimed.id == submitted.id
     counts = {"tenant-feed": 2, "loc": 1, "db-stale": 1, "osv_unanswered": 3}
-    completed = services.ops.complete(claimed.id, W1, JobResult.partly(counts))
+    completed = services.ops.complete(
+        claimed.id, W1, JobResult.partly(counts), lease_generation=claimed.lease_generation
+    )
     assert completed.state == OrderState.DEGRADED
     payload = (
         context.artifact_publisher(PublishSpecs(PublishSpec(RunManifestArtifact)))
@@ -180,9 +200,16 @@ def test_historical_degraded_keys_survive_progress_without_rewriting_the_artifac
     service = ops(engine)
     claimed = service.claim(W1, LEASE)
     assert claimed is not None and claimed.id == order.id
-    service.save_progress(order.id, OrderProgress(step=1))
+    service.save_progress(
+        claimed.id, OrderProgress(step=1), worker=W1, lease_generation=claimed.lease_generation
+    )
     assert manifest(engine, order)["degraded"] == {"historical-gap": 2}
     assert publisher(engine).get(held.artifact_id).payload == artifact.payload
-    completed = service.complete(order.id, W1, JobResult.partly({"unreachable": 1}))
+    completed = service.complete(
+        order.id,
+        W1,
+        JobResult.partly({"unreachable": 1}),
+        lease_generation=claimed.lease_generation,
+    )
     assert manifest(engine, completed)["degraded"] == {"unreachable": 1}
     assert publisher(engine).get(held.artifact_id).payload == artifact.payload

@@ -75,8 +75,8 @@ export function claim() {
   check(res, { 'claim is 200 or 204': () => ok });
   if (res.status === 200) {
     // finish the lease so the queue keeps flowing and a later claim can reach the head
-    const id = res.json('id');
-    const done = { result: { outcome: 'succeeded' } };
+    const { id, lease_generation } = res.json();
+    const done = { lease_generation, result: { outcome: 'succeeded' } };
     http.post(`${BASE}/v1/orders/${id}/complete`, JSON.stringify(done), RUNNER);
   }
 }

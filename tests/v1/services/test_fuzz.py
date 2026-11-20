@@ -16,12 +16,19 @@ from tests.v1.repositories.tables.conftest import Seed
 from tests.v1.services import test_assessment_record as recording
 from tests.v1.services.test_assessment_record import WHEN, fixture
 from traust_core.v1.context import Context
-from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError, ViewContractError
+from traust_core.v1.errors import (
+    ConfigError,
+    NotFoundError,
+    ServiceError,
+    ValidationError,
+    ViewContractError,
+)
 from traust_core.v1.models.artifacts import FuzzReportArtifact, IsolationReviewArtifact
 from traust_core.v1.models.assessment import Assessment, AssessmentKind
 from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.findings import AssessedJudgment, Decision
 from traust_core.v1.models.insight import ValidationFuzz, ViewFilter, ViewName
+from traust_core.v1.models.operations import RunOrder, WorkerId
 from traust_core.v1.models.validation import ValidationRollup
 from traust_core.v1.models.vocabulary import DispositionAssurance, SourceType, Validity
 from traust_core.v1.rendering.markdown import MarkdownRenderer
@@ -55,7 +62,14 @@ def ref(engine: Engine) -> UUID:
     return saved.id
 
 
-def record(context: Context, doc: FuzzReportArtifact, ref: UUID, at: Any = WHEN) -> Assessment:
+def record(
+    context: Context,
+    doc: FuzzReportArtifact,
+    ref: UUID,
+    at: Any = WHEN,
+    *,
+    order: RunOrder | None = None,
+) -> Assessment:
     return context.services().assessment.record(
         doc,
         ref,
@@ -63,6 +77,9 @@ def record(context: Context, doc: FuzzReportArtifact, ref: UUID, at: Any = WHEN)
         "skill:create-fuzzing",
         "0.1.0",
         Provenance(run_id=uuid4(), source=SourceType.INTERACTIVE, occurred_at=at),
+        run_order_id=order.id if order else None,
+        worker=WorkerId("machine:runner") if order else None,
+        lease_generation=order.lease_generation if order else None,
     )
 
 
@@ -104,6 +121,22 @@ def test_a_clean_run_records_no_finding(context: Context, ref: UUID) -> None:
     assessment = record(context, report(), ref)
     assert occurrences(context, assessment) == {}
     assert finding_count(context, ref) == 0
+
+
+def test_a_leased_fuzz_run_needs_a_ledger_only_for_a_reproduced_finding(
+    context: Context, ref: UUID
+) -> None:
+    run = recording.order(context, ref)
+    with pytest.raises(ServiceError, match="requires a ledger"):
+        record(context, report(crasher("C-1")), ref, order=run)
+    with SqlTraustUnitOfWork(context.database) as uow:
+        assert uow.assessments.list_for_ref(ref) == []
+        assert uow.artifacts.latest_imported(FuzzReportArtifact.schema) is None
+    assert finding_count(context, ref) == 0
+
+    clean = record(context, report(), ref, order=run)
+    assert clean.run_order_id == run.id
+    assert occurrences(context, clean) == {}
 
 
 def test_a_crasher_naming_a_finding_confirms_it_rather_than_minting_one(

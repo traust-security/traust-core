@@ -136,6 +136,9 @@ def test_a_reaudit_holds_a_finding_it_names_differently_instead_of_duplicating_i
     with SqlTraustUnitOfWork(engine) as uow:
         reported = {o.finding_id for o in uow.occurrences.list_for_assessment(again)}
     assert old.id not in reported and len(reported) == len(BODY["findings"]) - 1
+    bindings = services.assessment.intake_bindings(again).findings
+    assert set(bindings) == {f["id"] for f in BODY["findings"][1:]}
+    assert set(bindings.values()) == reported
     [item] = mapping_reviews(services, old.id)
     assert item.status == ReviewItemStatus.PENDING
     with pytest.raises(ConflictError, match="pending"):

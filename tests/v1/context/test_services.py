@@ -225,7 +225,8 @@ def test_an_identity_section_wires_the_trusted_issuers_and_local_keys(tmp_path: 
     context = Context.from_file(path)
     identity = context.services().identity
     assert identity is not None and identity is context.identity
-    assert identity._provider.check().detail == "https://idp.example, local"
+    assert identity._provider._issuers["https://idp.example"].audience == "traust"
+    assert identity.authenticate(context.local_issuer.mint("alice@example.com")).is_verified_human()
     assert identity._provider._local_jwks == tmp_path / "local-jwks.json"
     assert identity._directory is None
 

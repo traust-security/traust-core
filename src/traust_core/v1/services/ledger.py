@@ -125,11 +125,7 @@ class LedgerConfig(Model):
 
 
 class LedgerService:
-    """Proof that decisions weren't changed: traust-ledger computes, these tables store.
-
-    Optional: decisions live in the decision table either way. Share the caller's unit of
-    work to append in the decision's transaction.
-    """
+    """Append proof in the decision writer's transaction; seal batches before commit."""
 
     def __init__(self, uow: LedgerUnitOfWork, config: LedgerConfig) -> None:
         self._uow = uow
@@ -137,7 +133,45 @@ class LedgerService:
         self._signing = SigningConfig(method="keypair", key_path=key)
         keys = (config.public_key_path, config.previous_public_key_path)
         self._public_keys = tuple(str(k) for k in keys if k is not None)
-        self._signing_required = config.required
+        self.config = config
+
+    @staticmethod
+    def require_order_config(config: LedgerConfig | None, *, signed: bool) -> None:
+        if config is None:
+            raise ServiceError("ledger: order-bound decision recording requires a ledger")
+        if signed or config.required:
+            LedgerService.check_signing(config)
+
+    @staticmethod
+    def check_signing(config: LedgerConfig | None) -> None:
+        """Sign and verify an in-memory probe with the current pair; no ledger rows are touched."""
+        if config is None or config.key_path is None or not config.key_path.is_file():
+            raise ServiceError("ledger: set ledger.key_path to a readable local cosign private key")
+        public = config.public_key_path
+        if public is None or not public.is_file():
+            raise ServiceError("ledger: set ledger.public_key_path to the matching public key")
+        if not config.required:
+            raise ServiceError("ledger: set ledger.required: true for signed decision recording")
+        signer = CosignBackend()
+        if not signer.available():
+            raise ServiceError("ledger: cosign not found on PATH -- install cosign")
+        # This payload contains no deployment data, even if the signer is misconfigured.
+        document: dict[str, Any] = {
+            "events": [],
+            "metadata": {"merkle_root": "0" * 64, "leaf_format": LEAF_FORMAT_CURRENT},
+        }
+        attempt = sign_if_configured(
+            document, SigningConfig(method="keypair", key_path=str(config.key_path))
+        )
+        if attempt.status != Signing.SIGNED:
+            raise ServiceError(
+                "ledger: cosign could not sign -- check ledger.key_path and COSIGN_PASSWORD"
+            )
+        if verify_merkle_signature(document, str(public), backend=signer, required=True):
+            raise ServiceError(
+                "ledger: cosign could not verify -- check ledger.public_key_path matches "
+                "ledger.key_path"
+            )
 
     @staticmethod
     def verify_document(
@@ -263,7 +297,7 @@ class LedgerService:
     def require_signable(self) -> None:
         """Refuse up front when signing is required but no key is configured (nothing written)."""
         key = self._signing.key_path
-        if self._signing_required and not (key and Path(key).is_file()):
+        if self.config.required and not (key and Path(key).is_file()):
             raise ServiceError(f"ledger: not signed: signing is required but no key is at {key}")
 
     def layers(self, repository_id: UUID) -> list[Layer]:
@@ -373,7 +407,7 @@ class LedgerService:
     def _verify(self, layer_id: UUID) -> VerifyResult:
         with self._uow:
             document = self._document(self._uow.layers.get(layer_id))
-        issues = self._issues(document, required=self._signing_required)
+        issues = self._issues(document, required=self.config.required)
         return VerifyResult(
             layer_id=layer_id,
             errors=tuple(i.message for i in issues if i.severity is Severity.ERROR),
@@ -387,7 +421,7 @@ class LedgerService:
             if layer is not None:
                 document = self._document(layer)
                 self._refuse_unless_intact(
-                    layer, self._issues(document, required=self._signing_required)
+                    layer, self._issues(document, required=self.config.required)
                 )
                 if layer.merkle_frontier is None and document["events"]:
                     frontier = compute_frontier(
@@ -448,8 +482,8 @@ class LedgerService:
         if stale and attempt.status != Signing.SIGNED:
             attempt = replace(attempt, stale_signature_dropped=True)
         signing = Signing(attempt.status)
-        if self._signing_required and signing is not Signing.SIGNED:
-            raise ServiceError(f"ledger: layer {layer.id} not signed ({attempt.error or signing})")
+        if self.config.required and signing is not Signing.SIGNED:
+            raise ServiceError(f"ledger: layer {layer.id} not signed ({signing})")
         signed = {k: document["metadata"].get(k) for k in _SIGNATURE}
         saved = self._uow.layers.update(layer.model_copy(update=signed))
         return Checkpoint(layer=saved, signing=signing, warning=attempt.warning())

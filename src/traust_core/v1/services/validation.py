@@ -538,9 +538,11 @@ class ValidationService:
         bindings: ValidationRecordInput,
         run_order_id: UUID,
         principal: Principal,
+        *,
+        lease_generation: int,
     ) -> ValidationRecordResult:
         return self._decisions.record_validation_order(
-            doc, provenance, bindings, run_order_id, principal
+            doc, provenance, bindings, run_order_id, principal, lease_generation=lease_generation
         )
 
     def evidence(

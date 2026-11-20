@@ -13,6 +13,7 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.providers.test_crypto import AT, DEPENDENCY_PROBES, FIXTURE, legacy_shape
 from tests.v1.repositories.tables.conftest import Seed
+from tests.v1.services.test_exposure_sweep import FakeSbomTool
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError, IntegrityError
 from traust_core.v1.models.artifacts import CodeFactsArtifact
@@ -25,6 +26,7 @@ from traust_core.v1.models.code_facts import (
 )
 from traust_core.v1.models.dependencies import NoManifestSbomError
 from traust_core.v1.models.inventory import RepositoryRef
+from traust_core.v1.models.vocabulary import Ecosystem
 from traust_core.v1.providers.base import Acquisition, ProviderRegistry, Readiness, Result
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.crypto import CryptoProbe
@@ -82,7 +84,11 @@ class Stray:
 
 
 def services(
-    engine: Engine, *, exposure: bool = True, probe: object | None = None
+    engine: Engine,
+    *,
+    exposure: bool = True,
+    probe: object | None = None,
+    sbom_tool: FakeSbomTool | None = None,
 ) -> tuple[ExposureService, CodeFactsService]:
     uow = SqlTraustUnitOfWork(engine)
     store = InMemoryObjectStore()
@@ -92,6 +98,7 @@ def services(
         feeds=ProviderRegistry[FeedProvider]("feed"),
         objects=store,
         portfolio=PortfolioService(uow, PortfolioPolicy()),
+        sbom_tool=sbom_tool,
     )
     facts = CodeFactsService(
         AssessmentService(uow),
@@ -249,3 +256,40 @@ def test_a_non_crypto_fact_from_the_enumerator_is_an_integrity_error(engine: Eng
     exposure.ingest_sbom(MAPPING_SBOM, commit.id)
     with pytest.raises(IntegrityError, match="1 non-crypto facts"):
         code_facts.crypto(commit.id, CHECKOUT)
+
+
+def test_crypto_package_observations_keep_their_scan_coverage(engine: Engine, tmp_path: Path) -> None:
+    commit = ref(engine)
+    assert commit.id is not None
+    empty_sbom = b'{"bomFormat":"CycloneDX","components":[]}'
+    exposure, code_facts = services(engine, sbom_tool=FakeSbomTool(raw=empty_sbom))
+    (tmp_path / "package.json").write_text('{"dependencies":{"ordinary-package":"^1"}}')
+
+    exposure.ingest_dependencies(commit.id, tmp_path)
+    observed, facts = code_facts.package_observations(commit.id)
+    assert facts == []
+    gaps = code_facts.package_coverage([observed])[commit.id]
+    assert gaps is not None and {gap.ecosystem for gap in gaps} == {Ecosystem.NPM}
+
+    (tmp_path / "package-lock.json").write_text('{"lockfileVersion":3}')
+    exposure.ingest_dependencies(commit.id, tmp_path)
+    complete, facts = code_facts.package_observations(commit.id)
+    assert facts == []
+    assert code_facts.package_coverage([complete])[commit.id] == ()
+    assert code_facts.package_coverage([observed])[commit.id] == gaps
+
+    exposure.ingest_sbom(empty_sbom, commit.id)
+    unbacked, _ = code_facts.package_observations(commit.id)
+    assert code_facts.package_coverage([unbacked])[commit.id] is None
+
+
+def test_unresolved_manifests_do_not_erase_observed_crypto_packages(
+    engine: Engine, tmp_path: Path
+) -> None:
+    commit = ref(engine)
+    assert commit.id is not None
+    exposure, code_facts = services(engine, sbom_tool=FakeSbomTool(raw=MAPPING_SBOM))
+    (tmp_path / "package.json").write_text('{"dependencies":{"ordinary-package":"^1"}}')
+    exposure.ingest_dependencies(commit.id, tmp_path)
+    facts = code_facts.crypto(commit.id, ToolRequest(workspace=tmp_path))
+    assert any(f.package == "cryptography" for f in facts)

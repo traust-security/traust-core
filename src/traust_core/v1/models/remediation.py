@@ -1015,4 +1015,4 @@ class VerifySweep(Model):
 
 def regression_candidates(doc: Any, repository_id: UUID) -> list[FindingCandidate]:
     """The new vulnerabilities a verification found, for intake as findings of its own."""
-    return FindingCandidate.of_report(doc.regressions, repository_id)
+    return FindingCandidate.of_regressions(doc.regressions, repository_id)

@@ -10,6 +10,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 
 from traust_core.v1.context import Context
+from traust_core.v1.context.preflight import check_recording_server
 from traust_core.v1.errors import TraustError
 from traust_core.v1.providers.correlation import (
     REQUEST_ID_HEADER,
@@ -39,6 +40,7 @@ def request_id(request: Request) -> str:
 
 def create_app(context: Context) -> FastAPI:
     """The REST API over `context`'s services; each package in `DOMAINS` brings its router."""
+    check_recording_server(context)
     app = FastAPI(
         title="traust-core",
         version="v1",

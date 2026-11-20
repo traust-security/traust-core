@@ -93,6 +93,16 @@ def test_stronger_human_evidence_beats_later_weaker_machine_evidence() -> None:
     assert (h.fold().validity, h.fold().assurance) == (FP, "human_reviewed")
 
 
+@pytest.mark.parametrize("machine_grade", ["E2", "E3"], ids=["equal", "weaker"])
+def test_the_latest_human_beats_any_machine(machine_grade: str) -> None:
+    h = History()
+    h.report(1, CONFIRMED, severity="critical", evidence_grade="E2")
+    h.by(ALICE, 2, FP, severity="low", evidence_grade="E2")
+    h.report(3, CONFIRMED, severity="critical", evidence_grade=machine_grade)
+    result = h.fold()
+    assert (result.validity, result.severity) == (FP, "low")
+
+
 def test_a_machine_false_positive_waits_for_signoff_unless_auto_accepted() -> None:
     waiting = History()
     waiting.report(1, FP, evidence_grade="E2")

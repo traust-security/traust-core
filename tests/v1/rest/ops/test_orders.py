@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -102,14 +103,18 @@ def test_heartbeat_extends_the_lease(context: Context, client: TestClient) -> No
     seed_orders(context)
     order = client.post("/v1/orders/claim", json=CLAIM, headers=runner(context)).json()
     beat = client.post(
-        f"/v1/orders/{order['id']}/heartbeat", json={"lease_seconds": 600}, headers=runner(context)
+        f"/v1/orders/{order['id']}/heartbeat",
+        json={"lease_seconds": 600, "lease_generation": order["lease_generation"]},
+        headers=runner(context),
     ).json()
     assert beat["lease_expires_at"] > order["lease_expires_at"]
 
 
 def test_heartbeat_unknown_order_is_404(context: Context, client: TestClient) -> None:
     gone = client.post(
-        f"/v1/orders/{uuid4()}/heartbeat", json={"lease_seconds": 600}, headers=runner(context)
+        f"/v1/orders/{uuid4()}/heartbeat",
+        json={"lease_seconds": 600, "lease_generation": 1},
+        headers=runner(context),
     )
     assert gone.status_code == 404
 
@@ -117,7 +122,9 @@ def test_heartbeat_unknown_order_is_404(context: Context, client: TestClient) ->
 def test_heartbeat_an_unleased_order_is_409(context: Context, client: TestClient) -> None:
     order = seed_orders(context)
     conflict = client.post(
-        f"/v1/orders/{order.id}/heartbeat", json={"lease_seconds": 600}, headers=runner(context)
+        f"/v1/orders/{order.id}/heartbeat",
+        json={"lease_seconds": 600, "lease_generation": 1},
+        headers=runner(context),
     )
     assert conflict.status_code == 409
 
@@ -127,7 +134,7 @@ def test_heartbeat_by_another_runner_is_409(context: Context, client: TestClient
     order = client.post("/v1/orders/claim", json=CLAIM, headers=runner(context, "runner-a")).json()
     conflict = client.post(
         f"/v1/orders/{order['id']}/heartbeat",
-        json={"lease_seconds": 600},
+        json={"lease_seconds": 600, "lease_generation": order["lease_generation"]},
         headers=runner(context, "runner-b"),
     )
     assert conflict.status_code == 409
@@ -141,7 +148,7 @@ def test_complete_finishes_the_runners_order(context: Context, client: TestClien
     order = client.post("/v1/orders/claim", json=CLAIM, headers=runner(context)).json()
     done = client.post(
         f"/v1/orders/{order['id']}/complete",
-        json={"result": {"outcome": "succeeded"}},
+        json={"result": {"outcome": "succeeded"}, "lease_generation": order["lease_generation"]},
         headers=runner(context),
     ).json()
     assert done["state"] == "succeeded" and done["lease_holder"] is None
@@ -151,23 +158,30 @@ def test_complete_is_idempotent(context: Context, client: TestClient) -> None:
     seed_orders(context)
     order = client.post("/v1/orders/claim", json=CLAIM, headers=runner(context)).json()
     url = f"/v1/orders/{order['id']}/complete"
-    body = {"result": {"outcome": "failed", "reason": "runner-crashed"}}
+    body = {
+        "result": {"outcome": "failed", "reason": "runner-crashed"},
+        "lease_generation": order["lease_generation"],
+    }
     first = client.post(url, json=body, headers=runner(context)).json()
     again = client.post(url, json=body, headers=runner(context)).json()
-    # a retried complete returns the same finished order, never re-finishing it
-    assert again["id"] == first["id"] and again["started_at"] == first["started_at"]
+    assert again == first
     assert (again["state"], again["reason"], again["lease_holder"]) == (
         "failed",
         "runner-crashed",
         None,
     )
+    wrong_attempt = {**body, "lease_generation": order["lease_generation"] + 1}
+    assert client.post(url, json=wrong_attempt, headers=runner(context)).status_code == 409
+    wrong_result = {**body, "result": {"outcome": "succeeded"}}
+    assert client.post(url, json=wrong_result, headers=runner(context)).status_code == 409
+    assert client.post(url, json=body, headers=runner(context, "runner-b")).status_code == 409
 
 
 def test_complete_an_unleased_order_is_409(context: Context, client: TestClient) -> None:
     order = seed_orders(context)
     conflict = client.post(
         f"/v1/orders/{order.id}/complete",
-        json={"result": {"outcome": "succeeded"}},
+        json={"result": {"outcome": "succeeded"}, "lease_generation": 1},
         headers=runner(context),
     )
     assert conflict.status_code == 409
@@ -178,7 +192,7 @@ def test_complete_rejects_an_unknown_outcome(context: Context, client: TestClien
     order = client.post("/v1/orders/claim", json=CLAIM, headers=runner(context)).json()
     bad = client.post(
         f"/v1/orders/{order['id']}/complete",
-        json={"result": {"outcome": "exploded"}},
+        json={"result": {"outcome": "exploded"}, "lease_generation": order["lease_generation"]},
         headers=runner(context),
     )
     assert bad.status_code == 422
@@ -189,11 +203,42 @@ def test_complete_rejects_an_unregistered_reason(context: Context, client: TestC
     order = client.post("/v1/orders/claim", json=CLAIM, headers=runner(context)).json()
     bad = client.post(
         f"/v1/orders/{order['id']}/complete",
-        json={"result": {"outcome": "refused", "reason": "pack version mismatch"}},
+        json={
+            "result": {"outcome": "refused", "reason": "pack version mismatch"},
+            "lease_generation": order["lease_generation"],
+        },
         headers=runner(context),
     )
     assert bad.status_code == 422
     assert context.services().ops.get(UUID(order["id"])).state == "leased"
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "payload"),
+    [("heartbeat", {"lease_seconds": 600}), ("complete", {"result": {"outcome": "succeeded"}})],
+)
+def test_lease_mutation_requires_the_claimed_generation(
+    context: Context, client: TestClient, endpoint: str, payload: dict[str, object]
+) -> None:
+    seed_orders(context)
+    headers = runner(context)
+    order = client.post("/v1/orders/claim", json=CLAIM, headers=headers).json()
+    url = f"/v1/orders/{order['id']}/{endpoint}"
+    generation = order["lease_generation"]
+    assert client.post(url, json=payload, headers=headers).status_code == 422
+    for invalid in (None, True, str(generation), float(generation), 0, -1):
+        bad = client.post(url, json={**payload, "lease_generation": invalid}, headers=headers)
+        assert bad.status_code == 422, bad.text
+    with SqlTraustUnitOfWork(context.database) as uow:
+        uow.run_orders.requeue_expired(context.clock.now() + timedelta(minutes=10))
+        uow.commit()
+    renewed = client.post("/v1/orders/claim", json=CLAIM, headers=headers).json()
+    assert renewed["id"] == order["id"] and renewed["lease_generation"] > generation
+    stale = client.post(url, json={**payload, "lease_generation": generation}, headers=headers)
+    assert stale.status_code == 409
+    assert client.get(f"/v1/orders/{order['id']}", headers=headers).json() == renewed
+    current = {**payload, "lease_generation": renewed["lease_generation"]}
+    assert client.post(url, json=current, headers=headers).status_code == 200
 
 
 # submit ------------------------------------------------------------------------------------------

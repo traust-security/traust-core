@@ -126,17 +126,22 @@ def test_recording_start_rejects_malformed_capabilities(scope: dict[str, object]
         Config.model_validate({"recording": {"start": [scope]}})
 
 
+CHANNEL = ["0001_repository_disposition", "0002_run_order_lease_generation"]
+
+
 def test_a_fresh_local_store_bootstraps_with_the_channel_stamped(tmp_path: Path) -> None:
     engine = Context(Config(home=tmp_path)).database
     inspector = sa.inspect(engine)
     assert inspector.has_table("db_upgrade")
     assert "disposition" in {c["name"] for c in inspector.get_columns("repository")}
     with engine.connect() as connection:
-        stamps = connection.exec_driver_sql("SELECT name FROM db_upgrade").fetchall()
-        assert [name for (name,) in stamps] == ["0001_repository_disposition"]
+        stamps = connection.exec_driver_sql("SELECT name FROM db_upgrade ORDER BY name").fetchall()
+        assert [name for (name,) in stamps] == CHANNEL
     again = Context(Config(home=tmp_path)).database  # re-open: nothing re-applied
     with again.connect() as connection:
-        assert connection.exec_driver_sql("SELECT count(*) FROM db_upgrade").fetchone()[0] == 1
+        assert connection.exec_driver_sql("SELECT count(*) FROM db_upgrade").scalar_one() == len(
+            CHANNEL
+        )
 
 
 def test_a_fresh_store_logs_its_bootstrap_and_channel_trail(
@@ -314,7 +319,7 @@ def test_the_control_surface_brings_a_pre_channel_store_on_at_the_head(tmp_path:
     context = Context(Config(home=tmp_path))
     assert context.pending_db_upgrades() == []  # nothing pending: nothing has run yet
     stamped = context.apply_db_upgrades()  # the first apply brings it on, nothing runs
-    assert [upgrade.name for upgrade in stamped] == ["0001_repository_disposition"]
+    assert [upgrade.name for upgrade in stamped] == CHANNEL
     assert Context(Config(home=tmp_path)).store_status().state is StoreState.CURRENT
 
 

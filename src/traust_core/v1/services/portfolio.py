@@ -74,7 +74,13 @@ from traust_core.v1.models.observation import (
     ObservationTarget,
     SeenHead,
 )
-from traust_core.v1.models.operations import AssetName, OrderFilter, OrderManifest, OrderState
+from traust_core.v1.models.operations import (
+    AssetName,
+    OrderFilter,
+    OrderManifest,
+    OrderState,
+    WorkerId,
+)
 from traust_core.v1.models.product_definitions import (
     ProductDefinitions,
     ProductDefinitionsSnapshot,
@@ -114,6 +120,7 @@ from traust_core.v1.services.observation import (
     observe_forge_facts,
     parse_audit_date,
 )
+from traust_core.v1.services.order_binding import order_binding
 
 if TYPE_CHECKING:
     from traust_core.v1.services.assessment import AssessmentService
@@ -391,12 +398,30 @@ class PortfolioService:
         network: bool = True,
         breaker: BanBreaker | None = None,
         quota_deferred: bool | None = None,
+        run_order_id: UUID | None = None,
+        worker: WorkerId | None = None,
+        lease_generation: int | None = None,
     ) -> ForgeFacts:
         """Observe one repository at the forge and keep what it answered: public, archived and
         its fork's upstream (brought into the inventory) on the repository, and a repo-state
         assessment of the default-branch head when its status or measurements changed."""
         started = perf_counter()
         target = self._target(repository_id=repository_id, repo_url=repo_url)
+        guard = order_binding(
+            self._ops,
+            self._uow,
+            run_order_id,
+            target.repository_id,
+            worker,
+            lease_generation,
+            lock_at_commit=True,
+        )
+        if run_order_id is not None and (
+            self._assessment is None
+            or self._assessment._uow is not self._uow
+            or self._require_publisher()._uow is not self._uow
+        ):
+            raise ConfigError("order-bound observation needs a shared assessment transaction")
         facts = observe_forge_facts(
             target,
             self._sources,
@@ -408,10 +433,17 @@ class PortfolioService:
             seen=self._seen_head(target.repository_id),
             tools=self._tools,
         )
+        with guard:
+            self._keep_observation(target, facts, started, bound=run_order_id is not None)
+        return facts
+
+    def _keep_observation(
+        self, target: ObservationTarget, facts: ForgeFacts, started: float, *, bound: bool
+    ) -> None:
         self._count_toward_disposition(target.repository_id, facts, observed_url=target.repo_url)
         if facts.availability_queried:
             unknown = facts.liveness_status == LivenessStatus.UNKNOWN
-            self.record_liveness(
+            self._record_liveness(
                 Liveness(
                     repository_id=target.repository_id,
                     url=self.get_repository(target.repository_id).url,
@@ -426,11 +458,11 @@ class PortfolioService:
                     else facts.error
                     if facts.liveness_status == LivenessStatus.MISSING
                     else None,
-                )
+                ),
+                retry=not bound,
             )
         if facts.head is not None:
             self._keep(target, facts, started)
-        return facts
 
     def _keep(self, target: ObservationTarget, facts: ForgeFacts, started: float) -> None:
         assert facts.repo is not None and facts.head is not None and self._assessment is not None
@@ -812,6 +844,9 @@ class PortfolioService:
 
     def record_liveness(self, row: Liveness) -> PublishResult:
         """Record explicit availability evidence, carrying the start of an unchanged status."""
+        return self._record_liveness(row, retry=True)
+
+    def _record_liveness(self, row: Liveness, *, retry: bool) -> PublishResult:
         require_uuid(row.repository_id, "liveness.repository_id")
         repository = self.get_repository(row.repository_id)
         if row.url != repository.url:
@@ -867,7 +902,8 @@ class PortfolioService:
                     snapshot.to_artifact(), None if latest is None else latest.artifact_id
                 )
             except ConflictError:
-                continue
+                if not retry:  # A failed nested scope made the bound transaction rollback-only.
+                    raise
 
     def _completed_orders(self, repository_ids: Sequence[UUID], now: datetime) -> dict[UUID, list]:
         """The finished degraded/failed/refused repo_state orders of several repositories,

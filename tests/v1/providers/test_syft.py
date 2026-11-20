@@ -5,11 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 
 import pytest
 
-from traust_core.v1.errors import ServiceError, ValidationError
+from traust_core.v1.errors import ConfigError, ServiceError, ValidationError
 from traust_core.v1.providers.base import argv_digest
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.process import ProcessResult, ProcessRunner
@@ -171,6 +172,95 @@ def test_manifests_with_nothing_to_pin_them_are_unresolved(
     assert all(
         m.reason == ("unpinned" if "requirements" in m.path else "no-lockfile") for m in found
     )
+
+
+@pytest.mark.parametrize(
+    ("contents", "has_external_base"),
+    [
+        ("FROM base:1.2.3\n", True),
+        ("\ufeffFROM base:1.2.3\n", True),
+        ("# escape=\\\nFROM base:1.2.3\n", True),
+        ("from --platform=$PLATFORM \\\n  base@sha256:" + "a" * 64 + "\n", True),
+        ("FROM ${BASE}\n", True),
+        ("FROM scratch AS empty\nFROM empty\n", False),
+        ("# FROM base:1.2.3\nFROM scratch\n", False),
+        ("FROM scratch\nCOPY --from=registry.example/base:1 /tool /\n", True),
+        ("FROM scratch\nCOPY --link --chown=7 --from=\"${BASE}\" [\"/bin\", \"/\"]\n", True),
+        ("FROM scratch\nCOPY --fr\\\n# middle of flag\nom=base:1 /tool /\n", True),
+        ("FROM scratch AS BuIlD\nFROM scratch\nCOPY --from=build /tool /\n", False),
+        ("FROM scratch\nFROM scratch\nCOPY --link --from=0 /tool /\n", False),
+        ("FROM scratch\nCOPY --from=42 /tool /\n", True),
+        ("FROM scratch\nCOPY ./assets --from=not-a-flag /dst/\n", False),
+        ("FROM scratch\nRUN echo \\\n# not an instruction\n\n  FROM literal\n", False),
+        ("# escape=`\nFROM scratch\nRUN echo `\nCOPY --from=literal / /\n", False),
+        ("# escape=`\nFROM scratch\nCO`\nPY --from=external / /\n", True),
+        ("# escape=`\nFROM scratch\nCOPY --fr`om=external / /\n", True),
+        ("FROM scratch\nCOPY -- --from=literal /\n", False),
+        ("FROM scratch\nRUN <<'EOF'\nFROM literal\nCOPY --from=literal / /\nEOF\n", False),
+        ('FROM scratch\nCOPY <<A <<-"B" /\nFROM literal\nA\nCOPY --from=x / /\n\tB\n', False),
+        (
+            'FROM scratch\nRUN cat <<FIRST <<-"SECOND"\n'
+            "FROM external/one\nFIRST\nCOPY --from=external/two / /\n\tSECOND\n",
+            False,
+        ),
+        ("FROM scratch\nRUN echo 'cat<<EOF'\n", False),
+        ('FROM scratch\nRUN echo "cat<<EOF"\n', False),
+        ("FROM scratch\nRUN echo cat\\<<EOF\n", False),
+        ("FROM scratch\nRUN cat<<EOF\nFROM external/image\nEOF\n", True),
+        ("FROM scratch\nRUN cat 0<<'EOF'\nFROM external/image\nEOF\n", False),
+        ('FROM scratch\nRUN cat<<"END OF FILE"\nCOPY --from=external / /\nEND OF FILE\n', True),
+        (
+            'FROM scratch\nRUN cat<<FIRST<<-"SECOND"\n'
+            "FROM external/one\nFIRST\nCOPY --from=external/two / /\n\tSECOND\n",
+            True,
+        ),
+        ("FROM scratch\nRUN cat<<EOF; echo done\nFROM external/image\nEOF\n", True),
+        ("FROM scratch\nRUN cat<<EOF\nFROM literal\nEOF\nFROM external/image\n", True),
+        ("FROM scratch\nRUN cat<<EOF\nignored\nEOF\nCOPY --from=external / /\n", True),
+        ("FROM scratch\nRUN echo 'cat<<EOF'\nFROM external/image\n", True),
+        ('FROM scratch\nRUN echo "cat<<EOF"\nFROM external/image\n', True),
+        ('FROM scratch\nRUN echo \'cat<<"RUN true"\'\nFROM external/image\nRUN true\n', True),
+        ('FROM scratch\nCOPY file<<"RUN true" /dest\nFROM external/image\nRUN true\n', True),
+        ("FROM scratch\nRUN echo cat\\<<EOF\nFROM external/image\n", True),
+        ("FROM scratch\nRUN echo ok # cat<<EOF\nFROM external/image\n", True),
+        ("FROM scratch\nRUN cat<<<EOF\nFROM external/image\n", True),
+        ("FROM scratch\nRUN echo $((1<<2))\n", True),  # ambiguous, never clean
+        ("FROM scratch\nRUN cat<<EOF\nignored\n", True),  # compact but unterminated
+        ("FROM scratch\nRUN <<EOF\nignored\nEOF\nCOPY --from=base:1 /tool /\n", True),
+        ("FROM scratch\nRUN <<EOF\nignored\n", True),  # ambiguous boundary, never clean
+        ("FROM scratch\nRUN echo '<<EOF'\nCOPY --from=base:1 /tool /\n", True),
+        ("FROM scratch\nONBUILD COPY --from=base:1 /tool /\n", True),
+        ("FROM scratch\nRUN [ -f /tmp/x ] && cat <<EOF\nFROM literal\nEOF\n", False),
+    ],
+)
+def test_containerfile_external_images_have_unresolved_coverage(
+    tmp_path: Path, contents: str, has_external_base: bool
+) -> None:
+    found = unresolved_manifests(_tree(tmp_path, {"nested/Dockerfile.build": contents}))
+    expected = [("docker", "nested/Dockerfile.build", "unsupported-manifest")]
+    assert [(m.ecosystem, m.path, m.reason) for m in found] == (
+        expected if has_external_base else []
+    )
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "FROM external/image\n",
+        "FROM scratch\nRUN cat<<EOF\nFROM literal\nEOF\n",
+    ],
+)
+def test_docker_coverage_fails_closed_when_contract_reason_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, contents: str
+) -> None:
+    class LegacyReason(StrEnum):
+        NO_LOCKFILE = "no-lockfile"
+        UNPINNED = "unpinned"
+
+    monkeypatch.setattr("traust_core.v1.providers.syft.ManifestCoverageReason", LegacyReason)
+    workspace = _tree(tmp_path, {"package.json": PACKAGE, "Dockerfile": contents})
+    with pytest.raises(ConfigError, match="installed manifest coverage contract lacks reason"):
+        unresolved_manifests(workspace)
 
 
 def test_an_oversized_manifest_is_unresolved_without_reading_it(tmp_path: Path) -> None:

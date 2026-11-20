@@ -531,6 +531,26 @@ def test_a_report_finding_carries_its_owasp_llm_categories(target: Target) -> No
     assert all(f.owasp_llm_references == () for f in found[1:])
 
 
+def test_verification_regression_without_llm_fields_still_enters_intake(target: Target) -> None:
+    from tests.v1.services.reporting.documents import valid_verification_report
+    from traust_core.v1.models.artifacts import VerificationArtifact
+    from traust_core.v1.models.remediation import regression_candidates
+
+    doc = VerificationArtifact.from_document(valid_verification_report())
+    [regression] = regression_candidates(doc, target.repository.id)
+    assert regression.label == doc.regressions[0].id
+    assert regression.owasp_llm_references == ()
+
+
+def test_report_conversion_refuses_a_schema_missing_llm_fields(target: Target) -> None:
+    from tests.v1.services.reporting.documents import valid_verification_report
+    from traust_core.v1.models.artifacts import VerificationArtifact
+
+    doc = VerificationArtifact.from_document(valid_verification_report())
+    with pytest.raises(ValidationError, match="schema must declare owasp_llm_references"):
+        FindingCandidate.of_report(doc.regressions, target.repository.id)
+
+
 def test_a_report_finding_carries_its_kind(target: Target) -> None:
     """The contracts report's `findings[].kind` is the kind the intake writes onto the
     finding row; `of_report` must not be where it drops off (the audit: only the newest

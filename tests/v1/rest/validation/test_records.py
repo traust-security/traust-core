@@ -20,9 +20,9 @@ from tests.v1.services.test_validation import (
     snapshot,
 )
 from traust_core.v1.context import Context
-from traust_core.v1.errors import ForbiddenError
+from traust_core.v1.errors import ConflictError, ForbiddenError
 from traust_core.v1.models.artifacts import ValidationArtifact
-from traust_core.v1.models.common import ArtifactRef
+from traust_core.v1.models.common import ArtifactRef, Provenance
 from traust_core.v1.models.identity import Credential
 from traust_core.v1.models.operations import RunOrder
 from traust_core.v1.models.validation import (
@@ -57,7 +57,12 @@ def test_first_record_and_retries_preserve_native_ids_and_exact_utf8_evidence(
     assert response.status_code == 200, response.text
     result = ValidationRecordResult.model_validate(response.json())
     expected = context.services().validation.record_order(
-        doc, provenance, bindings, saved_id(run.order), run.principal
+        doc,
+        provenance,
+        bindings,
+        saved_id(run.order),
+        run.principal,
+        lease_generation=run.order.lease_generation,
     )
     same_as_in_process(response.json(), expected)
     (outcome,) = result.findings
@@ -78,6 +83,7 @@ def test_first_record_and_retries_preserve_native_ids_and_exact_utf8_evidence(
     assert assessment.run_order_id == run.order.id == provenance.run_id
     assert assessment.repository_ref_id == harness.source.repository_ref_id
     assert assessment.occurred_at == provenance.occurred_at
+    assert assessment.occurred_at != run.order.started_at
     assert artifact.assessment_id == assessment.id and artifact.kind == "validation"
     assert (decision.validity, decision.evidence_grade, decision.severity) == (
         "confirmed",
@@ -94,8 +100,45 @@ def test_first_record_and_retries_preserve_native_ids_and_exact_utf8_evidence(
         assert after[table] == before[table]
     retry = client.post(URL, json=run.body(doc, bindings, provenance), headers=run.headers)
     assert retry.status_code == 200 and retry.json() == response.json()
+    with pytest.raises(ConflictError, match="run order binding"):
+        context.services().validation.record(doc, provenance, bindings)
     assert snapshot(context.database) == after
     assert context.services().ops.get(saved_id(run.order)) == run.order
+
+
+def test_reclaimed_validation_fences_identical_replay_with_unchanged_event_and_start_times(
+    context: Context, client: TestClient, harness: ValidationHarness, run: ValidationRun
+) -> None:
+    body = run.body(report(harness, finding={"evidence_grade": "E0"}), harness.bindings())
+    first = client.post(URL, json=body, headers=run.headers)
+    assert first.status_code == 200, first.text
+    with SqlTraustUnitOfWork(context.database) as uow:
+        uow.run_orders.update(
+            run.order.model_copy(
+                update={"lease_expires_at": context.clock.now() - timedelta(seconds=1)}
+            )
+        )
+        uow.commit()
+    response = client.post(
+        "/v1/orders/claim",
+        json={"order_id": str(run.order.id), "lease_seconds": 60},
+        headers=run.headers,
+    )
+    assert response.status_code == 200, response.text
+    reclaimed = RunOrder.model_validate(response.json())
+    assert reclaimed.started_at == run.order.started_at != run.provenance.occurred_at
+    assert reclaimed.lease_holder == run.order.lease_holder
+    assert reclaimed.lease_generation == run.order.lease_generation + 1
+    before = snapshot(context.database)
+    objects = tuple(harness.objects.list())
+    stale = client.post(URL, json=body, headers=run.headers)
+    assert stale.status_code == 409, stale.text
+    current = client.post(
+        URL, json={**body, "lease_generation": reclaimed.lease_generation}, headers=run.headers
+    )
+    assert current.status_code == 200 and current.json() == first.json()
+    assert snapshot(context.database) == before
+    assert tuple(harness.objects.list()) == objects
 
 
 @pytest.mark.parametrize(
@@ -176,7 +219,12 @@ def test_review_only_outcomes_use_core_soundness_grade_and_target_rules(
     same_as_in_process(
         response.json(),
         context.services().validation.record_order(
-            doc, run.provenance, bindings, saved_id(run.order), run.principal
+            doc,
+            run.provenance,
+            bindings,
+            saved_id(run.order),
+            run.principal,
+            lease_generation=run.order.lease_generation,
         ),
     )
     (outcome,) = result.findings
@@ -355,6 +403,10 @@ def test_recording_requires_a_verified_bearer_without_writing(
         "bad-uuid",
         "missing-order",
         "bad-order",
+        "missing-generation",
+        "boolean-generation",
+        "zero-generation",
+        "string-generation",
         "extra-caller",
         "extra-signer",
     ],
@@ -385,6 +437,14 @@ def test_malformed_payload_and_transport_fields_are_422_without_writing(
         request.pop("run_order_id")
     elif defect == "bad-order":
         request["run_order_id"] = "not-a-uuid"
+    elif defect == "missing-generation":
+        request.pop("lease_generation")
+    elif defect == "boolean-generation":
+        request["lease_generation"] = True
+    elif defect == "zero-generation":
+        request["lease_generation"] = 0
+    elif defect == "string-generation":
+        request["lease_generation"] = str(run.order.lease_generation)
     elif defect in {"extra-caller", "extra-signer"}:
         request[defect.removeprefix("extra-")] = run.principal.model_dump(mode="json")
     before = snapshot(context.database)
@@ -425,6 +485,19 @@ def test_a_valid_report_requires_the_actual_verified_machine_lease_holder(
     assert accepted.status_code == 200, accepted.text
 
 
+def test_an_authorized_validation_writer_needs_its_own_ledger(
+    context: Context, client: TestClient, harness: ValidationHarness, run: ValidationRun
+) -> None:
+    context.config = context.config.model_copy(update={"ledger": None})
+    before = snapshot(context.database)
+    objects = tuple(harness.objects.list())
+    request = run.body(report(harness, finding={"evidence_grade": "E0"}), harness.bindings())
+    response = client.post(URL, json=request, headers=run.headers)
+    assert response.status_code == 500, response.text
+    assert snapshot(context.database) == before
+    assert tuple(harness.objects.list()) == objects
+
+
 def test_native_service_rejects_an_unrelated_runner_before_writing(
     context: Context, harness: ValidationHarness, run: ValidationRun
 ) -> None:
@@ -441,6 +514,7 @@ def test_native_service_rejects_an_unrelated_runner_before_writing(
             harness.bindings(),
             saved_id(run.order),
             other,
+            lease_generation=run.order.lease_generation,
         )
     assert snapshot(context.database) == before
     assert tuple(harness.objects.list()) == objects_before
@@ -455,6 +529,7 @@ def test_native_service_rejects_an_unrelated_runner_before_writing(
         ("expired", 409),
         ("completed", 409),
         ("queued", 409),
+        ("wrong-generation", 409),
         ("forged-run", 422),
         ("unknown-order", 404),
     ],
@@ -471,7 +546,10 @@ def test_order_scope_and_live_lease_are_checked_before_any_recording(
     if defect == "completed":
         completed = client.post(
             f"/v1/orders/{run.order.id}/complete",
-            json={"result": {"outcome": "succeeded"}},
+            json={
+                "result": {"outcome": "succeeded"},
+                "lease_generation": run.order.lease_generation,
+            },
             headers=run.headers,
         )
         assert completed.status_code == 200, completed.text
@@ -480,6 +558,8 @@ def test_order_scope_and_live_lease_are_checked_before_any_recording(
     elif defect == "unknown-order":
         request["run_order_id"] = str(UNKNOWN_ID)
         request["provenance"]["run_id"] = str(UNKNOWN_ID)
+    elif defect == "wrong-generation":
+        request["lease_generation"] = run.order.lease_generation + 1
     else:
         with SqlTraustUnitOfWork(context.database) as uow:
             order = uow.run_orders.get(saved_id(run.order))
@@ -537,6 +617,7 @@ def test_independent_run_keeps_new_identity_without_rebinding_another_orders_art
     assert claimed_order.id == other.id
     request["run_order_id"] = str(other.id)
     request["provenance"]["run_id"] = str(other.id)
+    request["lease_generation"] = claimed_order.lease_generation
     if explicit_artifact:
         with SqlTraustUnitOfWork(context.database) as uow:
             artifact = uow.artifacts.get(result.artifact_ids[0])
@@ -559,7 +640,7 @@ def test_independent_run_keeps_new_identity_without_rebinding_another_orders_art
             assert stored_bytes(harness.objects, retained_report) == doc.payload
     for artifact_id in independent.evidence_artifact_ids:
         evidence = context.services().validation.evidence(artifact_id)
-        assert evidence.provenance.model_dump(mode="json") == request["provenance"]
+        assert evidence.provenance == Provenance.model_validate(request["provenance"])
     independent_after = snapshot(context.database)
     objects_after = tuple(harness.objects.list())
     second_retry = client.post(URL, json=request, headers=run.headers)

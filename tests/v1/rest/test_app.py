@@ -11,9 +11,12 @@ from fastapi.testclient import TestClient
 
 from tests.v1.rest.conftest import bearer
 from tests.v1.rest.ops.conftest import runner
-from traust_core.v1.context import Context
+from traust_core.v1.context import Config, Context
+from traust_core.v1.context.config import RecordingConfig
+from traust_core.v1.errors import PreflightError
 from traust_core.v1.providers.correlation import current_correlation
 from traust_core.v1.rest.app import create_app
+from traust_core.v1.services.ledger import LedgerConfig
 
 TRACE = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 
@@ -173,3 +176,23 @@ def test_openapi_documents_the_routes_and_their_problems(client: TestClient) -> 
     assert {"/v1/healthz", "/v1/whoami"} <= set(spec["paths"])
     unauthorized = spec["paths"]["/v1/whoami"]["get"]["responses"]["401"]
     assert "application/problem+json" in unauthorized["content"]
+
+
+def test_read_only_startup_needs_no_signer_verifier_or_salt(tmp_path: Path) -> None:
+    ctx = Context(Config(home=tmp_path))
+    create_app(ctx)
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("kind", ["assessment", "validation", "verification"])
+def test_non_triage_writer_requires_verification_not_review_salt(
+    context: Context, kind: str
+) -> None:
+    recording = RecordingConfig.model_validate({kind: ["writer"]})
+    cfg = context.config.model_copy(update={"recording": recording, "ledger": LedgerConfig()})
+    ctx = Context(cfg)
+    with pytest.raises(PreflightError, match="no usable local JWKS"):
+        create_app(ctx)
+    ctx.local_issuer.mint("writer", machine=True)
+    create_app(ctx)
+    assert "database" not in ctx.__dict__

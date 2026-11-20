@@ -123,7 +123,7 @@ def reset_queue(url: sa.URL) -> int:
     engine = sa.create_engine(url)
     cleared = (
         "state = 'queued', lease_holder = NULL, lease_expires_at = NULL,"
-        " started_at = NULL, finished_at = NULL"
+        " completed_by = NULL, started_at = NULL, finished_at = NULL"
     )
     with engine.begin() as conn:
         conn.exec_driver_sql(

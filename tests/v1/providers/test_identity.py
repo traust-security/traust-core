@@ -70,15 +70,32 @@ KEY_A, KEY_B, LOCAL = Keys("a"), Keys("b"), Keys("local-1", curve=True)
 @pytest.fixture(scope="module")
 def jwks() -> Iterator[str]:
     """Each issuer's JWKS served over HTTP, as an IdP publishes it."""
-    sets = {"/a": [KEY_A.jwk], "/b": [KEY_B.jwk]}
+    sets = {
+        "/a": [KEY_A.jwk],
+        "/b": [KEY_B.jwk],
+        "/slow": [KEY_A.jwk],
+        "/enc": [{**KEY_A.jwk, "use": "enc"}],
+        "/no-kid": [{k: v for k, v in KEY_A.jwk.items() if k != "kid"}],
+        "/hmac": [{"kty": "oct", "k": "AQID", "kid": "symmetric"}],
+    }
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            body = json.dumps({"keys": sets.get(self.path, [])}).encode()
+            if self.path == "/404":
+                self.send_error(404)
+                return
+            if self.path == "/slow":
+                time.sleep(0.25)
+            payload = {"keys": sets.get(self.path, [])}
+            body = b"not JSON" if self.path == "/malformed" else json.dumps(payload).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except BrokenPipeError:
+                if self.path != "/slow":
+                    raise
 
         def log_message(self, *args: object) -> None:
             pass
@@ -87,6 +104,7 @@ def jwks() -> Iterator[str]:
     threading.Thread(target=server.serve_forever, daemon=True).start()
     yield f"http://127.0.0.1:{server.server_port}"
     server.shutdown()
+    server.server_close()
 
 
 @pytest.fixture
@@ -215,8 +233,75 @@ def test_local_tokens_need_this_machines_keys(jwks: str, tmp_path: Path) -> None
 
 
 def test_check_names_the_trusted_issuers(jwks: str, local_jwks: Path) -> None:
-    assert provider(jwks, local_jwks).check().detail == f"{IDP_A}, {IDP_B}, local"
+    remote = provider(jwks, local_jwks).check()
+    assert remote.ready and remote.detail == f"{IDP_A}, {IDP_B}"
+    both = provider(jwks, local_jwks, trust_local=True).check()
+    assert both.ready and both.detail == f"{IDP_A}, {IDP_B}, local"
+    assert not TokenIdentityProvider([], local_jwks=local_jwks).check().ready
     assert not TokenIdentityProvider([]).check().ready
+
+
+def test_the_issuer_identifier_need_not_be_an_http_url(jwks: str) -> None:
+    name = "urn:idp:example"
+    provider = TokenIdentityProvider([TrustedIssuer(issuer=name, jwks_url=f"{jwks}/a")])
+    assert provider.check().ready
+    principal = provider.authenticate(KEY_A.token(person(issuer=name)))
+    assert principal.verified_by == IdentitySource.OIDC
+
+
+@pytest.mark.parametrize("path", ["empty", "malformed", "enc", "hmac", "no-kid", "404"])
+def test_remote_readiness_needs_a_reachable_supported_signing_key(jwks: str, path: str) -> None:
+    issuer = TrustedIssuer(issuer=IDP_A, jwks_url=f"{jwks}/{path}")
+    ready = TokenIdentityProvider([issuer]).check()
+    assert not ready.ready
+    assert "jwks_url" in ready.detail
+
+
+def test_remote_readiness_times_out(jwks: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("traust_core.v1.providers.identity._JWKS_TIMEOUT_SECONDS", 0.05)
+    ready = TokenIdentityProvider([TrustedIssuer(issuer=IDP_A, jwks_url=f"{jwks}/slow")]).check()
+    assert not ready.ready and "cannot reach" in ready.detail
+
+
+def test_one_good_issuer_does_not_hide_other_configured_gaps(jwks: str, tmp_path: Path) -> None:
+    ready = TokenIdentityProvider(
+        [
+            TrustedIssuer(issuer=IDP_A, jwks_url=f"{jwks}/a"),
+            TrustedIssuer(issuer=IDP_B, jwks_url=f"{jwks}/empty"),
+            TrustedIssuer(issuer="https://idp-c.example", jwks_url="file:///secret"),
+        ],
+        local_jwks=tmp_path / "absent",
+        trust_local=True,
+    ).check()
+    assert not ready.ready
+    assert "issuers[1]" in ready.detail and "issuers[2]" in ready.detail
+    assert "no usable local JWKS" in ready.detail
+    assert "secret" not in ready.detail
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [[], {"keys": [{**LOCAL.jwk, "use": "enc"}]}, {"keys": [KEY_A.jwk]}],
+    ids=["not a JWKS object", "encryption only", "not the local signing key"],
+)
+def test_local_readiness_requires_the_local_verification_key(
+    local_jwks: Path, payload: object
+) -> None:
+    local_jwks.write_text(json.dumps(payload))
+    ready = TokenIdentityProvider([], local_jwks=local_jwks, trust_local=True).check()
+    assert not ready.ready and "no usable local JWKS" in ready.detail
+
+
+def test_local_readiness_compares_the_pair_only_on_a_minting_host(tmp_path: Path) -> None:
+    issuer = LocalIssuer(tmp_path, SystemClock())
+    issuer.mint("runner", machine=True)
+    provider = TokenIdentityProvider([], local_jwks=issuer.jwks, trust_local=True)
+    assert provider.check().ready
+    issuer.jwks.write_text(json.dumps({"keys": [LOCAL.jwk]}))
+    assert not provider.check().ready
+    (tmp_path / "local-key.pem").unlink()
+    assert provider.check().ready
+    assert not (tmp_path / "local-key.pem").exists()
 
 
 # The employee directory: `<command> <identity>` prints `RESULT uid=<identity> status=<status>`
