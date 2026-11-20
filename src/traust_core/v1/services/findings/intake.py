@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from uuid import UUID
 
 from pydantic import ValidationError as ModelValidationError
@@ -54,6 +54,10 @@ OWASP_LLM = "owasp-llm"
 REBASELINE_MAPPING = ReviewReason("rebaseline_mapping")
 # NEED(contracts): advisory-match vocabulary (confirmed | probable) once a schema carries it.
 CWE_IDENTIFIER = re.compile(r"CWE-\d{1,5}")
+
+
+# findings stamped per short transaction after an assessment commits (~5 ms each)
+_RESTAMP_BATCH = 100
 
 
 class FindingIntake:
@@ -166,10 +170,23 @@ class FindingIntake:
                             )
                         )
             uow.commit()
+        self._restamp(finding_id for finding_id, _ in taken.values())
         return IntakeResult(
             findings={label: finding_id for label, (finding_id, _) in taken.items()},
             created=tuple(dict.fromkeys(f for f, new in taken.values() if new)),
         )
+
+    def _restamp(self, finding_ids: Iterable[UUID]) -> None:
+        """Stamp the assessment's findings' current answer once it commits, in short
+        transactions: a rescan never holds a finding's row for its whole length, so a
+        person deciding on one waits at most one batch (the stamp is a projection, refolded
+        from what is recorded - it may trail the occurrence by a batch, never diverge)."""
+        ids = list(dict.fromkeys(finding_ids))
+        for start in range(0, len(ids), _RESTAMP_BATCH):
+            with self._uow as uow:
+                for finding_id in ids[start : start + _RESTAMP_BATCH]:
+                    state_history.restamp(uow, self._rating, finding_id)
+                uow.commit()
 
     def check(self, repository_id: UUID, candidates: Sequence[FindingCandidate]) -> None:
         """Refuse, writing nothing, what `accept` would refuse: lets a caller check before it
@@ -435,7 +452,6 @@ class FindingIntake:
                     rule=candidate.rule,
                 )
             )
-            state_history.restamp(uow, self._rating, finding.id)
             assert occurrence.id is not None
             pending[occurrence.id] = {}
         else:

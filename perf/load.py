@@ -30,6 +30,7 @@ from traust_core.v1.models.dashboard import (
 )
 from traust_core.v1.models.findings import Decision, Occurrence
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services.findings.intake import _RESTAMP_BATCH as RESTAMP_BATCH
 from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
 from traust_core.v1.services.findings.state_history import restamp, stamp
 
@@ -38,6 +39,7 @@ GRANT_SIZE = 366  # the migrated estate's largest real grant; the rig has 10,000
 # The farm's bars: a dashboard read under duress, and how far reads may slow the write door.
 READ_P95_BUDGET = 1.0  # seconds
 WRITE_SLOWDOWN_LIMIT = 2.0  # x the write door's own p95, measured alone first
+TRIAGE_WAIT_BUDGET = 2.0  # seconds a person's decision may wait on a rescan (one stamp batch)
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,8 +91,8 @@ class Duress:
 @dataclass(frozen=True, slots=True)
 class RescanDuress:
     """A full rescan of the long-tail repository while dashboards poll and a person
-    triages the same repository: the rescan's one transaction holds every finding's row
-    until it commits, so a triage decision there waits for it."""
+    triages the same repository: the stamps run in short batches, so a triage decision
+    there waits at most one batch, never the rescan's length."""
 
     findings: int
     rescan_seconds: float
@@ -102,7 +104,7 @@ class RescanDuress:
     def report(self) -> str:
         return "\n".join(
             (
-                f"rescan: {self.findings} findings in one transaction, {self.rescan_seconds:.1f}s"
+                f"rescan: {self.findings} findings, {self.rescan_seconds:.1f}s"
                 f" ({1000 * self.rescan_seconds / max(self.findings, 1):.1f} ms per finding)",
                 self.triage_alone.line("triage alone (baseline)"),
                 self.reads.line("dashboard reads"),
@@ -459,8 +461,9 @@ def hot_repository(engine: Engine) -> tuple[UUID, list[UUID]]:
 
 
 def rescan(engine: Engine, repository_id: UUID, findings: Sequence[UUID]) -> float:
-    """Intake's write shape for a full rescan: one assessment, one transaction, every
-    finding re-reported and restamped from the fold. Returns the seconds it held."""
+    """Intake's write shape for a full rescan: one assessment recorded in one transaction,
+    then every finding restamped from the fold in short batches (intake's `_restamp`).
+    Returns the seconds the whole rescan took."""
     rating = RatingPolicy(RatingConfig())
     started = time.perf_counter()
     with SqlTraustUnitOfWork(engine) as uow:
@@ -488,8 +491,12 @@ def rescan(engine: Engine, repository_id: UUID, findings: Sequence[UUID]) -> flo
                     rule="rule-rescan",
                 )
             )
-            restamp(uow, rating, finding_id)
         uow.commit()
+    for start in range(0, len(findings), RESTAMP_BATCH):
+        with SqlTraustUnitOfWork(engine) as uow:
+            for finding_id in findings[start : start + RESTAMP_BATCH]:
+                restamp(uow, rating, finding_id)
+            uow.commit()
     return time.perf_counter() - started
 
 

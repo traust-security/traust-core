@@ -15,6 +15,7 @@ from sqlalchemy.engine import Engine
 
 from perf.load import (
     READ_P95_BUDGET,
+    TRIAGE_WAIT_BUDGET,
     WRITE_SLOWDOWN_LIMIT,
     cards,
     run_duress,
@@ -69,16 +70,16 @@ def test_dashboard_reads_under_the_stamped_write_door(engine: Engine, context: C
 
 @skip_unless_gated
 def test_dashboard_reads_through_a_full_rescan(engine: Engine, context: Context) -> None:
-    """A rescan restamps every finding of the long-tail repository in one transaction:
-    dashboards keep their budget, nothing fails, and a triage decision on that repository
-    waits at most for the rescan's commit (its row locks), never fails."""
+    """A full rescan of the long-tail repository: dashboards keep their budget, nothing
+    fails, and a person's decision on that repository waits at most one stamp batch -
+    never the rescan's length (one transaction held every row: a 68s wait, measured)."""
     duress = run_rescan_duress(engine, context)
     print(duress.report())
     assert duress.reads.failures == 0, "no dashboard read may fail during a rescan"
     assert duress.triage.failures == 0, "a triage decision must wait for a rescan, not fail"
     assert duress.reads.pct(95) < READ_P95_BUDGET, "dashboard p95 over budget during a rescan"
-    assert duress.triage.max <= duress.rescan_seconds + 1.0, (
-        "a triage decision waited longer than the rescan held its rows"
+    assert duress.triage.max < TRIAGE_WAIT_BUDGET, (
+        "a person's decision waited on the rescan past one stamp batch"
     )
 
 
