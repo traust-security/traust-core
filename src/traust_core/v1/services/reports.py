@@ -80,6 +80,9 @@ class ReportService:
     ) -> None:
         self._uow = uow  # the transaction boundary only: tables are reached through doors
         self._objects = objects
+        # NEED(reports: domain alignment): reports build through InsightService; the views
+        # move out of services/insight.py into the reports domain (mechanical; foundry
+        # plan 2026-11-schema-performance-audit, follow-ups)
         self._insight = insight
         self._ops = ops
         self._log = log
