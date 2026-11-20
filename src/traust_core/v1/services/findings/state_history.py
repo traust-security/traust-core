@@ -14,7 +14,7 @@ from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from uuid import UUID
 
-from traust_core.v1.models.findings import Decision, Disposition, finding_state, kind_of
+from traust_core.v1.models.findings import Decision, Disposition, Occurrence, finding_state, kind_of
 from traust_core.v1.models.vocabulary import DispositionAssurance, Severity
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import AssessmentLog
@@ -87,8 +87,7 @@ def fold(
             }
             lines = decision_lines(judged, rows, baselines, refs)
         disposition = Disposition.fold(finding_id, judged, lines)
-    occurrences = uow.occurrences.list_for_finding(finding_id)
-    occurrence = occurrences[-1] if occurrences else None
+    occurrence = _latest_report(uow, uow.occurrences.list_for_finding(finding_id))
     return Folded(
         state=finding_state(kind_of(kind, tuple(d.validity for d in decisions)), disposition),
         severity=rating.effective_severity(occurrence, disposition),
@@ -97,6 +96,17 @@ def fold(
         and disposition.assurance == DispositionAssurance.EXECUTION_PROVEN,
         unverified=disposition is None or disposition.assurance == DispositionAssurance.CLAIMED,
     )
+
+
+def _latest_report(uow: TraustUnitOfWork, occurrences: Sequence[Occurrence]) -> Occurrence | None:
+    # the views' report order: the reporting assessment's time, then the occurrence's own
+    if not occurrences:
+        return None
+    when = {
+        a.id: a.occurred_at
+        for a in AssessmentLog(uow).list_by_ids({o.assessment_id for o in occurrences})
+    }
+    return max(occurrences, key=lambda o: (when[o.assessment_id], o.created_at, str(o.id)))
 
 
 def stamp(
