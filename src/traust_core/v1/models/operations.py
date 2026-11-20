@@ -93,6 +93,7 @@ class JobResult(Model):
     reason: OrderReason | None = None
     written: tuple[str, ...] = ()
     usage: tuple[ModelUsage, ...] = ()  # the run's measured model usage, settled on completion
+    outputs: tuple[UUID, ...] = ()  # artifacts the run produced outside any assessment
 
     @classmethod
     def succeeded(cls, written: tuple[str, ...] = ()) -> JobResult:
@@ -310,6 +311,7 @@ class OrderManifest(Model):
     approval: OrderApproval | None = None
     sessions: tuple[SessionRecord, ...] = ()
     degraded: Mapping[str, int] = Field(default_factory=dict)
+    outputs: tuple[UUID, ...] = ()
 
     @model_serializer(mode="wrap")
     def serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
@@ -318,6 +320,8 @@ class OrderManifest(Model):
             document.pop("sessions", None)
         if not self.degraded:
             document.pop("degraded", None)
+        if not self.outputs:
+            document.pop("outputs", None)
         return document
 
 
@@ -685,6 +689,7 @@ class RunOrder(Entity):
     fork_url: str | None = None  # the mirror the effort runs on (remediate_finding only)
     fork_branch: str | None = None  # its fix branch
     fork_scheduled_at: datetime | None = None  # when scheduling set them, checked
+    input_artifact_id: UUID | None = None  # the asset's input document, if it takes one
 
 
 FEED_ORDER_STATES = (*FINISHED_ORDER_STATES, OrderState.AWAITING_APPROVAL)

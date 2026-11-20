@@ -18,7 +18,7 @@ import sqlalchemy as sa
 import yaml
 from sqlalchemy.engine import Engine
 
-from traust_core.v1 import contracts
+from traust_core.v1 import contracts, data_migrations
 from traust_core.v1.context.attack import load_atlas_catalog, load_attack_catalog
 from traust_core.v1.context.config import (
     SHIPPED_EXTERNAL_TOOLS,
@@ -177,6 +177,7 @@ from traust_core.v1.services.attestation import AttestationService, StatementPol
 from traust_core.v1.services.below_range import BelowRangeService
 from traust_core.v1.services.code_facts import CodeFactsService
 from traust_core.v1.services.compliance import GATE, ComplianceService
+from traust_core.v1.services.dashboards import DashboardService
 from traust_core.v1.services.detection_quality import DetectionQualityService
 from traust_core.v1.services.exposure import AdvisoryCvssCache, AdvisoryCvssReader, ExposureService
 from traust_core.v1.services.findings import (
@@ -263,6 +264,7 @@ from traust_core.v1.services.remediation import (
 from traust_core.v1.services.remediation_scheduling import RemediationSchedulingService
 from traust_core.v1.services.repo_checkout import RepoCheckoutService
 from traust_core.v1.services.reporting import ReportingService
+from traust_core.v1.services.reports import ReportService
 from traust_core.v1.services.validation import ValidationRecords, ValidationService
 
 log = logging.getLogger(__name__)
@@ -320,6 +322,8 @@ class Services:
     detection_quality: DetectionQualityService
     remediation: RemediationService
     insight: InsightService
+    reports: ReportService
+    dashboards: DashboardService
     pqc: PqcService
     remediation_scheduling: RemediationSchedulingService
     verification: VerificationService
@@ -810,6 +814,9 @@ class Context:
             self.config.home.mkdir(parents=True, exist_ok=True)
         return create_database_engine(self.config.record_store_url())
 
+    def _advisory_cvss(self) -> AdvisoryCvssReader:
+        return AdvisoryCvssReader(self.object_store, self.advisory_cvss_cache)
+
     @cached_property
     def database(self) -> Engine:
         engine = self._store_engine
@@ -819,6 +826,7 @@ class Context:
             dialect = Dialect.of(engine)
             apply_schema(engine, contracts.database_ddl(dialect))
             _run_channel(engine, local=True)
+            data_migrations.run(engine, cvss=self._advisory_cvss())
             log.info(
                 "store bootstrap fresh dialect=%s: baseline schema and the whole channel applied",
                 dialect,
@@ -832,8 +840,13 @@ class Context:
             # configured database's is its deployment's, never an open's.
             if _channel_stamped(engine):
                 _run_channel(engine, local=local)
+                _run_data_channel(engine, local=local, cvss=self._advisory_cvss())
             elif local:
+                # brought on at the head (presumed current), then the data
+                # channel runs: its entries transform rows the stamp presumes
+                # shaped, so a local store applies them on the same open
                 _bring_store_on_channel(engine)
+                _run_data_channel(engine, local=True, cvss=self._advisory_cvss())
             else:
                 log.warning(
                     "configured database refused: not on the upgrade channel - its "
@@ -961,7 +974,16 @@ class Context:
     def _wire(self, uow: SqlTraustUnitOfWork, policy: PortfolioPolicy) -> Services:
         hosts = self.config.forge_hosts
         sources = command_source(hosts, clock=self.clock, api=self.forge_api)
-        intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy(), objects=self.object_store)
+        rating = RatingPolicy(self.config.rating)
+        cvss = self._advisory_cvss()
+        intake = FindingIntake(
+            uow,
+            IdentityPolicy(),
+            TaxonomyPolicy(),
+            objects=self.object_store,
+            rating=rating,
+            cvss=cvss,
+        )
         ledger = None if self.config.ledger is None else LedgerService(uow, self.config.ledger)
         identity = self.config.identity
         spend = SpendService(
@@ -996,7 +1018,6 @@ class Context:
         )
         validation_records = ValidationRecords(uow, self.object_store, findings=FindingRecords(uow))
         precedents = FindingPrecedents(uow, validation=validation_records)
-        rating = RatingPolicy(self.config.rating)
         review = ReviewPolicy(self.config.valve_salt())
         triage_lint = Lint({TriageArtifact: [VerdictCitations()]})
         decisions = FindingDecisions(
@@ -1007,14 +1028,14 @@ class Context:
             clock=self.clock,
             objects=self.object_store,
             review=review,
+            rating=rating,
             restatement=RestatementPolicy(identity.restatement_approvers if identity else 0),
             validation_records=validation_records,
             source=sources,
             hosts=hosts,
             recording=ops,
+            cvss=cvss,
         )
-        rating = RatingPolicy(self.config.rating)
-        cvss = AdvisoryCvssReader(self.object_store, self.advisory_cvss_cache)
         views = FindingViewQuery(rating, self.object_store, cvss)
         findings = FindingService(
             uow,
@@ -1258,6 +1279,68 @@ class Context:
                 PublishSpecs(PublishSpec(VerificationArtifact)), self.object_store, uow
             ),
         )
+        insight = InsightService(
+            (
+                FindingsRollupView(findings, portfolio, assessment),
+                ContainerFindingsView(findings, portfolio, assessment, rating),
+                InsecurePatternsView(findings, portfolio),
+                InventoryExportView(portfolio),
+                CriticalMissesView(detection_quality),
+                BenchmarkScorecardsView(detection_quality),
+                CompliancePrecisionView(detection_quality),
+                trend,
+                ProgramView(spend, ops, self.assets.names),
+                CoverageView(assessment, portfolio, self.clock),
+                ExposureView(exposure, self.clock),
+                DependencyReachView(exposure, portfolio),
+                PqcView(pqc),
+                PqcWorklistView(pqc),
+                pqc_portfolio,
+                PqcVendorsView(pqc, exposure, portfolio),
+                ComplianceDashboardView(compliance),
+                OscalExport(compliance),
+                SarifView(findings, portfolio, self.clock),
+                threats,
+                LocView(code_facts, portfolio, findings, clock=self.clock),
+                RemediationIndexView(remediation, portfolio),
+                FreshnessView(freshness, catalog, assessment, portfolio, self.clock),
+                executive,
+                ScoreboardView(executive, trend, threats, findings, self.clock),
+                PrivilegesView(assessment, portfolio),
+                ValidationFuzzView(assessment, portfolio, validation),
+                census,
+                ReviewCardView(findings, portfolio),
+                TriageView(
+                    ArtifactPublisher(
+                        PublishSpecs(PublishSpec(TriageArtifact)), self.object_store, uow
+                    )
+                ),
+                SlaView(
+                    findings,
+                    portfolio,
+                    lambda: self.sla_policy or self.default_sla_policy,
+                    self.clock,
+                    recorded=None if self.sla_policy else sla_policies,
+                ),
+                # Always in the set: each raises naming its file when its catalog is missing
+                # (the SlaView pattern), never silently absent.
+                SpendView(
+                    spend,
+                    portfolio,
+                    FindingsRollupView(findings, portfolio, assessment),
+                    self.model_catalog,
+                    self.invoices,
+                ),
+                attack,
+            ),
+            self.clock,
+            sla_policies=sla_policies,
+            builds=ArtifactPublisher(
+                PublishSpecs(PublishSpec(InsightBuildsArtifact)), self.object_store, uow
+            ),
+            decisions=findings.decisions,
+            parsed=self.parsed_builds,
+        )
         return Services(
             artifacts=ArtifactPublisher(PublishSpecs(), self.object_store, uow),
             redaction=RedactionPolicy(),
@@ -1313,68 +1396,9 @@ class Context:
             remediation_scheduling=RemediationSchedulingService(
                 uow, findings, remediation, verification, ops, portfolio
             ),
-            insight=InsightService(
-                (
-                    FindingsRollupView(findings, portfolio, assessment),
-                    ContainerFindingsView(findings, portfolio, assessment, rating),
-                    InsecurePatternsView(findings, portfolio),
-                    InventoryExportView(portfolio),
-                    CriticalMissesView(detection_quality),
-                    BenchmarkScorecardsView(detection_quality),
-                    CompliancePrecisionView(detection_quality),
-                    trend,
-                    ProgramView(spend, ops, self.assets.names),
-                    CoverageView(assessment, portfolio, self.clock),
-                    ExposureView(exposure, self.clock),
-                    DependencyReachView(exposure, portfolio),
-                    PqcView(pqc),
-                    PqcWorklistView(pqc),
-                    pqc_portfolio,
-                    PqcVendorsView(pqc, exposure, portfolio),
-                    ComplianceDashboardView(compliance),
-                    OscalExport(compliance),
-                    SarifView(findings, portfolio, self.clock),
-                    threats,
-                    LocView(code_facts, portfolio, findings, clock=self.clock),
-                    RemediationIndexView(remediation, portfolio),
-                    FreshnessView(freshness, catalog, assessment, portfolio, self.clock),
-                    executive,
-                    ScoreboardView(executive, trend, threats, findings, self.clock),
-                    PrivilegesView(assessment, portfolio),
-                    ValidationFuzzView(assessment, portfolio, validation),
-                    census,
-                    ReviewCardView(findings, portfolio),
-                    TriageView(
-                        ArtifactPublisher(
-                            PublishSpecs(PublishSpec(TriageArtifact)), self.object_store, uow
-                        )
-                    ),
-                    SlaView(
-                        findings,
-                        portfolio,
-                        lambda: self.sla_policy or self.default_sla_policy,
-                        self.clock,
-                        recorded=None if self.sla_policy else sla_policies,
-                    ),
-                    # Always in the set: each raises naming its file when its catalog is missing
-                    # (the SlaView pattern), never silently absent.
-                    SpendView(
-                        spend,
-                        portfolio,
-                        FindingsRollupView(findings, portfolio, assessment),
-                        self.model_catalog,
-                        self.invoices,
-                    ),
-                    attack,
-                ),
-                self.clock,
-                sla_policies=sla_policies,
-                builds=ArtifactPublisher(
-                    PublishSpecs(PublishSpec(InsightBuildsArtifact)), self.object_store, uow
-                ),
-                decisions=findings.decisions,
-                parsed=self.parsed_builds,
-            ),
+            insight=insight,
+            reports=ReportService(uow, self.object_store, insight, ops, AssessmentLog(uow)),
+            dashboards=DashboardService(uow, portfolio),
         )
 
     @contextmanager
@@ -1449,6 +1473,29 @@ def _bring_store_on_channel(engine: Engine) -> list[contracts.Upgrade]:
             extra={"operation": "store.channel", "outcome": "on", "count": len(stamped)},
         )
     return stamped
+
+
+def _run_data_channel(engine: Engine, *, local: bool, cvss: AdvisoryCvssReader) -> None:
+    """The data channel follows the DDL channel's rule: a local store applies it,
+    a configured database's data migrations are its deployment's - pending ones
+    are refused, not applied behind its operator's back."""
+    if local:
+        data_migrations.run(engine, cvss=cvss)
+        return
+    waiting = data_migrations.pending(engine)
+    if waiting:
+        names = ", ".join(entry.name for entry in waiting)
+        log.warning(
+            "configured database refused: behind the data channel, %d entr(y/ies) pending: %s",
+            len(waiting),
+            names,
+            extra={"operation": "store.bootstrap", "outcome": "refused_pending_data"},
+        )
+        raise ConfigError(
+            f"the database is behind the data channel ({len(waiting)} pending: {names}): "
+            "a configured database's data migrations are its deployment's - apply them "
+            "through traust_core.v1.data_migrations.run with its owners"
+        )
 
 
 def _run_channel(engine: Engine, *, local: bool) -> None:

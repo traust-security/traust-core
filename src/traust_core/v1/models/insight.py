@@ -128,19 +128,26 @@ class CompliancePrecision(ViewModel):
 
 class ReportFormat(StrEnum):
     """A rendered report's format: markdown and html for every insight, csv for one with an
-    export table. Each format carries its media type and file suffix."""
+    export table, json for the view itself (the contract-checked model a page renders). Each
+    format carries its media type and file suffix."""
 
     MARKDOWN = "markdown"
     HTML = "html"
     CSV = "csv"
+    JSON = "json"
 
     @property
     def media_type(self) -> str:
-        return {"markdown": "text/markdown", "html": "text/html", "csv": "text/csv"}[self.value]
+        return {
+            "markdown": "text/markdown",
+            "html": "text/html",
+            "csv": "text/csv",
+            "json": "application/json",
+        }[self.value]
 
     @property
     def suffix(self) -> str:
-        return {"markdown": "md", "html": "html", "csv": "csv"}[self.value]
+        return {"markdown": "md", "html": "html", "csv": "csv", "json": "json"}[self.value]
 
 
 class ExecutivePanel(StrEnum):

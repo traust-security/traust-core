@@ -14,6 +14,7 @@ ORDER = [
     "repositories",
     "rendering",
     "services",
+    "data_migrations",
     "context",
     "rest",
 ]
@@ -41,6 +42,7 @@ THIRD_PARTY = {
     "repositories": {"sqlalchemy", "psycopg", "pydantic", "boto3", "botocore"},  # boto*: [s3] extra
     "rendering": {"pydantic"},
     "services": {"pydantic", "traust_ledger"},  # one module: test_architecture
+    "data_migrations": {"sqlalchemy"},
     "context": {"pydantic", "yaml", "sqlalchemy"},
     "rest": {
         "pydantic",

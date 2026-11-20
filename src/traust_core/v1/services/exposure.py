@@ -1515,6 +1515,7 @@ class ExposureService:
         raw = build.to_bytes()
         key = ObjectKey.parse(f"feeds/{ADVISORY_CVSS_FEED}/{sha256_hex(raw)}.json")
         self._snapshot(ADVISORY_CVSS_FEED, key, raw, run_order_id)
+        self._intake.restamp_advisories(list(linked))  # their severity moved with the build
         return build
 
     def _document_scores(

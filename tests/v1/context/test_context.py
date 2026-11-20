@@ -5,6 +5,7 @@ import pytest
 import sqlalchemy as sa
 
 from tests.v1.example.repository import SqlTaskUnitOfWork, metadata
+from traust_core.v1 import contracts
 from traust_core.v1.context import Config, Context, StoreState
 from traust_core.v1.context.config import DatabaseConfig
 from traust_core.v1.errors import ConfigError
@@ -133,10 +134,14 @@ def test_a_fresh_local_store_bootstraps_with_the_channel_stamped(tmp_path: Path)
     assert "disposition" in {c["name"] for c in inspector.get_columns("repository")}
     with engine.connect() as connection:
         stamps = connection.exec_driver_sql("SELECT name FROM db_upgrade").fetchall()
-        assert [name for (name,) in stamps] == ["0001_repository_disposition"]
+        assert [name for (name,) in stamps] == [
+            "0001_repository_disposition",
+            "0002_finding_state_columns",
+            "0003_run_order_input",
+        ]
     again = Context(Config(home=tmp_path)).database  # re-open: nothing re-applied
     with again.connect() as connection:
-        assert connection.exec_driver_sql("SELECT count(*) FROM db_upgrade").fetchone()[0] == 1
+        assert connection.exec_driver_sql("SELECT count(*) FROM db_upgrade").fetchone()[0] == 3
 
 
 def test_a_fresh_store_logs_its_bootstrap_and_channel_trail(
@@ -314,7 +319,10 @@ def test_the_control_surface_brings_a_pre_channel_store_on_at_the_head(tmp_path:
     context = Context(Config(home=tmp_path))
     assert context.pending_db_upgrades() == []  # nothing pending: nothing has run yet
     stamped = context.apply_db_upgrades()  # the first apply brings it on, nothing runs
-    assert [upgrade.name for upgrade in stamped] == ["0001_repository_disposition"]
+    # everything shipped, whatever the channel holds today - the test follows
+    # the channel rather than naming its entries
+    shipped = [upgrade.name for upgrade in contracts.shipped_db_upgrades("sqlite")]
+    assert [upgrade.name for upgrade in stamped] == shipped
     assert Context(Config(home=tmp_path)).store_status().state is StoreState.CURRENT
 
 

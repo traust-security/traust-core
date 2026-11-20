@@ -194,6 +194,21 @@ class AssessmentLog:
         with self._uow as uow:
             return uow.artifacts.get(artifact_id)
 
+    def imported(self, digest: str) -> Artifact | None:
+        """An artifact no assessment produced, by digest: identical bytes are one row."""
+        with self._uow as uow:
+            return uow.artifacts.find(None, digest)
+
+    def keep_imported(self, artifact: Artifact) -> Artifact:
+        """Record an artifact no assessment produced; the same digest returns its row."""
+        with self._uow as uow:
+            return uow.artifacts.get_or_add(artifact)
+
+    def serialize_imported(self, stream: str) -> None:
+        """Serialize writers of one imported stream inside the caller's write transaction."""
+        with self._uow as uow:
+            uow.artifacts.lock_imported(stream)
+
     def list_artifacts(self, assessment_id: UUID, kind: str | None = None) -> list[Artifact]:
         """The assessment's documents, oldest first; an unknown assessment is a 404,
         never an empty listing (the door's semantics, not the query's)."""

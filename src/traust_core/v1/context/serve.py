@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+_SERVER_ROLE_ENV = "TRAUST_SERVER_ROLE"
 _SERVER_CONFIG_ENV = "TRAAST_SERVER_CONFIG"
 
 
@@ -24,3 +25,13 @@ def handed_config() -> Path | None:
     """The config file a spawned worker was handed, if any."""
     raw = os.environ.get(_SERVER_CONFIG_ENV)
     return Path(raw) if raw else None
+
+
+def hand_role(role: str) -> None:
+    """The parent hands its serving role to the workers it is about to spawn."""
+    os.environ[_SERVER_ROLE_ENV] = role
+
+
+def handed_role() -> str | None:
+    """The serving role a spawned worker was handed, if any."""
+    return os.environ.get(_SERVER_ROLE_ENV)

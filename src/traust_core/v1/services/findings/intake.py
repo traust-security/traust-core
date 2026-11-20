@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Collection, Iterable, Sequence
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from pydantic import ValidationError as ModelValidationError
@@ -38,11 +39,16 @@ from traust_core.v1.models.vocabulary import (
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectStore
 from traust_core.v1.services.artifact_publishing import AssessmentLog
+from traust_core.v1.services.findings import state_history
 from traust_core.v1.services.findings.claims import approved_claims_for, retained_claim_artifact
 from traust_core.v1.services.findings.identity import IdentityPolicy
+from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
 from traust_core.v1.services.findings.review import request
 from traust_core.v1.services.findings.taxonomy import TaxonomyPolicy
 from traust_core.v1.services.portfolio import Inventory
+
+if TYPE_CHECKING:
+    from traust_core.v1.services.exposure import AdvisoryCvssReader
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +60,10 @@ REBASELINE_MAPPING = ReviewReason("rebaseline_mapping")
 CWE_IDENTIFIER = re.compile(r"CWE-\d{1,5}")
 
 
+# findings stamped per short transaction after an assessment commits (~5 ms each)
+_RESTAMP_BATCH = 100
+
+
 class FindingIntake:
     def __init__(
         self,
@@ -62,8 +72,12 @@ class FindingIntake:
         taxonomy: TaxonomyPolicy,
         *,
         objects: ObjectStore | None = None,
+        rating: RatingPolicy | None = None,
+        cvss: AdvisoryCvssReader | None = None,
     ) -> None:
         self._uow = uow
+        self._rating = rating or RatingPolicy(RatingConfig())
+        self._cvss = cvss
         self._inventory = Inventory(uow)
         self._log = AssessmentLog(uow)
         self._identity = identity
@@ -162,10 +176,29 @@ class FindingIntake:
                             )
                         )
             uow.commit()
+        self._restamp(finding_id for finding_id, _ in taken.values())
         return IntakeResult(
             findings={label: finding_id for label, (finding_id, _) in taken.items()},
             created=tuple(dict.fromkeys(f for f, new in taken.values() if new)),
         )
+
+    def restamp_advisories(self, advisory_ids: Collection[UUID]) -> None:
+        """Restamp the findings naming these advisories: a new authority build moves their
+        selected score, so their effective severity, with no write to the finding."""
+        with self._uow as uow:
+            named = [f.id for a in advisory_ids for f in uow.findings.list_for_advisory(a)]
+        self._restamp(f for f in named if f is not None)
+
+    def _restamp(self, finding_ids: Iterable[UUID]) -> None:
+        # after the commit, in short batches: a rescan never holds a finding's row while a
+        # person decides on it (the stamp is refolded from what is recorded: it trails, never
+        # diverges)
+        ids = list(dict.fromkeys(finding_ids))
+        for start in range(0, len(ids), _RESTAMP_BATCH):
+            with self._uow as uow:
+                for finding_id in ids[start : start + _RESTAMP_BATCH]:
+                    state_history.restamp(uow, self._rating, finding_id, self._cvss)
+                uow.commit()
 
     def check(self, repository_id: UUID, candidates: Sequence[FindingCandidate]) -> None:
         """Refuse, writing nothing, what `accept` would refuse: lets a caller check before it

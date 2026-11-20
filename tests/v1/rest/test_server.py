@@ -35,7 +35,7 @@ def test_traust_server_serves_the_configured_context(
     records = (tmp_path / "logs" / "traust.log").read_text().splitlines()
     messages = [json.loads(line)["message"] for line in records]
     assert messages[0].startswith("no model-registry.yaml beside")  # spend stays unpriced
-    assert messages[1:] == ["server access event"]
+    assert messages[1:] == ["serving role all", "server access event"]
 
 
 def test_traust_server_prices_spend_from_the_rate_card_beside_the_config(
@@ -203,3 +203,20 @@ def test_db_upgrade_reports_a_channel_refusal_without_a_traceback(
         server.main(["--config", str(config), "db", "upgrade"])
     assert exit_code.value.code == 1
     assert "refused this store" in capsys.readouterr().err
+
+
+def test_the_reports_role_runs_the_report_worker_and_no_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--role reports serves no routes: it runs the report worker until stopped."""
+    from traust_core.v1.services.reports import ReportWorker
+
+    config = tmp_path / "traust.yaml"
+    config.write_text(f"home: {tmp_path}\n")
+    ran: dict[str, Any] = {}
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: ran.update(uvicorn=True))
+    monkeypatch.setattr(ReportWorker, "run", lambda self, stop: ran.update(worker=self))
+    with pytest.raises(SystemExit) as exited:
+        server.main(["--config", str(config), "--role", "reports"])
+    assert exited.value.code == 0
+    assert isinstance(ran["worker"], ReportWorker) and "uvicorn" not in ran

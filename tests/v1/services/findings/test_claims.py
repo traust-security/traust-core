@@ -82,6 +82,7 @@ def service(
         clock=FixedClock(NOW),
         objects=objects,
         review=ReviewPolicy(),
+        rating=RatingPolicy(RatingConfig()),
         restatement=RestatementPolicy(approvals),
     )
     return FindingService(

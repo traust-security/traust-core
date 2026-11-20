@@ -81,6 +81,7 @@ def service(engine: Engine, *, windows: WindowMemo | None = None) -> FindingServ
         clock=FixedClock(NOW),
         objects=InMemoryObjectStore(),
         review=ReviewPolicy(),
+        rating=RatingPolicy(RatingConfig()),
     )
     rating = RatingPolicy(RatingConfig())
     views = FindingViewQuery(rating)
@@ -535,7 +536,7 @@ def test_a_finding_judged_but_never_reported_still_counts(engine: Engine) -> Non
     assert service(engine).open_count(repo.id, (Severity.HIGH,)) == 3  # type: ignore[arg-type]
 
 
-def test_open_count_leaves_out_hardening_debt(engine: Engine) -> None:
+def test_open_count_leaves_out_judged_hardening_only(engine: Engine) -> None:
     with SqlTraustUnitOfWork(engine) as uow:
         seed = Seed(uow)
         repo = seed.repository()
@@ -550,9 +551,10 @@ def test_open_count_leaves_out_hardening_debt(engine: Engine) -> None:
         seed.decision(hardened, validity="hardening", statement_key="hardening")
         uow.commit()
     findings = service(engine)
-    assert findings.open_count(repo.id, (Severity.HIGH,)) == 1  # type: ignore[arg-type]
+    # the judged hardening leaves the count; an unjudged weakness is identified, so open
+    assert findings.open_count(repo.id, (Severity.HIGH,)) == 2  # type: ignore[arg-type]
     undecided = findings.get(weakness.id)  # type: ignore[arg-type]
-    assert undecided.is_open() and undecided.state() == FindingState.HARDENING
+    assert undecided.is_open() and undecided.state() == FindingState.OPEN
 
 
 # reads across repositories

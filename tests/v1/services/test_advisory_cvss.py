@@ -427,3 +427,45 @@ def test_a_store_failure_reading_the_build_is_no_build_and_never_kept(world: Wor
     assert world.cache.parse(one, outage) is None
     assert world.cache.parse(one, outage) is None and len(reads) == 2  # retried, never kept
     assert world.cache.parse(one, lambda: AdvisoryCvss(scores={}).to_bytes()) is not None
+
+
+def test_a_new_build_restamps_the_findings_naming_its_advisories(world: World) -> None:
+    """A build moves a finding's selected authority score - its effective severity - with no
+    write to the finding: the build restamps it, so the stored severity is the view's."""
+    from decimal import Decimal
+
+    from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
+    from traust_core.v1.services.findings.views import FindingViewQuery
+
+    canonical = advisory(world.engine, LOG4SHELL_GHSA, LOG4SHELL)
+    with SqlTraustUnitOfWork(world.engine) as uow:
+        seed = Seed(uow)
+        repository = seed.repository(url="https://github.com/org/stamped")
+        named = seed.finding(repository, advisory_id=canonical.id, advisory_match="confirmed")
+        run = seed.assessment(seed.repository_ref(repository))
+        medium = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"  # 5.3: the report's own
+        seed.occurrence(
+            named, run, severity="medium", cvss_vector=medium, cvss_score=Decimal("5.3")
+        )
+        uow.commit()
+
+    def stored() -> str | None:
+        with world.engine.connect() as conn:
+            table = "finding" if world.engine.dialect.name == "sqlite" else "traust.finding"
+            return conn.exec_driver_sql(
+                f"SELECT current_severity FROM {table} WHERE id = '{named.id}'"
+            ).scalar()
+
+    assert stored() == "medium"
+    world.serve_log4shell()
+    service = world.service()
+    reader = AdvisoryCvssReader(world.objects, world.cache)
+    service._intake = FindingIntake(  # the Context's wiring: the intake reads the builds
+        service._uow, IdentityPolicy(), TaxonomyPolicy(), cvss=reader
+    )
+    service.refresh_advisory_documents()
+
+    views = FindingViewQuery(RatingPolicy(RatingConfig()), world.objects, reader)
+    with SqlTraustUnitOfWork(world.engine) as uow:
+        (shown,) = views.views(uow, [uow.findings.get(named.id)])
+    assert stored() == shown.effective_severity == "critical"  # Log4Shell's authority band

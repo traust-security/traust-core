@@ -42,7 +42,6 @@ from traust_core.v1.models.findings import (
     Finding,
     FindingCandidate,
     FindingClock,
-    FindingCount,
     FindingDimension,
     FindingFilter,
     FindingFix,
@@ -88,7 +87,10 @@ from traust_core.v1.services.artifact_publishing import (
     PublishSpecs,
     stored_bytes,
 )
-from traust_core.v1.services.findings.census import FindingCensus, FindingCensusRow
+from traust_core.v1.services.findings.census import (
+    FindingCensus,
+    FindingCensusRow,
+)
 from traust_core.v1.services.findings.claims import FindingClaims, retained_claim_artifact
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.facts import FindingFacts
@@ -634,34 +636,6 @@ class FindingService:
         window = heapq.nsmallest(page.limit, survivors(), key=cmp_to_key(order.compare))
         return Page(items=tuple(window), next=None)
 
-    def count_in(self, filter: FindingSetFilter) -> FindingCount:
-        """The filtered total a paged listing's pager reads: the same keep rule as
-        `list_in`, counted in one census fold — counting views, no locations or cwes
-        read, nothing held — so the number under a worklist's pager costs one bounded
-        walk, not a consumer's page-by-page count of every row.
-
-        Outside a `shared()` build the count rides the process memo the windows ride, so
-        the pager's number and the page's window of one scope cost one fold together
-        instead of one each — what the worklist issues on every refresh. A cold count
-        therefore reads the locations a census skips; the trade is a shared fold for a
-        narrower one, and the memo's TTL bounds how long it is paid."""
-        if self._windows is not None and not self._shared_depth:
-            return FindingCount(
-                total=sum(
-                    1
-                    for view in self._window_views(filter.repository_ids, filter.as_of, census=True)
-                    if filter.keeps(view)
-                )
-            )
-        total = 0
-
-        def tally(batch: Mapping[UUID, Sequence[FindingView]]) -> None:
-            nonlocal total
-            total += sum(1 for views in batch.values() for view in views if filter.keeps(view))
-
-        self.census_fold(filter.repository_ids, tally, as_of=filter.as_of)
-        return FindingCount(total=total)
-
     def _window_views(
         self, repository_ids: Collection[UUID], as_of: datetime | None, *, census: bool = False
     ) -> Iterator[FindingView]:
@@ -735,59 +709,6 @@ class FindingService:
                 views = tuple(grouped.get(repository_id, ()))
                 held[repository_id] = views
                 memo.deposit(repository_id, as_of, views, census=census)
-
-    def summary_in(
-        self, repository_ids: Collection[UUID], as_of: datetime | None = None
-    ) -> list[FindingRollup]:
-        """Several repositories' findings counted by state per repository — the batched
-        `summary` under its one set-scoped dimension (`group_by=repository`, the census a
-        consumer renders per repository row): `summary`'s own rule (never-reported
-        findings count nowhere), folded one bounded batch of whole repositories at a
-        time instead of one summary call per repository. A batch holds whole
-        repositories, so each repository's rollup is complete when its batch folds and
-        the views release — the census fold's own discipline, nothing held but the
-        running rollups. A repository with no findings has no row, exactly as `summary`
-        returns no group for one."""
-        by_repo: defaultdict[UUID, list[Finding]] = defaultdict(list)
-        with self._uow as uow:
-            for finding in uow.findings.list_for_repositories(repository_ids):
-                by_repo[finding.repository_id].append(finding)
-            rollups: dict[str, FindingRollup] = {}
-            batch: list[Finding] = []
-            size = 0
-            for findings in by_repo.values():
-                if batch and size + len(findings) > _FACTS_BATCH:
-                    self._summary_batch(uow, batch, as_of, rollups)
-                    batch, size = [], 0
-                batch.extend(findings)
-                size += len(findings)
-            if batch:
-                self._summary_batch(uow, batch, as_of, rollups)
-        return sorted(rollups.values(), key=lambda r: (-r.findings, r.key is None, r.key or ""))
-
-    def _summary_batch(
-        self,
-        uow: TraustUnitOfWork,
-        findings: Sequence[Finding],
-        as_of: datetime | None,
-        rollups: dict[str, FindingRollup],
-    ) -> None:
-        # one facts load per bounded batch of whole repositories, the fold's own
-        # discipline: a whole scope's ids at once would exceed the bind limit. The
-        # census mode loads no locations or cwes — the repository rollup counts
-        # states and effective severities, exactly what a tally reads.
-        facts = FindingFacts.load(
-            uow, findings, until=as_of, objects=self._objects, census=True, cvss=self._views.cvss
-        )
-        groups: defaultdict[str, list[FindingView]] = defaultdict(list)
-        for finding in findings:
-            if not facts.reported_by(finding.id, as_of):  # type: ignore[arg-type]
-                continue  # never reported: no severity, and no baseline holds it either
-            view = self._views.view(facts, finding, as_of, {})
-            if view is not None:
-                groups[str(view.finding.repository_id)].append(view)
-        for key, views in groups.items():
-            rollups[key] = finding_rollup(key, views)
 
     def all(self, filter: FindingFilter) -> list[FindingView]:
         """Every finding `list` pages through, newest first."""

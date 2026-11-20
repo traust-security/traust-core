@@ -823,7 +823,8 @@ class OpsService:
 
     def complete(self, order_id: UUID, worker: WorkerId, result: JobResult) -> RunOrder:
         """Finish the order and settle its measured usage as its spend, in one transaction; degraded
-        keys and unpriced usage (`spend-unpriced`) go to its run manifest."""
+        keys, unpriced usage (`spend-unpriced`) and the run's assessment-less outputs go to its
+        run manifest."""
         outcome = OrderState(result.outcome)
         order = self.get(order_id)
         if order.state == outcome:
@@ -838,7 +839,12 @@ class OpsService:
         }
         degraded = dict(result.degraded)
         gaps = {SPEND_UNPRICED: len(unpriced)} if unpriced else {}
-        change = (lambda m: self._completion(m, degraded, gaps)) if degraded or gaps else None
+        outputs = list(dict.fromkeys(str(o) for o in result.outputs))
+        change = (
+            (lambda m: self._completion(m, degraded, gaps, outputs))
+            if degraded or gaps or outputs
+            else None
+        )
         saved = self._move(order_id, OrderState.LEASED, update, change, worker, spend)
         if degraded:
             self._uow.after_commit(
@@ -862,7 +868,11 @@ class OpsService:
         return saved
 
     def _completion(
-        self, manifest: dict[str, Any], degraded: dict[str, int], gaps: dict[str, int]
+        self,
+        manifest: dict[str, Any],
+        degraded: dict[str, int],
+        gaps: dict[str, int],
+        outputs: list[str],
     ) -> dict[str, Any]:
         registered = set(self._degraded_keys())
         for key in degraded:
@@ -871,7 +881,12 @@ class OpsService:
                     DegradedKey(key)
                 except (TypeError, ValueError) as error:
                     raise ValidationError(f"unregistered degraded key {key!r}") from error
-        return {**manifest, "degraded": {**degraded, **gaps}}
+        recorded = {**manifest}
+        if degraded or gaps:
+            recorded["degraded"] = {**degraded, **gaps}
+        if outputs:
+            recorded["outputs"] = outputs
+        return recorded
 
     def approve(self, order_id: UUID, principal: Principal) -> RunOrder:
         """Queue an order awaiting approval. A verified person approves anything; a verified
@@ -1022,6 +1037,29 @@ class OpsService:
             )
         return orders
 
+    def latest_with_input(self, asset: AssetName, input_artifact_id: UUID) -> RunOrder | None:
+        """The asset's newest order for exactly this input document: identical inputs are one
+        artifact, so this is the last run of the same request."""
+        with self._uow as uow:
+            return uow.run_orders.latest_with_input(asset, input_artifact_id)
+
+    def queue_for_core(
+        self, asset: AssetName, input_artifact_id: UUID, requested_by: str, priority: int
+    ) -> RunOrder:
+        """An order core queues for one of its own roles (a report build): no subject and no
+        run-asset policy - the door that took the request checked the caller's authority."""
+        order = RunOrder(
+            asset=asset,
+            state=OrderState.QUEUED,
+            priority=priority,
+            requested_by=requested_by,
+            input_artifact_id=input_artifact_id,
+        )
+        with self._uow as uow:
+            saved = uow.run_orders.add(order)
+            uow.commit()
+        return saved
+
     def get(self, order_id: UUID) -> RunOrder:
         with self._uow as uow:
             return uow.run_orders.get(order_id)
@@ -1081,7 +1119,11 @@ class OpsService:
                 raise NotFoundError(f"artifact {order.artifact_id} of order {order.id} not found")
             doc = json.loads(self._manifests.payload_of(row)) if row is not None else {}
             manifests[order.id] = OrderManifest.model_validate(
-                {k: doc[k] for k in ("config", "approval", "sessions", "degraded") if k in doc}
+                {
+                    k: doc[k]
+                    for k in ("config", "approval", "sessions", "degraded", "outputs")
+                    if k in doc
+                }
             )
         return manifests
 

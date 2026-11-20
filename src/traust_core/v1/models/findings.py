@@ -235,16 +235,23 @@ class FindingState(StrEnum):
 
 
 def finding_state(kind: str | None, disposition: Disposition | None) -> FindingState:
-    """The state classification a view serves and a census counts: closed by validity,
-    then by resolution; open splits off hardening (posture debt)."""
+    """The state classification a view serves and a census counts, along the workflow
+    (identified -> verify -> remediate | accept risk | false positive): closed by validity,
+    then by resolution; hardening is a verified defense-in-depth gap - a judged weakness, or
+    the historical hardening validity. Kind alone never decides: an unjudged weakness is
+    identified, so open (contracts: "kind alone does not establish confirmation")."""
     d = disposition
-    if d is not None and d.validity in _CLOSED_VALIDITY:
+    if d is None:
+        return FindingState.OPEN
+    if d.validity in _CLOSED_VALIDITY:
         return FindingState.FALSE_POSITIVE
-    if d is not None and d.resolution == DispositionResolution.RESOLVED:
+    if d.resolution == DispositionResolution.RESOLVED:
         return FindingState.RESOLVED
-    if d is not None and d.resolution == DispositionResolution.RISK_ACCEPTED:
+    if d.resolution == DispositionResolution.RISK_ACCEPTED:
         return FindingState.ACCEPTED
-    if kind == FindingKind.WEAKNESS or (d is not None and d.validity == Validity.HARDENING):
+    if d.validity == Validity.HARDENING or (
+        kind == FindingKind.WEAKNESS and d.validity in _AFFIRMED_VALIDITY
+    ):
         return FindingState.HARDENING
     return FindingState.OPEN
 
@@ -327,13 +334,6 @@ class SortDirection(StrEnum):
 
     ASC = "asc"
     DESC = "desc"
-
-
-class FindingCount(Model):
-    """The filtered total a paged listing's pager reads: one number, from one bounded
-    fold that holds no views."""
-
-    total: int
 
 
 class FindingRollup(Model):
@@ -773,6 +773,15 @@ class Decision(AppendOnly):
     auto_accept_tier: bool = False
     occurred_at: datetime
 
+    # The state projection: stamped at insert, never updated, storage only
+    # (serialization-excluded; the repository writes them at insert).
+    folded_state: str | None = Field(default=None, exclude=True)
+    folded_severity: str | None = Field(default=None, exclude=True)
+    folded_decided: bool | None = Field(default=None, exclude=True)
+    folded_proven: bool | None = Field(default=None, exclude=True)
+    folded_unverified: bool | None = Field(default=None, exclude=True)
+    folded_policy_version: str | None = Field(default=None, exclude=True)
+
 
 class CensusDecision(NamedTuple):
     """One decision's census columns — what the disposition fold reads, without a model:
@@ -944,6 +953,8 @@ _JUDGEMENTS = {
     "severity": frozenset(Severity),
 }
 _CLOSED_VALIDITY = frozenset({Validity.FALSE_POSITIVE, "not_affected"})
+# a verified claim: what makes a weakness a hardening finding rather than an identified one
+_AFFIRMED_VALIDITY = frozenset({Validity.CONFIRMED, Validity.TRUE_POSITIVE, Validity.CORRECTED})
 _CLOSED_RESOLUTION = frozenset(
     {DispositionResolution.RESOLVED, DispositionResolution.RISK_ACCEPTED}
 )
@@ -1001,9 +1012,21 @@ def kind_of(kind: str | None, validities: Iterable[str | None]) -> str | None:
     return folded
 
 
+_PROJECTION_FIELDS = (
+    "folded_state",
+    "folded_severity",
+    "folded_decided",
+    "folded_proven",
+    "folded_unverified",
+    "folded_policy_version",
+)
+
+
 def normalize_decision(decision: Decision) -> Decision:
     """Interpret historical classifiers without changing the saved statement or its key."""
     values = decision.model_dump()
+    # serialization-excluded projection columns ride along unchanged
+    values.update({field: getattr(decision, field) for field in _PROJECTION_FIELDS})
     values.update(
         {
             field: classifier
@@ -1386,7 +1409,7 @@ class FindingView(Model):
         return "open"
 
     def state(self) -> FindingState:
-        """Closed by validity, then by resolution; open splits off hardening (posture debt)."""
+        """The workflow state (`finding_state`): kind alone never decides."""
         return finding_state(self.finding.kind, self.disposition)
 
 

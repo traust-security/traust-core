@@ -18,7 +18,7 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from tests.v1.example import repository as example_repository
-from traust_core.v1 import contracts
+from traust_core.v1 import contracts, data_migrations
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.providers.base import Readiness
 from traust_core.v1.providers.clock import FixedClock
@@ -148,6 +148,7 @@ def apply_contract_db(engine: Engine) -> None:
     on_driver_connection(  # the runner drives a raw autocommit DBAPI connection
         engine, lambda dbapi: contracts.run_db_upgrades(dbapi, contract_dialect(engine))
     )
+    data_migrations.run(engine, cvss=None)  # what a deployment applies: DDL, then data
 
 
 def _engine(kind: str, tmp_path: Path) -> Engine:

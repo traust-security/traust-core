@@ -56,6 +56,7 @@ from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.identity import IdentityPolicy
 from traust_core.v1.services.findings.intake import FindingIntake
 from traust_core.v1.services.findings.precedents import FindingPrecedents
+from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
 from traust_core.v1.services.findings.review import ReviewPolicy
 from traust_core.v1.services.findings.taxonomy import TaxonomyPolicy
 from traust_core.v1.services.ledger import LedgerConfig, LedgerService
@@ -480,6 +481,7 @@ def test_the_same_report_again_is_the_same_assessment_and_adds_nothing(
 
 def test_assessed_decisions_are_appended_to_the_ledger_and_sealed(engine: Engine) -> None:
     uow = SqlTraustUnitOfWork(engine)
+    _rating = RatingPolicy(RatingConfig())
     decisions = FindingDecisions(
         uow,
         LedgerService(uow, LedgerConfig()),
@@ -488,6 +490,7 @@ def test_assessed_decisions_are_appended_to_the_ledger_and_sealed(engine: Engine
         clock=FixedClock(WHEN),
         objects=InMemoryObjectStore(),
         review=ReviewPolicy(),
+        rating=RatingPolicy(RatingConfig()),
     )
     intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy())
     service = AssessmentService(uow, intake, decisions=decisions)
@@ -529,6 +532,7 @@ def a_service_with_an_unsignable_ledger(engine: Engine) -> AssessmentService:
         clock=FixedClock(WHEN),
         objects=InMemoryObjectStore(),
         review=ReviewPolicy(),
+        rating=RatingPolicy(RatingConfig()),
     )
     return AssessmentService(
         uow, FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()), decisions=decisions
@@ -584,6 +588,7 @@ def test_assessed_decisions_need_the_assessments_occurrence(
         clock=FixedClock(WHEN),
         objects=InMemoryObjectStore(),
         review=ReviewPolicy(),
+        rating=RatingPolicy(RatingConfig()),
     )
     artifact_id = decided[0].artifact_id
     assert assessment.id is not None and artifact_id is not None
@@ -657,6 +662,7 @@ def test_record_audit_without_a_publisher_or_a_published_report_records_nothing(
         clock=FixedClock(WHEN),
         objects=InMemoryObjectStore(),
         review=ReviewPolicy(),
+        rating=RatingPolicy(RatingConfig()),
     )
     service = AssessmentService(
         uow, FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()), decisions=decisions
