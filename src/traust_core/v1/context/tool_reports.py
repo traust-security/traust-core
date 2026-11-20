@@ -83,14 +83,15 @@ def opengrep_report(
     *,
     pack: Path | None = None,
     rule_allow: str | None = None,
+    add_rules: Sequence[str] = (),
     timeout: int = opengrep.SCAN_TIMEOUT,
     binary: str = "opengrep",
 ) -> Doc:
-    """opengrep's facts report over `target`, on `pack` (default: the registered one) and, on a
-    default run, its supplements; ConfigError for a pack that isn't a directory."""
+    """Facts and rule coverage for a default, additive, or explicit replacement scan."""
     chosen = pack or ctx.rule_pack
     if not chosen.is_dir():
         raise ConfigError(f"opengrep rule pack is not a directory: {chosen}")
+    adopter_pack = ctx.config.locations.opengrep_adopter_rules if not rules else None
     return opengrep.execute_scan(
         target,
         rules,
@@ -100,8 +101,30 @@ def opengrep_report(
         load=yaml_documents,
         supplements=ctx.rule_pack_supplements,
         rule_allow=load_rule_allowlist(rule_allow),
+        additive=((adopter_pack,) if adopter_pack else ()) + tuple(add_rules),
         timeout=timeout,
         opengrep_bin=binary,
+    )
+
+
+def opengrep_intake_report(
+    ctx: Context,
+    sources: Sequence[str],
+    *,
+    pack: Path | None = None,
+    timeout: int = 300,
+    binary: str = "opengrep",
+) -> Doc:
+    """Run the additive-rule gate without scanning a target or activating any rule."""
+    return opengrep.intake_rules(
+        sources,
+        pack=pack or ctx.rule_pack,
+        supplements=ctx.rule_pack_supplements,
+        runner=_runner(ctx, ("opengrep", "git", binary), max(timeout, opengrep.SCAN_TIMEOUT)),
+        checkouts=ctx.checkouts,
+        load=yaml_documents,
+        timeout=timeout,
+        binary=binary,
     )
 
 

@@ -90,7 +90,7 @@ def fixture_name(rule: Path, example: str) -> str:
     return name
 
 
-def _read_text(source: Path, boundary: Path) -> str:
+def read_rule_text(source: Path, boundary: Path) -> str:
     if not source.resolve().is_relative_to(boundary.resolve()):
         raise ValidationError(f"rule fixture leaves its source directory: {source}")
     try:
@@ -98,6 +98,22 @@ def _read_text(source: Path, boundary: Path) -> str:
     except (OSError, UnicodeError) as error:
         raise ValidationError(f"cannot read rule input {source.name}") from error
     return text
+
+
+def rule_files(source: Path) -> Iterator[Path]:
+    root = source if source.is_dir() else source.parent
+    paths = (
+        sorted({*source.rglob("*.yaml"), *source.rglob("*.yml")}) if source.is_dir() else [source]
+    )
+    for path in paths:
+        if ".test." not in path.name and not any(
+            part.startswith(".") or part == "tests" for part in path.relative_to(root).parts[:-1]
+        ):
+            yield path
+
+
+def fixture_files(rule: Path) -> Iterator[Path]:
+    return (path for path in sorted(rule.parent.glob(rule.stem + ".*")) if _fixture(path, rule))
 
 
 def _snapshot(
@@ -111,19 +127,12 @@ def _snapshot(
         if not source.exists():
             raise ValidationError(f"rule source not found: {source}")
         boundary = source if source.is_dir() else source.parent
-        candidates = (
-            sorted({*source.rglob("*.yaml"), *source.rglob("*.yml")})
-            if source.is_dir()
-            else [source]
-        )
-        for path in candidates:
-            if path in seen or ".test." in path.name:
+        for path in rule_files(source):
+            if path in seen:
                 continue
             relative = path.relative_to(boundary)
-            if any(part.startswith(".") or part == "tests" for part in relative.parts[:-1]):
-                continue
             seen.add(path)
-            text = _read_text(path, boundary)
+            text = read_rule_text(path, boundary)
             # Native pairing ignores dotted config basenames such as rule.skeleton.yaml.
             destination = (
                 root
@@ -159,11 +168,10 @@ def _snapshot(
                 rules.append(rule_id)
                 if str(rule.get("pattern", "")).strip().startswith("TODO"):
                     problems.append(f"{rule_id} is an unauthored skeleton")
-            for fixture in sorted(path.parent.glob(path.stem + ".*")):
-                if _fixture(fixture, path):
-                    staged = destination.with_name("rule" + fixture.name[len(path.stem) :])
-                    fixtures[staged.resolve()] = _read_text(fixture, boundary)
-                    staged.write_text(fixtures[staged.resolve()], encoding="utf-8")
+            for fixture in fixture_files(path):
+                staged = destination.with_name("rule" + fixture.name[len(path.stem) :])
+                fixtures[staged.resolve()] = read_rule_text(fixture, boundary)
+                staged.write_text(fixtures[staged.resolve()], encoding="utf-8")
     if examples is not None:
         if len(configs) != 1:
             raise ValidationError("proposal examples require exactly one rule file")

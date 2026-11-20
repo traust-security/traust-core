@@ -184,10 +184,18 @@ class Locations(_Model):
     feeds_cache: str | None = None
     gitleaks_config: str | None = None
     opengrep_rules: str | None = None
+    opengrep_adopter_rules: str | None = None
     product_definitions: str | None = None
     sarif_tool_uri: str | None = None
     inputs: str | None = None
     mirror_cache: str | None = None
+
+    @pydantic.field_validator("opengrep_adopter_rules")
+    @classmethod
+    def _local_adopter_rules(cls, value: str | None) -> str | None:
+        if value is not None and (not value.strip() or "://" in value or value.startswith("git@")):
+            raise ValueError("opengrep_adopter_rules must be a non-empty local path")
+        return value
 
     def _absolute(self, home: Path) -> dict[str, str]:
         # Same rule as traust-contracts' loader: URIs stay as written; `inputs` follows traust's.
@@ -376,6 +384,7 @@ _PATH_FIELDS = (
     "feeds_cache",
     "gitleaks_config",
     "opengrep_rules",
+    "opengrep_adopter_rules",
     "mirror_cache",
 )
 

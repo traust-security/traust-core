@@ -1,6 +1,4 @@
-"""The rule-proposal gate's checks. A proposed rule is admitted only when it is one well-formed
-rule with no catch-all pattern, path glob or unsafe regex, its examples fire exactly, and it
-stays quiet on the repository it was proposed for."""
+"""Static, fixture and match-volume policy for candidate rules."""
 
 from __future__ import annotations
 
@@ -54,17 +52,17 @@ def structure(doc: Any) -> tuple[ProposalCheck, dict[str, Any] | None]:
     cwes = meta.get("cwe")
     languages = rule.get("languages")
     problems = []
-    if not _ID.match(str(rule.get("id", ""))):
+    if not _ID.fullmatch(str(rule.get("id", ""))):
         problems.append("id must be lowercase letters, digits, dots and dashes")
     if not str(rule.get("message", "")).strip():
         problems.append("message is required")
     if not isinstance(languages, list) or not languages:
         problems.append("languages must be a non-empty list")
-    if rule.get("severity") not in _SEVERITIES:
+    if not isinstance(rule.get("severity"), str) or rule["severity"] not in _SEVERITIES:
         problems.append(f"severity must be one of {sorted(_SEVERITIES)}")
     if not isinstance(cwes, list) or not all(_CWE.match(str(c).split(":")[0]) for c in cwes or [0]):
         problems.append("metadata.cwe must list CWE ids")
-    if "kind" in meta and meta["kind"] not in {str(k) for k in FindingKind}:
+    if "kind" in meta and meta["kind"] not in tuple(str(k) for k in FindingKind):
         problems.append("metadata.kind must be a finding kind")
     taint = rule.get("mode") == "taint" and "pattern-sources" in rule and "pattern-sinks" in rule
     if not taint and not any(k in rule for k in _MATCHERS):
@@ -90,8 +88,11 @@ def paths(rule: dict[str, Any]) -> ProposalCheck:
     spec = rule.get("paths") if isinstance(rule.get("paths"), dict) else {}
     problems = []
     for key in ("include", "exclude"):
-        for glob in spec.get(key) or []:
-            g = str(glob)
+        globs = spec.get(key, [])
+        if not isinstance(globs, list) or not all(isinstance(g, str) for g in globs):
+            problems.append(f"{key}: expected a list of path globs")
+            continue
+        for g in globs:
             if ".." in g.split("/") or g.startswith(("/", "~")):
                 problems.append(f"{key}: path leaves the tree")
             elif key == "include" and g.strip() in _CATCH_ALL_GLOBS:

@@ -489,6 +489,236 @@ def test_an_explicit_rule_allowlist_filters_every_fact(pack: Path, target: Path)
     }
 
 
+def _custom(rule_id: str, **changes: object) -> dict[str, Any]:
+    return {
+        "id": rule_id,
+        "languages": ["go"],
+        "severity": "WARNING",
+        "message": "Prefer the current API",
+        "metadata": {"cwe": ["CWE-477"]},
+        "pattern": "oldAPI($X)",
+    } | changes
+
+
+def _write_custom(root: Path, *rules: dict[str, Any]) -> Path:
+    root.mkdir()
+    config = root / "custom.yaml"
+    config.write_text(json.dumps({"rules": rules}))
+    write_fixture(config)
+    return config
+
+
+class AdditiveRunner(Runner):
+    def __init__(self, *, noisy: bool = False, timed_out: bool = False) -> None:
+        super().__init__(
+            {
+                "results": [
+                    {"check_id": f"pack.{rule_id}", "path": "main.go", "extra": {}}
+                    for rule_id in ("traust-go-1", "supp-rule")
+                ]
+            }
+        )
+        self.noisy = noisy
+        self.timed_out = timed_out
+
+    def run(self, argv: Any, **kw: Any) -> ProcessResult:
+        if argv[1] != "scan" or not kw.get("max_output_bytes"):
+            return super().run(argv, **kw)
+        self.calls.append((tuple(argv), kw))
+        if self.timed_out:
+            raise ProcessTimeout(tuple(argv), subprocess.TimeoutExpired(argv, 1))
+        ids = [
+            rule["id"]
+            for i, token in enumerate(argv)
+            if token == "--config"
+            for rule in json.loads(Path(argv[i + 1]).read_text())["rules"]
+        ]
+        return ProcessResult(
+            tuple(argv),
+            0,
+            json.dumps(
+                {
+                    "results": [
+                        {"check_id": f"optional.{rule_id}", "path": "main.go", "extra": {}}
+                        for rule_id in ids
+                        for _ in range(26 if self.noisy and rule_id == "extra-rule" else 1)
+                    ],
+                    "paths": {"scanned": ["main.go"]},
+                }
+            ).encode(),
+            b"",
+            0.1,
+        )
+
+
+def test_additions_preserve_primary_facts_and_reject_only_the_offending_rules(
+    pack: Path, target: Path, tmp_path: Path
+) -> None:
+    supplement = _write_custom(tmp_path / "supp", _custom("supp-rule"))
+    locale = _write_custom(
+        tmp_path / "extra",
+        _custom("extra-rule"),
+        _custom("traust-python-1"),
+        _custom("supp-rule"),
+        _custom("wrong-language", languages=["py"]),
+        _custom("bad-pattern", pattern="$X"),
+    )
+    (locale.parent / "broken.yaml").write_text("rules: [")
+    another = _write_custom(tmp_path / "another", _custom("extra-rule"))
+    opts = {
+        "pack": pack,
+        "checkouts": NEVER,
+        "load": yaml_documents,
+        "supplements": (SupplementalPack("required", str(supplement.parent), ("supp-rule",)),),
+    }
+    primary = R.execute_scan(target, [], runner=runner(AdditiveRunner()), **opts)
+    report = R.execute_scan(
+        target,
+        [],
+        runner=runner(AdditiveRunner()),
+        additive=(str(locale.parent), str(another.parent)),
+        **opts,
+    )
+    assert report["outcome"] == "degraded"
+    assert report["facts"][:2] == primary["facts"]
+    assert [f["origin"] for f in report["facts"]] == [
+        "traust",
+        "supplement:required",
+        f"additive:{locale.parent}",
+    ]
+    assert [f["rule_id"] for f in report["facts"]] == ["traust-go-1", "supp-rule", "extra-rule"]
+    assert "extra-rule" in report["rule_allowlist"]["rules"]
+    refusals = {r["rule_id"]: r for r in report["additive_rules"]["refused"]}
+    assert {rule: r["check"] for rule, r in refusals.items()} == {
+        None: "parse",
+        "traust-python-1": "collision",
+        "supp-rule": "collision",
+        "wrong-language": "skipped-for-language",
+        "bad-pattern": "catch-all",
+        "extra-rule": "collision",
+    }
+    assert "traust rule pack" in refusals["traust-python-1"]["reason"]
+    assert "required" in refusals["supp-rule"]["reason"]
+    assert str(locale.parent) in refusals["extra-rule"]["reason"]
+    assert str(another.parent) in refusals["extra-rule"]["reason"]
+    assert report["additive_rules"]["degraded"] == {str(locale.parent): 5, str(another.parent): 1}
+
+
+@pytest.mark.parametrize("timeout", [False, True])
+def test_optional_scan_timeout_or_output_volume_keeps_the_primary_scan(
+    pack: Path, target: Path, tmp_path: Path, timeout: bool
+) -> None:
+    extra = _write_custom(tmp_path / "extra", _custom("extra-rule"), _custom("another-rule"))
+    raw = AdditiveRunner(noisy=True, timed_out=timeout)
+    report = R.execute_scan(
+        target,
+        (),
+        pack=pack,
+        runner=runner(raw),
+        checkouts=NEVER,
+        load=yaml_documents,
+        additive=(str(extra.parent),),
+    )
+    assert report["outcome"] == "degraded"
+    assert report["facts"][0]["rule_id"] == "traust-go-1"
+    assert [f["rule_id"] for f in report["facts"][2:]] == ([] if timeout else ["another-rule"])
+    assert {r["check"] for r in report["additive_rules"]["refused"]} == {
+        "scan" if timeout else "explosion"
+    }
+
+
+def test_explicit_output_allowlist_still_filters_admitted_additions(
+    pack: Path, target: Path, tmp_path: Path
+) -> None:
+    extra = _write_custom(tmp_path / "extra", _custom("extra-rule"))
+    report = R.execute_scan(
+        target,
+        (),
+        pack=pack,
+        runner=runner(AdditiveRunner()),
+        checkouts=NEVER,
+        load=yaml_documents,
+        additive=(str(extra),),
+        rule_allow=RuleAllowlist(frozenset({"traust-go-1"}), "explicit"),
+    )
+    assert [f["rule_id"] for f in report["facts"]] == ["traust-go-1"]
+    assert [r["rule_id"] for r in report["additive_rules"]["applied"]] == ["extra-rule"]
+    assert report["rule_allowlist"]["suppressed_facts"] == 2
+    assert report["outcome"] == "succeeded"
+
+
+def test_intake_uses_the_same_gate_without_a_target_or_promotion(
+    pack: Path, tmp_path: Path
+) -> None:
+    extra = _write_custom(
+        tmp_path / "extra", _custom("extra-rule", languages=["typescript"]), _custom("traust-go-1")
+    )
+    original = extra.read_bytes()
+    raw = Runner()
+    report = R.intake_rules(
+        [str(extra)],
+        pack=pack,
+        supplements=(),
+        runner=runner(raw),
+        checkouts=NEVER,
+        load=yaml_documents,
+        timeout=5,
+        binary="opengrep",
+    )
+    assert [r["rule_id"] for r in report["applied"]] == ["extra-rule"]
+    assert [r["check"] for r in report["refused"]] == ["collision"]
+    assert all(argv[1] != "scan" for argv, _ in raw.calls)
+    assert extra.read_bytes() == original
+
+
+@pytest.mark.skipif(shutil.which("opengrep") is None, reason="requires native opengrep")
+def test_native_gate_keeps_a_passing_rule_from_the_same_file_as_a_failing_rule(
+    tmp_path: Path,
+) -> None:
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    extra = _write_custom(
+        tmp_path / "extra",
+        _custom("extra.good", pattern="deprecated($X)", languages=["python"]),
+        _custom("extra.bad", pattern="absent($X)", languages=["python"]),
+    )
+    extra.with_suffix(".py").write_text(
+        "# ruleid: extra.good,extra.bad\ndeprecated('value')\n"
+        "# ok: extra.good,extra.bad\ncurrent('value')\n"
+    )
+    report = R.intake_rules(
+        [str(extra)],
+        pack=pack,
+        supplements=(),
+        runner=ProcessRunner(("opengrep",)),
+        checkouts=NEVER,
+        load=yaml_documents,
+        timeout=30,
+        binary="opengrep",
+    )
+    assert [r["rule_id"] for r in report["applied"]] == ["extra.good"], report
+    assert [(r["rule_id"], r["check"]) for r in report["refused"]] == [("extra.bad", "test")]
+
+    write_rule(pack / "python", "baseline-rule")
+    target = tmp_path / "checkout"
+    target.mkdir()
+    (target / "code.py").write_text("dangerous(value)\ndeprecated('value')\n")
+    scan = R.execute_scan(
+        target,
+        (),
+        pack=pack,
+        runner=ProcessRunner(("opengrep",)),
+        checkouts=NEVER,
+        load=yaml_documents,
+        additive=[str(extra)],
+    )
+    assert [(f["rule_id"], f["origin"]) for f in scan["facts"]] == [
+        ("baseline-rule", "traust"),
+        ("extra.good", f"additive:{extra}"),
+    ]
+    assert scan["additive_rules"]["refused"] == report["refused"]
+
+
 def test_a_scan_with_no_json_or_past_its_timeout_fails(pack: Path, target: Path) -> None:
     with pytest.raises(ScannerError, match="invalid JSON") as invalid:
         R.execute_scan(

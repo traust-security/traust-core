@@ -24,6 +24,7 @@ from traust_core.v1.errors import (
     TraustError,
     ValidationError,
 )
+from traust_core.v1.models import rule_checks as rule_proposals
 from traust_core.v1.models.artifacts import (
     BenchmarkTargetArtifact,
     ComplianceAssessmentArtifact,
@@ -165,7 +166,6 @@ from traust_core.v1.providers.rule_drafts import RuleDraftDirectory
 from traust_core.v1.providers.sources import CheckoutRequest, Workspace, workspace_file
 from traust_core.v1.repositories.objects.store import ObjectKey, ObjectStore
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
-from traust_core.v1.services import rule_proposals
 from traust_core.v1.services.artifact_publishing import (
     ArtifactPublisher,
     AssessmentLog,

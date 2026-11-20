@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from traust_core.v1.services import rule_proposals as gate
+from traust_core.v1.models import rule_checks as gate
 
 RID = "traust-proposed-py-shell"
 

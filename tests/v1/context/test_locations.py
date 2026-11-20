@@ -10,6 +10,23 @@ import pytest
 from traust_core.v1.context import Config, Locations
 from traust_core.v1.errors import ConfigError
 
+
+def test_the_adopter_rules_location_is_optional_and_relative_to_config(tmp_path: Path) -> None:
+    path = tmp_path / "traust.yaml"
+    path.write_text("locations: {opengrep_adopter_rules: rules/adopter}\n")
+    assert Config().locations.opengrep_adopter_rules is None
+    locations = Config.from_file(path).locations
+    assert locations.opengrep_adopter_rules == str(tmp_path / "rules/adopter")
+
+
+@pytest.mark.parametrize("location", ["git@example.test:org/rules", "https://example.test/rules"])
+def test_the_adopter_rules_location_rejects_remote_sources(tmp_path: Path, location: str) -> None:
+    path = tmp_path / "traust.yaml"
+    path.write_text(f"locations: {{opengrep_adopter_rules: {location!r}}}\n")
+    with pytest.raises(ConfigError, match="must be a non-empty local path"):
+        Config.from_file(path)
+
+
 # Expected values were produced by running traust-engine's `locations` accessors (and traust's
 # `context.inputs_dir`) over the same files; "error" = the engine raised DeploymentConfigMissing.
 ACCESSORS = (

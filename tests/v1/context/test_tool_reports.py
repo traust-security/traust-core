@@ -132,6 +132,25 @@ def test_opengrep_reports_the_facts_on_the_registered_pack_with_the_binary_given
     assert report["supplemental_packs"] == {"applied": []}
 
 
+def test_opengrep_default_facts_scan_applies_configured_and_requested_additions(
+    tmp_path: Path, bindir: Path
+) -> None:
+    fake(bindir, "opengrep", OPENGREP)
+    adopter, explicit = tmp_path / "unavailable-adopter", tmp_path / "unavailable-explicit"
+    ctx = context(tmp_path, opengrep_adopter_rules=str(adopter))
+    baseline = pack(tmp_path)
+    ctx.register_rule_pack(baseline)
+    repo = checkout(tmp_path, {"main.go": "package main\n"})
+
+    report = reports.opengrep_report(ctx, repo, [], add_rules=[str(explicit)])
+    assert report["outcome"] == "degraded"
+    assert report["facts"][0]["origin"] == "traust"
+    assert report["additive_rules"]["degraded"] == {str(adopter): 1, str(explicit): 1}
+
+    replacement = reports.opengrep_report(ctx, repo, [str(baseline)])
+    assert replacement["additive_rules"]["degraded"] == {}
+
+
 def test_opengrep_keeps_only_the_allowed_rules_and_takes_a_pack_override(
     tmp_path: Path, bindir: Path
 ) -> None:

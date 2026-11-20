@@ -13,16 +13,24 @@ import json
 import logging
 import re
 import shutil
-from collections.abc import Mapping, Sequence
-from contextlib import ExitStack
-from dataclasses import dataclass
+from collections import Counter, defaultdict
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import ExitStack, contextmanager
+from dataclasses import asdict, dataclass, field
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from traust_core.v1.errors import ScannerError, ScannerFailure, ServiceError, ValidationError
+from traust_core.v1.errors import (
+    ScannerError,
+    ScannerFailure,
+    ServiceError,
+    TraustError,
+    ValidationError,
+)
+from traust_core.v1.models import rule_checks
 from traust_core.v1.models.artifacts import AdapterResultArtifact
 from traust_core.v1.models.rule_mining import ProposalCheck, RuleHit
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
@@ -31,6 +39,12 @@ from traust_core.v1.providers.config_matrix import YamlLoader
 from traust_core.v1.providers.process import ProcessRunner, ProcessTimeout
 from traust_core.v1.providers.sources import CheckoutRequest, Checkouts, Workspace
 from traust_core.v1.providers.tools.adapter import adapter_result
+from traust_core.v1.providers.tools.opengrep_additions import (
+    RuleBatch,
+    RuleReceipt,
+    protected_ids,
+    vet_rules,
+)
 from traust_core.v1.providers.tools.opengrep_quality import (
     OPENGREP_ENV,
     RuleQualityError,
@@ -40,6 +54,7 @@ from traust_core.v1.providers.tools.opengrep_quality import (
 log = logging.getLogger(__name__)
 
 SCAN_TIMEOUT = 900
+_ADDITIVE_OUTPUT_LIMIT = 4 << 20
 
 TRAUST_PACK_LICENSE = (
     "traust-authored pack: our IP, licensed with the engine, no external restrictions"
@@ -102,6 +117,22 @@ LANG_DIRS = {
 
 # The traust pack keeps its JavaScript rules in typescript/ (each rule declares both languages).
 PACK_DIRS = {"javascript": "typescript"}
+_LANGUAGE_ALIASES = {
+    "bash": ("sh", "shell"),
+    "cpp": ("c++",),
+    "csharp": ("c#",),
+    "go": ("golang",),
+    "header": ("c", "c++", "cpp"),
+    "javascript": ("js",),
+    "kotlin": ("kt",),
+    "python": ("py", "python2", "python3"),
+    "ruby": ("rb",),
+    "rust": ("rs",),
+    "solidity": ("sol",),
+    "terraform": ("hcl",),
+    "typescript": ("ts",),
+    "yaml": ("yml",),
+}
 
 # Below this many pack rules for a detected language the pre-scan can't seed the review, and the
 # audit skills switch that language's manual lanes to the assertive posture. 8 = two-thirds of
@@ -136,17 +167,49 @@ def resolve_rule_pack_dir(pack: Path) -> Path:
     return pack
 
 
-def detect_language_dirs(target: Path) -> set[str]:
+def _detect_languages(
+    target: Path, extensions: Mapping[str, str], *, additive: bool = False
+) -> set[str]:
     dirs: set[str] = set()
     for path in target.rglob("*"):
         if not path.is_file():
             continue
         parts = path.relative_to(target).parts
-        if parts and parts[0] in EXCLUDES:
+        if any(part in EXCLUDES for part in (parts[:-1] if additive else parts[:1])):
             continue
-        if lang := LANG_DIRS.get(path.suffix):
+        key = path.suffix.lower() if additive else path.suffix
+        if lang := extensions.get(key) or extensions.get(path.name):
             dirs.add(lang)
     return dirs
+
+
+def detect_language_dirs(target: Path) -> set[str]:
+    return _detect_languages(target, LANG_DIRS)
+
+
+def _additive_languages(target: Path) -> set[str]:
+    detected = _detect_languages(
+        target,
+        LANG_DIRS
+        | {
+            ".ex": "elixir",
+            ".exs": "elixir",
+            ".h": "header",
+            ".hcl": "terraform",
+            ".json": "json",
+            ".kts": "kotlin",
+            ".lua": "lua",
+            ".vue": "vue",
+            "Dockerfile": "dockerfile",
+        },
+        additive=True,
+    )
+    return {
+        "generic",
+        "regex",
+        *detected,
+        *(alias for language in detected for alias in _LANGUAGE_ALIASES.get(language, ())),
+    }
 
 
 def _rule_lines(path: Path) -> list[str]:
@@ -425,6 +488,188 @@ def _core_version() -> str:
         return "0.0.0"
 
 
+@dataclass(frozen=True, slots=True)
+class _AdditionGate:
+    pack: Path
+    runner: ProcessRunner
+    checkouts: Checkouts
+    load: YamlLoader
+    binary: str
+    timeout: int
+
+    def reserve(self, supplements: Sequence[SupplementalPack]) -> dict[str, str]:
+        ids = dict.fromkeys(protected_ids(self.pack, self.load), "traust rule pack")
+        with ExitStack() as held:
+            for supplement in supplements:
+                rules, workspaces = resolve_rules(
+                    (supplement.source,), self.pack, self.pack, self.checkouts
+                )
+                for workspace in workspaces:
+                    held.callback(self.checkouts.release, workspace)
+                ids.update(dict.fromkeys(supplement.rules, supplement.name))
+                for source in rules:
+                    for config in source["config"]:
+                        ids.update(
+                            dict.fromkeys(protected_ids(Path(config), self.load), supplement.name)
+                        )
+        return ids
+
+    @contextmanager
+    def vet(
+        self, source: str, protected: Mapping[str, str], languages: set[str] | None
+    ) -> Iterator[tuple[list[dict[str, Any]], RuleBatch]]:
+        with ExitStack() as held:
+            try:
+                resolved, workspaces = resolve_rules(
+                    (source,), self.pack, self.pack, self.checkouts
+                )
+                for workspace in workspaces:
+                    held.callback(self.checkouts.release, workspace)
+                batch = held.enter_context(
+                    vet_rules(
+                        source,
+                        tuple(Path(path) for entry in resolved for path in entry["config"]),
+                        self.runner,
+                        load=self.load,
+                        binary=self.binary,
+                        timeout=self.timeout,
+                        protected=protected,
+                        languages=languages,
+                    )
+                )
+            except (TraustError, OSError, RecursionError) as error:
+                detail = (
+                    str(error) if isinstance(error, ValidationError) else "cannot open rule source"
+                )
+                yield [], RuleBatch((), (), (RuleReceipt(source).refuse("source", detail),))
+            else:
+                yield resolved, batch
+
+
+def _degraded(refused: Sequence[RuleReceipt]) -> dict[str, int]:
+    return dict(Counter(receipt.source for receipt in refused))
+
+
+def intake_rules(
+    sources: Sequence[str],
+    *,
+    pack: Path,
+    supplements: Sequence[SupplementalPack],
+    runner: ProcessRunner,
+    checkouts: Checkouts,
+    load: YamlLoader,
+    timeout: int,
+    binary: str,
+) -> dict[str, Any]:
+    """Vet additions without a target, without changing checked-in or enabled rules."""
+    gate = _AdditionGate(pack, runner, checkouts, load, binary, timeout)
+    protected = gate.reserve(supplements)
+    applied: list[RuleReceipt] = []
+    refused: list[RuleReceipt] = []
+    for source in dict.fromkeys(sources):
+        with gate.vet(source, protected, None) as (_, batch):
+            applied.extend(batch.applied)
+            refused.extend(batch.refused)
+            protected.update({r.rule_id: r.source for r in batch.applied if r.rule_id is not None})
+    return _additive_report(applied, refused)
+
+
+def _additive_report(
+    applied: Sequence[RuleReceipt], refused: Sequence[RuleReceipt]
+) -> dict[str, Any]:
+    return {
+        "applied": [asdict(receipt) for receipt in applied],
+        "refused": [asdict(receipt) for receipt in refused],
+        "degraded": _degraded(refused),
+    }
+
+
+def _filter_additive_hits(
+    batch: RuleBatch, facts: list[dict[str, Any]], scanned: int
+) -> tuple[list[dict[str, Any]], list[RuleReceipt], list[RuleReceipt]]:
+    hits: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for fact in facts:
+        hits[fact["rule_id"]].append(fact)
+    kept, applied, refused = [], [], []
+    for receipt in batch.applied:
+        matched = hits.get(receipt.rule_id or "", [])
+        check = rule_checks.explosion(len(matched), len({f["file"] for f in matched}), scanned)
+        if not check.passed:
+            refused.append(receipt.refuse(check.name.value, check.detail))
+        else:
+            applied.append(receipt)
+            kept.extend(f | {"origin": f"additive:{receipt.source}"} for f in matched)
+    return kept, applied, refused
+
+
+def _run_addition(
+    gate: _AdditionGate, batch: RuleBatch, target: Path
+) -> tuple[list[dict[str, Any]], list[RuleReceipt], list[RuleReceipt]]:
+    ids = frozenset(r.rule_id for r in batch.applied if r.rule_id is not None)
+    try:
+        raw, facts, errors = _scan_snapshot(
+            target,
+            batch.configs,
+            ids,
+            gate.runner,
+            gate.binary,
+            gate.timeout,
+            output_limit=_ADDITIVE_OUTPUT_LIMIT,
+        )
+    except ScannerError as error:
+        reason = f"optional scan failed: {error.reason.value}"
+    else:
+        skipped = raw.get("skipped_rules", [])
+        if not errors and not skipped and all(fact["rule_id"] in ids for fact in facts):
+            return _filter_additive_hits(batch, facts, len(raw.get("paths", {}).get("scanned", [])))
+        reason = "optional scan returned errors, skipped rules, or unrecognized results"
+    return [], [], [r.refuse("scan", reason) for r in batch.applied]
+
+
+@dataclass(slots=True)
+class _AdditiveScan:
+    facts: list[dict[str, Any]] = field(default_factory=list)
+    sources: list[dict[str, Any]] = field(default_factory=list)
+    applied: list[RuleReceipt] = field(default_factory=list)
+    refused: list[RuleReceipt] = field(default_factory=list)
+
+
+def _scan_additions(
+    gate: _AdditionGate, sources: Sequence[str], target: Path, origins: Mapping[str, str]
+) -> _AdditiveScan:
+    result = _AdditiveScan()
+    if not sources:
+        return result
+    try:
+        protected = gate.reserve(())
+    except (ValidationError, OSError, RecursionError):
+        result.refused.extend(
+            RuleReceipt(source).refuse("collision", "unable to verify the full baseline ID set")
+            for source in dict.fromkeys(sources)
+        )
+        return result
+    protected.update(
+        {
+            rule: "traust rule pack" if origin == "traust" else origin.removeprefix("supplement:")
+            for rule, origin in origins.items()
+        }
+    )
+    languages = _additive_languages(target)
+    for source in dict.fromkeys(sources):
+        with gate.vet(source, protected, languages) as (resolved, batch):
+            result.refused.extend(batch.refused)
+            if not batch.applied:
+                continue
+            protected.update({r.rule_id: r.source for r in batch.applied if r.rule_id is not None})
+            matched, accepted, failed = _run_addition(gate, batch, target)
+            result.applied.extend(accepted)
+            result.refused.extend(failed)
+            if accepted:
+                result.sources.extend(resolved)
+                result.facts.extend(matched)
+    return result
+
+
 def execute_scan(
     target: Path,
     rule_sources: Sequence[str],
@@ -435,10 +680,13 @@ def execute_scan(
     load: YamlLoader,
     supplements: Sequence[SupplementalPack] = (),
     rule_allow: RuleAllowlist | None = None,
+    additive: Sequence[str] = (),
     timeout: int = SCAN_TIMEOUT,
     opengrep_bin: str = "opengrep",
 ) -> dict[str, Any]:
     """Scan only rule snapshots that passed native validation and strict fixture tests."""
+    if rule_sources and additive:
+        raise ValidationError("--rules replaces the pack and cannot be combined with --add-rules")
     rules, held = resolve_rules(rule_sources, target, pack, checkouts)
     applied: list[str] = []
     supp_allow: set[str] = set()
@@ -447,6 +695,8 @@ def execute_scan(
     active_configs: list[Path] = []
     active_ids: set[str] = set()
     enabled: dict[int, tuple[str, ...]] = {}
+    origins: dict[str, str] = {}
+    supplement_names: dict[int, str] = {}
     try:
         if not rule_sources:
             for supp in supplements:
@@ -461,6 +711,7 @@ def execute_scan(
                 held += supp_held
                 for source in supp_rules:
                     enabled[len(rules)] = supp.rules
+                    supplement_names[len(rules)] = supp.name
                     rules.append(source)
                 applied.append(supp.name)
                 supp_allow.update(supp.rules)
@@ -484,17 +735,37 @@ def execute_scan(
                 raise ValidationError(f"enabled rules not found in pack: {sorted(missing)}")
             active_ids.update(ids)
             active_configs.extend(checked.configs)
+            origin = (
+                f"supplement:{supplement_names[index]}"
+                if index in supplement_names
+                else f"override:{source['source']}"
+                if rule_sources
+                else "traust"
+            )
+            origins.update(dict.fromkeys(ids, origin))
         raw, facts, errors = _scan_snapshot(
             target, active_configs, frozenset(active_ids), runner, opengrep_bin, timeout
         )
+        for fact in facts:
+            if origin := origins.get(fact["rule_id"]):
+                fact["origin"] = origin
+
+        gate = _AdditionGate(pack, runner, checkouts, load, opengrep_bin, timeout)
+        extra = _scan_additions(gate, additive, target, origins)
+        facts.extend(extra.facts)
+        rules.extend(extra.sources)
         allow = rule_allow
         if allow is None and supp_allow:
-            traust_ids = harness_pack_rule_ids(pack)
+            traust_ids = harness_pack_rule_ids(pack) | {
+                rule_id for rule_id, origin in origins.items() if origin == "traust"
+            }
+            additive_ids = {r.rule_id for r in extra.applied if r.rule_id is not None}
             allow = RuleAllowlist(
-                frozenset(supp_allow | traust_ids),
+                frozenset(supp_allow | traust_ids | additive_ids),
                 "rule-pack-allowlist.yaml "
                 f"({len(supp_allow)} supplemental + "
-                f"{len(traust_ids)} traust rule pack rules)",
+                f"{len(traust_ids)} traust rule pack rules"
+                + (f" + {len(additive_ids)} additive rules)" if additive_ids else ")"),
             )
         suppressed = 0
         if allow is not None:
@@ -544,6 +815,8 @@ def execute_scan(
                 for r in rules
             ],
             "supplemental_packs": {"applied": applied},
+            "additive_rules": _additive_report(extra.applied, extra.refused),
+            "outcome": "degraded" if extra.refused or errors else "succeeded",
             "rule_allowlist": (
                 {
                     "source": allow.source,
@@ -580,6 +853,8 @@ def _scan_snapshot(
     runner: ProcessRunner,
     binary: str,
     timeout: int,
+    *,
+    output_limit: int | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     cmd = [binary, "scan", "--json", "--quiet", "--disable-nosem"]
     for config in configs:
@@ -588,7 +863,13 @@ def _scan_snapshot(
         cmd += ["--exclude", excluded]
     cmd += ["--", str(target)]
     try:
-        proc = runner.run(cmd, check=False, timeout_seconds=timeout, env=OPENGREP_ENV)
+        proc = runner.run(
+            cmd,
+            check=False,
+            timeout_seconds=timeout,
+            env=OPENGREP_ENV,
+            max_output_bytes=output_limit,
+        )
     except ProcessTimeout as error:
         raise ScannerError(
             f"opengrep timed out after {timeout}s",
