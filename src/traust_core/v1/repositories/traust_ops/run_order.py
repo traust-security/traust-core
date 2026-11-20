@@ -42,6 +42,7 @@ RUN_ORDER = TableSpec(
         text_column("fork_url", nullable=True),
         text_column("fork_branch", nullable=True),
         timestamp_column("fork_scheduled_at", nullable=True),
+        uuid_column("input_artifact_id", nullable=True),
     ),
 )
 
@@ -111,6 +112,11 @@ class RunOrderRepository(MutableRecordRepository[RunOrder], Protocol):
         """The order running a work item, if any (remediate_finding orders name theirs)."""
         ...
 
+    def latest_with_input(self, asset: str, input_artifact_id: UUID) -> RunOrder | None:
+        """The asset's newest order for exactly this input document: identical inputs are
+        one artifact, so this is the last run of the same request."""
+        ...
+
     def scheduling_orders(self, work_item_ids: Collection[UUID]) -> dict[UUID, RunOrder]:
         """Each work item's scheduling order: the oldest carrying both fork facts."""
         ...
@@ -175,6 +181,17 @@ class RunOrderRepository(MutableRecordRepository[RunOrder], Protocol):
 class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
     spec = RUN_ORDER
     record = RunOrder
+
+    def latest_with_input(self, asset: str, input_artifact_id: UUID) -> RunOrder | None:
+        c = self.table.c
+        stmt = (
+            self._select()
+            .where(c.input_artifact_id == input_artifact_id, c.asset == asset)
+            .order_by(c.created_at.desc(), c.id.desc())
+            .limit(1)
+        )
+        row = self._execute(f"latest {asset} for input", stmt).mappings().one_or_none()
+        return None if row is None else self._to_record(row)
 
     def claim(
         self,

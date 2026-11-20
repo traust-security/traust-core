@@ -69,10 +69,7 @@ const READS = {
   repo_findings: (vu, d) => ['GET', `/v1/repositories/${one(vu, d)}/findings?limit=100`],
   repo_summary: (vu, d) => ['GET', `/v1/repositories/${one(vu, d)}/findings/summary?group_by=severity`],
   repo_timeline: (vu, d) => ['GET', `/v1/repositories/${one(vu, d)}/findings/timeline`],
-  insight_rollup: (vu, d) => ['GET', `/v1/insights/findings-rollup?product_id=${d.product}`],
-  insight_trend: (vu, d) => ['GET', `/v1/insights/findings-trend?product_id=${d.product}`],
-  insight_coverage: (vu, d) => ['GET', `/v1/insights/coverage?product_id=${d.product}`],
-  insight_remediation: (vu, d) => ['GET', `/v1/insights/remediation-index?product_id=${d.product}`],
+  report_request: (vu, d) => ['POST', '/v1/reports', { report: 'findings-rollup', scope: { product_ids: [d.product] } }],
   feed: () => ['GET', '/v1/feed?limit=100'],
   orders: () => ['GET', '/v1/orders?states=queued&limit=50'],
 };

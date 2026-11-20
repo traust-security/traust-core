@@ -457,9 +457,20 @@ class InsightService:
             csv=None if export is None else csv_table(export(model)),
         )
 
+    def check(self, view: ViewName, filter: ViewFilter, format: ReportFormat) -> None:
+        """Refuse a request this view cannot answer before any work is queued: an unknown
+        view, scope it does not take, csv without an export table. Nothing is built."""
+        found = self._view(view, filter)
+        if format is ReportFormat.CSV and getattr(found, "export", None) is None:
+            raise ValidationError(f"{view.value} has no export table; ask for markdown or html")
+
     def render(self, view: ViewName, filter: ViewFilter, format: ReportFormat) -> RenderedReport:
         """The view built now and rendered in the one format asked for (no other format is
-        rendered); csv is refused before the view is built when it has no export table."""
+        rendered); csv is refused before the view is built when it has no export table; json
+        is the contract-checked view model itself."""
+        if format is ReportFormat.JSON:
+            body = self.build(view, filter).model_dump_json()
+            return RenderedReport(view=view, format=format, stem=view.value, body=body)
         found = self._view(view, filter)
         export = getattr(found, "export", None)
         if format is ReportFormat.CSV and export is None:

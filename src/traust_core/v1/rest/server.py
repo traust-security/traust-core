@@ -5,13 +5,19 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+import signal
+import socket
 import sys
+import threading
 from pathlib import Path
 
 from traust_core.v1.context import Config, Context, StoreState
 from traust_core.v1.context.serve import hand_config, hand_role, handed_config, handed_role
 from traust_core.v1.errors import ConfigError
+from traust_core.v1.models.operations import WorkerId
 from traust_core.v1.rest.roles import Role
+from traust_core.v1.services.reports import ReportWorker
 
 _REST_EXTRA = {"fastapi", "starlette", "uvicorn"}
 _UNTRUSTED = "this config does not trust its local issuer: set identity.trust_local: true"
@@ -30,6 +36,8 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "db":
         raise SystemExit(_db_upgrade(Context(config), args))
+    if args.role == Role.REPORTS:
+        raise SystemExit(_report_worker(config, args.config))
     try:
         import uvicorn
     except ModuleNotFoundError as e:
@@ -81,6 +89,25 @@ def _app(config: Config, config_path: Path | None, role: Role = Role.ALL):
 
     log.info("serving role %s", role, extra={"operation": "server.role", "outcome": role})
     return create_app(context, role)
+
+
+def _report_worker(config: Config, config_path: Path | None) -> int:
+    """The reports role: no routes, one process building report orders one at a time until
+    stopped (SIGTERM or SIGINT). Report usage scales with how many of these run."""
+    context = Context(config)
+    context.configure_logging()
+    if (rate_card := _rate_card(config_path)) is not None:
+        context.register_model_catalog(rate_card)
+    services = context.services()
+    worker = ReportWorker(
+        services.ops, services.reports, WorkerId(f"reports-{socket.gethostname()}-{os.getpid()}")
+    )
+    stop = threading.Event()
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(signum, lambda *_: stop.set())
+    log.info("serving role reports", extra={"operation": "server.role", "outcome": "reports"})
+    worker.run(stop)
+    return 0
 
 
 def _worker_app():
@@ -184,8 +211,8 @@ def _parser() -> argparse.ArgumentParser:
         "--role",
         choices=[r.value for r in Role],
         default=Role.ALL.value,
-        help="serve one role: query (reads), command (writes), ops (run orders); all serves "
-        "every route",
+        help="serve one role: query (reads), command (writes), ops (run orders), reports (the "
+        "report-building worker, no routes); all serves every route",
     )
     commands = parser.add_subparsers(dest="command")
     token = commands.add_parser("token", help="print a token from this server's local issuer")

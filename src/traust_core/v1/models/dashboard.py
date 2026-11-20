@@ -16,7 +16,6 @@ class Subject(StrEnum):
 
     FINDINGS = "findings"
     REVIEW_ITEMS = "review_items"
-    WORK_ITEMS = "work_items"
     REPOSITORIES = "repositories"
 
 
@@ -36,7 +35,6 @@ class Dimension(StrEnum):
     CHANGED_WEEK = "changed_week"
     REASON = "reason"
     STATUS = "status"
-    STRATEGY = "strategy"
 
 
 class Measure(StrEnum):
@@ -46,7 +44,6 @@ class Measure(StrEnum):
     REPOSITORIES = "repositories"
     OLDEST_OPEN_AGE = "oldest_open_age"
     REVIEW_ITEMS = "review_items"
-    WORK_ITEMS = "work_items"
     MEDIAN_OPEN_DAYS = "median_open_days"
 
 

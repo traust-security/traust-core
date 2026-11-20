@@ -18,8 +18,8 @@ export const feedLatency = new Trend('feed_latency', true);
 export const claimReqs = new Counter('claim_requests');
 export const listReqs = new Counter('list_requests');
 export const feedReqs = new Counter('feed_requests');
-export const insightLatency = new Trend('insight_latency', true);
-export const insightReqs = new Counter('insight_requests');
+export const reportLatency = new Trend('report_latency', true);
+export const reportReqs = new Counter('report_requests');
 export const consumerLatency = new Trend('consumer_latency', true);
 export const consumerReqs = new Counter('consumer_requests');
 export const dashboardLatency = new Trend('dashboard_latency', true);
@@ -148,7 +148,7 @@ export function setup() {
   check(res, { 'products list is 200': (r) => r.status === 200 });
   const product = res.json('items.0.id');
   if (!product) {
-    throw new Error('no product to scope the insight read to');
+    throw new Error('no product to scope the report request to');
   }
   // a repository with findings to page: the first the products page's scope admits, else the
   // fleet's first — the scenarios only need a real, non-empty read shape
@@ -160,17 +160,17 @@ export function setup() {
   return { product, repository };
 }
 
-// The dashboard's heaviest view family: an insight built on demand. Scoped to one product so
-// the read is request-shaped (the whole-portfolio cost is bounded by perf/queries, which sees
-// the statements); unscoped at fixture volume the build runs to minutes, not a gateable request.
-export function readInsight(data) {
-  const res = http.get(`${BASE}/v1/insights/findings-rollup?product_id=${data.product}`, READER);
-  insightLatency.add(res.timings.duration);
-  insightReqs.add(1);
+// A report request: the last ready build of the same request (200) or the build queued or in
+// flight (202) - never the build itself, which the reports role runs in its own process.
+export function requestReport(data) {
+  const body = { report: 'findings-rollup', scope: { product_ids: [data.product] } };
+  const res = http.post(`${BASE}/v1/reports`, JSON.stringify(body), READER_JSON);
+  reportLatency.add(res.timings.duration);
+  reportReqs.add(1);
   if (res.status !== 200) {
-    console.log(`insight ${res.status} ${JSON.stringify(res.error)} ${String(res.body).slice(0, 200)}`);
+    console.log(`report ${res.status} ${JSON.stringify(res.error)} ${String(res.body).slice(0, 200)}`);
   }
-  check(res, { 'insight is 200': (r) => r.status === 200 });
+  check(res, { 'report request is 200 or 202': (r) => r.status === 200 || r.status === 202 });
 }
 
 // Latency plus per-scenario request rates, so a run that collapsed to near-zero throughput
@@ -185,13 +185,13 @@ export function summary(data, extra = {}) {
     claim_p95_ms: p95('claim_latency'),
     list_p95_ms: p95('list_latency'),
     feed_p95_ms: p95('feed_latency'),
-    insight_p95_ms: p95('insight_latency'),
+    report_p95_ms: p95('report_latency'),
     consumer_p95_ms: p95('consumer_latency'),
     dashboard_p95_ms: p95('dashboard_latency'),
     claim_rps: rate('claim_requests'),
     list_rps: rate('list_requests'),
     feed_rps: rate('feed_requests'),
-    insight_rps: rate('insight_requests'),
+    report_rps: rate('report_requests'),
     consumer_rps: rate('consumer_requests'),
     dashboard_rps: rate('dashboard_requests'),
     http_reqs_rate: rate('http_reqs'),

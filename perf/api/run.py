@@ -48,10 +48,7 @@ SWEEP_TARGETS = (
     "repo_timeline",
     "feed",
     "orders",
-    "insight_rollup",
-    "insight_trend",
-    "insight_coverage",
-    "insight_remediation",
+    "report_request",
 )
 API_DATABASE = "traust_perf_api"
 REGRESSION = 1.20  # a run more than 20% slower, or more than 20% lower throughput, fails
@@ -59,7 +56,7 @@ LATENCY_KEYS = (
     "claim_p95_ms",
     "list_p95_ms",
     "feed_p95_ms",
-    "insight_p95_ms",
+    "report_p95_ms",
     "consumer_p95_ms",
     "dashboard_p95_ms",
 )
@@ -67,7 +64,7 @@ RATE_KEYS = (
     "claim_rps",
     "list_rps",
     "feed_rps",
-    "insight_rps",
+    "report_rps",
     "consumer_rps",
     "dashboard_rps",
     "http_reqs_rate",

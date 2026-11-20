@@ -90,10 +90,10 @@ def test_the_catalog_refuses_what_it_does_not_serve(backend: str, tmp_path) -> N
         service = _service(engine)
 
         with pytest.raises(ValidationError, match="not yet served"):
-            service.query(DashboardQuery(subject="work_items", measures=("work_items",)))
+            service.query(DashboardQuery(subject="repositories", measures=("repositories",)))
         with pytest.raises(ValidationError, match="does not group by"):
             service.query(
-                DashboardQuery(subject="findings", measures=("findings",), group_by=("strategy",))
+                DashboardQuery(subject="findings", measures=("findings",), group_by=("sla_status",))
             )
         with pytest.raises(ValidationError, match="does not measure"):
             service.query(DashboardQuery(subject="findings", measures=("median_open_days",)))

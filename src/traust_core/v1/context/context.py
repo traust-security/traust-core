@@ -264,6 +264,7 @@ from traust_core.v1.services.remediation import (
 from traust_core.v1.services.remediation_scheduling import RemediationSchedulingService
 from traust_core.v1.services.repo_checkout import RepoCheckoutService
 from traust_core.v1.services.reporting import ReportingService
+from traust_core.v1.services.reports import ReportService
 from traust_core.v1.services.validation import ValidationRecords, ValidationService
 
 log = logging.getLogger(__name__)
@@ -321,6 +322,7 @@ class Services:
     detection_quality: DetectionQualityService
     remediation: RemediationService
     insight: InsightService
+    reports: ReportService
     dashboards: DashboardService
     pqc: PqcService
     remediation_scheduling: RemediationSchedulingService
@@ -1266,6 +1268,68 @@ class Context:
                 PublishSpecs(PublishSpec(VerificationArtifact)), self.object_store, uow
             ),
         )
+        insight = InsightService(
+            (
+                FindingsRollupView(findings, portfolio, assessment),
+                ContainerFindingsView(findings, portfolio, assessment, rating),
+                InsecurePatternsView(findings, portfolio),
+                InventoryExportView(portfolio),
+                CriticalMissesView(detection_quality),
+                BenchmarkScorecardsView(detection_quality),
+                CompliancePrecisionView(detection_quality),
+                trend,
+                ProgramView(spend, ops, self.assets.names),
+                CoverageView(assessment, portfolio, self.clock),
+                ExposureView(exposure, self.clock),
+                DependencyReachView(exposure, portfolio),
+                PqcView(pqc),
+                PqcWorklistView(pqc),
+                pqc_portfolio,
+                PqcVendorsView(pqc, exposure, portfolio),
+                ComplianceDashboardView(compliance),
+                OscalExport(compliance),
+                SarifView(findings, portfolio, self.clock),
+                threats,
+                LocView(code_facts, portfolio, findings, clock=self.clock),
+                RemediationIndexView(remediation, portfolio),
+                FreshnessView(freshness, catalog, assessment, portfolio, self.clock),
+                executive,
+                ScoreboardView(executive, trend, threats, findings, self.clock),
+                PrivilegesView(assessment, portfolio),
+                ValidationFuzzView(assessment, portfolio, validation),
+                census,
+                ReviewCardView(findings, portfolio),
+                TriageView(
+                    ArtifactPublisher(
+                        PublishSpecs(PublishSpec(TriageArtifact)), self.object_store, uow
+                    )
+                ),
+                SlaView(
+                    findings,
+                    portfolio,
+                    lambda: self.sla_policy or self.default_sla_policy,
+                    self.clock,
+                    recorded=None if self.sla_policy else sla_policies,
+                ),
+                # Always in the set: each raises naming its file when its catalog is missing
+                # (the SlaView pattern), never silently absent.
+                SpendView(
+                    spend,
+                    portfolio,
+                    FindingsRollupView(findings, portfolio, assessment),
+                    self.model_catalog,
+                    self.invoices,
+                ),
+                attack,
+            ),
+            self.clock,
+            sla_policies=sla_policies,
+            builds=ArtifactPublisher(
+                PublishSpecs(PublishSpec(InsightBuildsArtifact)), self.object_store, uow
+            ),
+            decisions=findings.decisions,
+            parsed=self.parsed_builds,
+        )
         return Services(
             artifacts=ArtifactPublisher(PublishSpecs(), self.object_store, uow),
             redaction=RedactionPolicy(),
@@ -1321,68 +1385,8 @@ class Context:
             remediation_scheduling=RemediationSchedulingService(
                 uow, findings, remediation, verification, ops, portfolio
             ),
-            insight=InsightService(
-                (
-                    FindingsRollupView(findings, portfolio, assessment),
-                    ContainerFindingsView(findings, portfolio, assessment, rating),
-                    InsecurePatternsView(findings, portfolio),
-                    InventoryExportView(portfolio),
-                    CriticalMissesView(detection_quality),
-                    BenchmarkScorecardsView(detection_quality),
-                    CompliancePrecisionView(detection_quality),
-                    trend,
-                    ProgramView(spend, ops, self.assets.names),
-                    CoverageView(assessment, portfolio, self.clock),
-                    ExposureView(exposure, self.clock),
-                    DependencyReachView(exposure, portfolio),
-                    PqcView(pqc),
-                    PqcWorklistView(pqc),
-                    pqc_portfolio,
-                    PqcVendorsView(pqc, exposure, portfolio),
-                    ComplianceDashboardView(compliance),
-                    OscalExport(compliance),
-                    SarifView(findings, portfolio, self.clock),
-                    threats,
-                    LocView(code_facts, portfolio, findings, clock=self.clock),
-                    RemediationIndexView(remediation, portfolio),
-                    FreshnessView(freshness, catalog, assessment, portfolio, self.clock),
-                    executive,
-                    ScoreboardView(executive, trend, threats, findings, self.clock),
-                    PrivilegesView(assessment, portfolio),
-                    ValidationFuzzView(assessment, portfolio, validation),
-                    census,
-                    ReviewCardView(findings, portfolio),
-                    TriageView(
-                        ArtifactPublisher(
-                            PublishSpecs(PublishSpec(TriageArtifact)), self.object_store, uow
-                        )
-                    ),
-                    SlaView(
-                        findings,
-                        portfolio,
-                        lambda: self.sla_policy or self.default_sla_policy,
-                        self.clock,
-                        recorded=None if self.sla_policy else sla_policies,
-                    ),
-                    # Always in the set: each raises naming its file when its catalog is missing
-                    # (the SlaView pattern), never silently absent.
-                    SpendView(
-                        spend,
-                        portfolio,
-                        FindingsRollupView(findings, portfolio, assessment),
-                        self.model_catalog,
-                        self.invoices,
-                    ),
-                    attack,
-                ),
-                self.clock,
-                sla_policies=sla_policies,
-                builds=ArtifactPublisher(
-                    PublishSpecs(PublishSpec(InsightBuildsArtifact)), self.object_store, uow
-                ),
-                decisions=findings.decisions,
-                parsed=self.parsed_builds,
-            ),
+            insight=insight,
+            reports=ReportService(uow, self.object_store, insight, ops),
             dashboards=DashboardService(uow, portfolio),
         )
 

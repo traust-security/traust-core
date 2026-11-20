@@ -1,4 +1,4 @@
-// Ops REST API load: runners claim/complete while readers page orders, the feed, one insight
+// Ops REST API load: runners claim/complete while readers page orders, the feed, a report request
 // view, the consumer read family, and the dashboard personas — a persona is a grant × an app
 // area × a cadence (the findings subject only, until review_items and work_items land): a
 // poll persona re-reads its card at its own cadence like an open tab, a visit persona reads
@@ -15,7 +15,7 @@ import {
   queryDashboard,
   rateOf,
   readFeed,
-  readInsight,
+  requestReport,
   readReviewQueue,
   readSummary,
   readTimeline,
@@ -108,7 +108,7 @@ const OPS_SCENARIOS = {
   claim_contention: { executor: 'constant-vus', vus: 50, duration: DURATION, exec: 'claim' },
   order_reads: { executor: 'constant-vus', vus: 10, duration: DURATION, exec: 'listOrders' },
   feed_reads: { executor: 'constant-vus', vus: 10, duration: DURATION, exec: 'readFeed' },
-  insight_reads: { executor: 'constant-vus', vus: 2, duration: DURATION, exec: 'readInsight' },
+  report_requests: { executor: 'constant-vus', vus: 2, duration: DURATION, exec: 'requestReport' },
   findings_paging: { executor: 'constant-vus', vus: 5, duration: DURATION, exec: 'pageFindings' },
   findings_summary: { executor: 'constant-vus', vus: 3, duration: DURATION, exec: 'readSummary' },
   findings_timeline: { executor: 'constant-vus', vus: 3, duration: DURATION, exec: 'readTimeline' },
@@ -154,7 +154,7 @@ export {
   claim,
   listOrders,
   readFeed,
-  readInsight,
+  requestReport,
   pageFindings,
   readSummary,
   readTimeline,

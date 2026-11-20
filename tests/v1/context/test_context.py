@@ -138,10 +138,11 @@ def test_a_fresh_local_store_bootstraps_with_the_channel_stamped(tmp_path: Path)
             "0001_repository_disposition",
             "0002_query_statistics",
             "0003_finding_state_columns",
+            "0004_run_order_input",
         ]
     again = Context(Config(home=tmp_path)).database  # re-open: nothing re-applied
     with again.connect() as connection:
-        assert connection.exec_driver_sql("SELECT count(*) FROM db_upgrade").fetchone()[0] == 3
+        assert connection.exec_driver_sql("SELECT count(*) FROM db_upgrade").fetchone()[0] == 4
 
 
 def test_a_fresh_store_logs_its_bootstrap_and_channel_trail(

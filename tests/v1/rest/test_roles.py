@@ -63,3 +63,11 @@ def test_a_role_answers_its_routes_and_not_the_others(
 def test_the_server_takes_a_role_and_defaults_to_all() -> None:
     assert _parser().parse_args([]).role == "all"
     assert _parser().parse_args(["--role", "query"]).role == "query"
+
+
+def test_report_requests_answer_on_the_query_role_and_the_reports_role_serves_none() -> None:
+    assert role_of("/v1/reports", {"POST"}) is Role.QUERY
+    assert role_of("/v1/reports/{order_id}/file", {"GET"}) is Role.QUERY
+    assert not serves(Role.REPORTS, "/v1/reports", "POST")  # the worker: no routes
+    assert serves(Role.REPORTS, "/v1/healthz", "GET")
+    assert _parser().parse_args(["--role", "reports"]).role == "reports"
