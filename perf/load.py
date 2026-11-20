@@ -6,8 +6,11 @@ measures both directions. Run on the seeded rig (make perf-load)."""
 
 from __future__ import annotations
 
+import json
 import random
 import statistics
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Sequence
@@ -387,11 +390,19 @@ class MixedDuress:
 
 
 def run_mixed_duress(
-    engine: Engine, context: Context, *, seconds: int = 600, readers: int = 7, pagers: int = 3
+    engine: Engine,
+    context: Context,
+    *,
+    seconds: int = 600,
+    readers: int = 7,
+    pagers: int = 3,
+    report: bool = True,
 ) -> MixedDuress:
     """The steady spread: dashboards at full tilt, findings-page readers pausing like a
-    person paging, one report-grade build looping, the decision writer, and one full
-    rescan of the long-tail repository at the run's midpoint."""
+    person paging, the decision writer, one full rescan of the long-tail repository at the
+    run's midpoint, and one report-grade build looping in its own process (a report worker
+    role's shape: it competes for the database, not for the request path's interpreter -
+    measured in-process, its fold held the GIL and slowed the write door 8.6x)."""
     population = reader_cards(engine)
     _warm_identity(context, population[0])
     hot, hot_findings = hot_repository(engine)
@@ -412,11 +423,20 @@ def run_mixed_duress(
 
     clients = [DashboardReader(context, population, offset=i) for i in range(readers)]
     pagers_ = [PageReader(context, pages[i::pagers], pause=1.0) for i in range(pagers)]
-    report = PageReader(context, ["/v1/insights/findings-rollup?refresh=true"], pause=5.0)
+    url = engine.url.render_as_string(hide_password=False)
+    builder = (
+        subprocess.Popen(
+            [sys.executable, "-m", "perf.report_loop", url, str(seconds)],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        if report
+        else None
+    )
     stop = threading.Event()
     threads = [threading.Thread(target=writer.run, args=(stop, 0.05))]
     threads += [threading.Thread(target=c.run, args=(stop,)) for c in clients]
-    threads += [threading.Thread(target=p.run, args=(stop,)) for p in (*pagers_, report)]
+    threads += [threading.Thread(target=p.run, args=(stop,)) for p in pagers_]
     for t in threads:
         t.start()
     time.sleep(seconds // 2)
@@ -425,6 +445,11 @@ def run_mixed_duress(
     stop.set()
     for t in threads:
         t.join()
+    built = Side(latencies=(), failures=0)
+    if builder is not None:
+        out, _ = builder.communicate(timeout=300)
+        loop = json.loads(out.strip().splitlines()[-1])
+        built = Side(latencies=tuple(loop["latencies"]), failures=loop["failures"])
     return MixedDuress(
         seconds=seconds,
         dashboards=Side(
@@ -435,7 +460,7 @@ def run_mixed_duress(
             latencies=tuple(lat for p in pagers_ for lat in p.latencies),
             failures=sum(p.failures for p in pagers_),
         ),
-        report=report.side(),
+        report=built,
         writes=writer.side(),
         writes_alone=alone,
         rescan_seconds=held,

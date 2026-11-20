@@ -89,11 +89,12 @@ def test_everything_at_once_holds_the_budgets(engine: Engine, context: Context) 
     their budget beside findings pages, a report-grade build, the write door and a full
     rescan; nothing fails; the write door stays within twice its own p95."""
     seconds = int(os.environ.get("TRAUST_PERF_MIXED_SECONDS", "600"))
-    duress = run_mixed_duress(engine, context, seconds=seconds)
+    report = os.environ.get("TRAUST_PERF_MIXED_REPORT", "1") != "0"  # attribution runs
+    duress = run_mixed_duress(engine, context, seconds=seconds, report=report)
     print(duress.report_lines())
     for side in (duress.dashboards, duress.pages, duress.report, duress.writes):
         assert side.failures == 0, "nothing may fail in the steady spread"
-    assert duress.report.latencies, "the report-grade build must complete at least once"
+    assert duress.report.latencies or not report, "the report-grade build must complete"
     assert duress.dashboards.pct(95) < READ_P95_BUDGET, "dashboard p95 over budget"
     assert duress.writes.pct(95) <= WRITE_SLOWDOWN_LIMIT * duress.writes_alone.pct(95), (
         "the steady spread slowed the write door past twice its own p95"
