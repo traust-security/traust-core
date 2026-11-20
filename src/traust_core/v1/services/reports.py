@@ -31,8 +31,9 @@ from traust_core.v1.models.reports import (
     ReportRequest,
     ReportStatus,
 )
-from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects.store import ObjectKey, ObjectStore
+from traust_core.v1.repositories.unit_of_work import UnitOfWork
+from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.insight import InsightService
 from traust_core.v1.services.operations import OpsService
 
@@ -70,12 +71,18 @@ def canonical_input(request: ReportRequest) -> bytes:
 
 class ReportService:
     def __init__(
-        self, uow: TraustUnitOfWork, objects: ObjectStore, insight: InsightService, ops: OpsService
+        self,
+        uow: UnitOfWork,
+        objects: ObjectStore,
+        insight: InsightService,
+        ops: OpsService,
+        log: AssessmentLog,
     ) -> None:
-        self._uow = uow
+        self._uow = uow  # the transaction boundary only: tables are reached through doors
         self._objects = objects
         self._insight = insight
         self._ops = ops
+        self._log = log
 
     def request(self, request: ReportRequest, principal: Principal) -> Report:
         """The last ready build of this request, a build of it already in flight, or a new
@@ -83,31 +90,23 @@ class ReportService:
         self._insight.check(request.report, request.scope, request.format)  # 422 now, not later
         payload = canonical_input(request)
         digest = sha256_hex(payload)
-        with self._uow.write() as uow:
+        with self._uow as uow:
             # one request at a time per input: two callers share one build, never race two
-            uow.artifacts.lock_imported(f"{INPUT_KIND}:{digest}")
-            stored = uow.artifacts.find(None, digest)
+            self._log.serialize_imported(f"{INPUT_KIND}:{digest}")
+            stored = self._log.imported(digest)
             if stored is None:
                 ref = self._objects.put(ObjectKey.parse(f"reports/inputs/{digest}.json"), payload)
-                stored = uow.artifacts.get_or_add(
+                stored = self._log.keep_imported(
                     Artifact(digest=digest, kind=INPUT_KIND, uri=str(ref.key))
                 )
             assert stored.id is not None
-            latest = uow.run_orders.latest_with_input(REPORT_ASSET, stored.id)
+            latest = self._ops.latest_with_input(REPORT_ASSET, stored.id)
             reuse = latest is not None and (
                 latest.state in _IN_FLIGHT or (latest.state in _BUILT and not request.refresh)
             )
             order = latest if reuse else None
             if order is None:
-                order = uow.run_orders.add(
-                    RunOrder(
-                        asset=REPORT_ASSET,
-                        state=OrderState.QUEUED,
-                        priority=_PRIORITY,
-                        requested_by=principal.ref,
-                        input_artifact_id=stored.id,
-                    )
-                )
+                order = self._ops.queue_for_core(REPORT_ASSET, stored.id, principal.ref, _PRIORITY)
             uow.commit()
         assert order is not None
         if not reuse:
@@ -125,11 +124,10 @@ class ReportService:
 
     def get(self, order_id: UUID) -> Report:
         """One build: its request, its status, and its file once ready."""
-        with self._uow as uow:
-            order = uow.run_orders.get(order_id)
-            if order.asset != REPORT_ASSET or order.input_artifact_id is None:
-                raise NotFoundError(f"report {order_id}")
-            stored = uow.artifacts.get(order.input_artifact_id)
+        order = self._ops.get(order_id)
+        if order.asset != REPORT_ASSET or order.input_artifact_id is None:
+            raise NotFoundError(f"report {order_id}")
+        stored = self._log.get_artifact(order.input_artifact_id)
         built = self._built(order)
         document = self._input(stored)
         status = _STATUS.get(order.state, ReportStatus.FAILED)
@@ -152,8 +150,7 @@ class ReportService:
         report = self.get(order_id)
         if report.status is not ReportStatus.READY or report.artifact_id is None:
             raise ConflictError(f"report {order_id} is {report.status}, not ready")
-        with self._uow as uow:
-            built = uow.artifacts.get(report.artifact_id)
+        built = self._log.get_artifact(report.artifact_id)
         key = ObjectKey.parse(built.uri)
         return (
             self._objects.read(key, built.digest),
@@ -165,15 +162,13 @@ class ReportService:
         """Run one claimed report order: render it and publish the file as the order's
         artifact (the reports role's work)."""
         assert order.id is not None and order.input_artifact_id is not None
-        with self._uow as uow:
-            stored = uow.artifacts.get(order.input_artifact_id)
-        document = self._input(stored)
+        document = self._input(self._log.get_artifact(order.input_artifact_id))
         rendered = self._insight.render(document.report, document.scope, document.format)
         body = rendered.body.encode()
         name = f"{rendered.stem}.{document.format.suffix}"
         ref = self._objects.put(ObjectKey.parse(f"reports/{order.id}/{name}"), body)
-        with self._uow.write() as uow:
-            built = uow.artifacts.get_or_add(
+        with self._uow as uow:
+            built = self._log.keep_imported(
                 Artifact(digest=sha256_hex(body), kind=FILE_KIND, uri=str(ref.key))
             )
             uow.commit()
@@ -184,8 +179,7 @@ class ReportService:
         if order.artifact_id is None or order.state not in _BUILT:
             return None
         outputs = self._ops.manifests_of([order])[order.id].outputs  # type: ignore[index]
-        with self._uow as uow:
-            files = [a for a in uow.artifacts.list_by_ids(outputs) if a.kind == FILE_KIND]
+        files = [a for a in self._log.list_artifacts_by_ids(outputs) if a.kind == FILE_KIND]
         return files[0] if files else None
 
     def _input(self, stored: Artifact) -> ReportInput:

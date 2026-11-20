@@ -1386,7 +1386,7 @@ class Context:
                 uow, findings, remediation, verification, ops, portfolio
             ),
             insight=insight,
-            reports=ReportService(uow, self.object_store, insight, ops),
+            reports=ReportService(uow, self.object_store, insight, ops, AssessmentLog(uow)),
             dashboards=DashboardService(uow, portfolio),
         )
 

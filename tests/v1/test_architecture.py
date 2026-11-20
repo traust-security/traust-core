@@ -43,7 +43,6 @@ SPANS_SECTIONS = {
     "remediation",
     "remediation_scheduling",
     "insight",
-    "reports",
 }
 
 REPOSITORY_PACKAGES = {"traust", "traust_ops", "traust_ledger", "objects"}

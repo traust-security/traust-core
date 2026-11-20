@@ -1037,6 +1037,29 @@ class OpsService:
             )
         return orders
 
+    def latest_with_input(self, asset: AssetName, input_artifact_id: UUID) -> RunOrder | None:
+        """The asset's newest order for exactly this input document: identical inputs are one
+        artifact, so this is the last run of the same request."""
+        with self._uow as uow:
+            return uow.run_orders.latest_with_input(asset, input_artifact_id)
+
+    def queue_for_core(
+        self, asset: AssetName, input_artifact_id: UUID, requested_by: str, priority: int
+    ) -> RunOrder:
+        """An order core queues for one of its own roles (a report build): no subject and no
+        run-asset policy - the door that took the request checked the caller's authority."""
+        order = RunOrder(
+            asset=asset,
+            state=OrderState.QUEUED,
+            priority=priority,
+            requested_by=requested_by,
+            input_artifact_id=input_artifact_id,
+        )
+        with self._uow as uow:
+            saved = uow.run_orders.add(order)
+            uow.commit()
+        return saved
+
     def get(self, order_id: UUID) -> RunOrder:
         with self._uow as uow:
             return uow.run_orders.get(order_id)
