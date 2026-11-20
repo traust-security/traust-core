@@ -135,3 +135,36 @@ def test_order_and_limit_cap_the_answer(backend: str, tmp_path) -> None:
         assert len(results.rows) == 2
         counts = [row.measures["findings"] for row in results.rows]
         assert counts == sorted(counts, reverse=True)
+
+
+@pytest.mark.parametrize("backend", SQL_BACKENDS)
+def test_an_order_key_the_query_does_not_serve_is_refused(backend: str, tmp_path) -> None:
+    with contract_db(backend, tmp_path) as engine:
+        _seed(engine)
+        service = _service(engine)
+        for order in ({"by": "median_open_days"}, {"by": "category"}):  # unserved; not grouped
+            with pytest.raises(ValidationError, match="cannot order by"):
+                service.query(
+                    DashboardQuery(
+                        subject="findings",
+                        measures=("findings",),
+                        group_by=("severity",),
+                        order=(order,),
+                    )
+                )
+
+
+@pytest.mark.parametrize("backend", SQL_BACKENDS)
+def test_the_oldest_open_age_ignores_closed_findings(backend: str, tmp_path) -> None:
+    with contract_db(backend, tmp_path) as engine:
+        _seed(engine)  # every seeded finding was recorded now; one is resolved
+        with engine.begin() as conn:  # the resolved one becomes the oldest by far
+            table = "finding" if engine.dialect.name == "sqlite" else "traust.finding"
+            conn.exec_driver_sql(
+                f"UPDATE {table} SET created_at = '2000-01-01T00:00:00Z' WHERE title = 'Resolved'"
+            )
+        results = _service(engine).query(
+            DashboardQuery(subject="findings", measures=("oldest_open_age",))
+        )
+        age = results.rows[0].measures["oldest_open_age"]
+        assert age is not None and age < 1  # days: the open ones are new; the resolved one is not

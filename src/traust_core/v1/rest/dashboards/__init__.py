@@ -16,8 +16,8 @@ async def _body_within_cap(request: Request) -> None:
     """Refuse a dashboard request body over the cap, before it is parsed."""
     try:
         length = int(request.headers.get("content-length", ""))
-    except ValueError:
-        return
+    except ValueError:  # chunked, or no length: the cap could not be held before parsing
+        raise ValidationError("a dashboard request declares its Content-Length") from None
     if length > _MAX_BODY:
         raise ValidationError("the request body exceeds 1 MiB")
 

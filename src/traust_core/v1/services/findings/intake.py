@@ -177,10 +177,9 @@ class FindingIntake:
         )
 
     def _restamp(self, finding_ids: Iterable[UUID]) -> None:
-        """Stamp the assessment's findings' current answer once it commits, in short
-        transactions: a rescan never holds a finding's row for its whole length, so a
-        person deciding on one waits at most one batch (the stamp is a projection, refolded
-        from what is recorded - it may trail the occurrence by a batch, never diverge)."""
+        # after the commit, in short batches: a rescan never holds a finding's row while a
+        # person decides on it (the stamp is refolded from what is recorded: it trails, never
+        # diverges)
         ids = list(dict.fromkeys(finding_ids))
         for start in range(0, len(ids), _RESTAMP_BATCH):
             with self._uow as uow:

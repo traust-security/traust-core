@@ -5,6 +5,7 @@ bound, the request is served."""
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from pathlib import Path
 from uuid import uuid4
@@ -171,3 +172,13 @@ def test_the_bounds_at_their_limits_over_http_are_served(
     response = _post(client, context, at_the_bounds)
     assert response.status_code == 200
     assert response.json()["rows"] == []
+
+
+def test_a_body_without_a_declared_length_is_refused(context: Context, client: TestClient) -> None:
+    """Chunked (no Content-Length): the cap cannot be held before parsing, so it refuses."""
+
+    def chunks() -> Iterator[bytes]:
+        yield json.dumps(QUERY).encode()
+
+    headers = {**bearer(context), "Content-Type": "application/json"}
+    _problem(client.post("/v1/dashboards:query", content=chunks(), headers=headers))

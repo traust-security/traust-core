@@ -1,6 +1,6 @@
 """The duress apparatus: dashboard reads under the stamped write door.
 
-The duress run is gated by TRAAST_PERF_LOAD (it mutates the rig: decisions
+The duress run is gated by TRAUST_PERF_LOAD (it mutates the rig: decisions
 are written); `make perf-load` sets it. Readers default past the engine
 pool's size — the 504 shape the first concurrent receipt could not reach.
 The card population itself is pure and always runs."""

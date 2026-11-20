@@ -161,3 +161,42 @@ def test_a_build_that_fails_says_so(
         client.get(f"/v1/reports/{report['order_id']}/file", headers=bearer(context)).status_code
         == 409
     )
+
+
+def test_an_order_that_is_not_a_report_is_not_found(context: Context, client: TestClient) -> None:
+    from traust_core.v1.models.operations import RunOrder
+
+    with SqlTraustUnitOfWork(context.database) as uow:
+        other = uow.run_orders.add(
+            RunOrder(asset="repo_state", state="queued", priority=1, requested_by="human:x")
+        )
+        uow.commit()
+    assert client.get(f"/v1/reports/{other.id}", headers=bearer(context)).status_code == 404
+
+
+def test_a_build_the_report_refuses_fails_as_a_bad_request(
+    context: Context, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traust_core.v1.errors import ValidationError
+
+    report = request(client, context, report="findings-rollup").json()
+    services = context.services()
+
+    def refused(*_: object, **__: object) -> None:
+        raise ValidationError("the scope names no repositories")
+
+    monkeypatch.setattr(type(services.insight), "render", refused)
+    assert ReportWorker(services.ops, services.reports, WorkerId("reports-test")).run_once()
+    failed = client.get(f"/v1/reports/{report['order_id']}", headers=bearer(context)).json()
+    assert failed["status"] == "failed" and failed["reason"] == "bad_request"
+
+
+def test_the_worker_idles_when_nothing_is_queued_and_stops_on_request(context: Context) -> None:
+    import threading
+
+    services = context.services()
+    worker = ReportWorker(services.ops, services.reports, WorkerId("reports-test"))
+    assert worker.run_once() is None
+    stop = threading.Event()
+    stop.set()
+    worker.run(stop)  # returns at once: nothing claimed, the stop already asked

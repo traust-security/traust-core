@@ -47,7 +47,7 @@ from traust_core.v1.repositories.traust.assessments.occurrence import OCCURRENCE
 from traust_core.v1.repositories.traust.dependencies import DependenciesUnitOfWork
 from traust_core.v1.repositories.traust.findings import FindingsUnitOfWork
 from traust_core.v1.repositories.traust.findings.decision import DECISION
-from traust_core.v1.repositories.traust.findings.finding import FINDING
+from traust_core.v1.repositories.traust.findings.finding import FINDING, current_answer
 from traust_core.v1.repositories.traust.findings.finding_label import FINDING_LABEL
 from traust_core.v1.repositories.traust.inventory import InventoryUnitOfWork
 from traust_core.v1.repositories.traust.inventory.repository import REPOSITORY
@@ -394,17 +394,7 @@ class CensusReads(SqlRepository):
         return found
 
     def _current(self) -> sa.Alias:
-        """The finding's current answer, stamped by core's write doors from the fold: a table
-        clause of just the projection columns, joined by id (they stay off the model)."""
-        f = self._findings
-        return sa.table(
-            f.name,
-            sa.column("id", f.c.id.type),
-            sa.column("current_state", sa.Text),
-            sa.column("current_severity", sa.Text),
-            sa.column("current_decided", sa.Boolean),
-            schema=f.schema,
-        ).alias("cur")
+        return current_answer(self._findings).alias("cur")
 
     def current_claimed_rows(
         self, repository_ids: Collection[UUID]

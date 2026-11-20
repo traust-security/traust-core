@@ -8,10 +8,7 @@ from uuid import UUID
 
 from traust_core.v1.models.dashboard import DashboardQuery, DashboardResults, DashboardRow
 from traust_core.v1.repositories.contract import TraustUnitOfWork
-from traust_core.v1.repositories.traust.findings.dashboard_facts import (
-    DashboardFacts,
-    SqlDashboardFacts,
-)
+from traust_core.v1.repositories.traust.findings.dashboard_facts import SqlDashboardFacts
 from traust_core.v1.services.dashboards import catalog
 from traust_core.v1.services.portfolio import PortfolioService
 
@@ -27,10 +24,16 @@ class DashboardService:
         self._portfolio = portfolio
 
     def query(self, query: DashboardQuery) -> DashboardResults:
-        catalog.require(query.subject, query.group_by, query.measures, query.where)
+        catalog.require(
+            query.subject,
+            query.group_by,
+            query.measures,
+            query.where,
+            tuple(entry.by for entry in query.order),
+        )
         ids = self._resolve(query)
         with self._uow as uow:
-            facts: DashboardFacts = SqlDashboardFacts(uow.connection)
+            facts = SqlDashboardFacts(uow.connection)
             dialect = uow.connection.dialect.name
             columns = catalog.columns(query.group_by)
             aggregates = catalog.aggregates(query.measures, dialect)

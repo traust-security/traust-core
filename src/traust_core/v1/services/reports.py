@@ -162,8 +162,7 @@ class ReportService:
         )
 
     def build(self, order: RunOrder) -> Artifact:
-        """Run one claimed report order: render it and publish the file as the order's
-        artifact (the reports role's work)."""
+        """Render one claimed report order and keep its file (the reports role's work)."""
         assert order.id is not None and order.input_artifact_id is not None
         document = self._input(self._log.get_artifact(order.input_artifact_id))
         rendered = self._insight.render(document.report, document.scope, document.format)
@@ -178,7 +177,6 @@ class ReportService:
         return built  # the worker records it as the order's output, in its run manifest
 
     def _built(self, order: RunOrder) -> Artifact | None:
-        """The file a finished build produced: the report output its run manifest records."""
         if order.artifact_id is None or order.state not in _BUILT:
             return None
         outputs = self._ops.manifests_of([order])[order.id].outputs  # type: ignore[index]

@@ -92,8 +92,6 @@ def _app(config: Config, config_path: Path | None, role: Role = Role.ALL):
 
 
 def _report_worker(config: Config, config_path: Path | None) -> int:
-    """The reports role: no routes, one process building report orders one at a time until
-    stopped (SIGTERM or SIGINT). Report usage scales with how many of these run."""
     context = Context(config)
     context.configure_logging()
     if (rate_card := _rate_card(config_path)) is not None:

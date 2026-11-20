@@ -4,7 +4,6 @@ catalog."""
 
 from __future__ import annotations
 
-from typing import Protocol
 from uuid import UUID
 
 import sqlalchemy as sa
@@ -45,23 +44,6 @@ _FACTS = {Subject.FINDINGS: _FINDING_FACTS, Subject.REVIEW_ITEMS: _REVIEW_FACTS}
 
 
 _ROW_CAP = 1000
-
-
-class DashboardFacts(Protocol):
-    """What dashboards may read: aggregates over a subject, filtered to
-    repositories, grouped and ordered, capped. No folding, no view models.
-    Rows are positional: the group values, then the measure values."""
-
-    def aggregate(
-        self,
-        subject: Subject,
-        repository_ids: frozenset[UUID] | None,
-        columns: list[str],
-        aggregates: list[str],
-        predicates: list[tuple[str, tuple[str, ...]]],
-        order: list[str],
-        limit: int,
-    ) -> list[tuple[object, ...]]: ...
 
 
 class SqlDashboardFacts:

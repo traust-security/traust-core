@@ -471,10 +471,9 @@ class InsightService:
         if format is ReportFormat.JSON:
             body = self.build(view, filter).model_dump_json()
             return RenderedReport(view=view, format=format, stem=view.value, body=body)
+        self.check(view, filter, format)
         found = self._view(view, filter)
         export = getattr(found, "export", None)
-        if format is ReportFormat.CSV and export is None:
-            raise ValidationError(f"{view.value} has no export table; ask for markdown or html")
         model = found.build(filter)
         report = found.report(model, filter.as_of or self._clock.now())
         if format is ReportFormat.CSV:

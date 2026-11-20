@@ -106,9 +106,8 @@ def stamp(
     *,
     history: Sequence[Decision] | None = None,
 ) -> Decision:
-    """The single owner of the stored state: the draft carrying its fold result, and the
-    finding's current answer stamped from the same fold (one transaction: a refused insert
-    rolls both back)."""
+    """The single owner of the stored state: the draft and its finding stamped from one fold,
+    in one transaction."""
     history = uow.decisions.list_for_finding(draft.finding_id) if history is None else history
     finding = uow.findings.get(draft.finding_id)
     folded = fold(uow, rating, draft.finding_id, finding.kind, [*history, draft])
@@ -127,8 +126,8 @@ def restamp(uow: TraustUnitOfWork, rating: RatingPolicy, finding_id: UUID) -> No
 def restamp_all(
     uow: TraustUnitOfWork, rating: RatingPolicy, repository_ids: Collection[UUID]
 ) -> int:
-    """Stamp every finding's current answer from the fold, decided or not: the one-time
-    upgrade path for stores whose findings predate the stamp. Returns how many."""
+    """Stamp every finding's current answer from the fold: data channel 0002's one-time
+    upgrade path - remove with that entry once every store has applied it."""
     stamped = 0
     for finding_id, _repository_id, kind, _title, _created in uow.findings.census_for_repositories(
         repository_ids

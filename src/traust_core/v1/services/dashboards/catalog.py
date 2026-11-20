@@ -19,9 +19,11 @@ _COLUMNS: dict[Dimension, str] = {
     Dimension.STATUS: "status",
 }
 
+# the oldest open finding's age: closed findings never set it
+_OPEN_SINCE = "CASE WHEN state = 'open' THEN created_at END"
 _AGE_DAYS = {
-    "postgresql": "extract(epoch from (current_timestamp - min(created_at))) / 86400",
-    "sqlite": "(julianday(current_timestamp) - julianday(min(created_at)))",
+    "postgresql": f"extract(epoch from (current_timestamp - min({_OPEN_SINCE}))) / 86400",
+    "sqlite": f"(julianday(current_timestamp) - julianday(min({_OPEN_SINCE})))",
 }
 
 
@@ -37,7 +39,15 @@ def _aggregates(dialect: str) -> dict[Measure, str]:
 # What this build serves; the query schema states the intent, the catalog the
 # present. Subjects and vocabulary beyond these refuse until their facts land.
 _SERVED_MEASURES = frozenset({Measure.FINDINGS, Measure.REPOSITORIES, Measure.OLDEST_OPEN_AGE})
-_FINDING_DIMENSIONS = frozenset(_COLUMNS) - {Dimension.REASON, Dimension.STATUS}
+_FINDING_DIMENSIONS = frozenset(
+    {
+        Dimension.REPOSITORY,
+        Dimension.STATE,
+        Dimension.SEVERITY,
+        Dimension.CATEGORY,
+        Dimension.DECIDED,
+    }
+)
 SERVED: dict[Subject, tuple[frozenset[Dimension], frozenset[Measure]]] = {
     Subject.FINDINGS: (_FINDING_DIMENSIONS, _SERVED_MEASURES),
     # a review item with its finding's current answer: the countersign queue's counts
@@ -64,6 +74,7 @@ def require(
     dimensions: tuple[Dimension, ...],
     measures: tuple[Measure, ...],
     where: dict[Dimension, tuple[str, ...]],
+    order: tuple[Measure | Dimension, ...] = (),
 ) -> None:
     """Refuse what this build does not serve, before any SQL is built."""
     served_dims, served_measures = SERVED.get(subject, (frozenset(), frozenset()))
@@ -83,6 +94,12 @@ def require(
     if unknown:
         raise ValidationError(
             f"the {subject} subject does not filter by {', '.join(map(str, unknown))}"
+        )
+    unordered = [key for key in order if not (key in served_measures or key in dimensions)]
+    if unordered:
+        raise ValidationError(
+            f"the {subject} subject cannot order by {', '.join(map(str, unordered))}: order by a "
+            "served measure or a dimension the query groups by"
         )
 
 

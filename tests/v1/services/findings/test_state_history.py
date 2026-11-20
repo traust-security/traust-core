@@ -179,3 +179,39 @@ def test_check_catches_a_corrupted_column(engine: Engine) -> None:
 
 def _say(finding: UUID, **kw: Any) -> Any:
     return RecordDecision(finding_id=finding, **{"rationale": "parity of the stored fold", **kw})
+
+
+def test_restamp_all_stamps_every_finding_decided_or_not(engine: Engine) -> None:
+    """The data channel's backfill: findings written before core stamped them (raw rows, no
+    write door) get the fold's state, severity and decided - undecided ones included."""
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repository = seed.repository(url="https://github.com/example/backfill")
+        ref = seed.repository_ref(repository)
+        audit = seed.assessment(ref, occurred_at=datetime(2026, 1, 1, tzinfo=UTC))
+        identified, refuted = seed.finding(repository), seed.finding(repository)
+        for finding in (identified, refuted):  # raw rows: no restamp, as before the stamp
+            uow.occurrences.add(seed.new_occurrence(finding, audit, severity="high"))
+        uow.decisions.add(
+            seed.new_decision(refuted, validity="false_positive", actor="human:a@example.com")
+        )
+        uow.findings.stamp_current(identified.id, "open", None, False)  # stale: unrated
+        uow.commit()
+    rating = RatingPolicy(RatingConfig())
+
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert state_history.restamp_all(uow, rating, [repository.id]) == 2
+        uow.commit()
+
+    with engine.connect() as conn:
+        rows = dict(
+            (str(row[0]), tuple(row[1:]))
+            for row in conn.exec_driver_sql(
+                "SELECT id, current_state, current_severity, current_decided FROM finding"
+                if engine.dialect.name == "sqlite"
+                else "SELECT id, current_state, current_severity, current_decided"
+                " FROM traust.finding"
+            )
+        )
+    assert rows[str(identified.id)] == ("open", "high", False)
+    assert rows[str(refuted.id)][0] == "false_positive" and bool(rows[str(refuted.id)][2])
