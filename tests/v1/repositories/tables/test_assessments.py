@@ -529,8 +529,8 @@ def test_occurrences_carry_the_latest_report_and_the_firsts_time(seed: Seed) -> 
     seed.occurrence(other, early, severity="low")
     latest = {row[0]: row[1:] for row in u.census_reads.occurrences_for_repositories([repo.id])}
     assert latest == {
-        finding.id: ("high", newest.cvss_score, T0),
-        other.id: ("low", None, T0),
+        finding.id: ("high", None, newest.cvss_score, T0),
+        other.id: ("low", None, None, T0),
     }
     until = {
         row[0]: row[1:]
@@ -538,5 +538,8 @@ def test_occurrences_carry_the_latest_report_and_the_firsts_time(seed: Seed) -> 
             [repo.id], until=T0 + timedelta(days=1)
         )
     }
-    assert until == {finding.id: ("medium", None, T0), other.id: ("low", None, T0)}
+    assert until == {
+        finding.id: ("medium", None, None, T0),
+        other.id: ("low", None, None, T0),
+    }
     assert u.census_reads.occurrences_for_repositories([]) == []

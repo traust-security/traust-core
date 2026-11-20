@@ -71,9 +71,11 @@ class FindingCensusRow:
 
 class CensusOccurrence(NamedTuple):
     """The latest report's census columns — what the rating and the top cut read — with
-    the first report's time (the clock an SLA reads)."""
+    the first report's time (the clock an SLA reads). The vector rides along so the
+    census bands the same severity the views compute from it."""
 
     severity: str | None
+    cvss_vector: str | None
     cvss_score: Decimal | None
     first: datetime
 
@@ -167,9 +169,9 @@ class FindingCensus:
         # the fold's (str(id)) one, so the exact key is applied here)
         findings.sort(key=lambda row: newest_first_key(row[4], row[0]))
         latest = {
-            finding_id: CensusOccurrence(severity, cvss, first)
-            for finding_id, severity, cvss, first in uow.census_reads.occurrences_for_repositories(
-                batch, as_of
+            finding_id: CensusOccurrence(severity, vector, cvss, first)
+            for finding_id, severity, vector, cvss, first in (
+                uow.census_reads.occurrences_for_repositories(batch, as_of)
             )
         }
         decisions: defaultdict[UUID, list[CensusDecision]] = defaultdict(list)

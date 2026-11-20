@@ -1,4 +1,5 @@
-"""The score a finding shows: NIST > GHSA > CNA > ADP > Red Hat > scanner, 3.1 before 3.0."""
+"""The score a finding shows: NIST > GHSA > CNA > ADP > Red Hat > scanner, 3.1 before 3.0,
+and 4.0 only when no source has a 3.x score."""
 
 from __future__ import annotations
 
@@ -70,13 +71,38 @@ def test_the_scanners_vector_ranks_last() -> None:
 # ---- adversarial twins: each looks like a score, none can be trusted -------------------------
 
 
-def test_a_40_never_wins_even_alone_and_rides_alongside_the_chosen_score() -> None:
+def test_any_3x_score_beats_every_40_and_a_40_rides_alongside() -> None:
+    four = score_of(CvssSource.NIST, V40, document="test", stated="9.2")
+    assert four is not None
+    # NIST's 4.0 outranks nothing that is 3.x: even the scanner's 3.1 wins over it
+    beside = effective([four, _score(CvssSource.SCANNER, V31)])
+    assert beside.source is CvssSource.SCANNER and beside.v4 == four
+
+
+def test_with_no_3x_score_anywhere_the_40_score_is_the_findings() -> None:
+    """Owner, 2026-11-19 (revising D2): a 4.0 score sets the score only when no 3.x one exists."""
     four = score_of(CvssSource.NIST, V40, document="test", stated="9.2")
     assert four is not None
     alone = effective([four])
-    assert alone.chosen is None and alone.v4 == four
-    beside = effective([four, _score(CvssSource.CNA, V31)])
-    assert beside.source is CvssSource.CNA and beside.v4 == four
+    assert (alone.chosen, alone.score, alone.source, alone.v4) == (
+        four,
+        Decimal("9.2"),
+        CvssSource.NIST,
+        four,
+    )
+
+
+def test_the_40_fallback_takes_sources_in_the_same_order_and_the_highest_on_a_tie() -> None:
+    ghsa = score_of(CvssSource.GHSA, V40, document="test:ghsa")  # 9.2, computed
+    low = V40.replace("VC:H/VI:H/VA:H", "VC:L/VI:N/VA:N")
+    cna_low = score_of(CvssSource.CNA, low, document="test:cna")
+    adp_hi = score_of(CvssSource.ADP, V40, document="test:adp", stated="9.2")
+    assert ghsa is not None and cna_low is not None and adp_hi is not None
+    assert effective([cna_low, adp_hi, ghsa]).source is CvssSource.GHSA
+    assert effective([cna_low, adp_hi]).source is CvssSource.CNA  # rank before score
+    other = score_of(CvssSource.CNA, V40, document="test:cna-2")
+    assert other is not None
+    assert effective([cna_low, other]).chosen == other  # within one source, the highest
 
 
 def test_a_zero_score_is_a_real_score_and_can_win() -> None:

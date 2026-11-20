@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -18,7 +19,9 @@ from uuid import UUID
 import pytest
 from sqlalchemy.engine import Engine
 
-from tests.v1.conftest import SQL_BACKENDS, commit_all, contract_db, git
+from tests.v1.conftest import SQL_BACKENDS, NoCheckouts, commit_all, contract_db, git
+from tests.v1.providers.tools.opengrep_fixtures import write_rule
+from tests.v1.providers.tools.test_opengrep_quality import NativeRunner
 from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.services.findings.test_reads import service as finding_service
 from tests.v1.services.test_detection_quality_regression_pairs import (
@@ -55,8 +58,11 @@ from traust_core.v1.models.validation_benchmark import (
 from traust_core.v1.providers.base import Readiness
 from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.clock import FixedClock
+from traust_core.v1.providers.detection_quality import RuleSweepBatch
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.rule_drafts import RuleDraftDirectory
+from traust_core.v1.providers.tools import detection_quality as sweep_provider
+from traust_core.v1.providers.tools.opengrep_quality import RuleQualityError
 from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects.store import ObjectKey
@@ -120,6 +126,12 @@ class Sweeper:
 
     def check(self, binary: str) -> Readiness:
         return Readiness(ready=self.ready, detail=f"{binary} missing")
+
+    @contextmanager
+    def batch(self, rule: RuleFile, binary: str, timeout: int) -> Iterator[RuleSweepBatch]:
+        yield RuleSweepBatch(
+            "fake-rule-inputs", lambda repo: self.scan(repo, rule, binary, timeout)
+        )
 
     def scan(self, repo: SweepRepo, rule: RuleFile, binary: str, timeout: int) -> RepoSweep:
         self.scanned.append(repo.slug)
@@ -659,3 +671,48 @@ def test_the_trigger_reads_the_checkout_since_a_release(bench: Bench, tmp_path: 
     trigger = bench.service.benchmark_trigger(ToolRequest(workspace=checkout), base)
     assert trigger.paths == ("traust/harnessing/5-validate/validate-findings/SKILL.md",)
     assert bench.service.benchmark_trigger(ToolRequest(workspace=checkout), "HEAD").paths == ()
+
+
+def test_failed_quality_is_not_persisted_and_repaired_fixtures_rescan_legacy_errors(
+    bench: Bench, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = write_rule(bench.tmp / "custom", RID)
+    fixture = config.with_suffix(".py")
+    repaired = fixture.read_text()
+    fixture.write_text(f"# ruleid: {RID}\ndangerous(value)\n")
+    runner = NativeRunner()
+    monkeypatch.setattr(sweep_provider, "ProcessRunner", lambda *args, **kwargs: runner)
+    real = sweep_provider.OpengrepRuleSweep(config.parent, (), NoCheckouts(), load=yaml_documents)
+    monkeypatch.setattr(real, "check", lambda binary: Readiness(ready=True))
+    bench.sweeper = real  # type: ignore[assignment]
+    requested = tuple(
+        SweepRepo(slug=slug, url=f"dir:{bench.tmp}") for slug in ("quality", "invalid", "fresh")
+    )
+    prefix = f"detection-quality/sweeps/{RID}/repos"
+    for slug, error in (("quality", "rule_quality_failed"), ("invalid", "invalid_rules")):
+        bench.objects.put(
+            _key(f"{prefix}/{slug}.json"),
+            RepoSweep(slug=slug, error=error).model_dump_json().encode(),
+        )
+    request = RuleSweepRequest(rule=str(config), repos=requested)
+    with pytest.raises(RuleQualityError):
+        bench.service.sweep_rule(request)
+    assert not runner.scanned
+    assert not bench.objects.exists(_key(f"{prefix}/fresh.json"))
+    fixture.write_text(repaired)
+    swept = bench.service.sweep_rule(request)
+    assert (swept.swept, swept.skipped, swept.repo_errors) == (3, 0, 0)
+    for repo in requested:
+        stored = RepoSweep.model_validate_json(
+            bench.objects.get(bench.objects.stat(_key(f"{prefix}/{repo.slug}.json")))
+        )
+        assert stored.error is None and stored.rule_digest is not None
+        assert all(check.passed for check in stored.quality_checks)
+    assert bench.service.sweep_rule(request).swept == 0
+    assert sum(call[1] == "scan" for call in runner.calls) == 3
+    assert sum(call[1] == "validate" for call in runner.calls) == 3
+    fixture.write_text(repaired + "\n# changed but valid fixture\n")
+    assert bench.service.sweep_rule(request).swept == 3
+    fixture.write_text(f"# ruleid: {RID}\ndangerous(value)\n")
+    with pytest.raises(RuleQualityError):
+        bench.service.sweep_rule(request)

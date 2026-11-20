@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
@@ -41,6 +42,34 @@ def seed_reported(context: Context, count: int = 2) -> list:
             made.append(finding)
         uow.commit()
     return made
+
+
+def test_a_scored_finding_sends_its_computed_band_not_a_word(
+    context: Context, client: TestClient
+) -> None:
+    # the defect over the wire: reported medium, judged low, scored 9.8 — the body says critical
+    with SqlTraustUnitOfWork(context.database) as uow:
+        seed = Seed(uow)
+        repo = seed.repository()
+        finding = seed.finding(repo)
+        run = seed.assessment(seed.repository_ref(repo))
+        seed.occurrence(
+            finding,
+            run,
+            severity="medium",
+            cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+            cvss_score=Decimal("9.8"),
+        )
+        seed.decision(finding, severity="low", rationale="the triage rubric said so")
+        uow.commit()
+    body = client.get(f"/v1/findings/{finding.id}", headers=bearer(context, ANALYST)).json()
+    assert body["effective_severity"] == "critical"
+    assert body["cvss"] == {
+        "score": "9.8",
+        "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        "severity": "critical",
+        "basis": "computed",
+    }
 
 
 def test_get_a_finding_matches_in_process(context: Context, client: TestClient) -> None:

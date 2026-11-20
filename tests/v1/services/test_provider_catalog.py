@@ -300,6 +300,21 @@ def test_stale_reports_every_item_worst_first() -> None:
     ]
 
 
+def test_a_feed_with_an_error_and_no_usable_time_is_stale_and_says_why() -> None:
+    query = FreshnessQuery(
+        catalog(), FakeFeeds(feed("advisory-cvss", None, error="the latest build is unreadable")),
+        FixedClock(T0),
+    )  # fmt: skip
+    assert query.stale() == [
+        StaleItem(
+            item="feeds:advisory-cvss",
+            status=Freshness.STALE,
+            detail="the latest build is unreadable",
+            refresh="fetch feed advisory-cvss",
+        )
+    ]
+
+
 def test_stale_reports_unfetched_and_uninspectable_databases() -> None:
     missing = FreshnessQuery(
         catalog(FakeTool("grype"), inspector=FakeInspector({}, {"grype": GRYPE_DB.model_copy(

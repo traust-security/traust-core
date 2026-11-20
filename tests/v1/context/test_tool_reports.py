@@ -62,7 +62,13 @@ def git_repo(tmp_path: Path, files: dict[str, str]) -> tuple[Path, str]:
     return repo, commit_all(repo, "c")
 
 
-OPENGREP = """
+OPENGREP = (
+    f"sys.path.insert(0, {str(Path(__file__).parents[3])!r})\n"
+    "from tests.v1.providers.tools.opengrep_fixtures import native_output\n"
+    "quality = native_output(('opengrep', *args))\n"
+    "if quality is not None:\n"
+    "    print(quality.decode()); sys.exit(0)\n"
+    + """
 if args == ["--version"]:
     print("opengrep 1.25.0")
 else:
@@ -79,12 +85,20 @@ else:
         "skipped_rules": [],
     }))
 """
+)
 
 
 def pack(tmp_path: Path) -> Path:
     root = tmp_path / "pack"
     (root / "go").mkdir(parents=True)
-    (root / "go" / "weak-hash.yaml").write_text("rules:\n  - id: weak-hash\n")
+    (root / "go" / "weak-hash.yaml").write_text(
+        "rules:\n  - id: weak-hash\n    languages: [go]\n    severity: ERROR\n"
+        "    message: weak hash\n    pattern: md5.Sum(...)\n"
+    )
+    (root / "go" / "weak-hash.go").write_text(
+        "package fixture\nfunc sample(b []byte) {\n// ruleid: weak-hash\n"
+        "md5.Sum(b)\n// ok: weak-hash\nsha256.Sum256(b)\n}\n"
+    )
     return root
 
 
@@ -115,7 +129,7 @@ def test_opengrep_reports_the_facts_on_the_registered_pack_with_the_binary_given
         "suppressed_by_allowlist": 0,
     }
     assert report["rule_allowlist"] is None
-    assert report["supplemental_packs"] == {"applied": [], "skipped": []}
+    assert report["supplemental_packs"] == {"applied": []}
 
 
 def test_opengrep_keeps_only_the_allowed_rules_and_takes_a_pack_override(

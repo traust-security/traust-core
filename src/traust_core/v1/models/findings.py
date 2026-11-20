@@ -1308,11 +1308,37 @@ class Precedent(Model):
     reason: PrecedentReason
 
 
+class SeverityBasis(StrEnum):
+    """Which source won a finding's severity label: the CVSS band the vector computes, the
+    scanner's word for an unscored finding, a judgement's re-rating, or nothing."""
+
+    COMPUTED = "computed"
+    SCANNER = "scanner"
+    JUDGEMENT = "judgement"
+    UNRATED = "unrated"
+
+
+class FindingCvss(Model):
+    """A finding's CVSS as consumers render it: the occurrence's score and vector, the severity
+    the vector computes, and which source won the effective severity."""
+
+    score: Decimal | None
+    vector: str | None
+    severity: Severity | None
+    basis: SeverityBasis
+
+    @pydantic.field_serializer("score", when_used="json")
+    def _score(self, value: Decimal | None) -> str | None:
+        # the same exact score from every backend: SQLite reads 0E-10 and 7.5000000000
+        return canonical_decimal(value)
+
+
 class FindingView(Model):
     finding: Finding
     occurrence: Occurrence | None = None
     disposition: Disposition | None = None
     effective_severity: Severity | None = None
+    cvss: FindingCvss | None = None
     sla_due: datetime | None = None
     # When the reporting assessments ran (the occurrence→assessment join, the
     # same clock the census reads for its SLA `first`): None only on a finding

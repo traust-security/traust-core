@@ -555,17 +555,18 @@ class CensusReads(SqlRepository):
 
     def occurrences_for_repositories(
         self, repository_ids: Collection[UUID], until: datetime | None = None
-    ) -> list[tuple[UUID, str | None, Decimal | None, datetime]]:
-        """Each of the repositories' findings' latest occurrence's (severity, cvss_score)
-        in the report order the views fold (the reporting assessment's time, then the
-        occurrence's own), with its first report's assessment time — the clock an SLA
-        reads — reports after `until` left out: one windowed read, never an occurrence
-        row per finding through the caller."""
+    ) -> list[tuple[UUID, str | None, str | None, Decimal | None, datetime]]:
+        """Each of the repositories' findings' latest occurrence's (severity, cvss_vector,
+        cvss_score) in the report order the views fold (the reporting assessment's time,
+        then the occurrence's own), with its first report's assessment time — the clock
+        an SLA reads — reports after `until` left out: one windowed read, never an
+        occurrence row per finding through the caller. The vector rides along so the
+        census bands the same severity the views compute from it."""
         o, a, f = self._occurrences, self._assessments, self._findings
-        found: list[tuple[UUID, str | None, Decimal | None, datetime]] = []
+        found: list[tuple[UUID, str | None, str | None, Decimal | None, datetime]] = []
         for batch in batches(repository_ids):
             ranked = (
-                sa.select(o.c.finding_id, o.c.severity, o.c.cvss_score)
+                sa.select(o.c.finding_id, o.c.severity, o.c.cvss_vector, o.c.cvss_score)
                 .add_columns(
                     sa.func.row_number()
                     .over(
@@ -588,10 +589,14 @@ class CensusReads(SqlRepository):
                 ranked = ranked.where(a.c.occurred_at <= until)
             window = ranked.subquery()
             stmt = sa.select(
-                window.c.finding_id, window.c.severity, window.c.cvss_score, window.c.first
+                window.c.finding_id,
+                window.c.severity,
+                window.c.cvss_vector,
+                window.c.cvss_score,
+                window.c.first,
             ).where(window.c.rank == 1)
             rows = self._execute(f"census occurrences of {len(batch)} repositories", stmt)
-            found.extend((row[0], row[1], row[2], row[3]) for row in rows)
+            found.extend((row[0], row[1], row[2], row[3], row[4]) for row in rows)
         return found
 
 

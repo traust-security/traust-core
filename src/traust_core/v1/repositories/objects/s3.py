@@ -132,6 +132,11 @@ class S3ObjectStore:
     def get(self, ref: ObjectRef) -> bytes:
         return _verified(ref, self._read(ref.key))
 
+    def read(self, key: ObjectKey, sha256: str) -> bytes:
+        """The bytes at `key`, checked against a digest recorded elsewhere: one read."""
+        data = self._read(key)
+        return _verified(ObjectRef(key, sha256, len(data)), data)
+
     def stat(self, key: ObjectKey) -> ObjectRef:
         # Re-hashed like the local store: ArtifactPublisher.verify trusts stat's digest.
         data = self._read(key)

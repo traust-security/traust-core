@@ -326,6 +326,33 @@ def test_execution_proof_outranks_a_human_false_positive(engine: Engine) -> None
     assert view.disposition.assurance is DispositionAssurance.EXECUTION_PROVEN
 
 
+def test_a_scored_finding_carries_its_cvss_block(engine: Engine) -> None:
+    # the defect's shape: reported medium, scored 9.8 — the view says critical and shows its work
+    a = audited(
+        engine,
+        severity="medium",
+        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        cvss_score=Decimal("9.8"),
+    )
+    findings = service(engine)
+    findings.decisions.decide(said(a.finding, 1, severity=Severity.LOW), ALICE)
+    view = findings.get(a.finding.id)  # type: ignore[arg-type]
+    assert view.effective_severity is Severity.CRITICAL
+    assert view.cvss is not None
+    assert (view.cvss.basis, view.cvss.severity) == ("computed", Severity.CRITICAL)
+    assert view.cvss.vector == "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+    assert view.cvss.score == Decimal("9.8")
+    assert view.model_dump(mode="json")["cvss"]["score"] == "9.8"
+
+
+def test_an_unscored_finding_labels_from_its_word_and_says_so(engine: Engine) -> None:
+    a = audited(engine, severity="high")
+    view = service(engine).get(a.finding.id)  # type: ignore[arg-type]
+    assert view.effective_severity is Severity.HIGH
+    assert view.cvss is not None
+    assert (view.cvss.basis, view.cvss.severity, view.cvss.score) == ("scanner", None, None)
+
+
 def test_a_re_rating_changes_severity_and_deadline(engine: Engine) -> None:
     a = audited(engine, severity="high")
     findings = service(engine)

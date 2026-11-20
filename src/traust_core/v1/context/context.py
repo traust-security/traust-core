@@ -179,7 +179,7 @@ from traust_core.v1.services.code_facts import CodeFactsService
 from traust_core.v1.services.compliance import GATE, ComplianceService
 from traust_core.v1.services.dashboards import DashboardService
 from traust_core.v1.services.detection_quality import DetectionQualityService
-from traust_core.v1.services.exposure import ExposureService
+from traust_core.v1.services.exposure import AdvisoryCvssCache, ExposureService
 from traust_core.v1.services.findings import (
     FindingDecisions,
     FindingIntake,
@@ -527,6 +527,7 @@ class Context:
         # the names first, so no error about a variable can echo an unregistered name
         check_api_key_sources(registry, self.config.feeds.api_keys)
         api_keys = self.config.feeds.api_key_values()
+        unset = self.config.feeds.unset_api_keys()
         feeds = load_feeds(registry, http=self.http, clock=self.clock)
         sources = load_feed_sources(
             registry,
@@ -535,6 +536,7 @@ class Context:
             clock=self.clock,
             api_keys=api_keys,
             api_key_variables=self.config.feeds.api_keys,
+            unset_api_keys=unset,
         )
         package_sources = load_package_sources(
             registry, http=HttpFetcher(PACKAGE_SOURCE_AGENT, self._http_policy, clock=self.clock)
@@ -552,6 +554,16 @@ class Context:
             self.feed_sources.register(source.name, lambda source=source: source)
         self.package_sources = package_sources
         self.advisories = advisories
+        # only once the feeds registered: a failed load runs nothing, keyless or not
+        for source, variable in unset.items():
+            log.error(
+                "feeds.api_keys.%s names %s, which is unset or empty: %s runs keyless at its "
+                "lower rate limit",
+                source,
+                variable,
+                source,
+                extra={"operation": "feeds.api_key", "outcome": "keyless", "source": source},
+            )
 
     def use_exported_advisories(self, paths: Sequence[Path]) -> None:
         """Air-gapped runs: advisory reads answer from these exported OSV records only."""
@@ -609,6 +621,12 @@ class Context:
         """The stored census builds' parse, shared by every wired InsightService: services are
         built per request, the parse is once per publication."""
         return ParsedBuilds()
+
+    @cached_property
+    def advisory_cvss_cache(self) -> AdvisoryCvssCache:
+        """The advisory CVSS build's parse, shared by every wired ExposureService: services are
+        built per request, the parse is once per publication."""
+        return AdvisoryCvssCache()
 
     @cached_property
     def window_memo(self) -> WindowMemo:
@@ -755,7 +773,7 @@ class Context:
             checkouts=self.checkouts,
         )
         self.rule_sweeper = OpengrepRuleSweep(
-            self.rule_pack, self.config.process.keep_env, self.checkouts
+            self.rule_pack, self.config.process.keep_env, self.checkouts, load=yaml_documents
         )
 
     def register_rule_drafts(self, root: Path) -> None:
@@ -1084,6 +1102,7 @@ class Context:
             hosts=hosts,
             sbom_tool=SyftSbom(self.process, self.clock),
             findings=findings,
+            advisory_cvss=self.advisory_cvss_cache,
             checkout=self.checkouts,
         )
         sync = PortfolioSync(portfolio, sources, clock=self.clock, hosts=hosts)

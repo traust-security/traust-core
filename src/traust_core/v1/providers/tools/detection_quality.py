@@ -4,6 +4,7 @@ the checkout service, pinned to a commit — never a clone of a default branch."
 
 from __future__ import annotations
 
+import hashlib
 import re
 import shutil
 import tempfile
@@ -15,7 +16,13 @@ from urllib.parse import urlsplit
 
 from pydantic import ValidationError as InvalidModel
 
-from traust_core.v1.errors import ConfigError, NotFoundError, ServiceError, ValidationError
+from traust_core.v1.errors import (
+    ConfigError,
+    NotFoundError,
+    ScannerError,
+    ServiceError,
+    ValidationError,
+)
 from traust_core.v1.models.detection_quality import (
     CanaryInjection,
     CanaryKind,
@@ -31,13 +38,20 @@ from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.models.vocabulary import FindingKind
 from traust_core.v1.providers.base import Readiness, on_path
 from traust_core.v1.providers.config_matrix import YamlLoader
+from traust_core.v1.providers.detection_quality import RuleSweepBatch
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.sources import CheckoutRequest, Checkouts, Workspace
 from traust_core.v1.providers.tools.opengrep import (
     SupplementalPack,
-    execute_scan,
+    _scan_snapshot,
     pinned_rules_source,
     rules_root,
+)
+from traust_core.v1.providers.tools.opengrep_quality import (
+    CheckedRules,
+    RuleQualityError,
+    checked_rules,
+    fixture_name,
 )
 
 GIT_TIMEOUT = 120.0
@@ -89,12 +103,27 @@ class OpengrepRulePacks:
         return RulePack(name=name, version=ref, rules=tuple(found.values()))
 
     def _supplement(self, supplement: SupplementalPack) -> RulePack:
-        try:
-            url, ref = pinned_rules_source(supplement.source)
-        except ValueError as e:
-            raise ConfigError(f"rule pack {supplement.name}: {e}") from e
-        with self._at(url, ref) as workspace:
-            found = rule_refs(rules_root(url, workspace.path), self._load)
+        if supplement.source.startswith(("https://", "http://", "git@")):
+            try:
+                url, ref = pinned_rules_source(supplement.source)
+            except ValidationError as error:
+                raise ConfigError(f"rule pack {supplement.name}: {error}") from error
+            with self._at(url, ref) as workspace:
+                found = rule_refs(rules_root(url, workspace.path), self._load)
+        else:
+            root = Path(supplement.source)
+            if not root.is_dir():
+                raise ConfigError(f"local rule pack {supplement.name} is not a directory: {root}")
+            found = rule_refs(root, self._load)
+            digest = hashlib.sha256()
+            for path in sorted(root.rglob("*")):
+                relative = path.relative_to(root)
+                if not path.is_file() or any(p.startswith(".") for p in relative.parts):
+                    continue
+                if not path.resolve().is_relative_to(root.resolve()):
+                    raise ValidationError(f"rule input leaves its pack directory: {path}")
+                digest.update(relative.as_posix().encode() + b"\0" + path.read_bytes() + b"\0")
+            ref = "local:" + digest.hexdigest()
         if missing := sorted(set(supplement.rules) - set(found)):
             raise ValidationError(
                 f"rule pack {supplement.name}@{ref[:12]}: allowlisted rules not in the pack: "
@@ -126,17 +155,52 @@ class OpengrepRuleSweep:
 
     name = "opengrep-sweep"
 
-    def __init__(self, pack: Path, keep_env: Sequence[str], checkouts: Checkouts) -> None:
+    def __init__(
+        self, pack: Path, keep_env: Sequence[str], checkouts: Checkouts, *, load: YamlLoader
+    ) -> None:
         self._pack = pack
         self._keep_env = tuple(keep_env)
         self._checkouts = checkouts
+        self._load = load
 
     def check(self, binary: str) -> Readiness:
         return on_path(binary)
 
+    @contextmanager
+    def batch(self, rule: RuleFile, binary: str, timeout: int) -> Iterator[RuleSweepBatch]:
+        """Validate once, then scan repositories using only the private checked snapshot."""
+        runner = ProcessRunner(
+            [Path(binary).name], keep_env=self._keep_env, timeout_seconds=float(timeout)
+        )
+        with checked_rules(
+            [rule.path], runner, load=self._load, binary=binary, timeout=timeout
+        ) as checked:
+            if not checked.report.passed:
+                raise RuleQualityError(checked.report)
+            yield RuleSweepBatch(
+                rule_digest=checked.digest,
+                scan=lambda repo: self._scan(repo, checked, runner, binary, timeout),
+            )
+
     def scan(self, repo: SweepRepo, rule: RuleFile, binary: str, timeout: int) -> RepoSweep:
-        """The rule's hits in one repository, or the error that stopped it (never raised)."""
-        found = RepoSweep(slug=repo.slug, url=repo.url)
+        """Rule quality raises before checkout; repository-specific failures remain results."""
+        with self.batch(rule, binary, timeout) as batch:
+            return batch.scan(repo)
+
+    def _scan(
+        self,
+        repo: SweepRepo,
+        checked: CheckedRules,
+        runner: ProcessRunner,
+        binary: str,
+        timeout: int,
+    ) -> RepoSweep:
+        found = RepoSweep(
+            slug=repo.slug,
+            url=repo.url,
+            rule_digest=checked.digest,
+            quality_checks=checked.report.checks,
+        )
         # A local checkout needs the explicit dir: prefix: a URL that happens to name an existing
         # path must never alias to it.
         workspace = None
@@ -162,42 +226,39 @@ class OpengrepRuleSweep:
                     )
                 ).data
                 target = workspace.path
-            except (ServiceError, NotFoundError, ValidationError) as e:
-                return found.model_copy(update={"error": "clone_failed", "detail": str(e)})
+            except (ServiceError, NotFoundError, ValidationError):
+                return found.model_copy(
+                    update={"error": "clone_failed", "detail": "checkout failed"}
+                )
         else:
             return found.model_copy(
                 update={"error": "unsupported url (use https://… or dir:<path>)"}
             )
-        runner = ProcessRunner(
-            [Path(binary).name], keep_env=self._keep_env, timeout_seconds=float(timeout)
-        )
         try:
-            report = execute_scan(
-                target,
-                [str(rule.path)],
-                pack=self._pack,
-                runner=runner,
-                checkouts=self._checkouts,
-                timeout=timeout,
-                opengrep_bin=binary,
+            raw, facts, errors = _scan_snapshot(
+                target, checked.configs, frozenset(checked.report.rules), runner, binary, timeout
             )
-        except TimeoutError:
-            return found.model_copy(update={"error": "scan_timeout"})
-        except RuntimeError:
-            return found.model_copy(update={"error": "opengrep_no_json"})
+        except ScannerError as error:
+            return found.model_copy(update={"error": str(error.reason), "detail": str(error)})
         finally:
             if workspace is not None:
                 self._checkouts.release(workspace)
         return found.model_copy(
             update={
-                "files_scanned": report["stats"]["files_scanned"],
-                "engine_errors": report["stats"]["errors"],
-                "facts": tuple(RuleHit.model_validate(f) for f in report["facts"]),
+                "files_scanned": len((raw.get("paths") or {}).get("scanned", [])),
+                "engine_errors": len(errors),
+                "facts": tuple(RuleHit.model_validate(f) for f in facts),
             }
         )
 
     def trial(
-        self, rule: str, target: Path | Mapping[str, str], binary: str, timeout: int
+        self,
+        rule: str,
+        target: Path | Mapping[str, str],
+        binary: str,
+        timeout: int,
+        *,
+        examples: Mapping[str, str],
     ) -> RepoSweep:
         """An unstaged rule's hits over a checkout, or over `target` files written to a
         temporary tree (names are bare file names)."""
@@ -205,6 +266,8 @@ class OpengrepRuleSweep:
             root = Path(tmp)
             path = root / "rule.yaml"
             path.write_text(rule, encoding="utf-8")
+            for name, text in examples.items():
+                (root / fixture_name(path, name)).write_text(text, encoding="utf-8")
             if isinstance(target, Path):
                 scanned = target
             else:
@@ -216,7 +279,15 @@ class OpengrepRuleSweep:
                     (scanned / name).write_text(text, encoding="utf-8")
             repo = SweepRepo(slug="trial", url=f"dir:{scanned}")
             staged = RuleFile(path=path, ids=(), unauthored=False)
-            return self.scan(repo, staged, binary, timeout)
+            try:
+                return self.scan(repo, staged, binary, timeout)
+            except RuleQualityError as error:
+                return RepoSweep(
+                    slug="trial",
+                    error="rule_quality_failed",
+                    detail=str(error),
+                    quality_checks=error.report.checks,
+                )
 
 
 def rule_refs(root: Path, load: YamlLoader) -> dict[str, RuleRef]:
@@ -230,7 +301,7 @@ def rule_refs(root: Path, load: YamlLoader) -> dict[str, RuleRef]:
         try:
             doc = _one_document(load, path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, ValidationError) as e:
-            raise ValidationError(f"rule file {path}: unreadable: {e}") from e
+            raise ValidationError(f"rule file {path.name}: unreadable YAML") from e
         if not (isinstance(doc, dict) and isinstance(doc.get("rules"), list)):
             continue
         for rule in doc["rules"]:

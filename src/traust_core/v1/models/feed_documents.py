@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 import pydantic
 from pydantic import AwareDatetime, Field, computed_field
 
-from traust_core.v1.errors import ValidationError
+from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.base import Model
 
 _DIGEST = r"^[0-9a-f]{64}$"
@@ -70,6 +70,15 @@ class AdvisoryDocumentsRefresh(Model):
     def ok(self) -> bool:
         """Whether this source refreshed (or had nothing to refresh)."""
         return self.error is None
+
+
+class AdvisoryCvssNotBuilt(ServiceError):
+    """The documents refreshed (`outcomes`, each source's) but ranking them failed on the store;
+    the last CVSS build stays served."""
+
+    def __init__(self, message: str, outcomes: Sequence[AdvisoryDocumentsRefresh]) -> None:
+        super().__init__(message, operation="advisory-cvss build")
+        self.outcomes = tuple(outcomes)
 
 
 class StoredDocument(Model):

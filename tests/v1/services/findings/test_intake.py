@@ -310,6 +310,17 @@ def test_an_empty_report_records_nothing(engine: Engine, target: Target) -> None
     ("change", "message"),
     [
         ({"reported_severity": None}, "no severity"),
+        (
+            {
+                "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+                "cvss_score": Decimal("5.0"),
+            },
+            "is not what its vector computes",
+        ),
+        (
+            {"cvss_vector": "CVSS:3.1/AV:N/AC:L", "cvss_score": Decimal("5.0")},
+            "not what its vector computes",
+        ),
         ({"cwes": ("CWE89",)}, "not CWE identifiers"),
         ({"locations": ()}, "no usable location"),
         ({"repository_id": uuid4()}, "examined"),

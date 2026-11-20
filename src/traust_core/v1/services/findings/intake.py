@@ -10,6 +10,7 @@ from pydantic import ValidationError as ModelValidationError
 from traust_core.v1 import contracts
 from traust_core.v1.errors import ConfigError, ConflictError, ForbiddenError, ValidationError
 from traust_core.v1.models.common import CodeHash, CodeSpan
+from traust_core.v1.models.cvss import cvss_computed_score
 from traust_core.v1.models.dependencies import AdvisoryMatch
 from traust_core.v1.models.findings import (
     Cwe,
@@ -318,6 +319,13 @@ class FindingIntake:
         if candidate.reported_severity is None:
             raise ValidationError(f"{candidate.label}: no severity reported")
         contracts.validate_enum("scanner_severity", candidate.reported_severity)
+        if candidate.cvss_vector is not None and candidate.cvss_score is not None:
+            computed = cvss_computed_score(candidate.cvss_vector)
+            if computed is None or candidate.cvss_score != computed:
+                raise ValidationError(
+                    f"{candidate.label}: cvss score {candidate.cvss_score} is not what its "
+                    "vector computes"
+                )
         if malformed := [c for c in candidate.cwes if not CWE_IDENTIFIER.fullmatch(c)]:
             raise ValidationError(f"{candidate.label}: not CWE identifiers: {malformed}")
         for span in candidate.locations:

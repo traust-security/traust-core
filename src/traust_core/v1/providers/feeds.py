@@ -30,6 +30,7 @@ from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.http import HttpFetcher, is_header_name, is_header_value
 
 log = logging.getLogger(__name__)
+_THROTTLED = (403, 429)  # a keyless rate limit answers either
 
 # The last snapshot's bytes, read only by a feed that builds on it.
 Previous = Callable[[], bytes | None]
@@ -40,6 +41,7 @@ class FeedStatus(Dto):
     fetched_at: datetime | None = None
     max_age: timedelta
     last_error: str | None = None
+    refresh: str | None = None  # what refreshes it when stale; None: fetching the feed itself
 
     def stale(self, now: datetime) -> bool:
         return self.fetched_at is None or now - self.fetched_at > self.max_age
@@ -360,12 +362,15 @@ class FeedSource:
         probe_http: HttpFetcher,
         clock: Clock,
         api_key: ApiKey | None = None,
+        keyless: str | None = None,
         max_bytes: int = DOCUMENT_BYTES,
+        max_age: timedelta = timedelta(hours=24),
     ) -> None:
         if max_bytes < 1:
             raise ConfigError(f"{name}: a document size cap is at least one byte")
         self.name = name
         self._max_bytes = max_bytes
+        self.max_age = max_age  # how old its kept documents may be (`max_age_hours`)
         self.url = url
         self.template = template
         self._ident = _IDENTS.get(ident or "")
@@ -377,6 +382,20 @@ class FeedSource:
         if api_key is not None and post:
             raise ConfigError(f"{name}: an API key travels on a GET source only")
         self._api_key = api_key
+        self._keyless = None if api_key is not None else keyless
+
+    def _throttled(self, e: ServiceError) -> ServiceError | None:
+        """A keyless refusal of a source that takes a key, worded as the rate limit it most
+        likely is (keyless limits answer 403 or 429), or None for any other error."""
+        if self._keyless is None or e.status not in _THROTTLED:
+            return None
+        return ServiceError(
+            f"{e} ({self.name} was {self._keyless}: most likely its keyless rate limit, which "
+            f"an API key raises)",
+            status=e.status,
+            operation=e.operation,
+            target_hash=e.target_hash,
+        )
 
     def _get(self, http: HttpFetcher, url: str, *, keyed: bool, limit: int | None = None) -> bytes:
         """A GET, carrying the source's API key only when `keyed` (a URL `_resolve` built from
@@ -384,7 +403,12 @@ class FeedSource:
         one: a secret header, sent to this URL only. Any other request is exactly as before."""
         bound = {} if limit is None else {"limit": limit}
         if self._api_key is None or not keyed:
-            return http.get(url, **bound)
+            try:
+                return http.get(url, **bound)
+            except ServiceError as e:
+                if keyed and (throttled := self._throttled(e)) is not None:
+                    raise throttled from e
+                raise
         try:
             return http.get(url, secret_headers=self._api_key.headers(), **bound)
         except ServiceError as e:
@@ -427,6 +451,14 @@ class FeedSource:
         except (ConfigError, ValidationError) as e:
             return Readiness(ready=False, detail=f"probe URL could not be built: {e}")
         except ServiceError as e:
+            if keyed and self._keyless is not None and e.status in _THROTTLED:
+                # host and status only, never the probe URL: `_get` already explained the error
+                return Readiness(
+                    ready=False,
+                    detail=f"{_host(probed or self.url)} answered HTTP {e.status} to the probe "
+                    f"({self.name} was {self._keyless}): most likely its keyless rate limit, "
+                    "which an API key raises",
+                )
             if e.status is not None and 400 <= e.status < 500 and e.status != 429:
                 if probed is not None and keyed and self._api_key is not None:
                     return Readiness(

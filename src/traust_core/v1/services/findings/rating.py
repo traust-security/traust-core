@@ -8,13 +8,16 @@ import pydantic
 
 from traust_core.v1.models.assessment import Threat
 from traust_core.v1.models.base import Model
+from traust_core.v1.models.cvss import severity_of
 from traust_core.v1.models.findings import (
     LIKELIHOOD_FACTORS,
     Disposition,
+    FindingCvss,
     Occurrence,
     RatingInputs,
     RiskLevel,
     RiskRating,
+    SeverityBasis,
 )
 from traust_core.v1.models.vocabulary import (
     OwaspImpactBasis,
@@ -122,6 +125,28 @@ class RatingConfig(Model):
     sla: SlaConfig = SlaConfig()
 
 
+class SeverityLabel(Model):
+    """The severity a finding shows, and which source won it: the CVSS band a scored
+    occurrence computes, the scanner's word, or a judgement's re-rating."""
+
+    severity: Severity | None
+    basis: SeverityBasis
+
+
+def finding_cvss(occurrence: Occurrence | None, label: SeverityLabel) -> FindingCvss | None:
+    """The cvss block for a finding shown with `occurrence`: that occurrence's score and
+    vector, the severity its vector computes, and the label's basis — one constructor, so
+    the chain always describes the occurrence the view displays."""
+    if occurrence is None:
+        return None
+    return FindingCvss(
+        score=occurrence.cvss_score,
+        vector=occurrence.cvss_vector,
+        severity=severity_of(occurrence.cvss_vector),
+        basis=label.basis,
+    )
+
+
 class RatingPolicy:
     def __init__(self, config: RatingConfig) -> None:
         self._config = config
@@ -160,15 +185,27 @@ class RatingPolicy:
             band=risk_band(im, lk),
         )
 
+    def severity_label(
+        self, occurrence: Occurrence | None, disposition: Disposition | None
+    ) -> SeverityLabel:
+        """The label and its provenance: the band the occurrence's vector computes, else a
+        judgement's re-rating, else the scanner's word — the score, never a word, is the
+        authority for what was scored; a recorded decision, not the report's first word,
+        corrects the rest (the remediation plan's step 7 tightens that correction to
+        evidence-backed decisions)."""
+        if occurrence is not None and (band := severity_of(occurrence.cvss_vector)) is not None:
+            return SeverityLabel(severity=band, basis="computed")
+        if disposition is not None and disposition.severity is not None:
+            return SeverityLabel(severity=disposition.severity, basis="judgement")
+        if occurrence is not None and occurrence.severity != ScannerSeverity.UNRATED:
+            return SeverityLabel(severity=Severity(occurrence.severity), basis="scanner")
+        return SeverityLabel(severity=None, basis="unrated")
+
     def effective_severity(
         self, occurrence: Occurrence | None, disposition: Disposition | None
     ) -> Severity | None:
-        """The strongest re-rating, else the latest report's severity."""
-        if disposition is not None and disposition.severity is not None:
-            return disposition.severity
-        if occurrence is None or occurrence.severity == ScannerSeverity.UNRATED:
-            return None
-        return Severity(occurrence.severity)
+        """`severity_label`'s severity, without the provenance."""
+        return self.severity_label(occurrence, disposition).severity
 
     def sla_due(
         self, severity: Severity | None, opened_at: datetime, cvss_score: Decimal | None = None

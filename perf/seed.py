@@ -61,12 +61,13 @@ ARTIFACTS_PER_ASSESSMENT = 10
 PACKAGES = 100_000
 ADVISORIES = 50_000
 ADVISORY_BACKED_EVERY = 5
-# A year of daily snapshots per feed: the whole-file feeds and the per-source document manifests
-# (`<source>-documents`), each for a run order. Per-feed shape: it doesn't scale with the estate.
+# A year of daily snapshots per feed: the whole-file feeds, the per-source document manifests
+# (`<source>-documents`) and the ranked CVSS build they make (`advisory-cvss`), each for a run
+# order. Per-feed shape: it doesn't scale with the estate.
 # Like every seeded artifact, their artifacts are rows with no bytes behind them: perf measures
 # query plans, never payload reads (no case reads a feed's bytes).
 FEEDS = ("epss", "kev", "rh-cve", "vex", "cve-list-documents", "nvd-documents",
-         "ghsa-documents", "rh-cve-documents")  # fmt: skip
+         "ghsa-documents", "rh-cve-documents", "advisory-cvss")  # fmt: skip
 SNAPSHOT_DAYS = 365
 SBOMS = 20_000
 DEPENDENCIES_PER_SBOM = 150

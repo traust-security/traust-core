@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Literal, TypeVar
+from uuid import UUID
 
 import pydantic
 from cvss import CVSS3, CVSS4
@@ -16,6 +18,7 @@ from pydantic import Field, StrictBool, StrictFloat, StrictInt, StrictStr
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.base import Dto, Model
+from traust_core.v1.models.vocabulary import Severity
 
 
 class CvssSource(StrEnum):
@@ -62,8 +65,31 @@ class CvssScore(Model):
     acquired_at: datetime | None = None
 
 
+class AdvisoryCvss(Model):
+    """Every authority's scores for each linked advisory (canonical id), ranked, from one day's
+    kept documents; `unreadable` names a kept document that didn't parse, so it stated nothing."""
+
+    scores: Mapping[UUID, tuple[CvssScore, ...]]
+    unreadable: tuple[str, ...] = ()
+
+    def to_bytes(self) -> bytes:
+        # canonical: the same scores are the same bytes, so an unchanged day is one artifact
+        body = self.model_dump(mode="json")
+        return json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+
+    @classmethod
+    def from_bytes(cls, raw: bytes) -> AdvisoryCvss:
+        try:
+            return cls.model_validate_json(raw)
+        except pydantic.ValidationError as e:
+            raise ValidationError(
+                f"not an advisory CVSS build ({e.error_count()} problem(s))"
+            ) from e
+
+
 class EffectiveCvss(Model):
-    """A finding's chosen 3.x score, the highest-ranked 4.0 beside it, and every source's."""
+    """A finding's chosen score (3.x; 4.0 only when no source has 3.x), the highest-ranked 4.0
+    beside it, and every source's."""
 
     chosen: CvssScore | None
     v4: CvssScore | None
@@ -80,9 +106,36 @@ class EffectiveCvss(Model):
 
 def cvss_base_score(vector: str) -> float | None:
     """A `CVSS:3.0/` or `CVSS:3.1/` vector's base score; None for any other, or one FIRST's
-    formula refuses (a 4.0 score is never ranked, so it isn't one of these)."""
+    formula refuses (`AdvisoryRecord.cvss_score` ranks 3.x vectors only)."""
     score = _v3_base_score(vector)
     return None if score is None else float(score)
+
+
+def severity_of(vector: str | None) -> Severity | None:
+    """A vector's qualitative rating — FIRST's bands, Red Hat's `cvss` — or None when the
+    vector doesn't parse: never a guess at a malformed one. CVSS "None" reads informational."""
+    if not isinstance(vector, str) or (version := _version(vector)) is None:
+        return None
+    # the spec's 4.0 metric order, the same refusal `score_of` applies — a vector the
+    # scoring path rejects as malformed never supplies a computed label either
+    if version == "4.0" and not _in_spec_order(vector, version):
+        return None
+    try:
+        parsed = CVSS4(vector) if version == "4.0" else CVSS3(vector)
+        label = parsed.severities()[0]
+    except CVSSError:
+        return None
+    return Severity.INFORMATIONAL if label == "None" else Severity(label.lower())
+
+
+def cvss_computed_score(vector: str) -> Decimal | None:
+    """The base score FIRST's formula computes for a 3.x or 4.0 vector, or None when the
+    vector doesn't parse — the number a stated score must agree with."""
+    if (version := _version(vector)) is None:
+        return None
+    if version == "4.0":
+        return _v4_base_score(vector) if _in_spec_order(vector, version) else None
+    return _v3_base_score(vector)
 
 
 def _v3_base_score(vector: str) -> Decimal | None:
@@ -445,3 +498,18 @@ def distinct(scores: Iterable[CvssScore | None]) -> tuple[CvssScore, ...]:
             key = (score.source, score.version, score.vector, score.document, score.scored_by)
             seen.setdefault((*key, score.score), score)
     return tuple(seen.values())
+
+
+def record_ids(kind: str, raw: bytes) -> tuple[str, ...]:
+    """The record ids a document names, `kind` being its scores' `document` prefix: each CVE an
+    NVD response holds, else the one record's; checked against the id asked for."""
+    if kind == "nvd":
+        record = _parsed(_NvdRecord, raw, "an NVD API 2.0 CVE record")
+        return tuple(v.cve.cve_id for v in record.vulnerabilities)
+    if kind == "cve-list":
+        return (_parsed(_CveListHeader, raw, "a CVE List record").metadata.cve_id,)
+    if kind == "osv":
+        return (_parsed(_OsvRecord, raw, "an OSV record").record_id,)
+    if kind == "rh-cve":
+        return (_parsed(_RhCveRecord, raw, "a Red Hat Security Data CVE record").cve_id,)
+    raise ValidationError(f"{kind}: not a document kind with record ids")

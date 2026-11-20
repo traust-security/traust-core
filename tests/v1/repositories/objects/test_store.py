@@ -43,6 +43,15 @@ def test_get_with_wrong_digest_raises_integrity_error(store: ObjectStore) -> Non
         store.get(ObjectRef(ref.key, "0" * 64, ref.size))
 
 
+def test_read_by_key_and_digest_checks_the_bytes(store: ObjectStore) -> None:
+    ref = store.put(KEY, b"original")
+    assert store.read(KEY, ref.sha256) == b"original"
+    with pytest.raises(IntegrityError):
+        store.read(KEY, "0" * 64)
+    with pytest.raises(NotFoundError):
+        store.read(ObjectKey.parse("absent/x.json"), ref.sha256)
+
+
 def test_missing_key_raises_not_found(store: ObjectStore) -> None:
     assert not store.exists(KEY)
     with pytest.raises(NotFoundError):

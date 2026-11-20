@@ -263,6 +263,7 @@ def source(
     probe: Probe | None = LOG4SHELL,
     http: _Http | None = None,
     api_key: ApiKey | None = None,
+    keyless: str | None = None,
 ) -> FeedSource:
     fetcher = http or _Http()
     return FeedSource(
@@ -276,6 +277,7 @@ def source(
         probe_http=fetcher,  # type: ignore[arg-type]
         clock=FixedClock(AT),
         api_key=api_key,
+        keyless=keyless,
     )
 
 
@@ -425,6 +427,44 @@ def test_a_refused_keyed_request_names_the_key() -> None:
     assert raised.value.status == 404 and SECRET not in str(raised.value)
     # keyless, a refusal still reads as the registry and the service disagreeing
     assert "correct its URL" in source(http=http).check().detail
+
+
+KEYLESS = "sent keyless because NVD_API_KEY is unset or empty"
+
+
+@pytest.mark.parametrize("status", [403, 429])
+def test_a_keyless_refusal_of_a_keyed_source_reads_as_its_rate_limit(status: int) -> None:
+    refused = ServiceError(f"https://nvd.test/x: HTTP {status}", status=status)
+    http = _Http(
+        {
+            "https://nvd.test/cves?cveId=CVE-2021-44228": refused,
+            "https://nvd.test/cves?cveId=CVE-2026-0001": refused,
+        }
+    )
+    nvd = source(http=http, keyless=KEYLESS)
+    with pytest.raises(ServiceError, match="keyless rate limit") as raised:
+        nvd.document("CVE-2026-0001")
+    assert raised.value.status == status and "NVD_API_KEY is unset" in str(raised.value)
+    readiness = nvd.check()
+    assert not readiness.ready and readiness.detail.count("keyless rate limit") == 1
+    assert "cveId" not in readiness.detail and "nvd.test" in readiness.detail  # host, never URL
+    assert http.headers == [None, None]  # still sent, keyless
+
+
+def test_a_keyless_source_says_nothing_of_rate_limits_for_other_errors() -> None:
+    missing = ServiceError("https://nvd.test/x: HTTP 404", status=404)
+    http = _Http({"https://nvd.test/cves?cveId=CVE-2026-0001": missing})
+    with pytest.raises(ServiceError) as raised:
+        source(http=http, keyless=KEYLESS).document("CVE-2026-0001")
+    assert "rate limit" not in str(raised.value)
+
+
+def test_a_keyed_source_ignores_a_keyless_reason() -> None:
+    refused = ServiceError("https://nvd.test/x: HTTP 403", status=403)
+    http = _Http({"https://nvd.test/cves?cveId=CVE-2026-0001": refused})
+    with pytest.raises(ServiceError, match=r"feeds\.api_keys\.nvd") as raised:
+        source(http=http, api_key=NVD_KEY, keyless=KEYLESS).document("CVE-2026-0001")
+    assert "keyless" not in str(raised.value)
 
 
 def test_a_post_source_cannot_hold_a_key() -> None:

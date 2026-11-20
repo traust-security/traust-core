@@ -220,7 +220,13 @@ from traust_core.v1.rendering import (
 )
 from traust_core.v1.services.findings.census import FindingCensusRow, StateGroup, TopCutRow
 from traust_core.v1.services.findings.intake import CATEGORY
-from traust_core.v1.services.findings.rating import CvssFloor, RatingConfig, RatingPolicy, SlaConfig
+from traust_core.v1.services.findings.rating import (
+    CvssFloor,
+    RatingConfig,
+    RatingPolicy,
+    SlaConfig,
+    finding_cvss,
+)
 from traust_core.v1.services.provider_catalog import core_version
 
 if TYPE_CHECKING:
@@ -1118,11 +1124,15 @@ class ContainerFindingsView:
             held = occurrences[finding_id]
             latest = held[-1]
             assert latest.id is not None
+            label = self._rating.severity_label(latest, view.disposition)
             selected = view.model_copy(
                 update={
                     "occurrence": latest,
                     "locations": tuple(self._findings.locations([latest.id])),
-                    "effective_severity": self._rating.effective_severity(latest, view.disposition),
+                    "effective_severity": label.severity,
+                    # the chain describes the occurrence the row shows — never the
+                    # repository-wide latest the unselected view folded
+                    "cvss": finding_cvss(latest, label),
                     "sla_due": None,
                 }
             )

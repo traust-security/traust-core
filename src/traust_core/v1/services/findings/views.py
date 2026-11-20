@@ -23,7 +23,7 @@ from traust_core.v1.repositories.objects import ObjectStore
 from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.findings.claims import claim_fold
 from traust_core.v1.services.findings.facts import FindingFacts
-from traust_core.v1.services.findings.rating import RatingPolicy
+from traust_core.v1.services.findings.rating import RatingPolicy, finding_cvss
 
 
 class FindingViewQuery:
@@ -196,7 +196,8 @@ class FindingViewQuery:
             )
         latest = reported[-1] if reported else None
         disposition = facts.disposition(finding.id, as_of)
-        severity = self._rating.effective_severity(latest, disposition)
+        label = self._rating.severity_label(latest, disposition)
+        severity = label.severity
         # the reporting assessments' own times — the occurrence→assessment
         # join the census reads for its SLA `first` — computed once here for
         # the view's date fields (facts.at already holds them for the fold)
@@ -212,6 +213,7 @@ class FindingViewQuery:
             occurrence=latest,
             disposition=disposition,
             effective_severity=severity,
+            cvss=finding_cvss(latest, label),
             sla_due=due,
             first_reported_at=first_reported,
             last_reported_at=last_reported,

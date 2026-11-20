@@ -54,6 +54,14 @@ def test_the_census_rows_are_the_views_counted_facts(engine: Engine) -> None:
     left, right = new_repo(engine), new_repo(engine)
     open_high = left.reported(day=0, severity="high")
     top = left.reported(day=1, severity="critical", cvss_score="9.1")
+    # the defect's shape: a medium word on a 9.8 vector — the census must band it
+    # critical exactly as the view does, not fall back to the scanner's word
+    scored = left.reported(
+        day=0,
+        severity="medium",
+        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        cvss_score="9.8",
+    )
     hardening = left.reported(day=0, severity="high", labels=(("category", "xss"),))
     left.judged(hardening, 1, validity="hardening")
     weakness = left.reported(day=0, severity="medium", labels=(("category", "xss"),))
@@ -90,6 +98,7 @@ def test_the_census_rows_are_the_views_counted_facts(engine: Engine) -> None:
     assert rows[proven.id].proven and rows[proven.id].state == "open"
     assert rows[unjugded_later.id].unverified and not rows[unjugded_later.id].decided
     assert rows[quiet.id].state == "open" and rows[quiet.id].severity == "low"
+    assert rows[scored.id].severity == "critical"  # the band, never the medium word
 
 
 def test_the_census_honours_the_as_of_cut_like_the_views_do(engine: Engine) -> None:

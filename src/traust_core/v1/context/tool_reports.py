@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from traust_core.v1.context.documents import yaml_documents_with_lines
+from traust_core.v1.context.documents import yaml_documents, yaml_documents_with_lines
 from traust_core.v1.context.tools import (
     gitleaks_config,
     load_rule_allowlist,
@@ -20,6 +20,7 @@ from traust_core.v1.context.tools import (
     yara_engine,
 )
 from traust_core.v1.errors import ConfigError, TraustError, ValidationError
+from traust_core.v1.models.rule_mining import RuleQualityReport
 from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.process import ProcessResult, ProcessRunner, ProcessTimeout
 from traust_core.v1.providers.tools import (
@@ -32,6 +33,7 @@ from traust_core.v1.providers.tools import (
 )
 from traust_core.v1.providers.tools.elf import ElfAnalyzer
 from traust_core.v1.providers.tools.gitleaks import Gitleaks, parse_report
+from traust_core.v1.providers.tools.opengrep_quality import checked_rules
 from traust_core.v1.providers.tools.toolchain import (
     POPULATABLE_TOOLS,
     ToolCheck,
@@ -59,6 +61,21 @@ GOVULNCHECK_ROLE = (
 )
 
 
+def opengrep_quality_report(
+    ctx: Context,
+    rules: Sequence[Path],
+    *,
+    timeout: int = 300,
+    binary: str = "opengrep",
+) -> RuleQualityReport:
+    """Run the native rule-quality gate without opening the record store."""
+    runner = _runner(ctx, ("opengrep", binary), max(timeout, opengrep.SCAN_TIMEOUT))
+    with checked_rules(
+        rules, runner, load=yaml_documents, binary=binary, timeout=timeout
+    ) as checked:
+        return checked.report
+
+
 def opengrep_report(
     ctx: Context,
     target: Path,
@@ -80,6 +97,7 @@ def opengrep_report(
         pack=chosen,
         runner=_runner(ctx, ("opengrep", "git", binary), max(timeout, opengrep.SCAN_TIMEOUT)),
         checkouts=ctx.checkouts,
+        load=yaml_documents,
         supplements=ctx.rule_pack_supplements,
         rule_allow=load_rule_allowlist(rule_allow),
         timeout=timeout,

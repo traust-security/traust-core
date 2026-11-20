@@ -11,7 +11,9 @@ from typing import Any
 import pytest
 
 from tests.v1.conftest import CheckoutForge, NoCheckouts
-from traust_core.v1.errors import NotFoundError, ValidationError
+from tests.v1.providers.tools.opengrep_fixtures import native_output, write_fixture, write_rule
+from traust_core.v1.context.documents import yaml_documents
+from traust_core.v1.errors import NotFoundError, ScannerError, ScannerFailure, ValidationError
 from traust_core.v1.models.artifacts import AdapterResultArtifact
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.process import (
@@ -82,6 +84,7 @@ def pack(tmp_path: Path) -> Path:
     for lang, n in {"go": 12, "python": 8, "bash": 3}.items():
         (root / lang).mkdir(parents=True)
         (root / lang / "rules.yaml").write_text(_rules(n, f"traust-{lang}"))
+        write_fixture(root / lang / "rules.yaml")
     return root
 
 
@@ -103,6 +106,9 @@ class Runner:
     def run(self, argv: Any, **kw: Any) -> ProcessResult:
         args = tuple(argv)
         self.calls.append((args, kw))
+        native = native_output(args)
+        if native is not None:
+            return ProcessResult(args, 0, native, b"", 0.1)
         out = b""
         if args[1:] == ("--version",):
             out = b"warning\n1.25.0\n"
@@ -193,9 +199,9 @@ def test_auto_is_refused(pack: Path) -> None:
         R.resolve_rules(["auto"], Path(), pack, NEVER)
 
 
-def test_registry_shorthand_carries_license_note(pack: Path) -> None:
-    [resolved], _ = R.resolve_rules(["p/golang"], Path(), pack, NEVER)
-    assert resolved["config"] == ["p/golang"] and "license" in resolved["license_note"].lower()
+def test_registry_shorthand_without_local_fixtures_is_refused(pack: Path) -> None:
+    with pytest.raises(ValidationError, match="no local test fixtures"):
+        R.resolve_rules(["p/golang"], Path(), pack, NEVER)
 
 
 def test_local_path_used_as_is(tmp_path: Path, pack: Path) -> None:
@@ -218,8 +224,10 @@ def test_default_is_the_pack_language_filtered(pack: Path, target: Path) -> None
 
 
 def test_a_target_in_no_pack_language_scans_with_the_whole_pack(pack: Path, tmp_path: Path) -> None:
-    (tmp_path / "x.rs").write_text("fn main() {}\n")
-    [resolved], _ = R.resolve_rules([], tmp_path, pack, NEVER)
+    target = tmp_path / "checkout"
+    target.mkdir()
+    (target / "x.rs").write_text("fn main() {}\n")
+    [resolved], _ = R.resolve_rules([], target, pack, NEVER)
     assert resolved["config"] == [str(pack)]
 
 
@@ -229,6 +237,7 @@ def web_pack(tmp_path: Path) -> Path:
     for lang, n in {"typescript": 10, "yaml": 2}.items():
         (root / lang).mkdir(parents=True)
         (root / lang / "rules.yaml").write_text(_rules(n, f"traust-{lang}"))
+        write_fixture(root / lang / "rules.yaml")
     return root
 
 
@@ -245,8 +254,10 @@ def test_javascript_scans_with_the_typescript_rules(
 
 
 def test_javascript_coverage_counts_the_typescript_rules(web_pack: Path, tmp_path: Path) -> None:
-    (tmp_path / "server.js").write_text("module.exports = {};\n")
-    cov = R.coverage_block(tmp_path, web_pack)
+    target = tmp_path / "checkout"
+    target.mkdir()
+    (target / "server.js").write_text("module.exports = {};\n")
+    cov = R.coverage_block(target, web_pack)
     assert cov["detected_languages"] == ["javascript"]
     assert cov["traust_rules_by_language"] == {"javascript": 10}
     assert cov["uncovered_languages"] == [] and cov["thin_languages"] == []
@@ -295,7 +306,7 @@ def test_a_git_source_is_a_workspace_from_the_checkout_service_at_its_pin(
         [f"{R.ARGUS_RULES_REPO}@{sha}"], target, pack, forge.service()
     )
     (workspace,) = held
-    assert resolved["config"] == [str(workspace.path / "rules" / "languages" / "go")]
+    assert resolved["config"] == [str(workspace.path / "rules" / "languages")]
     assert resolved["sha"] == str(sha) and resolved["license_note"] == R.ARGUS_RULES_LICENSE
     assert (workspace.path / "rules" / "languages" / "go" / "tls.yaml").is_file()
     forge.service().release(workspace)
@@ -346,22 +357,29 @@ def test_reads_enabled_packs() -> None:
     ]
 
 
-@pytest.mark.parametrize(
-    "packs",
-    [_packs(enabled=False), _packs(rules=[]), _packs(source=None), {"p": "not a mapping"}, {}],
-)
-def test_a_disabled_ruleless_or_sourceless_pack_is_off(packs: dict[str, Any]) -> None:
+@pytest.mark.parametrize("packs", [_packs(enabled=False), {"p": "not a mapping"}, {}])
+def test_a_disabled_pack_is_off(packs: dict[str, Any]) -> None:
     assert R.supplemental_packs(packs) == []
+
+
+@pytest.mark.parametrize("packs", [_packs(rules=[]), _packs(source=None), _packs(rules=["r", "r"])])
+def test_an_enabled_pack_cannot_silently_disable_or_duplicate_rules(packs: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError, match="needs a source and unique rule ids"):
+        R.supplemental_packs(packs)
+
+
+def test_local_adopter_sources_resolve_beside_the_allowlist(tmp_path: Path) -> None:
+    [pack] = R.supplemental_packs(_packs(source="rules/acme"), base=tmp_path)
+    assert pack.source == str(tmp_path / "rules" / "acme")
 
 
 def test_the_scan_command_never_honours_the_targets_own_suppressions(
     pack: Path, target: Path
 ) -> None:
     fake = Runner()
-    R.execute_scan(target, [], pack=pack, runner=runner(fake), checkouts=NEVER)
+    R.execute_scan(target, [], pack=pack, runner=runner(fake), checkouts=NEVER, load=yaml_documents)
     [scan] = [a for a, _ in fake.calls if a[1] == "scan"]
     assert scan[:5] == ("opengrep", "scan", "--json", "--quiet", "--disable-nosem")
-    assert scan[5:7] == ("--config", str(pack / "go"))
     assert scan[-1] == str(target)
     assert [scan[i + 1] for i, a in enumerate(scan) if a == "--exclude"] == list(R.EXCLUDES)
 
@@ -369,7 +387,9 @@ def test_the_scan_command_never_honours_the_targets_own_suppressions(
 def test_the_report_carries_facts_rules_coverage_and_the_scanner_version(
     pack: Path, target: Path
 ) -> None:
-    report = R.execute_scan(target, [], pack=pack, runner=runner(Runner()), checkouts=NEVER)
+    report = R.execute_scan(
+        target, [], pack=pack, runner=runner(Runner()), checkouts=NEVER, load=yaml_documents
+    )
     assert report["tool"] == "run_opengrep" and report["opengrep_version"] == "1.25.0"
     assert report["rules"] == [
         {
@@ -387,7 +407,7 @@ def test_the_report_carries_facts_rules_coverage_and_the_scanner_version(
         "suppressed_by_allowlist": 0,
     }
     assert report["rule_allowlist"] is None
-    assert report["supplemental_packs"] == {"applied": [], "skipped": []}
+    assert report["supplemental_packs"] == {"applied": []}
     assert report["coverage"]["detected_languages"] == ["go"]
 
 
@@ -395,7 +415,18 @@ def test_a_supplements_allowlist_filters_only_the_supplement(
     pack: Path, target: Path, tmp_path: Path
 ) -> None:
     forge = CheckoutForge(tmp_path, "https://example.com/o/argus")
-    sha = forge.commit({"go/x.yaml": "rules: []\n"})
+    sha = forge.commit(
+        {
+            "go/x.yaml": (
+                "rules:\n  - id: go-tls-bypass\n    languages: [go]\n"
+                "    severity: ERROR\n    message: TLS bypass\n    pattern: tls()\n"
+            ),
+            "go/x.go": (
+                "package fixture\nfunc sample() {\n// ruleid: go-tls-bypass\n"
+                "tls()\n// ok: go-tls-bypass\nverified_tls()\n}\n"
+            ),
+        }
+    )
     raw = {
         "results": [
             {"check_id": "traust-go-1", "path": "main.go", "extra": {}},
@@ -405,7 +436,6 @@ def test_a_supplements_allowlist_filters_only_the_supplement(
     }
     supplements = (
         SupplementalPack("argus", f"https://example.com/o/argus@{sha}", ("go-tls-bypass",)),
-        SupplementalPack("broken", "https://example.com/broken@main", ("x",)),
     )
     report = R.execute_scan(
         target,
@@ -413,12 +443,11 @@ def test_a_supplements_allowlist_filters_only_the_supplement(
         pack=pack,
         runner=runner(Runner(raw)),
         checkouts=forge.service(),
+        load=yaml_documents,
         supplements=supplements,
     )
     assert [f["rule_id"] for f in report["facts"]] == ["traust-go-1", "go-tls-bypass"]
     assert report["supplemental_packs"]["applied"] == ["argus"]
-    [skipped] = report["supplemental_packs"]["skipped"]
-    assert skipped["pack"] == "broken" and "40-hex commit" in skipped["reason"]
     allowlist = report["rule_allowlist"]
     assert allowlist["source"] == (
         "rule-pack-allowlist.yaml (1 supplemental + 23 traust rule pack rules)"
@@ -427,8 +456,7 @@ def test_a_supplements_allowlist_filters_only_the_supplement(
 
 
 def test_supplements_apply_only_to_a_default_run(pack: Path, target: Path, tmp_path: Path) -> None:
-    rules = tmp_path / "r.yaml"
-    rules.write_text("rules: []\n")
+    rules = write_rule(tmp_path, "custom-rule", name="r")
     supplement = SupplementalPack("argus", f"https://example.com/o/argus@{SHA}", ("r",))
     report = R.execute_scan(
         target,
@@ -436,6 +464,7 @@ def test_supplements_apply_only_to_a_default_run(pack: Path, target: Path, tmp_p
         pack=pack,
         runner=runner(Runner()),
         checkouts=NEVER,
+        load=yaml_documents,
         supplements=(supplement,),
     )
     assert report["supplemental_packs"]["applied"] == []
@@ -444,7 +473,13 @@ def test_supplements_apply_only_to_a_default_run(pack: Path, target: Path, tmp_p
 def test_an_explicit_rule_allowlist_filters_every_fact(pack: Path, target: Path) -> None:
     allow = RuleAllowlist(frozenset({"go-sqli-taint"}), "inline")
     report = R.execute_scan(
-        target, [], pack=pack, runner=runner(Runner()), checkouts=NEVER, rule_allow=allow
+        target,
+        [],
+        pack=pack,
+        runner=runner(Runner()),
+        checkouts=NEVER,
+        rule_allow=allow,
+        load=yaml_documents,
     )
     assert [f["rule_id"] for f in report["facts"]] == ["go-sqli-taint"]
     assert report["rule_allowlist"] == {
@@ -455,8 +490,11 @@ def test_an_explicit_rule_allowlist_filters_every_fact(pack: Path, target: Path)
 
 
 def test_a_scan_with_no_json_or_past_its_timeout_fails(pack: Path, target: Path) -> None:
-    with pytest.raises(RuntimeError, match="opengrep produced no JSON"):
-        R.execute_scan(target, [], pack=pack, runner=runner(Runner(b"")), checkouts=NEVER)
+    with pytest.raises(ScannerError, match="invalid JSON") as invalid:
+        R.execute_scan(
+            target, [], pack=pack, runner=runner(Runner(b"")), checkouts=NEVER, load=yaml_documents
+        )
+    assert invalid.value.reason is ScannerFailure.OUTPUT
 
     class Slow(Runner):
         def run(self, argv: Any, **kw: Any) -> ProcessResult:
@@ -464,8 +502,18 @@ def test_a_scan_with_no_json_or_past_its_timeout_fails(pack: Path, target: Path)
                 raise ProcessTimeout(tuple(argv), subprocess.TimeoutExpired(argv, 5))
             return super().run(argv, **kw)
 
-    with pytest.raises(TimeoutError, match="opengrep timed out after 5s"):
-        R.execute_scan(target, [], pack=pack, runner=runner(Slow()), checkouts=NEVER, timeout=5)
+    with pytest.raises(ScannerError, match="opengrep timed out after 5s") as timeout:
+        R.execute_scan(
+            target,
+            [],
+            pack=pack,
+            runner=runner(Slow()),
+            checkouts=NEVER,
+            timeout=5,
+            load=yaml_documents,
+        )
+    assert timeout.value.reason is ScannerFailure.TIMEOUT
+    assert timeout.value.timeout_seconds == 5
 
 
 class Refused:
@@ -490,22 +538,20 @@ class Refused:
     ],
     ids=["process-error", "process-timeout", "not-found"],
 )
-def test_an_unfetchable_supplement_is_refused_with_its_reason_not_a_scan_abort(
+def test_an_unfetchable_enabled_supplement_aborts_instead_of_falling_back(
     pack: Path, target: Path, error: Exception
 ) -> None:
     supplement = SupplementalPack("argus", f"https://example.com/o/argus@{SHA}", ("go-tls-bypass",))
-    report = R.execute_scan(
-        target,
-        [],
-        pack=pack,
-        runner=runner(Runner()),
-        checkouts=Refused(error),  # type: ignore[arg-type]
-        supplements=(supplement,),
-    )
-    assert report["stats"]["facts"] == 3  # the scan itself ran to its report
-    assert report["supplemental_packs"]["applied"] == []
-    [skipped] = report["supplemental_packs"]["skipped"]
-    assert skipped == {"pack": "argus", "reason": str(error)}
+    with pytest.raises(type(error)):
+        R.execute_scan(
+            target,
+            [],
+            pack=pack,
+            runner=runner(Runner()),
+            checkouts=Refused(error),  # type: ignore[arg-type]
+            load=yaml_documents,
+            supplements=(supplement,),
+        )
 
 
 @pytest.mark.parametrize("name", ["repo", "-looks-like-an-option"])
@@ -516,7 +562,7 @@ def test_the_scanned_target_is_separated_from_the_options(
     target.mkdir()
     (target / "main.go").write_text("package main\n")
     run = runner(Runner())
-    R.execute_scan(target, [], pack=pack, runner=run, checkouts=NEVER)
+    R.execute_scan(target, [], pack=pack, runner=run, checkouts=NEVER, load=yaml_documents)
     scan_argv, _ = next(c for c in run.calls if c[0][1] == "scan")
     assert scan_argv[-2:] == ("--", str(target))
 
@@ -543,7 +589,12 @@ def test_scan_returns_typed_findings(
     }
     with caplog.at_level(logging.WARNING):
         result = R.scan(
-            target, pack, runner=runner(Runner(raw)), checkouts=NEVER, clock=FixedClock(NOW)
+            target,
+            pack,
+            runner=runner(Runner(raw)),
+            checkouts=NEVER,
+            clock=FixedClock(NOW),
+            load=yaml_documents,
         )
     assert isinstance(result, AdapterResultArtifact)
     assert result.target == str(target.resolve()) and result.scanned_at == "2026-10-24T12:00:00Z"
@@ -570,7 +621,7 @@ def test_scan_forwards_the_supplements_and_never_loads_config(
     monkeypatch.setattr(R, "execute_scan", execute)
     monkeypatch.setattr(R.shutil, "which", lambda _: "/usr/bin/opengrep")
     clock = FixedClock(NOW)
-    R.scan(target, pack, runner=runner(Runner()), checkouts=NEVER, clock=clock)
+    R.scan(target, pack, runner=runner(Runner()), checkouts=NEVER, clock=clock, load=yaml_documents)
     assert seen["supplements"] == ()
     supplement = SupplementalPack("p", f"https://example.com/o/rules@{SHA}", ("r1",))
     R.scan(
@@ -578,6 +629,7 @@ def test_scan_forwards_the_supplements_and_never_loads_config(
         pack,
         runner=runner(Runner()),
         checkouts=NEVER,
+        load=yaml_documents,
         clock=clock,
         supplements=(supplement,),
     )
@@ -589,10 +641,24 @@ def test_scan_refuses_a_missing_target_or_binary(
 ) -> None:
     clock = FixedClock(NOW)
     with pytest.raises(ValueError, match="not a directory"):
-        R.scan(tmp_path / "absent", pack, runner=runner(Runner()), checkouts=NEVER, clock=clock)
+        R.scan(
+            tmp_path / "absent",
+            pack,
+            runner=runner(Runner()),
+            checkouts=NEVER,
+            clock=clock,
+            load=yaml_documents,
+        )
     monkeypatch.setattr(R.shutil, "which", lambda _: None)
     with pytest.raises(FileNotFoundError, match="opengrep not found on PATH"):
-        R.scan(tmp_path, pack, runner=runner(Runner()), checkouts=NEVER, clock=clock)
+        R.scan(
+            tmp_path,
+            pack,
+            runner=runner(Runner()),
+            checkouts=NEVER,
+            clock=clock,
+            load=yaml_documents,
+        )
 
 
 @pytest.mark.skipif(not shutil.which("opengrep"), reason="opengrep not on PATH")
@@ -609,8 +675,18 @@ def test_a_real_scan_with_a_local_rule(tmp_path: Path, pack: Path) -> None:
         "    message: shell exec\n"
         '    pattern: exec.Command("sh", "-c", ...)\n'
     )
+    rule.with_suffix(".go").write_text(
+        'package fixture\nimport "os/exec"\nfunc sample(c string) {\n'
+        '// ruleid: sh-c\nexec.Command("sh", "-c", c)\n'
+        '// ok: sh-c\nexec.Command("echo", c)\n}\n'
+    )
     report = R.execute_scan(
-        tmp_path, [str(rule)], pack=pack, runner=ProcessRunner(("opengrep", "git")), checkouts=NEVER
+        tmp_path,
+        [str(rule)],
+        pack=pack,
+        runner=ProcessRunner(("opengrep", "git")),
+        checkouts=NEVER,
+        load=yaml_documents,
     )
     assert report["stats"]["facts"] == 1
     [fact] = report["facts"]
@@ -674,7 +750,34 @@ def test_a_weakness_rule_hit_is_a_weakness_finding(
     weak["extra"] = {**hit["extra"], "metadata": {"cwe": ["CWE-693"], "kind": "weakness"}}
     raw = {"results": [{**hit, "check_id": "go.traust-go-plain"}, weak]}
     result = R.scan(
-        target, pack, runner=runner(Runner(raw)), checkouts=NEVER, clock=FixedClock(NOW)
+        target,
+        pack,
+        runner=runner(Runner(raw)),
+        checkouts=NEVER,
+        clock=FixedClock(NOW),
+        load=yaml_documents,
     )
     kinds = {f.id: f.kind for f in result.findings}
     assert kinds == {"opengrep/traust-go-plain": None, "opengrep/traust-go-weak": "weakness"}
+
+
+def test_engine_error_diagnostics_do_not_expose_native_source_text() -> None:
+    sentinel = "PRIVATE_NATIVE_SENTINEL"
+    _, errors = R.normalize(
+        {
+            "results": [],
+            "errors": [
+                {
+                    "level": sentinel,
+                    "type": sentinel,
+                    "message": f"syntax error near {sentinel}",
+                    "path": sentinel,
+                }
+            ],
+        },
+        Path("/repo"),
+    )
+    assert errors == [
+        {"level": "error", "type": "ScannerError", "message": "native scanner reported an error"}
+    ]
+    assert sentinel not in json.dumps(errors)
