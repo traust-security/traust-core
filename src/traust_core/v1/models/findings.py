@@ -328,13 +328,6 @@ class SortDirection(StrEnum):
     DESC = "desc"
 
 
-class FindingCount(Model):
-    """The filtered total a paged listing's pager reads: one number, from one bounded
-    fold that holds no views."""
-
-    total: int
-
-
 class FindingRollup(Model):
     """The findings in one group by state; key is None for findings without that dimension."""
 

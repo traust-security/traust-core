@@ -20,7 +20,8 @@ FACTS = sa.text(
     """
     WITH facts AS (
       SELECT f.id, f.repository_id,
-        coalesce(f.current_state, 'open') AS state,
+        coalesce(f.current_state,
+          CASE WHEN f.kind = 'weakness' THEN 'hardening' ELSE 'open' END) AS state,
         f.current_severity AS severity,
         f.category
       FROM traust.finding f)

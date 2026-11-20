@@ -15,12 +15,14 @@ from traust_core.v1.models.dashboard import Subject
 # The findings subject's facts: one indexed row per finding. State, severity and
 # category are the finding's current answer, kept by the contracts' triggers at
 # write (the stamped fold, the latest occurrence's band, the first category
-# label). A finding with no decision is open by rule; unrated severity is null.
+# label). An undecided finding is open by rule, an undecided weakness hardening
+# (`finding_state`); unrated severity is null.
 _FACTS = sa.text(
     """
     WITH facts AS (
         SELECT f.id, f.repository_id, f.created_at,
-            coalesce(f.current_state, 'open') AS state,
+            coalesce(f.current_state,
+                CASE WHEN f.kind = 'weakness' THEN 'hardening' ELSE 'open' END) AS state,
             f.current_severity AS severity,
             f.category,
             (f.current_state IS NOT NULL) AS decided

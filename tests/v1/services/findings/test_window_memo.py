@@ -159,21 +159,6 @@ def test_a_window_inside_a_shared_build_reads_its_own_fleet(engine: Engine) -> N
     assert memo.folds == 0  # the build's composition owns the load; the memo stays out
 
 
-def test_a_count_folds_once_and_agrees_with_the_window(engine: Engine) -> None:
-    left, right, _made = seeded_estate(engine)
-    memo = WindowMemo()
-    scope = set_of(left, right)
-    counted = service(engine, windows=memo).count_in(scope)
-    again = service(engine, windows=memo).count_in(scope)
-    listed = window(service(engine, windows=memo), scope)
-    assert counted.total == again.total == len(listed)  # the pager's number and the page agree
-    # Two flavours, two folds: a count never pays the window's weight (locations and
-    # cwes), and a window never serves the censused rows a tally folded.
-    assert memo.folds == 2
-    assert memo.take([left.repository.id], None, census=True)[1] == []  # type: ignore[list-item]
-    assert memo.take([left.repository.id], None, census=False)[1] == []  # type: ignore[list-item]
-
-
 def test_a_newest_page_never_reads_the_memo(engine: Engine) -> None:
     left, right, _made = seeded_estate(engine)
     memo = WindowMemo()
