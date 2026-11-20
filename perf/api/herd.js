@@ -18,6 +18,14 @@ const TARGET = __ENV.TARGET || 'dashboard';
 const herdLatency = new Trend('herd_latency', true);
 
 const LANDING = { measures: ['findings'], group_by: ['severity'], where: { state: ['open'] } };
+// A whole dashboard page: its cards fire together, so a herd of pages is HERD x 5 queries at once.
+const PAGE = [
+  { measures: ['findings'] },
+  LANDING,
+  { measures: ['findings'], group_by: ['category'] },
+  { measures: ['findings'], group_by: ['repository'], order: [{ by: 'findings', desc: true }], limit: 10 },
+  { measures: ['findings'], group_by: ['severity'], where: { state: ['open'], severity: ['critical', 'high'] } },
+];
 
 export const options = {
   scenarios: {
@@ -76,16 +84,35 @@ const READS = {
 
 export default function (data) {
   const started = Date.now();
-  const [method, path, body] = READS[TARGET](__VU, data);
-  const res = method === 'POST'
+  const responses = TARGET === 'dashboard_page' ? page(__VU, data) : [single(__VU, data)];
+  for (const res of responses) {
+    herdLatency.add(res.timings.duration);
+    if (res.status !== 200) {
+      console.log(`herd ${TARGET} ${__VU} ${res.status} ${String(res.body).slice(0, 200)}`);
+    }
+    check(res, { 'read is 200': (r) => r.status === 200 });
+  }
+  sleep(Math.max(0, WAVE_GAP - (Date.now() - started) / 1000));
+}
+
+function single(vu, data) {
+  const [method, path, body] = READS[TARGET](vu, data);
+  return method === 'POST'
     ? http.post(`${BASE}${path}`, JSON.stringify(body), READER_JSON)
     : http.get(`${BASE}${path}`, READER);
-  herdLatency.add(res.timings.duration);
-  if (res.status !== 200) {
-    console.log(`herd ${TARGET} ${__VU} ${res.status} ${String(res.body).slice(0, 200)}`);
-  }
-  check(res, { 'read is 200': (r) => r.status === 200 });
-  sleep(Math.max(0, WAVE_GAP - (Date.now() - started) / 1000));
+}
+
+// One user's page load: every card at once, over the user's own grant.
+function page(vu, data) {
+  const grant = grantOf(vu, data.repositories);
+  return http.batch(
+    PAGE.map((card) => [
+      'POST',
+      `${BASE}/v1/dashboards:query`,
+      JSON.stringify({ subject: 'findings', repository_ids: grant, ...card }),
+      READER_JSON,
+    ])
+  );
 }
 
 export function handleSummary(data) {

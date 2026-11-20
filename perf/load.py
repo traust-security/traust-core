@@ -32,6 +32,7 @@ from traust_core.v1.models.dashboard import (
     Subject,
 )
 from traust_core.v1.models.findings import Decision, Occurrence
+from traust_core.v1.models.insight import ViewFilter, ViewName
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.findings.intake import _RESTAMP_BATCH as RESTAMP_BATCH
 from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
@@ -297,6 +298,27 @@ class PageReader:
         return Side(latencies=tuple(self.latencies), failures=self.failures)
 
 
+class RollupReader:
+    """The road the dashboard replaced: each read builds the findings rollup (contract check
+    and serialization included, as GET /v1/insights/findings-rollup did)."""
+
+    def __init__(self, context: Context) -> None:
+        self._context = context
+        self.latencies: list[float] = []
+        self.failures = 0
+        self.problems: dict[int, str] = {}
+
+    def run(self, stop: threading.Event) -> None:
+        insight = self._context.services().insight
+        while not stop.is_set():
+            started = time.perf_counter()
+            try:
+                insight.build(ViewName.FINDINGS_ROLLUP, ViewFilter()).model_dump_json()
+                self.latencies.append(time.perf_counter() - started)
+            except Exception:
+                self.failures += 1
+
+
 def _warm_identity(context: Context, card: DashboardQuery) -> None:
     """One request before the threads: the local issuer generates its signing key
     lazily, and concurrent first mints race the key under the verifier — every
@@ -321,16 +343,22 @@ def run_duress(
     readers: int = 7,
     seconds: int = 60,
     writer_pause: float = 0.05,
+    rollup: bool = False,
 ) -> Duress:
     """`readers` dashboard clients past the pool's size, plus the stamped write
-    door: the 504 shape. Returns both directions' latencies."""
+    door: the 504 shape. Returns both directions' latencies. `rollup` swaps the readers
+    for the road the dashboard replaced (the findings rollup), for a same-rig before."""
     targets = write_targets(engine)
     if not targets:
         raise RuntimeError("the rig has no open findings to write against")
     population = reader_cards(engine)
     _warm_identity(context, population[0])
     writer = StampedWriter(engine, targets)
-    clients = [DashboardReader(context, population, offset=i) for i in range(readers)]
+    clients: list[DashboardReader] | list[RollupReader] = (
+        [RollupReader(context) for _ in range(readers)]
+        if rollup
+        else [DashboardReader(context, population, offset=i) for i in range(readers)]
+    )
 
     # the baseline: the write door alone
     stop = threading.Event()

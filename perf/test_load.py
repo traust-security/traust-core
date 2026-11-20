@@ -99,3 +99,20 @@ def test_everything_at_once_holds_the_budgets(engine: Engine, context: Context) 
     assert duress.writes.pct(95) <= WRITE_SLOWDOWN_LIMIT * duress.writes_alone.pct(95), (
         "the steady spread slowed the write door past twice its own p95"
     )
+
+
+@skip_unless_gated
+def test_the_dashboard_beats_the_road_it_replaced_on_the_same_rig(
+    engine: Engine, context: Context
+) -> None:
+    """Before and after on one rig, one run, the same duress: readers building the findings
+    rollup (the old road), then readers on the dashboard query. The dashboard holds its bar
+    and is at least ten times faster at p95; nothing it serves fails."""
+    seconds = int(os.environ.get("TRAUST_PERF_SECONDS", "60"))
+    before = run_duress(engine, context, seconds=seconds, rollup=True)
+    after = run_duress(engine, context, seconds=seconds)
+    print("before - the findings rollup:\n" + before.report())
+    print("after - the dashboard query:\n" + after.report())
+    assert after.reads.failures == 0
+    assert after.reads.pct(95) < READ_P95_BUDGET
+    assert after.reads.pct(95) * 10 < before.reads.pct(95), "not ten times faster at p95"
