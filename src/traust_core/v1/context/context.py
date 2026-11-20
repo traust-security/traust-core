@@ -179,7 +179,7 @@ from traust_core.v1.services.code_facts import CodeFactsService
 from traust_core.v1.services.compliance import GATE, ComplianceService
 from traust_core.v1.services.dashboards import DashboardService
 from traust_core.v1.services.detection_quality import DetectionQualityService
-from traust_core.v1.services.exposure import AdvisoryCvssCache, ExposureService
+from traust_core.v1.services.exposure import AdvisoryCvssCache, AdvisoryCvssReader, ExposureService
 from traust_core.v1.services.findings import (
     FindingDecisions,
     FindingIntake,
@@ -814,6 +814,9 @@ class Context:
             self.config.home.mkdir(parents=True, exist_ok=True)
         return create_database_engine(self.config.record_store_url())
 
+    def _advisory_cvss(self) -> AdvisoryCvssReader:
+        return AdvisoryCvssReader(self.object_store, self.advisory_cvss_cache)
+
     @cached_property
     def database(self) -> Engine:
         engine = self._store_engine
@@ -823,7 +826,7 @@ class Context:
             dialect = Dialect.of(engine)
             apply_schema(engine, contracts.database_ddl(dialect))
             _run_channel(engine, local=True)
-            data_migrations.run(engine)
+            data_migrations.run(engine, cvss=self._advisory_cvss())
             log.info(
                 "store bootstrap fresh dialect=%s: baseline schema and the whole channel applied",
                 dialect,
@@ -837,13 +840,13 @@ class Context:
             # configured database's is its deployment's, never an open's.
             if _channel_stamped(engine):
                 _run_channel(engine, local=local)
-                _run_data_channel(engine, local=local)
+                _run_data_channel(engine, local=local, cvss=self._advisory_cvss())
             elif local:
                 # brought on at the head (presumed current), then the data
                 # channel runs: its entries transform rows the stamp presumes
                 # shaped, so a local store applies them on the same open
                 _bring_store_on_channel(engine)
-                _run_data_channel(engine, local=True)
+                _run_data_channel(engine, local=True, cvss=self._advisory_cvss())
             else:
                 log.warning(
                     "configured database refused: not on the upgrade channel - its "
@@ -972,8 +975,14 @@ class Context:
         hosts = self.config.forge_hosts
         sources = command_source(hosts, clock=self.clock, api=self.forge_api)
         rating = RatingPolicy(self.config.rating)
+        cvss = self._advisory_cvss()
         intake = FindingIntake(
-            uow, IdentityPolicy(), TaxonomyPolicy(), objects=self.object_store, rating=rating
+            uow,
+            IdentityPolicy(),
+            TaxonomyPolicy(),
+            objects=self.object_store,
+            rating=rating,
+            cvss=cvss,
         )
         ledger = None if self.config.ledger is None else LedgerService(uow, self.config.ledger)
         identity = self.config.identity
@@ -1025,8 +1034,9 @@ class Context:
             source=sources,
             hosts=hosts,
             recording=ops,
+            cvss=cvss,
         )
-        views = FindingViewQuery(rating, self.object_store)
+        views = FindingViewQuery(rating, self.object_store, cvss)
         findings = FindingService(
             uow,
             intake,
@@ -1036,6 +1046,7 @@ class Context:
             rating,
             self.object_store,
             windows=self.window_memo,
+            advisory_cvss=cvss,
         )
         assessment = AssessmentService(
             uow,
@@ -1464,12 +1475,12 @@ def _bring_store_on_channel(engine: Engine) -> list[contracts.Upgrade]:
     return stamped
 
 
-def _run_data_channel(engine: Engine, *, local: bool) -> None:
+def _run_data_channel(engine: Engine, *, local: bool, cvss: AdvisoryCvssReader) -> None:
     """The data channel follows the DDL channel's rule: a local store applies it,
     a configured database's data migrations are its deployment's - pending ones
     are refused, not applied behind its operator's back."""
     if local:
-        data_migrations.run(engine)
+        data_migrations.run(engine, cvss=cvss)
         return
     waiting = data_migrations.pending(engine)
     if waiting:

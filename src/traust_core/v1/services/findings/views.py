@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from datetime import datetime
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from traust_core.v1.errors import IntegrityError, NotFoundError
@@ -22,16 +23,26 @@ from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectStore
 from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.findings.claims import claim_fold
+from traust_core.v1.services.findings.cvss import selection
 from traust_core.v1.services.findings.facts import FindingFacts
 from traust_core.v1.services.findings.rating import RatingPolicy, finding_cvss
+
+if TYPE_CHECKING:
+    from traust_core.v1.services.exposure import AdvisoryCvssReader
 
 
 class FindingViewQuery:
     """Batched finding context and normalized history, within the caller's transaction."""
 
-    def __init__(self, rating: RatingPolicy, objects: ObjectStore | None = None) -> None:
+    def __init__(
+        self,
+        rating: RatingPolicy,
+        objects: ObjectStore | None = None,
+        cvss: AdvisoryCvssReader | None = None,
+    ) -> None:
         self._rating = rating
         self._objects = objects
+        self.cvss = cvss  # every facts load a view folds from reads the authority scores
 
     def views(
         self,
@@ -53,6 +64,7 @@ class FindingViewQuery:
                 read_budget=read_budget,
                 objects=self._objects,
                 census=census,
+                cvss=self.cvss,
             )
         )
         return self._views(uow, findings, as_of, facts, read_budget=read_budget, census=census)
@@ -95,7 +107,7 @@ class FindingViewQuery:
         if not items:
             return []
         findings = uow.findings.list_by_ids({item.finding_id for item in items})
-        facts = FindingFacts.load(uow, findings, until=None, objects=self._objects)
+        facts = FindingFacts.load(uow, findings, until=None, objects=self._objects, cvss=self.cvss)
         by_id = {view.finding.id: view for view in self._views(uow, findings, None, facts)}
         histories = {
             finding_id: tuple(normalize_decision(row) for row in rows)
@@ -196,8 +208,17 @@ class FindingViewQuery:
             )
         latest = reported[-1] if reported else None
         disposition = facts.disposition(finding.id, as_of)
-        label = self._rating.severity_label(latest, disposition)
+        authority = facts.authority.get(finding.advisory_id, ()) if finding.advisory_id else ()
+        picked = selection(
+            authority,
+            latest.cvss_vector if latest is not None else None,
+            latest.cvss_score if latest is not None else None,
+            reported=latest is not None,
+            document=f"occurrence:{latest.id}" if latest is not None else "",
+        )
+        label = self._rating.severity_label(latest, disposition, picked.chosen)
         severity = label.severity
+        cvss = finding_cvss(latest, label, picked)
         # the reporting assessments' own times — the occurrence→assessment
         # join the census reads for its SLA `first` — computed once here for
         # the view's date fields (facts.at already holds them for the fold)
@@ -206,14 +227,15 @@ class FindingViewQuery:
         due = None
         if latest is not None and (disposition is None or disposition.is_open()):
             opened = first_reported
-            due = self._rating.sla_due(severity, opened, latest.cvss_score)
+            score = cvss.effective_score if cvss is not None else latest.cvss_score
+            due = self._rating.sla_due(severity, opened, score)
         claim = folded.claim if folded is not None else None
         return FindingView(
             finding=finding,
             occurrence=latest,
             disposition=disposition,
             effective_severity=severity,
-            cvss=finding_cvss(latest, label),
+            cvss=cvss,
             sla_due=due,
             first_reported_at=first_reported,
             last_reported_at=last_reported,

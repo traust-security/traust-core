@@ -17,10 +17,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from functools import cache
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 from uuid import UUID
 
 from traust_core.v1.models.assessment import CensusAssessment
+from traust_core.v1.models.cvss import CvssScore, CvssSource
 from traust_core.v1.models.findings import (
     CensusDecision,
     Disposition,
@@ -36,9 +37,13 @@ from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectStore
 from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.findings.claims import ApprovedClaim, approved_claims_for, claim_fold
+from traust_core.v1.services.findings.cvss import selection
 from traust_core.v1.services.findings.facts import decision_lines
 from traust_core.v1.services.findings.rating import RatingPolicy
 from traust_core.v1.services.portfolio import Inventory
+
+if TYPE_CHECKING:
+    from traust_core.v1.services.exposure import AdvisoryCvssReader
 
 # The census walks whole repositories at a time, a batch closed once it holds this many
 # findings: memory stays bounded by findings, never by repository count alone — a
@@ -67,6 +72,7 @@ class FindingCensusRow:
     title: str
     cvss_score: Decimal | None
     sla_due: datetime | None
+    cvss_source: CvssSource | None = None
 
 
 class CensusOccurrence(NamedTuple):
@@ -124,9 +130,15 @@ class FindingCensus:
     column set per table, the disposition folded over tuples (the policy's own owner),
     each bounded batch of whole repositories handed to the counter and released."""
 
-    def __init__(self, rating: RatingPolicy, objects: ObjectStore | None = None) -> None:
+    def __init__(
+        self,
+        rating: RatingPolicy,
+        objects: ObjectStore | None = None,
+        cvss: AdvisoryCvssReader | None = None,
+    ) -> None:
         self._rating = rating
         self._objects = objects
+        self._cvss = cvss
 
     def rows(
         self,
@@ -183,17 +195,23 @@ class FindingCensus:
                 categories[finding_id] = label
         claims = self._claims_of(uow, findings, with_claims)
         lines = self._lines_of(uow, decisions, batch)
+        named = {row[5] for row in findings if row[5] is not None}
+        authority = self._cvss.read(uow, named).scores if self._cvss is not None else {}
         return [
             row
             for finding in findings
-            if (row := self._row(finding, as_of, latest, decisions, categories, claims, lines))
+            if (
+                row := self._row(
+                    finding, as_of, latest, decisions, categories, claims, lines, authority
+                )
+            )
             is not None
         ]
 
     def _claims_of(
         self,
         uow: TraustUnitOfWork,
-        findings: Sequence[tuple[UUID, UUID, str | None, str, datetime]],
+        findings: Sequence[tuple[UUID, UUID, str | None, str, datetime, UUID | None]],
         with_claims: set[UUID],
     ) -> Mapping[UUID, Sequence[ApprovedClaim]]:
         if self._objects is None:
@@ -206,7 +224,7 @@ class FindingCensus:
                 fingerprint="",
                 title=title,
             )
-            for finding_id, repository_id, _, title, _ in findings
+            for finding_id, repository_id, _, title, _, _ in findings
             if finding_id in with_claims
         ]
         if not corrected:
@@ -245,15 +263,16 @@ class FindingCensus:
 
     def _row(
         self,
-        finding: tuple[UUID, UUID, str | None, str, datetime],
+        finding: tuple[UUID, UUID, str | None, str, datetime, UUID | None],
         as_of: datetime | None,
         latest: Mapping[UUID, CensusOccurrence],
         decisions: Mapping[UUID, Sequence[CensusDecision]],
         categories: Mapping[UUID, str | None],
         claims: Mapping[UUID, Sequence[ApprovedClaim]],
         lines: Mapping[UUID, bool],
+        authority: Mapping[UUID, Sequence[CvssScore]],
     ) -> FindingCensusRow | None:
-        finding_id, repository_id, kind, title, _ = finding
+        finding_id, repository_id, kind, title, _, advisory_id = finding
         occurrence = latest.get(finding_id)
         if as_of is not None and occurrence is None:
             return None  # never reported by then: the view a tally would count is absent
@@ -269,14 +288,25 @@ class FindingCensus:
             Disposition.fold(finding_id, judged, lines, normalize=_normalized) if judged else None
         )
         state = finding_state(kind_of(kind, tuple(d.validity for d in raw)), disposition)
-        severity = self._rating.effective_severity(occurrence, disposition)
+        # the views' own selection (FindingViewQuery.view), so both count the same severity
+        chosen = selection(
+            authority.get(advisory_id, ()) if advisory_id is not None else (),
+            occurrence.cvss_vector if occurrence is not None else None,
+            occurrence.cvss_score if occurrence is not None else None,
+            reported=occurrence is not None,
+            document="occurrence",
+        ).chosen
+        severity = self._rating.effective_severity(occurrence, disposition, chosen)
+        score = chosen.score if chosen is not None else None
+        if chosen is None and occurrence is not None:
+            score = occurrence.cvss_score
         folded = claim_fold(claims.get(finding_id, ()), as_of)
         category = categories.get(finding_id)
         if folded is not None and folded.claim is not None:
             category = folded.category
         due = None
         if occurrence is not None and (disposition is None or disposition.is_open()):
-            due = self._rating.sla_due(severity, occurrence.first, occurrence.cvss_score)
+            due = self._rating.sla_due(severity, occurrence.first, score)
         return FindingCensusRow(
             finding_id=finding_id,
             repository_id=repository_id,
@@ -288,200 +318,13 @@ class FindingCensus:
             and disposition.assurance == DispositionAssurance.EXECUTION_PROVEN,
             unverified=disposition is None or disposition.assurance == DispositionAssurance.CLAIMED,
             title=folded.title if folded is not None else title,
-            cvss_score=occurrence.cvss_score if occurrence is not None else None,
+            cvss_score=score,
             sla_due=due,
+            cvss_source=(
+                chosen.source
+                if chosen is not None
+                else CvssSource.SCANNER
+                if score is not None
+                else None
+            ),
         )
-
-
-# The top cut's severities: the rollup's own bound, mirrored from the insight views
-# that read it (an import the other way would cycle).
-_TOP_CUT = (Severity.CRITICAL, Severity.HIGH)
-
-
-class StateGroup(NamedTuple):
-    """One grouped count of the projected tallies: what a census row counted, n findings
-    at a time."""
-
-    repository_id: UUID
-    state: FindingState
-    severity: Severity | None
-    decided: bool
-    proven: bool
-    unverified: bool
-    category: str | None
-    count: int
-
-
-class TopCutRow(NamedTuple):
-    """One open critical or high finding as the top cut reads it, with the census's own
-    counting order — the stable tie-break the fold road counted in."""
-
-    finding_id: UUID
-    repository_id: UUID
-    category: str | None
-    title: str
-    severity: Severity
-    cvss_score: Decimal | None
-    execution_proven: bool
-    sla_due: datetime | None
-    order: tuple[float, str]
-
-
-@dataclass(frozen=True, slots=True)
-class ProjectedRollup:
-    """The rollup's counted facts off the stamped projection: grouped tallies for the
-    unclaimed bulk, census rows for the claimed few (their category and title are a
-    claim's, folded where the review machinery lives), and the top cut."""
-
-    tallies: list[StateGroup]
-    claimed: list[FindingCensusRow]
-    top: list[TopCutRow]
-
-
-class ProjectedCensus:
-    """The rollup's counted facts read off the stamped projection instead of folded per
-    finding: one grouped row per distinct counted shape for the bulk, per-finding rows
-    only for the claim-carrying few. The census road stays the owner of point-in-time
-    views — the projection is the current fold only."""
-
-    def __init__(self, rating: RatingPolicy, objects: ObjectStore | None = None) -> None:
-        self._rating = rating
-        self._objects = objects
-
-    def rows(self, uow: TraustUnitOfWork, repository_ids: Collection[UUID]) -> ProjectedRollup:
-        wanted = list(dict.fromkeys(repository_ids))
-        if not wanted:
-            return ProjectedRollup([], [], [])
-        tallies = [
-            StateGroup(
-                repository_id=repository_id,
-                state=FindingState(state),
-                severity=Severity(severity) if severity is not None else None,
-                decided=decided,
-                proven=proven,
-                unverified=unverified,
-                category=category,
-                count=count,
-            )
-            for repository_id, state, severity, decided, proven, unverified, category, count in (
-                uow.census_reads.current_tallies(wanted)
-            )
-        ]
-        claimed, claimed_top = self._claimed_rows(uow, wanted)
-        top = sorted([*self._top_rows(uow, wanted), *claimed_top], key=lambda row: row.order)
-        return ProjectedRollup(tallies=tallies, claimed=claimed, top=top)
-
-    def _claimed_rows(
-        self, uow: TraustUnitOfWork, repository_ids: Sequence[UUID]
-    ) -> tuple[list[FindingCensusRow], list[TopCutRow]]:
-        """The claim-carrying few as census rows (a claim's category and title folded in)
-        and, separately, their top-cut entries."""
-        raw = uow.census_reads.current_claimed_rows(repository_ids)
-        if not raw:
-            return [], []
-        claims = self._claims_of(uow, raw)
-        rows: list[FindingCensusRow] = []
-        top: list[TopCutRow] = []
-        for (
-            finding_id,
-            repository_id,
-            title,
-            created_at,
-            label,
-            state,
-            severity,
-            decided,
-            proven,
-            unverified,
-            cvss_score,
-            first,
-        ) in raw:
-            folded = claim_fold(claims.get(finding_id, ()), None)
-            category = label
-            if folded is not None and folded.claim is not None:
-                category = folded.category
-            row_title = folded.title if folded is not None else title
-            state, severity = FindingState(state), Severity(severity) if severity else None
-            due = self._sla(state, severity, first, cvss_score)
-            rows.append(
-                FindingCensusRow(
-                    finding_id=finding_id,
-                    repository_id=repository_id,
-                    state=state,
-                    severity=severity,
-                    category=category,
-                    decided=decided,
-                    proven=proven,
-                    unverified=unverified,
-                    title=row_title,
-                    cvss_score=cvss_score,
-                    sla_due=due,
-                )
-            )
-            if state is FindingState.OPEN and severity in _TOP_CUT:
-                top.append(
-                    TopCutRow(
-                        finding_id,
-                        repository_id,
-                        category,
-                        row_title,
-                        severity,
-                        cvss_score,
-                        proven,
-                        due,
-                        newest_first_key(created_at, finding_id),
-                    )
-                )
-        return rows, top
-
-    def _top_rows(self, uow: TraustUnitOfWork, repository_ids: Sequence[UUID]) -> list[TopCutRow]:
-        """The unclaimed bulk's open criticals and highs, the SLA a rating policy owns."""
-        top: list[TopCutRow] = []
-        for row in uow.census_reads.current_top(repository_ids):
-            finding_id, repository_id, title, created_at, label, severity, cvss, proven, first = row
-            severity = Severity(severity)
-            top.append(
-                TopCutRow(
-                    finding_id,
-                    repository_id,
-                    label,
-                    title,
-                    severity,
-                    cvss,
-                    proven,
-                    self._sla(FindingState.OPEN, severity, first, cvss),
-                    newest_first_key(created_at, finding_id),
-                )
-            )
-        return top
-
-    def _sla(
-        self,
-        state: FindingState,
-        severity: Severity | None,
-        first: datetime | None,
-        cvss_score: Decimal | None,
-    ) -> datetime | None:
-        """The top cut's own deadline: only an open critical or high with a report reads one."""
-        if state is FindingState.OPEN and severity in _TOP_CUT and first is not None:
-            return self._rating.sla_due(severity, first, cvss_score)
-        return None
-
-    def _claims_of(
-        self, uow: TraustUnitOfWork, raw: Sequence[tuple]
-    ) -> Mapping[UUID, Sequence[ApprovedClaim]]:
-        """The claimed findings' accepted claims, over the same corrected stubs the census
-        road folds (fingerprints unread by the review machinery, empty by the same rule)."""
-        if self._objects is None:
-            return {}
-        corrected = [
-            Finding(
-                id=finding_id,
-                repository_id=repository_id,
-                fingerprint_algo="",
-                fingerprint="",
-                title=title,
-            )
-            for finding_id, repository_id, title, *_ in raw
-        ]
-        return approved_claims_for(uow, self._objects, corrected)

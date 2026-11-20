@@ -34,7 +34,12 @@ from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.feeds import FeedProvider, FeedSource
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects import InMemoryObjectStore
-from traust_core.v1.services.exposure import ADVISORY_CVSS_FEED, AdvisoryCvssCache, ExposureService
+from traust_core.v1.services.exposure import (
+    ADVISORY_CVSS_FEED,
+    AdvisoryCvssCache,
+    AdvisoryCvssReader,
+    ExposureService,
+)
 from traust_core.v1.services.findings import FindingIntake, IdentityPolicy, TaxonomyPolicy
 
 NVD = "https://nvd.test/cves?cveId=CVE-2021-44228"
@@ -108,15 +113,28 @@ def test_the_document_refresh_ranks_every_authoritys_scores_by_canonical_advisor
     assert (nist.score, nist.document) == (Decimal("10.0"), f"nvd:{LOG4SHELL}")
 
 
-def test_an_alias_asked_reads_its_canonicals_scores_keyed_as_asked(world: World) -> None:
+def test_a_finding_naming_an_alias_reads_its_canonicals_scores_with_no_lookup(
+    world: World,
+) -> None:
+    canonical = advisory(world.engine, LOG4SHELL_GHSA, LOG4SHELL)
+    alias = alias_id(world.engine, LOG4SHELL)
+    finding(world.engine, alias)  # the finding names the CVE alias row, not the canonical GHSA
+    world.serve_log4shell()
+    world.service().refresh_advisory_documents()
+    assert canonical.id is not None
+    read = world.service().advisory_cvss([alias, canonical.id])
+    assert set(read.scores) == {alias, canonical.id}  # the build keys both
+    assert read.scores[alias] == read.scores[canonical.id]
+    assert {s.source for s in read.scores[alias]} >= {CvssSource.NIST, CvssSource.GHSA}
+
+
+def test_an_alias_no_finding_names_is_not_in_the_build(world: World) -> None:
     canonical = advisory(world.engine, LOG4SHELL_GHSA, LOG4SHELL)
     finding(world.engine, canonical.id)
     world.serve_log4shell()
     world.service().refresh_advisory_documents()
-    alias = alias_id(world.engine, LOG4SHELL)
-    read = world.service().advisory_cvss([alias, canonical.id])  # type: ignore[list-item]
-    assert set(read.scores) == {alias, canonical.id}
-    assert read.scores[alias] == read.scores[canonical.id]  # type: ignore[index]
+    read = world.service().advisory_cvss([alias_id(world.engine, LOG4SHELL)])
+    assert dict(read.scores) == {}  # views read by the ids findings name, and only those
 
 
 def test_before_the_first_build_nothing_is_scored_and_no_build_time_is_claimed(
@@ -237,9 +255,9 @@ def test_a_build_whose_artifact_row_is_gone_reads_as_unreadable(world: World) ->
     with SqlTraustUnitOfWork(world.engine) as uow:
         latest = uow.feed_snapshots.latest(ADVISORY_CVSS_FEED)
     assert latest is not None and canonical.id is not None
-    svc = world.service()
     lost = latest.model_copy(update={"artifact_id": uuid4()})
-    assert svc._parsed_build(lost) is None  # never raises: the read and freshness fold
+    with SqlTraustUnitOfWork(world.engine) as uow:  # never raises: the read and freshness fold
+        assert AdvisoryCvssReader(world.objects, world.cache).parsed(uow, lost) is None
 
 
 def test_a_source_with_names_that_kept_nothing_is_named_and_the_build_is_not_fresh(
@@ -371,3 +389,83 @@ def counting(monkeypatch: pytest.MonkeyPatch) -> Callable[[], int]:
 
     monkeypatch.setattr(AdvisoryCvss, "from_bytes", staticmethod(parse))
     return lambda: len(calls)
+
+
+def test_a_pinned_reader_reads_which_build_once_and_forgets_it_after(world: World) -> None:
+    canonical = advisory(world.engine, LOG4SHELL)
+    finding(world.engine, canonical.id)
+    world.serve_log4shell()
+    world.service().refresh_advisory_documents()
+    assert canonical.id is not None
+    reader = AdvisoryCvssReader(world.objects, world.cache)
+    with reader.pinned():
+        with SqlTraustUnitOfWork(world.engine) as uow:
+            first = reader.read(uow, [canonical.id])
+        world.at = AT + timedelta(days=1)
+        world.service().refresh_advisory_cvss()  # a newer publication, mid-build
+        with SqlTraustUnitOfWork(world.engine) as uow:
+            assert reader.read(uow, [canonical.id]).built_at == first.built_at  # the same build
+    with SqlTraustUnitOfWork(world.engine) as uow:
+        after = reader.read(uow, [canonical.id])  # outside the block: the newer one
+    assert after.built_at is not None and first.built_at is not None
+    assert after.built_at > first.built_at
+
+
+def test_a_store_failure_reading_the_build_is_no_build_and_never_kept(world: World) -> None:
+    canonical = advisory(world.engine, LOG4SHELL)
+    finding(world.engine, canonical.id)
+    world.serve_log4shell()
+    world.service().refresh_advisory_documents()
+    assert canonical.id is not None
+    reads: list[int] = []
+
+    def outage() -> bytes:
+        reads.append(1)
+        raise RepositoryError("the store is unreachable", operation="get")
+
+    one = uuid4()
+    assert world.cache.parse(one, outage) is None
+    assert world.cache.parse(one, outage) is None and len(reads) == 2  # retried, never kept
+    assert world.cache.parse(one, lambda: AdvisoryCvss(scores={}).to_bytes()) is not None
+
+
+def test_a_new_build_restamps_the_findings_naming_its_advisories(world: World) -> None:
+    """A build moves a finding's selected authority score - its effective severity - with no
+    write to the finding: the build restamps it, so the stored severity is the view's."""
+    from decimal import Decimal
+
+    from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
+    from traust_core.v1.services.findings.views import FindingViewQuery
+
+    canonical = advisory(world.engine, LOG4SHELL_GHSA, LOG4SHELL)
+    with SqlTraustUnitOfWork(world.engine) as uow:
+        seed = Seed(uow)
+        repository = seed.repository(url="https://github.com/org/stamped")
+        named = seed.finding(repository, advisory_id=canonical.id, advisory_match="confirmed")
+        run = seed.assessment(seed.repository_ref(repository))
+        medium = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"  # 5.3: the report's own
+        seed.occurrence(
+            named, run, severity="medium", cvss_vector=medium, cvss_score=Decimal("5.3")
+        )
+        uow.commit()
+
+    def stored() -> str | None:
+        with world.engine.connect() as conn:
+            table = "finding" if world.engine.dialect.name == "sqlite" else "traust.finding"
+            return conn.exec_driver_sql(
+                f"SELECT current_severity FROM {table} WHERE id = '{named.id}'"
+            ).scalar()
+
+    assert stored() == "medium"
+    world.serve_log4shell()
+    service = world.service()
+    reader = AdvisoryCvssReader(world.objects, world.cache)
+    service._intake = FindingIntake(  # the Context's wiring: the intake reads the builds
+        service._uow, IdentityPolicy(), TaxonomyPolicy(), cvss=reader
+    )
+    service.refresh_advisory_documents()
+
+    views = FindingViewQuery(RatingPolicy(RatingConfig()), world.objects, reader)
+    with SqlTraustUnitOfWork(world.engine) as uow:
+        (shown,) = views.views(uow, [uow.findings.get(named.id)])
+    assert stored() == shown.effective_severity == "critical"  # Log4Shell's authority band

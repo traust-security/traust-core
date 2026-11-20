@@ -12,15 +12,20 @@ from __future__ import annotations
 import logging
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from traust_core.v1.models.findings import Decision, Disposition, Occurrence, finding_state, kind_of
 from traust_core.v1.models.vocabulary import DispositionAssurance, Severity
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import AssessmentLog
+from traust_core.v1.services.findings.cvss import selection
 from traust_core.v1.services.findings.facts import decision_lines
 from traust_core.v1.services.findings.rating import RatingPolicy
 from traust_core.v1.services.portfolio import Inventory
+
+if TYPE_CHECKING:
+    from traust_core.v1.services.exposure import AdvisoryCvssReader
 
 # Bumped when the fold policy changes; the rebuild re-stamps.
 POLICY_VERSION = "2026-11-16.1"
@@ -60,8 +65,11 @@ def fold(
     finding_id: UUID,
     kind: str | None,
     decisions: Sequence[Decision],
+    cvss: AdvisoryCvssReader | None = None,
+    advisory_id: UUID | None = None,
 ) -> Folded:
-    """The census's derivation, unchanged."""
+    """The census's derivation, unchanged; severity as the views compute it - the latest
+    report under the advisory's selected authority score (CVSS plan D2, D3)."""
     judged = [
         d
         for d in decisions
@@ -88,9 +96,21 @@ def fold(
             lines = decision_lines(judged, rows, baselines, refs)
         disposition = Disposition.fold(finding_id, judged, lines)
     occurrence = _latest_report(uow, uow.occurrences.list_for_finding(finding_id))
+    authority = (
+        cvss.read(uow, {advisory_id}).scores.get(advisory_id, ())
+        if cvss is not None and advisory_id is not None
+        else ()
+    )
+    picked = selection(
+        authority,
+        occurrence.cvss_vector if occurrence is not None else None,
+        occurrence.cvss_score if occurrence is not None else None,
+        reported=occurrence is not None,
+        document=f"occurrence:{occurrence.id}" if occurrence is not None else "",
+    )
     return Folded(
         state=finding_state(kind_of(kind, tuple(d.validity for d in decisions)), disposition),
-        severity=rating.effective_severity(occurrence, disposition),
+        severity=rating.effective_severity(occurrence, disposition, picked.chosen),
         decided=disposition is not None,
         proven=disposition is not None
         and disposition.assurance == DispositionAssurance.EXECUTION_PROVEN,
@@ -115,35 +135,53 @@ def stamp(
     rating: RatingPolicy,
     *,
     history: Sequence[Decision] | None = None,
+    cvss: AdvisoryCvssReader | None = None,
 ) -> Decision:
     """The single owner of the stored state: the draft and its finding stamped from one fold,
     in one transaction."""
     history = uow.decisions.list_for_finding(draft.finding_id) if history is None else history
     finding = uow.findings.get(draft.finding_id)
-    folded = fold(uow, rating, draft.finding_id, finding.kind, [*history, draft])
+    folded = fold(
+        uow, rating, draft.finding_id, finding.kind, [*history, draft], cvss, finding.advisory_id
+    )
     folded.onto_finding(uow, draft.finding_id)
     return folded.onto(draft)
 
 
-def restamp(uow: TraustUnitOfWork, rating: RatingPolicy, finding_id: UUID) -> None:
+def restamp(
+    uow: TraustUnitOfWork,
+    rating: RatingPolicy,
+    finding_id: UUID,
+    cvss: AdvisoryCvssReader | None = None,
+) -> None:
     """Refold one finding and stamp its current answer: after an occurrence, so the
     effective severity follows the most recent report (Q8) under the standing judgment."""
     finding = uow.findings.get(finding_id)
     decisions = uow.decisions.list_for_finding(finding_id)
-    fold(uow, rating, finding_id, finding.kind, decisions).onto_finding(uow, finding_id)
+    folded = fold(uow, rating, finding_id, finding.kind, decisions, cvss, finding.advisory_id)
+    folded.onto_finding(uow, finding_id)
 
 
 def restamp_all(
-    uow: TraustUnitOfWork, rating: RatingPolicy, repository_ids: Collection[UUID]
+    uow: TraustUnitOfWork,
+    rating: RatingPolicy,
+    repository_ids: Collection[UUID],
+    cvss: AdvisoryCvssReader | None = None,
 ) -> int:
     """Stamp every finding's current answer from the fold: data channel 0002's one-time
     upgrade path - remove with that entry once every store has applied it."""
     stamped = 0
-    for finding_id, _repository_id, kind, _title, _created in uow.findings.census_for_repositories(
-        repository_ids
-    ):
+    for (
+        finding_id,
+        _repository_id,
+        kind,
+        _title,
+        _created,
+        advisory_id,
+    ) in uow.findings.census_for_repositories(repository_ids):
         decisions = uow.decisions.list_for_finding(finding_id)
-        fold(uow, rating, finding_id, kind, decisions).onto_finding(uow, finding_id)
+        folded = fold(uow, rating, finding_id, kind, decisions, cvss, advisory_id)
+        folded.onto_finding(uow, finding_id)
         stamped += 1
     return stamped
 
@@ -163,6 +201,7 @@ def backfill(
     uow: TraustUnitOfWork,
     rating: RatingPolicy,
     repository_ids: Collection[UUID],
+    cvss: AdvisoryCvssReader | None = None,
 ) -> Backfill:
     """Fold once per finding, stamp its latest decision row (filling NULLs).
 
@@ -174,12 +213,12 @@ def backfill(
     """
     stamped = absent = 0
     rows = uow.findings.census_for_repositories(repository_ids)
-    for finding_id, _repository_id, kind, _title, _created in rows:
+    for finding_id, _repository_id, kind, _title, _created, advisory_id in rows:
         decisions = uow.decisions.list_for_finding(finding_id)
         if not decisions:
             absent += 1
             continue
-        folded = fold(uow, rating, finding_id, kind, decisions)
+        folded = fold(uow, rating, finding_id, kind, decisions, cvss, advisory_id)
         uow.decisions.stamp_latest(
             _latest(decisions).id,
             {
@@ -218,16 +257,17 @@ def check(
     repository_ids: Collection[UUID],
     *,
     report_limit: int = 20,
+    cvss: AdvisoryCvssReader | None = None,
 ) -> Drift:
     """Re-derive without writing: the drift detector."""
     matched = drifted = unstamped = 0
     drifted_ids: list[UUID] = []
     rows = uow.findings.census_for_repositories(repository_ids)
-    for finding_id, _r, kind, _t, _c in rows:
+    for finding_id, _r, kind, _t, _c, advisory_id in rows:
         decisions = uow.decisions.list_for_finding(finding_id)
         if not decisions:
             continue
-        folded = fold(uow, rating, finding_id, kind, decisions)
+        folded = fold(uow, rating, finding_id, kind, decisions, cvss, advisory_id)
         latest = _latest(decisions)
         if latest.folded_state is None:
             unstamped += 1

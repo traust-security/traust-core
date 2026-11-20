@@ -137,41 +137,6 @@ class FakeFindings:
         wanted = set(repository_ids)
         count([_census_row(v) for v in self.views if v.finding.repository_id in wanted])
 
-    def projected_census(self, repository_ids: Any) -> Any:
-        # the same views as the projection road's shape: the census rows regrouped, the
-        # top cut lifted from them — the fake stays the fold's own shape while the view's
-        # projected road is what runs
-        from collections import Counter
-
-        from traust_core.v1.services.findings.census import ProjectedRollup, StateGroup, TopCutRow
-        from traust_core.v1.services.insight import _census_row
-
-        wanted = set(repository_ids)
-        rows = [_census_row(v) for v in self.views if v.finding.repository_id in wanted]
-        grouped = Counter(
-            (r.repository_id, r.state, r.severity, r.decided, r.proven, r.unverified, r.category)
-            for r in rows
-        )
-        return ProjectedRollup(
-            tallies=[StateGroup(*key, count) for key, count in grouped.items()],
-            claimed=[],
-            top=[
-                TopCutRow(
-                    r.finding_id,
-                    r.repository_id,
-                    r.category,
-                    r.title,
-                    r.severity,
-                    r.cvss_score,
-                    r.proven,
-                    r.sla_due,
-                    (0.0, str(r.finding_id)),
-                )
-                for r in rows
-                if r.state.value == "open" and str(r.severity) in ("critical", "high")
-            ],
-        )
-
 
 class NoThreatModels:
     def attack_scenarios(self, repository_ids: Any, as_of: Any) -> list[Any]:

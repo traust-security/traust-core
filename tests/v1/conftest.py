@@ -148,7 +148,7 @@ def apply_contract_db(engine: Engine) -> None:
     on_driver_connection(  # the runner drives a raw autocommit DBAPI connection
         engine, lambda dbapi: contracts.run_db_upgrades(dbapi, contract_dialect(engine))
     )
-    data_migrations.run(engine)  # what a deployment applies: DDL, then data
+    data_migrations.run(engine, cvss=None)  # what a deployment applies: DDL, then data
 
 
 def _engine(kind: str, tmp_path: Path) -> Engine:

@@ -4,10 +4,12 @@ from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from traust_core.v1.models.assessment import Assessment
 from traust_core.v1.models.common import RecordBudget
+from traust_core.v1.models.cvss import CvssScore
 from traust_core.v1.models.findings import (
     Decision,
     Disposition,
@@ -21,6 +23,9 @@ from traust_core.v1.repositories.objects import ObjectStore
 from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.findings.claims import ApprovedClaim, approved_claims_for
 from traust_core.v1.services.portfolio import Inventory
+
+if TYPE_CHECKING:
+    from traust_core.v1.services.exposure import AdvisoryCvssReader
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +41,8 @@ class FindingFacts:
     assessments: Mapping[UUID, Assessment]
     lines: Mapping[UUID, bool]
     claims: Mapping[UUID, Sequence[ApprovedClaim]] = field(default_factory=dict)
+    # every authority's scores by the advisory a finding names: today's, whatever `until` is
+    authority: Mapping[UUID, Sequence[CvssScore]] = field(default_factory=dict)
 
     @classmethod
     def load(
@@ -48,6 +55,7 @@ class FindingFacts:
         read_budget: RecordBudget | None = None,
         objects: ObjectStore | None = None,
         census: bool = False,
+        cvss: AdvisoryCvssReader | None = None,
     ) -> FindingFacts:
         """Decisions made after `until` are left out; every occurrence is kept. A census
         load leaves the cwes unread — counting views never read them."""
@@ -107,6 +115,11 @@ class FindingFacts:
             claims=(
                 approved_claims_for(uow, objects, claimed)
                 if objects is not None and (claimed := [f for f in findings if f.id in corrected])
+                else {}
+            ),
+            authority=(
+                cvss.read(uow, {f.advisory_id for f in findings if f.advisory_id}).scores
+                if cvss is not None
                 else {}
             ),
         )

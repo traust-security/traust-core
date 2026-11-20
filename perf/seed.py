@@ -494,7 +494,7 @@ def seeded_database(url: str) -> Engine:
             _upgrade(engine)  # the seed writes the shape the channel leaves, not the baseline
             apply_schema(engine, SEED)
             _stamp_layers(engine)
-            data_migrations.run(engine)  # the seeded decisions get their stamped state
+            data_migrations.run(engine, cvss=None)  # the seeded decisions get their stamped state
             with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
                 for table in ANALYZED:
                     conn.exec_driver_sql(f"VACUUM (ANALYZE) {table}")
@@ -504,7 +504,7 @@ def seeded_database(url: str) -> Engine:
             raise
     else:
         _upgrade(engine)  # a reused database gains any script it lacks; a current one, none
-        data_migrations.run(engine)  # and any data entry it lacks, the same way
+        data_migrations.run(engine, cvss=None)  # and any data entry it lacks, the same way
     return engine
 
 

@@ -69,6 +69,19 @@ def test_a_scored_finding_sends_its_computed_band_not_a_word(
         "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
         "severity": "critical",
         "basis": "computed",
+        "authority_scores": [],  # no advisory: the scanner's own statement is the selected one
+        "selected": {
+            "source": "scanner",
+            "version": "3.1",
+            "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+            "score": "9.8",
+            "band": "critical",
+            "scored_by": None,
+            "document": f"occurrence:{body['occurrence']['id']}",
+            "acquired_at": None,
+            "reason": "precedence",
+        },
+        "conflict": False,
     }
 
 

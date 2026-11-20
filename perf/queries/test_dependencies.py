@@ -344,20 +344,20 @@ def test_the_aliases_of_many_advisories_are_read_from_the_alias_index(
         assert statement.execution_ms < 25, statement.plan
 
 
-def test_a_pages_advisory_cvss_read_is_three_keyed_reads(
+def test_a_pages_advisory_cvss_read_is_the_builds_snapshot_and_artifact(
     engine: sa.Engine, explained: Profile
 ) -> None:
-    """The views' per-page read of the daily build (`advisory_cvss`): snapshot, artifact and the
-    page's advisories, each by index (the seeded artifact has no bytes: perf measures plans)."""
+    """The views' per-page read of the daily build (`AdvisoryCvssReader`): its snapshot, and its
+    artifact once per publication; never an advisory lookup (the build keys every linked id)."""
     ids = [
         *_advisory_ids(engine, aliases=True, limit=25),
         *_advisory_ids(engine, aliases=False, limit=25),
     ]
     statements = explained(lambda uow: _exposure(uow).advisory_cvss(ids))
-    assert len(statements) == 3, [s.sql[:120] for s in statements]
-    latest, advisories, _artifact = statements
+    assert len(statements) == 2, [s.sql[:120] for s in statements]
+    latest, artifact = statements
     assert latest.uses_index("idx_ops_feed_snapshot_feed_retrieved"), latest.plan
-    assert advisories.uses_index("advisory_pkey"), advisories.plan
+    assert "artifact" in artifact.sql, artifact.sql[:120]
     for statement in statements:
         assert not statement.seq_scans(), statement.plan
         assert statement.execution_ms < 10, statement.plan

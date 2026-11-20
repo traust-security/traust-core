@@ -8,7 +8,14 @@ import pydantic
 
 from traust_core.v1.models.assessment import Threat
 from traust_core.v1.models.base import Model
-from traust_core.v1.models.cvss import severity_of
+from traust_core.v1.models.cvss import (
+    CvssScore,
+    CvssSource,
+    CvssStatement,
+    EffectiveCvss,
+    SelectedCvss,
+    severity_of,
+)
 from traust_core.v1.models.findings import (
     LIKELIHOOD_FACTORS,
     Disposition,
@@ -25,6 +32,7 @@ from traust_core.v1.models.vocabulary import (
     ScannerSeverity,
     Severity,
 )
+from traust_core.v1.services.findings.cvss import conflicting
 
 _DEFAULT_RESOLVE_DAYS: Mapping[Severity, int | None] = {
     Severity.CRITICAL: 30,
@@ -126,24 +134,30 @@ class RatingConfig(Model):
 
 
 class SeverityLabel(Model):
-    """The severity a finding shows, and which source won it: the CVSS band a scored
-    occurrence computes, the scanner's word, or a judgement's re-rating."""
+    """The severity a finding shows, and which source won it: the selected authority's band,
+    the CVSS band a scored occurrence computes, the scanner's word, or a judgement's re-rating."""
 
     severity: Severity | None
     basis: SeverityBasis
 
 
-def finding_cvss(occurrence: Occurrence | None, label: SeverityLabel) -> FindingCvss | None:
-    """The cvss block for a finding shown with `occurrence`: that occurrence's score and
-    vector, the severity its vector computes, and the label's basis — one constructor, so
-    the chain always describes the occurrence the view displays."""
+def finding_cvss(
+    occurrence: Occurrence | None, label: SeverityLabel, picked: EffectiveCvss | None = None
+) -> FindingCvss | None:
+    """The cvss block for a finding shown with `occurrence`: its score, vector and computed
+    severity, the label's basis, and (`picked`) every authority's statement and the selected one."""
     if occurrence is None:
         return None
+    authority = [s for s in picked.scores if s.source is not CvssSource.SCANNER] if picked else []
+    chosen = picked.chosen if picked is not None else None
     return FindingCvss(
         score=occurrence.cvss_score,
         vector=occurrence.cvss_vector,
         severity=severity_of(occurrence.cvss_vector),
         basis=label.basis,
+        authority_scores=tuple(CvssStatement.of(s) for s in authority),
+        selected=None if chosen is None else SelectedCvss(**CvssStatement.of(chosen).model_dump()),
+        conflict=conflicting(authority),
     )
 
 
@@ -186,13 +200,21 @@ class RatingPolicy:
         )
 
     def severity_label(
-        self, occurrence: Occurrence | None, disposition: Disposition | None
+        self,
+        occurrence: Occurrence | None,
+        disposition: Disposition | None,
+        chosen: CvssScore | None = None,
     ) -> SeverityLabel:
         """The label and its provenance: the band the occurrence's vector computes, else a
         judgement's re-rating, else the scanner's word — the score, never a word, is the
         authority for what was scored; a recorded decision, not the report's first word,
         corrects the rest (the remediation plan's step 7 tightens that correction to
         evidence-backed decisions)."""
+        if chosen is not None and chosen.source is not CvssSource.SCANNER:
+            # an authority's selected score sets it unless a severity decision stands (D20)
+            if disposition is not None and disposition.severity is not None:
+                return SeverityLabel(severity=disposition.severity, basis="judgement")
+            return SeverityLabel(severity=severity_of(chosen.vector), basis="authority")
         if occurrence is not None and (band := severity_of(occurrence.cvss_vector)) is not None:
             return SeverityLabel(severity=band, basis="computed")
         if disposition is not None and disposition.severity is not None:
@@ -202,10 +224,13 @@ class RatingPolicy:
         return SeverityLabel(severity=None, basis="unrated")
 
     def effective_severity(
-        self, occurrence: Occurrence | None, disposition: Disposition | None
+        self,
+        occurrence: Occurrence | None,
+        disposition: Disposition | None,
+        chosen: CvssScore | None = None,
     ) -> Severity | None:
         """`severity_label`'s severity, without the provenance."""
-        return self.severity_label(occurrence, disposition).severity
+        return self.severity_label(occurrence, disposition, chosen).severity
 
     def sla_due(
         self, severity: Severity | None, opened_at: datetime, cvss_score: Decimal | None = None
@@ -219,10 +244,10 @@ class RatingPolicy:
         days = sla.resolve_days.get(severity)
         return None if days is None else opened_at + timedelta(days=days)
 
-    def risk_weight(self, occurrence: Occurrence | None, severity: Severity | None) -> float | None:
+    def risk_weight(self, cvss_score: Decimal | None, severity: Severity | None) -> float | None:
         """What a finding adds to a risk index: its CVSS score, else its band's midpoint."""
-        if occurrence is not None and occurrence.cvss_score is not None:
-            return float(occurrence.cvss_score)
+        if cvss_score is not None:
+            return float(cvss_score)
         return _BAND_MIDPOINT[severity] if severity is not None else None
 
     def threat_rating(self, threat: Threat) -> RiskRatingBand:

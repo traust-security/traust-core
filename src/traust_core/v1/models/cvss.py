@@ -8,7 +8,7 @@ from collections.abc import Iterable, Mapping
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
-from typing import Literal, TypeVar
+from typing import Literal, Self, TypeVar
 from uuid import UUID
 
 import pydantic
@@ -18,6 +18,7 @@ from pydantic import Field, StrictBool, StrictFloat, StrictInt, StrictStr
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.base import Dto, Model
+from traust_core.v1.models.values import canonical_decimal
 from traust_core.v1.models.vocabulary import Severity
 
 
@@ -65,9 +66,42 @@ class CvssScore(Model):
     acquired_at: datetime | None = None
 
 
+class CvssStatement(Model):
+    """One source's statement as a view shows it: its score with FIRST's band beside it."""
+
+    source: CvssSource
+    version: CvssVersion
+    vector: str
+    score: Decimal | None
+    band: Severity | None
+    scored_by: str | None
+    document: str
+    acquired_at: datetime | None
+
+    @classmethod
+    def of(cls, stated: CvssScore) -> Self:
+        band = severity_of(stated.vector) if stated.score is not None else None
+        return cls(**stated.model_dump(), band=band)
+
+    def stated(self) -> CvssScore:
+        return CvssScore(**self.model_dump(exclude={"band"}))
+
+    @pydantic.field_serializer("score", when_used="json")
+    def _score(self, value: Decimal | None) -> str | None:
+        return canonical_decimal(value)
+
+
+class SelectedCvss(CvssStatement):
+    """The statement a finding's score follows, chosen by precedence: never an unscored one."""
+
+    score: Decimal
+    band: Severity
+    reason: Literal["precedence"] = "precedence"
+
+
 class AdvisoryCvss(Model):
-    """Every authority's scores for each linked advisory (canonical id), ranked, from one day's
-    kept documents; `unreadable` names a kept document that didn't parse, so it stated nothing."""
+    """Every authority's scores for each linked advisory, ranked, from one day's kept documents,
+    by canonical id and every id a finding names; `unreadable`: what scored nothing, and why."""
 
     scores: Mapping[UUID, tuple[CvssScore, ...]]
     unreadable: tuple[str, ...] = ()

@@ -104,6 +104,7 @@ from traust_core.v1.services.validation import (
 )
 
 if TYPE_CHECKING:
+    from traust_core.v1.services.exposure import AdvisoryCvssReader
     from traust_core.v1.services.operations import OpsService
 
 
@@ -148,8 +149,10 @@ class FindingDecisions:
         source: SourceProvider | None = None,
         hosts: Collection[str] = DEFAULT_FORGE_HOSTS,
         recording: OpsService | None = None,
+        cvss: AdvisoryCvssReader | None = None,
     ) -> None:
         self._uow = uow
+        self._cvss = cvss
         self._inventory = Inventory(uow)
         self._log = AssessmentLog(uow)
         self._records = FindingRecords(uow)
@@ -201,7 +204,7 @@ class FindingDecisions:
             if same is not None:
                 return normalize_decision(same)
             Disposition.admit(self._admission_history(draft, history), draft, principal, now)
-            draft = state_history.stamp(draft, uow, self._rating, history=history)
+            draft = state_history.stamp(draft, uow, self._rating, history=history, cvss=self._cvss)
             saved = uow.decisions.add_statement(draft)
             if self._ledger is not None:
                 self._ledger.append_decision(saved, finding.repository_id)
@@ -371,7 +374,7 @@ class FindingDecisions:
                 if same.rationale != draft.rationale:
                     raise ConflictError("this claim decision already has a different rationale")
                 return same
-            draft = state_history.stamp(draft, uow, self._rating)
+            draft = state_history.stamp(draft, uow, self._rating, cvss=self._cvss)
             saved = uow.decisions.add_statement(draft)
             for approver in sorted(approvers):
                 uow.decision_approvers.add(
@@ -469,7 +472,7 @@ class FindingDecisions:
             )
             if self._ledger is not None:
                 self._ledger.require_intact(finding.repository_id)
-            draft = state_history.stamp(draft, uow, self._rating)
+            draft = state_history.stamp(draft, uow, self._rating, cvss=self._cvss)
             saved = uow.decisions.add_statement(draft)
             for approver in sorted(approvers):
                 ref = f"{ActorKind.HUMAN}:{approver}"
@@ -864,7 +867,7 @@ class FindingDecisions:
         draft = draft.model_copy(update={"statement_key": self.statement_key(draft)})
         if (same := self._same(draft)) is not None:
             return normalize_decision(same), False
-        draft = state_history.stamp(draft, uow, self._rating)
+        draft = state_history.stamp(draft, uow, self._rating, cvss=self._cvss)
         saved = uow.decisions.add_statement(draft)
         if (reason := self._review.needs_signoff(saved)) is not None:
             request(uow, saved.finding_id, reason, saved.id)
@@ -1200,7 +1203,7 @@ class FindingDecisions:
             same := self._same(draft, uow.decisions.list_for_finding(draft.finding_id))
         ) is not None:
             return normalize_decision(same), False
-        draft = state_history.stamp(draft, uow, self._rating)
+        draft = state_history.stamp(draft, uow, self._rating, cvss=self._cvss)
         saved = uow.decisions.add_statement(draft)
         if self._ledger is not None:
             self._ledger.append_decision(saved, repository_id, sign=False)

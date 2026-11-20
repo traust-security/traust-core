@@ -19,6 +19,7 @@ from traust_core.v1.models import candidate_formats
 from traust_core.v1.models.base import AppendOnly, Entity, Model
 from traust_core.v1.models.candidate_formats import SuppressionStatus
 from traust_core.v1.models.common import CodeHash, CodeSpan, RepoPath
+from traust_core.v1.models.cvss import CvssSource, CvssStatement, SelectedCvss
 from traust_core.v1.models.finding_claims import ClaimLocation
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import canonical_json, sha256_hex
@@ -1316,16 +1317,31 @@ class SeverityBasis(StrEnum):
     SCANNER = "scanner"
     JUDGEMENT = "judgement"
     UNRATED = "unrated"
+    AUTHORITY = "authority"
 
 
 class FindingCvss(Model):
     """A finding's CVSS as consumers render it: the occurrence's score and vector, the severity
-    the vector computes, and which source won the effective severity."""
+    the vector computes, which source won the effective severity, and every authority's say."""
 
     score: Decimal | None
     vector: str | None
     severity: Severity | None
     basis: SeverityBasis
+    authority_scores: tuple[CvssStatement, ...] = ()
+    selected: SelectedCvss | None = None
+    conflict: bool = False
+
+    @property
+    def effective_score(self) -> Decimal | None:
+        """The score the finding counts at: the selected statement's, else the occurrence's."""
+        return self.selected.score if self.selected is not None else self.score
+
+    @property
+    def effective_source(self) -> CvssSource | None:
+        if self.selected is not None:
+            return self.selected.source
+        return CvssSource.SCANNER if self.score is not None else None
 
     @pydantic.field_serializer("score", when_used="json")
     def _score(self, value: Decimal | None) -> str | None:
@@ -1352,6 +1368,20 @@ class FindingView(Model):
     locations: tuple[Location | ClaimLocation, ...] = ()
     cwes: tuple[str, ...] = ()
     labels: tuple[FindingLabel, ...] = ()
+
+    @property
+    def cvss_score(self) -> Decimal | None:
+        """The score it counts at: the selected statement's, else the occurrence's own."""
+        if self.cvss is not None:
+            return self.cvss.effective_score
+        return self.occurrence.cvss_score if self.occurrence is not None else None
+
+    @property
+    def cvss_source(self) -> CvssSource | None:
+        """Who stated `cvss_score`; None exactly when it is None."""
+        if self.cvss is not None:
+            return self.cvss.effective_source
+        return CvssSource.SCANNER if self.cvss_score is not None else None
 
     def label(self, taxonomy: str) -> str | None:
         return next((fl.label for fl in self.labels if fl.taxonomy == taxonomy), None)

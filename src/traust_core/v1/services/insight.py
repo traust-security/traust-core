@@ -45,6 +45,7 @@ from traust_core.v1.models.compliance import (
     DocVarianceFilter,
 )
 from traust_core.v1.models.corpus import CorpusRegistry
+from traust_core.v1.models.cvss import CvssSource
 from traust_core.v1.models.dependencies import (
     ExposureDimension,
     ExposureFilter,
@@ -95,6 +96,7 @@ from traust_core.v1.models.insight import (
     ExecutivePanel,
     ExecutiveSummary,
     ExposureDashboard,
+    FindingHeadline,
     FindingsRollup,
     FindingsTrend,
     FindingsTrendPoint,
@@ -218,7 +220,8 @@ from traust_core.v1.rendering import (
     inline,
     markdown_text,
 )
-from traust_core.v1.services.findings.census import FindingCensusRow, StateGroup, TopCutRow
+from traust_core.v1.services.findings.census import FindingCensusRow
+from traust_core.v1.services.findings.cvss import selection
 from traust_core.v1.services.findings.intake import CATEGORY
 from traust_core.v1.services.findings.rating import (
     CvssFloor,
@@ -1134,7 +1137,16 @@ class ContainerFindingsView:
             held = occurrences[finding_id]
             latest = held[-1]
             assert latest.id is not None
-            label = self._rating.severity_label(latest, view.disposition)
+            # the same authority statements, selected against this image's report
+            authority = [s.stated() for s in view.cvss.authority_scores] if view.cvss else []
+            picked = selection(
+                authority,
+                latest.cvss_vector,
+                latest.cvss_score,
+                reported=True,
+                document=f"occurrence:{latest.id}",
+            )
+            label = self._rating.severity_label(latest, view.disposition, picked.chosen)
             selected = view.model_copy(
                 update={
                     "occurrence": latest,
@@ -1142,7 +1154,7 @@ class ContainerFindingsView:
                     "effective_severity": label.severity,
                     # the chain describes the occurrence the row shows — never the
                     # repository-wide latest the unselected view folded
-                    "cvss": finding_cvss(latest, label),
+                    "cvss": finding_cvss(latest, label, picked),
                     "sla_due": None,
                 }
             )
@@ -1265,23 +1277,15 @@ class FindingsRollupView:
         """The rollup before its contract check, for a composite that reads only its totals
         (spend's unit economics): drift in a field it never reads must not fail it."""
         products, shipped, repositories = _scope(self._portfolio, filter)
+        # the census: the tallies read states, severities and labels off narrow rows —
+        # never a view materialized — and each batch is counted and released, never held
+        # for the whole scope
         counted = _Counted(filter, products, shipped, repositories)
-        if filter.as_of is None:
-            # the projection road: the tallies read the stamped state, grouped in SQL —
-            # never a row per finding. Claims stay per-finding: their category and title
-            # are a claim's, folded where the review machinery lives
-            rows = self._findings.projected_census([r.id for r in repositories])
-            counted.groups(rows.tallies)
-            counted.count_rows(rows.claimed)
-            counted.note_top(rows.top)
-        else:
-            # point-in-time: the projection is the current fold only, so the census road
-            # folds as of the filter's moment — each batch counted and released
-            self._findings.census(
-                [r.id for r in repositories],
-                counted.census,
-                filter.as_of,  # type: ignore[misc,arg-type]
-            )
+        self._findings.census(
+            [r.id for r in repositories],
+            counted.census,
+            filter.as_of,  # type: ignore[misc,arg-type]
+        )
         rollup = counted.rollup()
         if filter.product_ids or filter.team_ids:
             scenarios = self._assessment.attack_scenarios(
@@ -1624,18 +1628,6 @@ class _Counting:
             self.proven += row.proven
             self.unverified += row.unverified
 
-    def group(self, counted: StateGroup) -> None:
-        """The same counting, a grouped count at a time."""
-        bucket, n = counted.state, counted.count
-        self.states[bucket] += n
-        self.decided += n if counted.decided else 0
-        if bucket == FindingState.RESOLVED:
-            self.remediated[counted.severity] += n
-        if bucket == _OPEN:
-            self.opened[counted.severity] += n
-            self.proven += n if counted.proven else 0
-            self.unverified += n if counted.unverified else 0
-
     def severities(self, counts: Counter[Severity | None]) -> SeverityCounts:
         return SeverityCounts(
             **{
@@ -1693,7 +1685,14 @@ class _Counted:
         for row in rows:
             if not self.wants(row):
                 continue
-            self.count(row)
+            self.total.add(row)
+            self.by_repository[row.repository_id].add(row)  # type: ignore[index]
+            if row.state is _HARDENING:
+                self.hardening[row.repository_id][row.category or "uncategorized"] += 1  # type: ignore[index]
+            for product_id, shipped in self.shipped.items():
+                if row.repository_id in shipped:
+                    self.by_product[product_id].add(row)
+            self.categories[row.category].add(row)
             if row.state is _OPEN and str(row.severity) in _TOP:
                 self.top.append(
                     TopFinding(
@@ -1702,61 +1701,11 @@ class _Counted:
                         title=row.title,
                         severity=row.severity,
                         cvss_score=row.cvss_score,
+                        cvss_source=row.cvss_source,
                         execution_proven=row.proven,
                         sla_due=row.sla_due,
                     )
                 )
-
-    def count_rows(self, rows: Iterable[FindingCensusRow]) -> None:
-        """Count the claimed few: the shared routing, the top cut served separately."""
-        for row in rows:
-            if self.wants(row):
-                self.count(row)
-
-    def count(self, row: FindingCensusRow) -> None:
-        """Count one finding: the routing every road shares, the top cut's fields unread."""
-        self.total.add(row)
-        self.by_repository[row.repository_id].add(row)  # type: ignore[index]
-        if row.state is _HARDENING:
-            self.hardening[row.repository_id][row.category or "uncategorized"] += 1  # type: ignore[index]
-        for product_id, shipped in self.shipped.items():
-            if row.repository_id in shipped:
-                self.by_product[product_id].add(row)
-        self.categories[row.category].add(row)
-
-    def groups(self, tallies: Iterable[StateGroup]) -> None:
-        """Count the unclaimed bulk's grouped tallies; a category scope keeps only groups
-        carrying one of those labels."""
-        for counted in tallies:
-            if self._wanted is not None and counted.category not in self._wanted:
-                continue
-            self.total.group(counted)
-            self.by_repository[counted.repository_id].group(counted)  # type: ignore[index]
-            if counted.state is _HARDENING:
-                bucket = counted.category or "uncategorized"  # type: ignore[index]
-                self.hardening[counted.repository_id][bucket] += counted.count
-            for product_id, shipped in self.shipped.items():
-                if counted.repository_id in shipped:
-                    self.by_product[product_id].group(counted)
-            self.categories[counted.category].group(counted)
-
-    def note_top(self, top: Iterable[TopCutRow]) -> None:
-        """The projected road's top cut, in the census's own counting order; a category
-        scope keeps only rows carrying one of those labels."""
-        for row in top:
-            if self._wanted is not None and row.category not in self._wanted:
-                continue
-            self.top.append(
-                TopFinding(
-                    finding_id=row.finding_id,
-                    repository_url=self._urls[row.repository_id],
-                    title=row.title,
-                    severity=row.severity,
-                    cvss_score=row.cvss_score,
-                    execution_proven=row.execution_proven,
-                    sla_due=row.sla_due,
-                )
-            )
 
     def rollup(self) -> FindingsRollup:
         # imported here: findings.decisions imports this module's TriageView, so a
@@ -1831,7 +1780,7 @@ class _SummaryCensus:
     urls: Mapping[UUID, str]
     audit_repositories: set[UUID]
     language_of: Mapping[UUID, str]
-    leaks: list[TopFinding] = field(default_factory=list)
+    leaks: list[FindingHeadline] = field(default_factory=list)
     themes: Counter[str] = field(default_factory=Counter)
     hardening_themes: Counter[str] = field(default_factory=Counter)
     languages: defaultdict[str, _Counting] = field(default_factory=lambda: defaultdict(_Counting))
@@ -1909,13 +1858,13 @@ def _is(view: FindingView, state: FindingState) -> bool:
     return view.state() is state
 
 
-def _top(view: FindingView, repository_url: str) -> TopFinding:
-    return TopFinding(
+def _top(view: FindingView, repository_url: str) -> FindingHeadline:
+    return FindingHeadline(
         finding_id=view.finding.id,  # type: ignore[arg-type]
         repository_url=repository_url,
         title=view.finding.title,
         severity=view.effective_severity,
-        cvss_score=view.occurrence.cvss_score if view.occurrence else None,
+        cvss_score=view.cvss_score,
         execution_proven=_proven(view),
         sla_due=view.sla_due,
     )
@@ -1942,8 +1891,9 @@ def _census_row(view: FindingView) -> FindingCensusRow:
         unverified=view.disposition is None
         or view.disposition.assurance == DispositionAssurance.CLAIMED,
         title=view.finding.title,
-        cvss_score=view.occurrence.cvss_score if view.occurrence else None,
+        cvss_score=view.cvss_score,
         sla_due=view.sla_due,
+        cvss_source=view.cvss_source,
     )
 
 
@@ -2080,7 +2030,8 @@ class FindingsTrendView:
                 repository_url=urls[v.finding.repository_id],
                 title=v.finding.title,
                 severity=v.effective_severity,
-                cvss_score=v.occurrence.cvss_score if v.occurrence else None,
+                cvss_score=v.cvss_score,
+                cvss_source=v.cvss_source,
                 accepted_at=None if last is None else last.occurred_at,
                 accepted_by=None if last is None else last.actor,
                 rationale=last and last.rationale and last.rationale[:_RATIONALE_CHARS],
@@ -4760,7 +4711,7 @@ def _themes_of(view: FindingView) -> set[str]:
     return {_THEMES[c] for c in view.cwes if c in _THEMES} or {"Other"}
 
 
-def _top_row(f: TopFinding) -> tuple[str, ...]:
+def _top_row(f: FindingHeadline) -> tuple[str, ...]:
     return (
         f.repository_url,
         f.title,
@@ -5938,7 +5889,7 @@ def _sla_profile(
     for repository, clock, owners in clocked:
         view = clock.view
         severity = view.effective_severity
-        cvss = view.occurrence.cvss_score if view.occurrence else None
+        cvss = view.cvss_score
         floored = floor is not None and cvss is not None and cvss >= floor.threshold
         if severity not in profile.slas and not floored:
             counts["out_of_profile_scope"] += 1
@@ -6327,10 +6278,18 @@ def _sarif_result(view: FindingView, rule_index: int) -> dict[str, Any]:
         properties["security-severity"] = rating[1]
     if view.cwes:
         properties["tags"] = ["security", *view.cwes]
-    if view.occurrence is not None and view.occurrence.cvss_vector:
+    selected = view.cvss.selected if view.cvss is not None else None
+    if selected is not None:  # the score the finding counts at, and who stated it
+        properties["traust/cvss"] = {
+            "vector": selected.vector,
+            "score": str(selected.score),
+            "source": selected.source.value,
+        }
+    elif view.occurrence is not None and view.occurrence.cvss_vector:
         properties["traust/cvss"] = {
             "vector": view.occurrence.cvss_vector,
             "score": str(view.occurrence.cvss_score),
+            "source": CvssSource.SCANNER.value,
         }
     if disposition is not None:
         properties["traust/disposition"] = disposition.model_dump(mode="json")

@@ -148,6 +148,28 @@ def test_get_undecided_finding_is_rated_by_its_report_with_a_deadline(engine: En
     assert view.sla_due == T0 + timedelta(days=30)
 
 
+def test_a_scored_finding_labels_from_its_band_over_a_judgement(engine: Engine) -> None:
+    # the defect's shape: reported medium, re-rated low, scored 9.8 — the view says critical
+    a = audited(
+        engine,
+        severity="medium",
+        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        cvss_score=Decimal("9.8"),
+    )
+    findings = service(engine)
+    findings.decisions.decide(said(a.finding, 1, severity=Severity.LOW), ALICE)
+    view = findings.get(a.finding.id)  # type: ignore[arg-type]
+    assert view.effective_severity is Severity.CRITICAL
+
+
+def test_an_unscored_finding_keeps_its_judgement_over_its_word(engine: Engine) -> None:
+    a = audited(engine, severity="high")
+    findings = service(engine)
+    findings.decisions.decide(said(a.finding, 1, severity=Severity.LOW), ALICE)
+    view = findings.get(a.finding.id)  # type: ignore[arg-type]
+    assert view.effective_severity is Severity.LOW
+
+
 def test_get_unknown_finding_is_not_found(engine: Engine) -> None:
     with pytest.raises(NotFoundError):
         service(engine).get(uuid4())

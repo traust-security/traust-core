@@ -29,9 +29,13 @@ import inspect
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
+
+if TYPE_CHECKING:
+    from traust_core.v1.services.exposure import AdvisoryCvssReader
 
 log = logging.getLogger(__name__)
 
@@ -63,14 +67,14 @@ class DataMigration:
     edit after databases applied it is refused (fix forward with a new entry)."""
 
     name: str
-    fn: Callable[[Engine], None]
+    fn: Callable[[Engine, AdvisoryCvssReader | None], None]
 
     @property
     def sha256(self) -> str:
         return hashlib.sha256(inspect.getsource(self.fn).encode()).hexdigest()
 
 
-def _state_projection_backfill(engine: Engine) -> None:
+def _state_projection_backfill(engine: Engine, cvss: AdvisoryCvssReader | None) -> None:
     """Stamp the folded state on every finding's latest decision: the decisions
     written before the projection existed. Fresh stores carry none and finish
     in seconds; replay is safe (the stamp fills NULLs only)."""
@@ -84,7 +88,7 @@ def _state_projection_backfill(engine: Engine) -> None:
         repository_ids = [
             row[0] for row in uow.connection.execute(sa.text("SELECT id FROM repository"))
         ]
-        result = state_history.backfill(u, rating, repository_ids)
+        result = state_history.backfill(u, rating, repository_ids, cvss)
         u.commit()
     log.info(
         "data channel: state projection stamped=%d absent=%d",
@@ -94,7 +98,7 @@ def _state_projection_backfill(engine: Engine) -> None:
     )
 
 
-def _finding_current_backfill(engine: Engine) -> None:
+def _finding_current_backfill(engine: Engine, cvss: AdvisoryCvssReader | None) -> None:
     """Stamp every finding's current answer (state, effective severity, decided) from the
     fold: the findings written before core stamped them. Replay is safe (a restamp)."""
     from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -107,7 +111,7 @@ def _finding_current_backfill(engine: Engine) -> None:
         repository_ids = [
             row[0] for row in uow.connection.execute(sa.text("SELECT id FROM repository"))
         ]
-        stamped = state_history.restamp_all(u, rating, repository_ids)
+        stamped = state_history.restamp_all(u, rating, repository_ids, cvss)
         u.commit()
     log.info(
         "data channel: finding current answer stamped=%d",
@@ -148,11 +152,12 @@ def pending(engine: Engine) -> list[DataMigration]:
     return waiting
 
 
-def run(engine: Engine) -> list[DataMigration]:
-    """Apply pending entries; each commits its work, then its stamp."""
+def run(engine: Engine, *, cvss: AdvisoryCvssReader | None) -> list[DataMigration]:
+    """Apply pending entries; each commits its work, then its stamp. `cvss` reads the
+    advisories' authority scores, so a restamped severity is the views' own."""
     applied: list[DataMigration] = []
     for entry in pending(engine):
-        entry.fn(engine)
+        entry.fn(engine, cvss)
         with engine.begin() as conn:
             conn.exec_driver_sql(
                 _insert(engine),

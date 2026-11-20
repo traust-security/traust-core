@@ -27,6 +27,7 @@ from traust_core.v1.models.base import Model
 from traust_core.v1.models.code_facts import LanguageCount
 from traust_core.v1.models.common import TimeBucket, TimeWindow
 from traust_core.v1.models.compliance import ComplianceRollup, DocVariance
+from traust_core.v1.models.cvss import CvssSource
 from traust_core.v1.models.dependencies import ExposureRollup
 from traust_core.v1.models.detection_quality import ComplianceCalibration, CriticalMiss, Scorecard
 from traust_core.v1.models.findings import (
@@ -231,7 +232,9 @@ class ProductRollup(Model):
     tally: FindingTally
 
 
-class TopFinding(Model):
+class FindingHeadline(Model):
+    """A finding as a list row names it: the executive summary's credential leaks."""
+
     finding_id: UUID
     repository_url: str
     title: str
@@ -243,6 +246,12 @@ class TopFinding(Model):
     @field_serializer("cvss_score", when_used="json")
     def _cvss(self, value: Decimal | None) -> str | None:
         return canonical_decimal(value)
+
+
+class TopFinding(FindingHeadline):
+    """The rollup's top cut, which also says who stated `cvss_score`."""
+
+    cvss_source: CvssSource | None = None
 
 
 class ContainerReport(Model):
@@ -356,6 +365,7 @@ class AcceptedRisk(Model):
     title: str
     severity: Severity | None  # None: unrated
     cvss_score: Decimal | None = None
+    cvss_source: CvssSource | None = None  # who stated `cvss_score`
     accepted_at: datetime | None = None
     accepted_by: str | None = None
     rationale: str | None = None
@@ -901,7 +911,7 @@ class ExecutiveSummary(ViewModel):
     """The leadership roll-up; `exposure` is fleet-wide, None for a product or team scope."""
 
     rollup: FindingsRollup
-    credential_leaks: tuple[TopFinding, ...] = ()
+    credential_leaks: tuple[FindingHeadline, ...] = ()
     themes: Mapping[str, int] = Field(default_factory=dict)
     hardening_themes: Mapping[str, int] = Field(default_factory=dict)
     languages: tuple[LanguageSeverity, ...] = ()

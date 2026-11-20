@@ -34,19 +34,6 @@ FINDING = TableSpec(
 )
 
 
-def current_answer(findings: sa.Table) -> sa.TableClause:
-    """The finding's projection columns (the fold's state, effective severity, decided), kept
-    off the Finding model."""
-    return sa.table(
-        findings.name,
-        sa.column("id", findings.c.id.type),
-        sa.column("current_state", sa.Text),
-        sa.column("current_severity", sa.Text),
-        sa.column("current_decided", sa.Boolean),
-        schema=findings.schema,
-    )
-
-
 class FindingRepository(MutableRecordRepository[Finding], Protocol):
     def get_for_update(self, finding_id: UUID) -> Finding: ...
 
@@ -58,10 +45,10 @@ class FindingRepository(MutableRecordRepository[Finding], Protocol):
     def list_for_repositories(self, repository_ids: Collection[UUID]) -> list[Finding]: ...
     def census_for_repositories(
         self, repository_ids: Collection[UUID]
-    ) -> list[tuple[UUID, UUID, str | None, str, datetime]]:
-        """(id, repository_id, kind, title, created_at) per finding of the repositories,
-        newest first in bounded batches: the census counts states, severities and labels
-        without materializing a model per row, in the order the views' own fold counts."""
+    ) -> list[tuple[UUID, UUID, str | None, str, datetime, UUID | None]]:
+        """(id, repository_id, kind, title, created_at, advisory_id) per finding, newest first
+        in bounded batches: the census counts states, severities and labels without a model
+        per row, in the order the views' own fold counts."""
         ...
 
     def census_counts_for_repositories(
@@ -99,7 +86,15 @@ class SqlFindingRepository(SqlMutableRepository[Finding]):
     def stamp_current(
         self, finding_id: UUID, state: str, severity: str | None, decided: bool
     ) -> None:
-        current = current_answer(self.table)
+        # the projection columns stay off the Finding model: a table clause of just them
+        current = sa.table(
+            self.table.name,
+            sa.column("id", self.table.c.id.type),
+            sa.column("current_state", sa.Text),
+            sa.column("current_severity", sa.Text),
+            sa.column("current_decided", sa.Boolean),
+            schema=self.table.schema,
+        )
         stmt = (
             sa.update(current)
             .where(current.c.id == finding_id)
@@ -144,20 +139,20 @@ class SqlFindingRepository(SqlMutableRepository[Finding]):
 
     def census_for_repositories(
         self, repository_ids: Collection[UUID]
-    ) -> list[tuple[UUID, UUID, str | None, str, datetime]]:
-        """(id, repository_id, kind, title, created_at) per finding of the repositories,
-        newest first in bounded batches: the census counts states, severities and labels
-        without materializing a model per row, in the order the views' own fold counts."""
+    ) -> list[tuple[UUID, UUID, str | None, str, datetime, UUID | None]]:
+        """(id, repository_id, kind, title, created_at, advisory_id) per finding, newest first
+        in bounded batches: the census counts states, severities and labels without a model
+        per row, in the order the views' own fold counts."""
         c = self.table.c
-        found: list[tuple[UUID, UUID, str | None, str, datetime]] = []
+        found: list[tuple[UUID, UUID, str | None, str, datetime, UUID | None]] = []
         for batch in self._batches(repository_ids):
             stmt = (
-                sa.select(c.id, c.repository_id, c.kind, c.title, c.created_at)
+                sa.select(c.id, c.repository_id, c.kind, c.title, c.created_at, c.advisory_id)
                 .where(c.repository_id.in_(batch))
                 .order_by(c.created_at.desc(), c.id.desc())
             )
             rows = self._execute(f"census for {len(batch)} repositories", stmt)
-            found.extend((row[0], row[1], row[2], row[3], row[4]) for row in rows)
+            found.extend((row[0], row[1], row[2], row[3], row[4], row[5]) for row in rows)
         return found
 
     def census_counts_for_repositories(
