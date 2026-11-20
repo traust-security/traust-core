@@ -51,6 +51,9 @@ REVISIONS_PER_REPOSITORY = 12
 RELEASES_PER_PRODUCT = 12
 OWNERSHIP_PERIODS = 10
 FINDINGS = 100_000
+# The long tail: one repository holds this many v3 findings (the rescan duress lands there).
+HOT_FINDINGS = 3_000
+CATEGORIES = 40
 # A year of scans (Appendix D: ~250k occurrences): every seeded finding reported once, ten per
 # assessment; half the locations name a line range (with its enclosing function), half a file.
 FINDINGS_PER_ASSESSMENT = 10
@@ -252,31 +255,49 @@ SEED = (
     """INSERT INTO traust.location_hash (location_id, algorithm, digest)
     SELECT id, 'file-bytes-sha256/v1', encode(sha256(convert_to(path, 'UTF8')), 'hex')
     FROM traust.location WHERE symbol IS NOT NULL AND mod(abs(hashtext(id::text)), 5) < 3""",
+    # The v3 population is the estate's realistic shape: a long-tail repository holding
+    # HOT_FINDINGS (what a full rescan lands on), the rest spread; a weakness slice; every
+    # finding reported once at a mixed severity and labelled with one of CATEGORIES; and
+    # judged along the workflow in realistic proportions (m = the fingerprint number % 100):
+    # 0-39 identified (no decision), 40-54 confirmed, 55-69 false positive, 70-79
+    # remediated, 80-86 verified weakness (hardening), 87-94 risk accepted, 95-99 not
+    # affected. Severity by the number % 20: 5% critical, 20% high, 35% medium, 25% low,
+    # 10% informational, 5% unrated.
     f"""INSERT INTO traust.finding
         (repository_id, fingerprint_algo, fingerprint, kind, title)
-    SELECT r.id, 'v3', 'perf-' || g, 'vulnerability', 'Performance finding'
+    SELECT r.id, 'v3', 'perf-' || g,
+        CASE WHEN mod(g, 100) BETWEEN 80 AND 86 THEN 'weakness' ELSE 'vulnerability' END,
+        'Performance finding'
     FROM generate_series(1, {FINDINGS}) g
     JOIN traust.repository r
-        ON r.url = 'https://forge.example/org/r' || (1 + mod(g, {REPOSITORIES}))""",
-    # Every tenth finding stays undecided: it folds open with its occurrence's
-    # severity — the open critical/high cut needs that combination, and a real
-    # estate always has undecided high-severity findings.
+        ON r.url = 'https://forge.example/org/r'
+            || (CASE WHEN g <= {HOT_FINDINGS} THEN 1 ELSE 1 + mod(g, {REPOSITORIES}) END)""",
     """INSERT INTO traust.decision
-        (finding_id, statement_key, validity, evidence_grade, actor, occurred_at)
-    SELECT id, fingerprint, 'confirmed', 'E0', 'human:perf@example.com', now()
-    FROM (SELECT id, fingerprint, row_number() OVER (ORDER BY id) n
-          FROM traust.finding WHERE fingerprint_algo = 'v3') ranked
-    WHERE mod(ranked.n, 10) <> 0""",
-    # The undecided tenth gets scanned too, on existing assessments: an
-    # undecided finding with a critical occurrence is the dashboard's open
-    # critical/high cut, and a real estate always has them.
+        (finding_id, statement_key, validity, resolution, evidence_grade, actor, occurred_at)
+    SELECT id, fingerprint,
+        CASE WHEN m BETWEEN 55 AND 69 THEN 'false_positive'
+             WHEN m BETWEEN 80 AND 86 THEN 'true_positive'
+             WHEN m >= 95 THEN 'not_affected'
+             ELSE 'confirmed' END,
+        CASE WHEN m BETWEEN 70 AND 79 THEN 'resolved'
+             WHEN m BETWEEN 87 AND 94 THEN 'risk_accepted' END,
+        'E0', 'human:perf@example.com', now()
+    FROM (SELECT id, fingerprint, mod(split_part(fingerprint, '-', 2)::int, 100) AS m
+          FROM traust.finding WHERE fingerprint_algo = 'v3') v
+    WHERE m >= 40""",
     f"""INSERT INTO traust.occurrence (finding_id, assessment_id, severity, rule)
-    SELECT f.id, a.id, 'critical', 'rule-' || mod(f.n, 50)
-    FROM (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.finding
-          WHERE fingerprint_algo = 'v3') f
+    SELECT f.id, a.id,
+        CASE WHEN s = 0 THEN 'critical' WHEN s <= 4 THEN 'high' WHEN s <= 11 THEN 'medium'
+             WHEN s <= 16 THEN 'low' WHEN s <= 18 THEN 'informational' ELSE 'unrated' END,
+        'rule-' || mod(f.n, 50)
+    FROM (SELECT id, row_number() OVER (ORDER BY id) n,
+                 mod(split_part(fingerprint, '-', 2)::int, 20) AS s
+          FROM traust.finding WHERE fingerprint_algo = 'v3') f
     JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.assessment) a
-        ON a.n = 1 + mod(f.n - 1, {DECISIONS // FINDINGS_PER_ASSESSMENT})
-    WHERE mod(f.n, 10) = 0""",
+        ON a.n = 1 + mod(f.n - 1, {DECISIONS // FINDINGS_PER_ASSESSMENT})""",
+    f"""INSERT INTO traust.finding_label (finding_id, taxonomy, label)
+    SELECT id, 'category', 'cat-' || mod(split_part(fingerprint, '-', 2)::int, {CATEGORIES})
+    FROM traust.finding WHERE fingerprint_algo = 'v3'""",
     """INSERT INTO traust.review_item (finding_id, decision_id, reason, status)
     SELECT d.finding_id, d.id, 'needs_manual_test',
         CASE WHEN mod(row_number() OVER (ORDER BY d.id), 100) = 0

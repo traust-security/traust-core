@@ -9,8 +9,9 @@ import sys
 from pathlib import Path
 
 from traust_core.v1.context import Config, Context, StoreState
-from traust_core.v1.context.serve import hand_config, handed_config
+from traust_core.v1.context.serve import hand_config, hand_role, handed_config, handed_role
 from traust_core.v1.errors import ConfigError
+from traust_core.v1.rest.roles import Role
 
 _REST_EXTRA = {"fastapi", "starlette", "uvicorn"}
 _UNTRUSTED = "this config does not trust its local issuer: set identity.trust_local: true"
@@ -43,6 +44,7 @@ def main(argv: list[str] | None = None) -> None:
         # the config path is handed over, never the object
         if args.config is not None:
             hand_config(args.config)
+        hand_role(args.role)
         uvicorn.run(
             _WORKER_FACTORY,
             host=args.host,
@@ -52,10 +54,15 @@ def main(argv: list[str] | None = None) -> None:
             log_config=None,
         )
         return
-    uvicorn.run(_app(config, args.config), host=args.host, port=args.port, log_config=None)
+    uvicorn.run(
+        _app(config, args.config, Role(args.role)),
+        host=args.host,
+        port=args.port,
+        log_config=None,
+    )
 
 
-def _app(config: Config, config_path: Path | None):
+def _app(config: Config, config_path: Path | None, role: Role = Role.ALL):
     """The app fully wired: feeds registered, the rate card loaded when the deployment
     ships one beside its config."""
     context = Context(config)
@@ -72,7 +79,8 @@ def _app(config: Config, config_path: Path | None):
         )
     from traust_core.v1.rest.app import create_app
 
-    return create_app(context)
+    log.info("serving role %s", role, extra={"operation": "server.role", "outcome": role})
+    return create_app(context, role)
 
 
 def _worker_app():
@@ -82,7 +90,7 @@ def _worker_app():
     request (measured: 7 concurrent dashboard reads, 29.4s p50 single-process, 14.2s at
     four workers)."""
     path = handed_config()
-    return _app(Config.from_file(path) if path else Config(), path)
+    return _app(Config.from_file(path) if path else Config(), path, Role(handed_role() or "all"))
 
 
 def _rate_card(config_path: Path | None) -> Path | None:
@@ -171,6 +179,13 @@ def _parser() -> argparse.ArgumentParser:
         default=1,
         help="server processes: CPU-bound insight reads serialize in one, so concurrent "
         "dashboards need more than one process to use the CPU budget",
+    )
+    parser.add_argument(
+        "--role",
+        choices=[r.value for r in Role],
+        default=Role.ALL.value,
+        help="serve one role: query (reads), command (writes), ops (run orders); all serves "
+        "every route",
     )
     commands = parser.add_subparsers(dest="command")
     token = commands.add_parser("token", help="print a token from this server's local issuer")

@@ -35,7 +35,7 @@ def test_traust_server_serves_the_configured_context(
     records = (tmp_path / "logs" / "traust.log").read_text().splitlines()
     messages = [json.loads(line)["message"] for line in records]
     assert messages[0].startswith("no model-registry.yaml beside")  # spend stays unpriced
-    assert messages[1:] == ["server access event"]
+    assert messages[1:] == ["serving role all", "server access event"]
 
 
 def test_traust_server_prices_spend_from_the_rate_card_beside_the_config(

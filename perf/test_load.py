@@ -13,7 +13,14 @@ from uuid import uuid4
 import pytest
 from sqlalchemy.engine import Engine
 
-from perf.load import cards, run_duress
+from perf.load import (
+    READ_P95_BUDGET,
+    WRITE_SLOWDOWN_LIMIT,
+    cards,
+    run_duress,
+    run_mixed_duress,
+    run_rescan_duress,
+)
 from traust_core.v1.context import Context
 from traust_core.v1.models.dashboard import Dimension, Subject
 
@@ -48,6 +55,45 @@ def test_every_card_is_a_body_the_route_accepts() -> None:
 
 @skip_unless_gated
 def test_dashboard_reads_under_the_stamped_write_door(engine: Engine, context: Context) -> None:
+    """The farm's duress bar: dashboard p95 under a second with zero failures, and the
+    write door's p95 within twice its own, measured alone first."""
     duress = run_duress(engine, context, seconds=int(os.environ.get("TRAUST_PERF_SECONDS", "60")))
     print(duress.report())
+    assert duress.reads.failures == 0, "no dashboard read may fail under duress"
     assert duress.writes.failures == 0, "the write door must not fail under read load"
+    assert duress.reads.pct(95) < READ_P95_BUDGET, "dashboard p95 over budget"
+    assert duress.writes.pct(95) <= WRITE_SLOWDOWN_LIMIT * duress.baseline.pct(95), (
+        "readers slowed the write door past twice its own p95"
+    )
+
+
+@skip_unless_gated
+def test_dashboard_reads_through_a_full_rescan(engine: Engine, context: Context) -> None:
+    """A rescan restamps every finding of the long-tail repository in one transaction:
+    dashboards keep their budget, nothing fails, and a triage decision on that repository
+    waits at most for the rescan's commit (its row locks), never fails."""
+    duress = run_rescan_duress(engine, context)
+    print(duress.report())
+    assert duress.reads.failures == 0, "no dashboard read may fail during a rescan"
+    assert duress.triage.failures == 0, "a triage decision must wait for a rescan, not fail"
+    assert duress.reads.pct(95) < READ_P95_BUDGET, "dashboard p95 over budget during a rescan"
+    assert duress.triage.max <= duress.rescan_seconds + 1.0, (
+        "a triage decision waited longer than the rescan held its rows"
+    )
+
+
+@skip_unless_gated
+def test_everything_at_once_holds_the_budgets(engine: Engine, context: Context) -> None:
+    """The steady spread (TRAUST_PERF_MIXED_SECONDS, default ten minutes): dashboards keep
+    their budget beside findings pages, a report-grade build, the write door and a full
+    rescan; nothing fails; the write door stays within twice its own p95."""
+    seconds = int(os.environ.get("TRAUST_PERF_MIXED_SECONDS", "600"))
+    duress = run_mixed_duress(engine, context, seconds=seconds)
+    print(duress.report_lines())
+    for side in (duress.dashboards, duress.pages, duress.report, duress.writes):
+        assert side.failures == 0, "nothing may fail in the steady spread"
+    assert duress.report.latencies, "the report-grade build must complete at least once"
+    assert duress.dashboards.pct(95) < READ_P95_BUDGET, "dashboard p95 over budget"
+    assert duress.writes.pct(95) <= WRITE_SLOWDOWN_LIMIT * duress.writes_alone.pct(95), (
+        "the steady spread slowed the write door past twice its own p95"
+    )
