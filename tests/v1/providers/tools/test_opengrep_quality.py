@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -23,7 +24,11 @@ from traust_core.v1.providers.process import (
 )
 from traust_core.v1.providers.tools import detection_quality as sweep_provider
 from traust_core.v1.providers.tools.opengrep import SupplementalPack, execute_scan
-from traust_core.v1.providers.tools.opengrep_quality import RuleQualityError, checked_rules
+from traust_core.v1.providers.tools.opengrep_quality import (
+    RuleQualityError,
+    checked_rules,
+    import_rules,
+)
 
 
 class NativeRunner:
@@ -421,3 +426,274 @@ def test_version_output_cannot_serialize_private_native_text(tmp_path: Path) -> 
         )
     assert caught.value.reason is ScannerFailure.OUTPUT
     assert "PRIVATE_NATIVE_SENTINEL" not in str(caught.value)
+
+
+def test_import_preserves_pack_bytes_paths_and_credits_after_both_native_checks(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    config = write_rule(source / "python" / "security", name="policy.skeleton")
+    config.write_bytes(config.read_bytes().replace(b"\n", b"\r\n"))
+    fixture = config.with_suffix(".py")
+    fixture.write_bytes(fixture.read_bytes().replace(b"\n", b"\r\n"))
+    (source / "LICENSE").write_bytes(b"License and attribution\r\n")
+    (source / "NOTICE").write_bytes(b"Original author\n")
+    (source / "assets").mkdir()
+    (source / "assets" / "reference.bin").write_bytes(b"\x00\xff")
+    (source / "tests").mkdir()
+    (source / "tests" / "reference.py").write_bytes(b"safe(value)\n")
+    destination = tmp_path / "accepted"
+    original = {
+        path.relative_to(source): path.read_bytes() for path in source.rglob("*") if path.is_file()
+    }
+
+    class InspectingRunner(NativeRunner):
+        def run(self, argv: Sequence[str], **kwargs: Any) -> ProcessResult:
+            assert not destination.exists()
+            root = Path(argv[-1])
+            assert next(root.rglob("*.yaml")).read_bytes() == original[config.relative_to(source)]
+            assert next(root.rglob("*.py")).read_bytes() == original[fixture.relative_to(source)]
+            return super().run(argv, **kwargs)
+
+    runner = InspectingRunner()
+    report = import_rules(source, destination, runner, load=yaml_documents)
+
+    assert report.passed
+    assert report.rules == ("example-rule",)
+    assert [call[1] for call in runner.calls] == ["validate", "test"]
+    assert "--strict" in runner.calls[1]
+    assert {
+        path.relative_to(destination): path.read_bytes()
+        for path in destination.rglob("*")
+        if path.is_file()
+    } == original
+    assert (destination / "tests").is_dir()
+    assert not list(tmp_path.glob(".opengrep-import-*"))
+    with checked_rules([destination], NativeRunner(), load=yaml_documents) as checked:
+        assert checked.report.passed
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["validate-exit", "validate-skipped", "test-exit", "test-empty", "test-missing-fixture"],
+)
+def test_import_quality_refusal_never_creates_a_destination(tmp_path: Path, failure: str) -> None:
+    config = write_rule(tmp_path / "source")
+    destination = tmp_path / "accepted"
+    runner = NativeRunner(failure)
+
+    report = import_rules(config.parent, destination, runner, load=yaml_documents)
+
+    assert not report.passed
+    assert not destination.exists()
+    assert config.is_file()
+    assert not list(tmp_path.glob(".opengrep-import-*"))
+    assert [call[1] for call in runner.calls] == (
+        ["validate"] if failure.startswith("validate") else ["validate", "test"]
+    )
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    ["# ruleid: example-rule\ndangerous(value)\n", "# ok: example-rule\nsafe(value)\n"],
+)
+def test_import_refuses_missing_positive_or_negative_receipts(tmp_path: Path, fixture: str) -> None:
+    config = write_rule(tmp_path / "source")
+    config.with_suffix(".py").write_text(fixture)
+    destination = tmp_path / "accepted"
+
+    report = import_rules(config.parent, destination, NativeRunner(), load=yaml_documents)
+
+    assert not report.passed
+    assert report.checks[0].passed
+    assert not destination.exists()
+
+
+def test_import_uses_only_the_snapshot_even_when_source_changes_during_native_checks(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    write_rule(source / "nested")
+    (source / "LICENSE").write_bytes(b"Original license\n")
+    destination = tmp_path / "accepted"
+    original = {
+        path.relative_to(source): path.read_bytes() for path in source.rglob("*") if path.is_file()
+    }
+
+    class ChangingSource(NativeRunner):
+        def run(self, argv: Sequence[str], **kwargs: Any) -> ProcessResult:
+            if argv[1] == "validate":
+                shutil.rmtree(source)
+                source.mkdir()
+                (source / "replacement.yaml").write_text("rules: invalid\n")
+                (source / "LICENSE").write_bytes(b"Changed license\n")
+            return super().run(argv, **kwargs)
+
+    report = import_rules(source, destination, ChangingSource(), load=yaml_documents)
+
+    assert report.passed
+    assert {
+        path.relative_to(destination): path.read_bytes()
+        for path in destination.rglob("*")
+        if path.is_file()
+    } == original
+
+
+@pytest.mark.parametrize("kind", ["directory", "file", "broken-link"])
+def test_import_never_overwrites_an_existing_destination(tmp_path: Path, kind: str) -> None:
+    config = write_rule(tmp_path / "source")
+    destination = tmp_path / "accepted"
+    if kind == "directory":
+        destination.mkdir()
+        (destination / "keep").write_bytes(b"Existing pack\n")
+    elif kind == "file":
+        destination.write_bytes(b"Existing file\n")
+    else:
+        destination.symlink_to(tmp_path / "absent")
+    runner = NativeRunner()
+
+    with pytest.raises(ValidationError, match="destination already exists"):
+        import_rules(config.parent, destination, runner, load=yaml_documents)
+
+    assert not runner.calls
+    if kind == "directory":
+        assert (destination / "keep").read_bytes() == b"Existing pack\n"
+    elif kind == "file":
+        assert destination.read_bytes() == b"Existing file\n"
+    else:
+        assert destination.is_symlink()
+        assert not (tmp_path / "absent").exists()
+
+
+def test_import_loses_a_destination_creation_race_without_touching_the_winner(
+    tmp_path: Path,
+) -> None:
+    config = write_rule(tmp_path / "source")
+    destination = tmp_path / "accepted"
+
+    class RacingDestination(NativeRunner):
+        def run(self, argv: Sequence[str], **kwargs: Any) -> ProcessResult:
+            if argv[1] == "test":
+                destination.mkdir()
+                (destination / "keep").write_bytes(b"Race winner\n")
+            return super().run(argv, **kwargs)
+
+    runner = RacingDestination()
+    with pytest.raises(ValidationError, match="cannot import rule pack"):
+        import_rules(config.parent, destination, runner, load=yaml_documents)
+
+    assert [call[1] for call in runner.calls] == ["validate", "test"]
+    assert list(destination.iterdir()) == [destination / "keep"]
+    assert (destination / "keep").read_bytes() == b"Race winner\n"
+    assert not list(tmp_path.glob(".opengrep-import-*"))
+
+
+@pytest.mark.parametrize("destination_kind", ["same", "child", "ancestor"])
+def test_import_rejects_overlapping_paths(tmp_path: Path, destination_kind: str) -> None:
+    source = tmp_path / "source"
+    write_rule(source)
+    destination = {
+        "same": source,
+        "child": source / "accepted",
+        "ancestor": tmp_path,
+    }[destination_kind]
+    runner = NativeRunner()
+
+    with pytest.raises(ValidationError):
+        import_rules(source, destination, runner, load=yaml_documents)
+
+    assert not runner.calls
+    assert (source / "rules.yaml").is_file()
+    assert not (source / "accepted").exists()
+
+
+@pytest.mark.parametrize("kind", ["file-link", "directory-link", "broken-link", "fifo"])
+def test_import_rejects_links_and_special_inputs_without_following_them(
+    tmp_path: Path, kind: str
+) -> None:
+    source = tmp_path / "source"
+    write_rule(source)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "private").write_bytes(b"Do not copy\n")
+    unsafe = source / "unsafe"
+    if kind == "file-link":
+        unsafe.symlink_to(outside / "private")
+    elif kind == "directory-link":
+        unsafe.symlink_to(outside, target_is_directory=True)
+    elif kind == "broken-link":
+        unsafe.symlink_to(outside / "missing")
+    else:
+        os.mkfifo(unsafe)
+    runner = NativeRunner()
+    destination = tmp_path / "accepted"
+
+    with pytest.raises(ValidationError, match="link or special file"):
+        import_rules(source, destination, runner, load=yaml_documents)
+
+    assert not runner.calls
+    assert not destination.exists()
+    assert (outside / "private").read_bytes() == b"Do not copy\n"
+    assert not list(tmp_path.glob(".opengrep-import-*"))
+
+
+@pytest.mark.parametrize("kind", ["missing", "file", "directory-link", "missing-parent"])
+def test_import_reports_invalid_paths_as_typed_errors(tmp_path: Path, kind: str) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "accepted"
+    if kind == "file":
+        source.write_text("not a directory\n")
+    elif kind == "directory-link":
+        actual = tmp_path / "actual"
+        write_rule(actual)
+        source.symlink_to(actual, target_is_directory=True)
+    elif kind == "missing-parent":
+        write_rule(source)
+        destination = tmp_path / "missing" / "accepted"
+
+    with pytest.raises(ValidationError, match="cannot import rule pack"):
+        import_rules(source, destination, NativeRunner(), load=yaml_documents)
+
+    assert not destination.exists()
+
+
+def test_import_cleans_only_its_own_publication_files_after_an_io_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    write_rule(source)
+    destination = tmp_path / "accepted"
+    link = os.link
+    published = 0
+
+    def fail_second_link(original: Path, target: str, **kwargs: Any) -> None:
+        nonlocal published
+        if published:
+            (destination / "unrelated").write_bytes(b"Another writer\n")
+            raise OSError("disk failure")
+        link(original, target, **kwargs)
+        published += 1
+
+    monkeypatch.setattr(os, "link", fail_second_link)
+
+    with pytest.raises(ValidationError, match="cannot import rule pack"):
+        import_rules(source, destination, NativeRunner(), load=yaml_documents)
+
+    assert list(destination.iterdir()) == [destination / "unrelated"]
+    assert (destination / "unrelated").read_bytes() == b"Another writer\n"
+    assert (source / "rules.yaml").is_file()
+    assert not list(tmp_path.glob(".opengrep-import-*"))
+
+
+@pytest.mark.skipif(not shutil.which("opengrep"), reason="real Opengrep integration")
+def test_real_native_import_produces_a_pack_usable_by_the_runtime_gate(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    write_rule(source / "nested", name="policy.skeleton")
+    destination = tmp_path / "accepted"
+    runner = ProcessRunner(("opengrep",))
+
+    report = import_rules(source, destination, runner, load=yaml_documents)
+
+    assert report.passed
+    with checked_rules([destination], runner, load=yaml_documents) as checked:
+        assert checked.report.passed

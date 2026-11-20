@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import shutil
+import stat
 import sys
 import tempfile
 from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -94,7 +97,7 @@ def _read_text(source: Path, boundary: Path) -> str:
     if not source.resolve().is_relative_to(boundary.resolve()):
         raise ValidationError(f"rule fixture leaves its source directory: {source}")
     try:
-        text = source.read_text(encoding="utf-8")
+        text = source.read_bytes().decode("utf-8")
     except (OSError, UnicodeError) as error:
         raise ValidationError(f"cannot read rule input {source.name}") from error
     return text
@@ -144,7 +147,7 @@ def _snapshot(
             if not authored and path != source:
                 continue
             destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_text(text, encoding="utf-8")
+            destination.write_bytes(text.encode("utf-8"))
             configs.append(destination)
             if len(documents) != 1 or not authored or not isinstance(authored[0]["rules"], list):
                 problems.append(f"{path.name} must contain one rule document")
@@ -163,7 +166,7 @@ def _snapshot(
                 if _fixture(fixture, path):
                     staged = destination.with_name("rule" + fixture.name[len(path.stem) :])
                     fixtures[staged.resolve()] = _read_text(fixture, boundary)
-                    staged.write_text(fixtures[staged.resolve()], encoding="utf-8")
+                    staged.write_bytes(fixtures[staged.resolve()].encode("utf-8"))
     if examples is not None:
         if len(configs) != 1:
             raise ValidationError("proposal examples require exactly one rule file")
@@ -309,3 +312,109 @@ def checked_rules(
             digest=digest.hexdigest(),
             report=RuleQualityReport(rules=rules, checks=(validation, testing)),
         )
+
+
+def _copy_pack(source: int, destination: Path) -> None:
+    for name in os.listdir(source):
+        mode = os.stat(name, dir_fd=source, follow_symlinks=False).st_mode
+        target = destination / name
+        if stat.S_ISDIR(mode):
+            descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=source)
+            try:
+                target.mkdir()
+                _copy_pack(descriptor, target)
+            finally:
+                os.close(descriptor)
+        elif stat.S_ISREG(mode):
+            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=source)
+            with os.fdopen(descriptor, "rb") as original:
+                metadata = os.fstat(original.fileno())
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ValidationError(f"rule pack input is not a regular file: {name}")
+                with target.open("xb") as copied:
+                    shutil.copyfileobj(original, copied)
+                    os.fchmod(copied.fileno(), stat.S_IMODE(metadata.st_mode) & 0o777)
+        else:
+            raise ValidationError(f"rule pack input is a link or special file: {name}")
+
+
+def _publish_pack(snapshot: Path, destination: Path) -> None:
+    owned: list[tuple[int, str, os.stat_result]] = []
+    with ExitStack() as descriptors:
+        parent = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        descriptors.callback(os.close, parent)
+
+        def publish(source: Path, name: str, parent: int) -> None:
+            os.mkdir(name, dir_fd=parent)
+            metadata = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise ValidationError("rule pack destination changed during import")
+            owned.append((parent, name, metadata))
+            directory = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            descriptors.callback(os.close, directory)
+            if not os.path.samestat(metadata, os.fstat(directory)):
+                raise ValidationError("rule pack destination changed during import")
+            for entry in sorted(source.iterdir()):
+                if entry.is_dir():
+                    publish(entry, entry.name, directory)
+                else:
+                    os.link(entry, entry.name, dst_dir_fd=directory, follow_symlinks=False)
+                    owned.append((directory, entry.name, entry.stat(follow_symlinks=False)))
+
+        try:
+            publish(snapshot, destination.name, parent)
+            if not os.path.samestat(owned[0][2], destination.stat(follow_symlinks=False)):
+                raise ValidationError("rule pack destination changed during import")
+        except BaseException:
+            for directory, name, original in reversed(owned):
+                try:
+                    current = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if os.path.samestat(current, original):
+                    if stat.S_ISDIR(current.st_mode):
+                        os.rmdir(name, dir_fd=directory)
+                    else:
+                        os.unlink(name, dir_fd=directory)
+            raise
+
+
+def import_rules(
+    source: Path,
+    destination: Path,
+    runner: ProcessRunner,
+    *,
+    load: YamlLoader,
+    binary: str = "opengrep",
+    timeout: int = 300,
+) -> RuleQualityReport:
+    """Admit a whole local pack only after native checks pass on private, stable bytes."""
+    try:
+        source = source.expanduser()
+        destination = destination.expanduser()
+        destination = destination.parent.resolve(strict=True) / destination.name
+        if destination.exists() or destination.is_symlink():
+            raise ValidationError(f"rule pack destination already exists: {destination}")
+        boundary = source.resolve(strict=True)
+        if destination.is_relative_to(boundary) or boundary.is_relative_to(destination):
+            raise ValidationError("rule pack source and destination must not overlap")
+        descriptor = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix=".opengrep-import-", dir=destination.parent
+            ) as temporary:
+                snapshot = Path(temporary) / "pack"
+                snapshot.mkdir()
+                _copy_pack(descriptor, snapshot)
+                with checked_rules(
+                    [snapshot], runner, load=load, binary=binary, timeout=timeout
+                ) as checked:
+                    if checked.report.passed:
+                        _publish_pack(snapshot, destination)
+                    return checked.report
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        raise ValidationError(
+            f"cannot import rule pack from {source} into {destination}"
+        ) from error

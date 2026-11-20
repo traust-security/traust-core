@@ -102,6 +102,65 @@ def pack(tmp_path: Path) -> Path:
     return root
 
 
+def test_rule_import_runs_native_checks_without_a_store_or_enabling_the_pack(
+    tmp_path: Path, bindir: Path
+) -> None:
+    source = pack(tmp_path)
+    destination = tmp_path / "imported"
+    calls = tmp_path / "native-calls.jsonl"
+    fake(
+        bindir,
+        "custom-opengrep",
+        "from pathlib import Path\n"
+        f"assert not Path({str(destination)!r}).exists()\n"
+        f"with Path({str(calls)!r}).open('a') as log:\n"
+        "    log.write(json.dumps(args) + '\\n')\n" + OPENGREP,
+    )
+    ctx = context(tmp_path)
+    baseline = tmp_path / "baseline"
+    baseline.mkdir()
+    ctx.register_rule_pack(baseline)
+
+    report = reports.import_opengrep_rules(
+        ctx, source, destination, binary="custom-opengrep", timeout=20
+    )
+
+    assert report.passed
+    assert report.rules == ("weak-hash",)
+    assert (destination / "go" / "weak-hash.yaml").read_bytes() == (
+        source / "go" / "weak-hash.yaml"
+    ).read_bytes()
+    invocations = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert [args[0] for args in invocations] == ["validate", "test"]
+    assert invocations[1][:3] == ["test", "--json", "--strict"]
+    assert ctx.rule_pack == baseline
+    assert not ctx.rule_pack_supplements
+    assert not (tmp_path / "store" / "traust.db").exists()
+
+
+@pytest.mark.parametrize("phase", ["validate", "test"])
+def test_rule_import_refuses_native_failure_before_creating_accepted_rules(
+    tmp_path: Path, bindir: Path, phase: str
+) -> None:
+    fake(bindir, "opengrep", f"if args[0] == {phase!r}: sys.exit(2)\n" + OPENGREP)
+    destination = tmp_path / "imported"
+
+    report = reports.import_opengrep_rules(context(tmp_path), pack(tmp_path), destination)
+
+    assert not report.passed
+    assert not destination.exists()
+    assert not (tmp_path / "store" / "traust.db").exists()
+
+
+def test_rule_import_reports_path_errors_without_accepting_rules(tmp_path: Path) -> None:
+    destination = tmp_path / "imported"
+
+    with pytest.raises(ValidationError, match="cannot import rule pack"):
+        reports.import_opengrep_rules(context(tmp_path), tmp_path / "missing", destination)
+
+    assert not destination.exists()
+
+
 def test_opengrep_reports_the_facts_on_the_registered_pack_with_the_binary_given(
     tmp_path: Path, bindir: Path
 ) -> None:

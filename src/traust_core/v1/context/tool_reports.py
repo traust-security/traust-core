@@ -33,7 +33,7 @@ from traust_core.v1.providers.tools import (
 )
 from traust_core.v1.providers.tools.elf import ElfAnalyzer
 from traust_core.v1.providers.tools.gitleaks import Gitleaks, parse_report
-from traust_core.v1.providers.tools.opengrep_quality import checked_rules
+from traust_core.v1.providers.tools.opengrep_quality import checked_rules, import_rules
 from traust_core.v1.providers.tools.toolchain import (
     POPULATABLE_TOOLS,
     ToolCheck,
@@ -74,6 +74,21 @@ def opengrep_quality_report(
         rules, runner, load=yaml_documents, binary=binary, timeout=timeout
     ) as checked:
         return checked.report
+
+
+def import_opengrep_rules(
+    ctx: Context,
+    source: Path,
+    destination: Path,
+    *,
+    timeout: int = 300,
+    binary: str = "opengrep",
+) -> RuleQualityReport:
+    """Import a local pack only after native validation and strict fixture tests pass."""
+    runner = _runner(ctx, ("opengrep", binary), max(timeout, opengrep.SCAN_TIMEOUT))
+    return import_rules(
+        source, destination, runner, load=yaml_documents, binary=binary, timeout=timeout
+    )
 
 
 def opengrep_report(
