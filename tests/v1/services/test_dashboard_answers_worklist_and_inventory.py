@@ -4,15 +4,19 @@ repository's findings by state with its open findings by severity (formerly GET
 /v1/findings/summaries). The oracle is the seeded table below, each finding's state and
 severity stated by the agreed fact definitions, never derived from the code under test.
 
+The state follows the workflow (identified -> verify -> remediate | accept risk | false
+positive) and the contracts: kind alone never decides, so an unjudged weakness is
+identified (open) and a verified one is hardening. Severity follows the most recent report.
 Deliberate departures from the removed endpoints (their vocabulary was assembled, not
-agreed): `not_affected` is false_positive, not open; an undecided weakness is hardening;
-"closed" is the caller's `state in [resolved, accepted]`; a never-reported finding counts."""
+agreed): `not_affected` is false_positive, not open; "closed" is the caller's
+`state in [resolved, accepted]`; a never-reported finding counts."""
 
 from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from uuid import UUID
 
@@ -35,6 +39,7 @@ class Case:
     state: str  # expected, by the agreed definitions
     effective: str | None  # expected severity fact
     kind: str | None = None
+    later: str | None = None  # a newer report's band, after the decision
 
 
 CASES = (
@@ -68,7 +73,25 @@ CASES = (
     Case("svc", "false positive", "low", {"validity": "false_positive"}, "false_positive", "low"),
     Case("svc", "not affected", "high", {"validity": "not_affected"}, "false_positive", "high"),
     Case("svc", "hardening debt", "low", {"validity": "hardening"}, "hardening", "low"),
-    Case("svc", "undecided weakness", "medium", None, "hardening", "medium", kind="weakness"),
+    Case("svc", "undecided weakness", "medium", None, "open", "medium", kind="weakness"),
+    Case(
+        "svc",
+        "verified weakness",
+        "low",
+        {"validity": "true_positive"},
+        "hardening",
+        "low",
+        kind="weakness",
+    ),
+    Case(
+        "svc",
+        "re-reported after a decision",
+        "medium",
+        {"validity": "confirmed"},
+        "open",
+        "critical",
+        later="critical",
+    ),
     Case("svc", "unrated", "unrated", None, "open", None),
     Case("svc", "never reported", None, None, "open", None),
     Case("lib", "lib critical", "critical", None, "open", "critical"),
@@ -91,8 +114,11 @@ def _seed(engine: Engine) -> dict[str, UUID]:
             name: s.repository(url=f"https://github.com/example-org/{name}")
             for name in ("svc", "lib", "outside")
         }
-        audits = {
-            name: s.assessment(s.repository_ref(r), occurred_at=T0) for name, r in repos.items()
+        refs = {name: s.repository_ref(r) for name, r in repos.items()}
+        audits = {name: s.assessment(ref, occurred_at=T0) for name, ref in refs.items()}
+        later = {
+            name: s.assessment(ref, occurred_at=T0 + timedelta(days=1))
+            for name, ref in refs.items()
         }
         for case in CASES:
             finding = s.finding(repos[case.repo], title=case.title, kind=case.kind)
@@ -100,6 +126,8 @@ def _seed(engine: Engine) -> dict[str, UUID]:
                 s.occurrence(finding, audits[case.repo], severity=case.severity)
             if case.decision is not None:
                 s.decision(finding, actor=HUMAN, **case.decision)
+            if case.later is not None:
+                s.occurrence(finding, later[case.repo], severity=case.later)
         uow.commit()
         return {name: r.id for name, r in repos.items()}
 

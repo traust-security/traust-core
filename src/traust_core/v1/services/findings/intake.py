@@ -37,8 +37,10 @@ from traust_core.v1.models.vocabulary import (
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectStore
 from traust_core.v1.services.artifact_publishing import AssessmentLog
+from traust_core.v1.services.findings import state_history
 from traust_core.v1.services.findings.claims import approved_claims_for, retained_claim_artifact
 from traust_core.v1.services.findings.identity import IdentityPolicy
+from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
 from traust_core.v1.services.findings.review import request
 from traust_core.v1.services.findings.taxonomy import TaxonomyPolicy
 from traust_core.v1.services.portfolio import Inventory
@@ -61,8 +63,10 @@ class FindingIntake:
         taxonomy: TaxonomyPolicy,
         *,
         objects: ObjectStore | None = None,
+        rating: RatingPolicy | None = None,
     ) -> None:
         self._uow = uow
+        self._rating = rating or RatingPolicy(RatingConfig())
         self._inventory = Inventory(uow)
         self._log = AssessmentLog(uow)
         self._identity = identity
@@ -423,6 +427,7 @@ class FindingIntake:
                     rule=candidate.rule,
                 )
             )
+            state_history.restamp(uow, self._rating, finding.id)
             assert occurrence.id is not None
             pending[occurrence.id] = {}
         else:

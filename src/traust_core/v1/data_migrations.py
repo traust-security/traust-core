@@ -94,8 +94,31 @@ def _state_projection_backfill(engine: Engine) -> None:
     )
 
 
+def _finding_current_backfill(engine: Engine) -> None:
+    """Stamp every finding's current answer (state, effective severity, decided) from the
+    fold: the findings written before core stamped them. Replay is safe (a restamp)."""
+    from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+    from traust_core.v1.services.findings import state_history
+    from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
+
+    uow = SqlTraustUnitOfWork(engine)
+    rating = RatingPolicy(RatingConfig())
+    with uow.write() as u:
+        repository_ids = [
+            row[0] for row in uow.connection.execute(sa.text("SELECT id FROM repository"))
+        ]
+        stamped = state_history.restamp_all(u, rating, repository_ids)
+        u.commit()
+    log.info(
+        "data channel: finding current answer stamped=%d",
+        stamped,
+        extra={"operation": "data.apply", "outcome": "stamped", "count": stamped},
+    )
+
+
 ENTRIES: tuple[DataMigration, ...] = (
     DataMigration("0001_state_projection_backfill", _state_projection_backfill),
+    DataMigration("0002_finding_current_backfill", _finding_current_backfill),
 )
 
 

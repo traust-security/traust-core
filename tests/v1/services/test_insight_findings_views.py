@@ -462,7 +462,7 @@ def _both_roads(context: Context) -> tuple[FindingsRollup, FindingsRollup]:
 
 def _seed_every_counted_shape(engine: Engine) -> None:
     """Findings across every shape the tallies count: each state, unjudged and unrated,
-    weakness-kind hardening, scored and unscored, labelled and unlabelled, two
+    an unjudged weakness (identified: open), scored and unscored, labelled and unlabelled, two
     repositories."""
     with SqlTraustUnitOfWork(engine) as uow:
         s = Seed(uow)
@@ -521,8 +521,8 @@ def test_the_projected_road_tallies_the_same_as_the_fold(context: Context, engin
     projected, folded = _both_roads(context)
     assert projected == folded
     # the parity is over a real rollup, not two empty ones
-    assert projected.total.open.total == 14
-    assert projected.total.resolved + projected.total.hardening == 4
+    assert projected.total.open.total == 15  # the unjudged weakness is identified, so open
+    assert projected.total.resolved + projected.total.hardening == 3
     assert len(projected.top) == 6  # the open criticals and highs
     assert {c.key for c in projected.categories} == {
         "authorization",

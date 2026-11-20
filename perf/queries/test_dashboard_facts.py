@@ -1,6 +1,6 @@
 """The dashboard facts, one statement per card: the probe the dashboard service's
-budget rests on. Every fact is the finding's current answer, kept by the contracts'
-triggers at write; a finding with no decision is open by rule."""
+budget rests on. Every fact is the finding's current answer, stamped by core's write
+doors from the fold and read as stored."""
 
 from __future__ import annotations
 
@@ -20,8 +20,7 @@ FACTS = sa.text(
     """
     WITH facts AS (
       SELECT f.id, f.repository_id,
-        coalesce(f.current_state,
-          CASE WHEN f.kind = 'weakness' THEN 'hardening' ELSE 'open' END) AS state,
+        f.current_state AS state,
         f.current_severity AS severity,
         f.category
       FROM traust.finding f)

@@ -286,7 +286,13 @@ class Seed:
     def occurrence(
         self, finding: Finding | None = None, assessment: Assessment | None = None, **kw: Any
     ) -> Occurrence:
-        return self._add("occurrence", self.new_occurrence(finding, assessment, **kw))
+        # a write door, like intake: the finding's current answer follows its newest report
+        from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
+        from traust_core.v1.services.findings.state_history import restamp
+
+        occurrence = self._add("occurrence", self.new_occurrence(finding, assessment, **kw))
+        restamp(self.uow, RatingPolicy(RatingConfig()), occurrence.finding_id)
+        return occurrence
 
     def new_location(self, occurrence: Occurrence | None = None, **kw: Any) -> Location:
         values = {

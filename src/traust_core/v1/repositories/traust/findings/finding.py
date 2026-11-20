@@ -72,10 +72,36 @@ class FindingRepository(MutableRecordRepository[Finding], Protocol):
         """Every advisory some finding names, once each."""
         ...
 
+    def stamp_current(
+        self, finding_id: UUID, state: str, severity: str | None, decided: bool
+    ) -> None:
+        """Write the finding's current answer (the fold's state, effective severity and
+        decided) onto its row: what dashboards read, one indexed row per finding."""
+        ...
+
 
 class SqlFindingRepository(SqlMutableRepository[Finding]):
     spec = FINDING
     record = Finding
+
+    def stamp_current(
+        self, finding_id: UUID, state: str, severity: str | None, decided: bool
+    ) -> None:
+        # the projection columns stay off the Finding model: a table clause of just them
+        current = sa.table(
+            self.table.name,
+            sa.column("id", self.table.c.id.type),
+            sa.column("current_state", sa.Text),
+            sa.column("current_severity", sa.Text),
+            sa.column("current_decided", sa.Boolean),
+            schema=self.table.schema,
+        )
+        stmt = (
+            sa.update(current)
+            .where(current.c.id == finding_id)
+            .values(current_state=state, current_severity=severity, current_decided=decided)
+        )
+        self._execute(f"stamp finding {finding_id}", stmt)
 
     def update(self, record: Finding) -> Finding:
         record = self._to_record(record)

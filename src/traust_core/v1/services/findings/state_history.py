@@ -36,6 +36,11 @@ class Folded:
     proven: bool
     unverified: bool
 
+    def onto_finding(self, uow: TraustUnitOfWork, finding_id: UUID) -> None:
+        """The finding's current answer: what dashboards read, stamped from this fold."""
+        severity = self.severity.value if self.severity is not None else None
+        uow.findings.stamp_current(finding_id, self.state, severity, self.decided)
+
     def onto(self, draft: Decision) -> Decision:
         return draft.model_copy(
             update={
@@ -101,10 +106,37 @@ def stamp(
     *,
     history: Sequence[Decision] | None = None,
 ) -> Decision:
-    """The single owner of the stored state: the draft carrying its fold result."""
+    """The single owner of the stored state: the draft carrying its fold result, and the
+    finding's current answer stamped from the same fold (one transaction: a refused insert
+    rolls both back)."""
     history = uow.decisions.list_for_finding(draft.finding_id) if history is None else history
     finding = uow.findings.get(draft.finding_id)
-    return fold(uow, rating, draft.finding_id, finding.kind, [*history, draft]).onto(draft)
+    folded = fold(uow, rating, draft.finding_id, finding.kind, [*history, draft])
+    folded.onto_finding(uow, draft.finding_id)
+    return folded.onto(draft)
+
+
+def restamp(uow: TraustUnitOfWork, rating: RatingPolicy, finding_id: UUID) -> None:
+    """Refold one finding and stamp its current answer: after an occurrence, so the
+    effective severity follows the most recent report (Q8) under the standing judgment."""
+    finding = uow.findings.get(finding_id)
+    decisions = uow.decisions.list_for_finding(finding_id)
+    fold(uow, rating, finding_id, finding.kind, decisions).onto_finding(uow, finding_id)
+
+
+def restamp_all(
+    uow: TraustUnitOfWork, rating: RatingPolicy, repository_ids: Collection[UUID]
+) -> int:
+    """Stamp every finding's current answer from the fold, decided or not: the one-time
+    upgrade path for stores whose findings predate the stamp. Returns how many."""
+    stamped = 0
+    for finding_id, _repository_id, kind, _title, _created in uow.findings.census_for_repositories(
+        repository_ids
+    ):
+        decisions = uow.decisions.list_for_finding(finding_id)
+        fold(uow, rating, finding_id, kind, decisions).onto_finding(uow, finding_id)
+        stamped += 1
+    return stamped
 
 
 @dataclass(frozen=True, slots=True)

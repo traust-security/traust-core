@@ -30,8 +30,6 @@ from traust_core.v1.models.operations import (
 )
 from traust_core.v1.models.vocabulary import (
     DecisionReason,
-    FindingKind,
-    ScannerSeverity,
     Severity,
 )
 from traust_core.v1.repositories import traust_ledger, traust_ops
@@ -359,55 +357,54 @@ class CensusReads(SqlRepository):
         f = self._findings
         found: list[tuple[UUID, str, str | None, bool, bool, bool, str | None, int]] = []
         for batch in batches(repository_ids):
-            latest, label, occ = (
-                self._stamped_latest(batch),
-                self._first_labels(batch),
-                self._latest_occurrences(batch),
-            )
-            state = sa.func.coalesce(
-                latest.c.folded_state,
-                sa.case(
-                    (f.c.kind == FindingKind.WEAKNESS, FindingState.HARDENING),
-                    else_=FindingState.OPEN,
-                ),
-            )
-            severity = sa.func.coalesce(
-                latest.c.folded_severity, sa.func.nullif(occ.c.severity, ScannerSeverity.UNRATED)
-            )
+            latest, label = self._stamped_latest(batch), self._first_labels(batch)
+            cur = self._current()
+            state, severity = cur.c.current_state, cur.c.current_severity
             stmt = (
                 sa.select(
                     f.c.repository_id,
                     state,
                     severity,
-                    sa.func.coalesce(latest.c.folded_decided, sa.false()),
+                    cur.c.current_decided,
                     sa.func.coalesce(latest.c.folded_proven, sa.false()),
                     sa.func.coalesce(latest.c.folded_unverified, sa.true()),
                     label.c.label,
                     sa.func.count(),
                 )
                 .select_from(f)
+                .join(cur, cur.c.id == f.c.id)
                 .outerjoin(latest, latest.c.finding_id == f.c.id)
                 .outerjoin(label, label.c.finding_id == f.c.id)
-                .outerjoin(occ, occ.c.finding_id == f.c.id)
                 .where(
                     f.c.repository_id.in_([*batch]),
                     f.c.id.not_in(self._claimed_findings()),
                 )
                 .group_by(
                     f.c.repository_id,
-                    latest.c.folded_state,
-                    latest.c.folded_severity,
-                    latest.c.folded_decided,
+                    cur.c.current_state,
+                    cur.c.current_severity,
+                    cur.c.current_decided,
                     latest.c.folded_proven,
                     latest.c.folded_unverified,
-                    f.c.kind,
-                    occ.c.severity,
                     label.c.label,
                 )
             )
             rows = self._execute(f"current tallies of {len(batch)} repositories", stmt)
             found.extend(tuple(row) for row in rows)
         return found
+
+    def _current(self) -> sa.Alias:
+        """The finding's current answer, stamped by core's write doors from the fold: a table
+        clause of just the projection columns, joined by id (they stay off the model)."""
+        f = self._findings
+        return sa.table(
+            f.name,
+            sa.column("id", f.c.id.type),
+            sa.column("current_state", sa.Text),
+            sa.column("current_severity", sa.Text),
+            sa.column("current_decided", sa.Boolean),
+            schema=f.schema,
+        ).alias("cur")
 
     def current_claimed_rows(
         self, repository_ids: Collection[UUID]
@@ -455,6 +452,7 @@ class CensusReads(SqlRepository):
                 self._first_labels(batch),
                 self._latest_occurrences(batch),
             )
+            cur = self._current()
             stmt = (
                 sa.select(
                     f.c.id,
@@ -462,24 +460,16 @@ class CensusReads(SqlRepository):
                     f.c.title,
                     f.c.created_at,
                     label.c.label,
-                    sa.func.coalesce(
-                        latest.c.folded_state,
-                        sa.case(
-                            (f.c.kind == FindingKind.WEAKNESS, FindingState.HARDENING),
-                            else_=FindingState.OPEN,
-                        ),
-                    ),
-                    sa.func.coalesce(
-                        latest.c.folded_severity,
-                        sa.func.nullif(occ.c.severity, ScannerSeverity.UNRATED),
-                    ),
-                    sa.func.coalesce(latest.c.folded_decided, sa.false()),
+                    cur.c.current_state,
+                    cur.c.current_severity,
+                    cur.c.current_decided,
                     sa.func.coalesce(latest.c.folded_proven, sa.false()),
                     sa.func.coalesce(latest.c.folded_unverified, sa.true()),
                     occ.c.cvss_score,
                     occ.c.first,
                 )
                 .select_from(f)
+                .join(cur, cur.c.id == f.c.id)
                 .outerjoin(latest, latest.c.finding_id == f.c.id)
                 .outerjoin(label, label.c.finding_id == f.c.id)
                 .outerjoin(occ, occ.c.finding_id == f.c.id)
@@ -533,16 +523,8 @@ class CensusReads(SqlRepository):
                 self._first_labels(batch),
                 self._latest_occurrences(batch),
             )
-            state = sa.func.coalesce(
-                latest.c.folded_state,
-                sa.case(
-                    (f.c.kind == FindingKind.WEAKNESS, FindingState.HARDENING),
-                    else_=FindingState.OPEN,
-                ),
-            )
-            severity = sa.func.coalesce(
-                latest.c.folded_severity, sa.func.nullif(occ.c.severity, ScannerSeverity.UNRATED)
-            )
+            cur = self._current()
+            state, severity = cur.c.current_state, cur.c.current_severity
             stmt = (
                 sa.select(
                     f.c.id,
@@ -556,6 +538,7 @@ class CensusReads(SqlRepository):
                     occ.c.first,
                 )
                 .select_from(f)
+                .join(cur, cur.c.id == f.c.id)
                 .outerjoin(latest, latest.c.finding_id == f.c.id)
                 .outerjoin(label, label.c.finding_id == f.c.id)
                 .outerjoin(occ, occ.c.finding_id == f.c.id)

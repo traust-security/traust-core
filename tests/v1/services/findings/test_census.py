@@ -82,7 +82,8 @@ def test_the_census_rows_are_the_views_counted_facts(engine: Engine) -> None:
     assert rows[top.id].sla_due is not None  # the top cut carries its SLA
     assert rows[open_high.id].sla_due == views[open_high.id].sla_due  # the view's own clock
     assert rows[hardening.id].state == "hardening" and rows[hardening.id].category == "xss"
-    assert rows[weakness.id].state == "hardening" and rows[weakness.id].category == "xss"
+    # kind alone never decides: an unjudged weakness is identified, so open
+    assert rows[weakness.id].state == "open" and rows[weakness.id].category == "xss"
     assert rows[refuted.id].state == "false_positive" and rows[refuted.id].decided
     assert rows[resolved.id].state == "resolved" and rows[resolved.id].decided
     assert rows[accepted.id].state == "accepted"
