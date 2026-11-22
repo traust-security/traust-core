@@ -66,7 +66,7 @@ jobs:
         run: make perf-api-baseline
       - name: Open a baseline refresh PR
         if: ${{ inputs.update_baseline }}
-        uses: peter-evans/create-pull-request@c5a7806660adbe173f04e3e038b0ccdcd758773c # v6
+        uses: peter-evans/create-pull-request@3ffccacd46053766916f087ce41d627c0b8cf2d1 # v8
         with:
           branch: perf/api-baseline-refresh
           title: "perf(api): refresh the k6 baseline from CI"
