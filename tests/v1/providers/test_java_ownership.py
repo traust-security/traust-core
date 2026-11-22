@@ -532,7 +532,7 @@ def probe(tmp_path_factory: pytest.TempPathFactory) -> dict:
             "GET",
             "/p/finder/{id}",
             "scoped",
-        ),  # a load handed a caller value: trusted (owner decision)
+        ),  # a load handed a caller value: trusted
         ("GET", "/p/finder-request/{id}", "caller-blind"),  # handed request data, not the caller
     ],
 )
@@ -544,8 +544,7 @@ def test_protection_that_doesnt_hold_stays_judged(
     assert row["judgement_required"] is (ownership in ("caller-blind", "unchecked"))
 
 
-# A second independent review: shapes credited without protection, each beside a correct twin
-# that the allow-list (owner decision 2026-10-31) still credits.
+# Shapes without protection, each beside a correct twin that the allow-list credits.
 REVIEW = (
     "package review;\n"
     "import org.springframework.web.bind.annotation.*;\n"
@@ -768,8 +767,7 @@ def test_under_a_deploy_time_chain_only_the_routes_own_rules_decide(tmp_path) ->
     assert _row(result, "GET", "/open/{id}")["ownership"] == "n/a"
 
 
-# A third independent review: protection credited where a caller can still reach another user's
-# object, and the fifth allowed shape (owner decision 2026-11-02) beside its twins.
+# Protection that still lets a caller reach another user's object, and the fifth allowed shape.
 AUDIT = (
     "package audit;\n"
     "import org.springframework.web.bind.annotation.*;\n"

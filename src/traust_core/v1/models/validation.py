@@ -28,8 +28,7 @@ from traust_core.v1.models.vocabulary import (
 )
 
 # Control-plane namespaces/resources are a deny-floor, not a grant: only explicit
-# engagement grants unlock them (legacy assessments 2026-07-31 F2/F4; "openshift-*"
-# replaced a literal list that missed openshift-config/-ingress/-monitoring).
+# engagement grants unlock them. `openshift-*` covers control-plane namespaces.
 # Stays in core on purpose — moving a deny-list out weakens it.
 _CONTROL_PLANE_NAMESPACES = (
     "kube-system",

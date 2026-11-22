@@ -40,8 +40,7 @@ QUERY_SC = r"""
     // c2cpg emits "<unresolvedNamespace>.ConsumeFieldMessage:<unresolvedSig>"
     // for C++ member calls and never qualifies with "::", so comparing the
     // whole string made every C++ member query fail by construction, while
-    // still matching plain C where the name IS the whole prefix. Measured
-    // 2026-08-14 on protobuf text_format.cc: 3325 calls, 0 matches.
+    // still matching plain C where the name IS the whole prefix.
     def calleeName(fn: String): String = {
       val base = fn.split(":").headOption.getOrElse(fn)
       base.split('.').lastOption.getOrElse(base)
