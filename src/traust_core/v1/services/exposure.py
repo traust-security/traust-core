@@ -238,15 +238,15 @@ _RECORDED_STATE = {
     ImpactClassification.AFFECTED: ImpactState.AFFECTED,
     ImpactClassification.LIKELY_AFFECTED: ImpactState.LIKELY_AFFECTED,
     ImpactClassification.NOT_OBSERVED: ImpactState.NOT_OBSERVED,
-    ImpactClassification.VERSION_NOT_IN_RANGE: ImpactState.FIXED,
+    ImpactClassification.VERSION_NOT_IN_RANGE: ImpactState.VERSION_NOT_IN_RANGE,
 }
 _PROVEN = frozenset(
     {
         ImpactState.AFFECTED,
         ImpactState.LIKELY_AFFECTED,
         ImpactState.NOT_OBSERVED,
-        ImpactState.FIXED,
-        ImpactState.NOT_USING,
+        ImpactState.VERSION_NOT_IN_RANGE,
+        ImpactState.NOT_IMPORTED,
         ImpactState.NOT_IN_ECOSYSTEM,
     }
 )
@@ -1567,7 +1567,7 @@ class ExposureService:
             for d in uow.dependencies.list_for_packages_in_sboms(named, sbom_ids):
                 holding[d.sbom_id].append(d)
         # Carriers: what each tracked ref reaches through a base image or an internal library
-        # (the blast-radius walk) is held too — never a silent `not_using`.
+        # (the blast-radius walk) is held too — never a silent `not_imported`.
         carried: defaultdict[UUID, list[Dependency]] = defaultdict(list)
         for dep, ref_id, _ in self._reach(set(named)):
             if ref_id is not None:
@@ -1604,7 +1604,7 @@ class ExposureService:
                     recorded.get(ref.id),
                     unprotected,
                 )
-                if row.state in (ImpactState.FIXED, ImpactState.NOT_USING):
+                if row.state in (ImpactState.VERSION_NOT_IN_RANGE, ImpactState.NOT_IMPORTED):
                     unproven[ref.id] = row  # proven only once its coverage resolves
                 else:
                     rows.append(row)
@@ -1652,7 +1652,7 @@ class ExposureService:
             named_unprotected = ", ".join(sorted(str(e) for e in unprotected))
             caveats.append(
                 f"absence is unproven for {named_unprotected}: no manifest coverage rule "
-                "(a ref using the ecosystem shows undetermined, never not_using)"
+                "(a ref using the ecosystem shows undetermined, never not_imported)"
             )
         gaps = [s for s in counted if s not in _PROVEN]
         return ImpactAnswer(
@@ -1778,7 +1778,7 @@ class ExposureService:
                     + ", ".join(sorted(str(e) for e in unprotected)),
                 )
             else:
-                state, reason = ImpactState.NOT_USING, None
+                state, reason = ImpactState.NOT_IMPORTED, None
         elif True in verdicts:
             # In range: the skill's ceiling — manifest evidence caps at likely_affected, and
             # only a verdict recorded at this exact ref (govulncheck, joern) says more.
@@ -1801,7 +1801,11 @@ class ExposureService:
         elif None in verdicts:
             state, reason = ImpactState.UNDETERMINED, _UNORDERABLE
         else:
-            state, reason, evidence = ImpactState.FIXED, None, DependencyEvidenceLevel.MANIFEST
+            state, reason, evidence = (
+                ImpactState.VERSION_NOT_IN_RANGE,
+                None,
+                DependencyEvidenceLevel.MANIFEST,
+            )
         return RefImpact(
             repository_ref_id=ref.id,
             repository_id=ref.repository_id,

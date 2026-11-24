@@ -260,7 +260,7 @@ _RULES = (
 
 # Ecosystems whose absence a manifest scan can prove: a rule knows the manifests that declare
 # membership and the lockfiles (or pins) that resolve it. Elsewhere syft's silence proves
-# nothing, and the impact read must not assert `not_using` off it.
+# nothing, and the impact read must not assert `not_imported` off it.
 PROTECTED_ECOSYSTEMS = frozenset({rule.ecosystem for rule in _RULES})
 
 

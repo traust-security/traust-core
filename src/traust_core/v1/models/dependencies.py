@@ -878,14 +878,15 @@ class ImpactExport(Model):
 
 
 class ImpactState(StrEnum):
-    """One tracked ref's outcome for an advisory. The first three are proven; every other
-    state is a gap that says why it can't be judged (never read as "not affected")."""
+    """One tracked ref's outcome for an advisory. The judged states reuse the contracts
+    impact-classification values (affected through not_imported) plus not_in_ecosystem; every
+    other state is a gap that says why it can't be judged (never read as "not affected")."""
 
     AFFECTED = "affected"
     LIKELY_AFFECTED = "likely_affected"
     NOT_OBSERVED = "not_observed"
-    FIXED = "fixed"
-    NOT_USING = "not_using"
+    VERSION_NOT_IN_RANGE = "version_not_in_range"
+    NOT_IMPORTED = "not_imported"
     NOT_IN_ECOSYSTEM = "not_in_ecosystem"
     UNDETERMINED = "undetermined"
     UNRESOLVED_MANIFEST = "unresolved_manifest"

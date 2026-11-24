@@ -177,7 +177,7 @@ def test_every_state_over_the_tracked_fleet(engine: Engine, tmp_path: Path) -> N
         affected = default_ref(uow, seed, repository=repo)
         seed.repository_ref(repo, name="dev", sha="b" * 40)  # an attached line, never scanned
         fixed = default_ref(uow, seed)
-        not_using = default_ref(uow, seed)
+        not_imported = default_ref(uow, seed)
         unresolved = default_ref(uow, seed)
         outside = default_ref(uow, seed)
         default_ref(uow, seed)  # never scanned: no SBOM, its line never scanned either
@@ -194,7 +194,7 @@ def test_every_state_over_the_tracked_fleet(engine: Engine, tmp_path: Path) -> N
 
     ingest(engine, tool, objects, affected, AFFECTED, tmp_path / "a", locked=True)
     ingest(engine, tool, objects, fixed, FIXED, tmp_path / "b", locked=True)
-    ingest(engine, tool, objects, not_using, OTHER_NPM, tmp_path / "c", locked=True)
+    ingest(engine, tool, objects, not_imported, OTHER_NPM, tmp_path / "c", locked=True)
     ingest(engine, tool, objects, unresolved, OTHER_NPM, tmp_path / "d", locked=False)
     ingest(engine, tool, objects, outside, GO, tmp_path / "e", locked=True)
     ingest(engine, tool, objects, scanned_head, OTHER_NPM, tmp_path / "f", locked=True)
@@ -207,21 +207,21 @@ def test_every_state_over_the_tracked_fleet(engine: Engine, tmp_path: Path) -> N
     by_state = {row.state: row for row in answer.rows}
     assert set(by_state) == {
         ImpactState.LIKELY_AFFECTED,
-        ImpactState.FIXED,
-        ImpactState.NOT_USING,
+        ImpactState.VERSION_NOT_IN_RANGE,
+        ImpactState.NOT_IMPORTED,
         ImpactState.UNRESOLVED_MANIFEST,
     }
     assert by_state[ImpactState.LIKELY_AFFECTED].evidence == "manifest"  # no verdict recorded
     [held] = by_state[ImpactState.LIKELY_AFFECTED].held
     assert (held.name, held.version, held.in_range) == ("lodash", Version("4.17.20"), True)
     assert by_state[ImpactState.UNRESOLVED_MANIFEST].reason == "ui/package.json"
-    assert by_state[ImpactState.NOT_USING].product_slugs == ()
+    assert by_state[ImpactState.NOT_IMPORTED].product_slugs == ()
     assert by_state[ImpactState.LIKELY_AFFECTED].repository_ref_id == affected
 
     assert answer.counts == {
         ImpactState.LIKELY_AFFECTED: 1,
-        ImpactState.FIXED: 1,
-        ImpactState.NOT_USING: 1,
+        ImpactState.VERSION_NOT_IN_RANGE: 1,
+        ImpactState.NOT_IMPORTED: 1,
         ImpactState.UNRESOLVED_MANIFEST: 1,
         ImpactState.NOT_IN_ECOSYSTEM: 2,  # the go-scanned default head and the shipped commit
         ImpactState.NO_SBOM: 2,  # the unscanned default head and the never-scanned dev line
@@ -547,7 +547,7 @@ def test_a_recorded_not_observed_demotes_and_another_refs_record_does_not(
     assert by_ref[other].state is ImpactState.LIKELY_AFFECTED  # no record at that ref
 
 
-def test_a_carrier_through_a_base_image_is_held_never_not_using(
+def test_a_carrier_through_a_base_image_is_held_never_not_imported(
     engine: Engine, tmp_path: Path
 ) -> None:
     tool, objects = Tool(), InMemoryObjectStore()
