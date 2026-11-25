@@ -90,6 +90,25 @@ jobs:
             echo "::notice::'make api-check' not defined yet (XWING-2208) — skipping"
           fi
 
+  api-diff:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0   # the merge-base with the base branch needs history
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --frozen
+      # /v1 only grows: the PR head's OpenAPI vs the merge-base with the base
+      # branch, oasdiff fails on ERR-level breaks. The "api-breaking" label
+      # lets an intended break through while still printing it.
+      - run: make api-diff BASE=origin/${{ github.base_ref }}
+        env:
+          ALLOW_BREAKING: ${{ contains(github.event.pull_request.labels.*.name, 'api-breaking') && '1' || '0' }}
+
   ratchet:
     runs-on: ubuntu-latest
     steps:

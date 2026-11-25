@@ -31,6 +31,7 @@ Python 3.11+ library. The platform API lives in `traust_core.v1`. Overview: [REA
 - First time in a clone: `make setup` (uv sync + git hooks via `core.hooksPath=.githooks`). Hooks: ruff on staged files (pre-commit), conventional subject (commit-msg), `make lint` + `make coverage` (pre-push). Don't bypass with `--no-verify`
 
 - `make lint-fix` then `make test`; both must pass. `tests/v1/test_architecture.py` holds the placement rules; a failure there means the code is in the wrong layer, not that the allowlist needs widening. CI runs `make coverage`, which fails below 80% line+branch coverage (`fail_under` in `pyproject.toml`); stub bodies (`raise NotImplementedError`) are excluded, so new code must arrive with tests. Database changes also need `make db-up && make test-integration`; a new or changed query also gets a case in `perf/` and a `make perf` run (paste `.perf/report.md` into the PR)
+- `/v1` only grows: `make api-diff BASE=<ref>` fails on breaking OpenAPI changes against the base (pinned oasdiff), and CI runs it on every PR; a PR labelled `api-breaking` lets an intended break through, still printing the changes
 - Tests that need Postgres are marked `@pytest.mark.integration`; `make test` excludes them
 - Commits: conventional `type(scope): subject`
 - Public repo: no deployment-specific hostnames or figures in code, tests or docs

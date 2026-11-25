@@ -14,7 +14,7 @@ LOCAL_CONFIG ?= $(LOCAL)/traust.yaml
 K6_VERSION ?= v0.54.0
 K6 ?= .perf/bin/k6
 
-.PHONY: help setup sync hooks lint lint-fix test test-changed test-integration test-repositories coverage coverage-html coverage-all perf perf-api perf-api-baseline perf-api-breakpoint k6 api-check openapi serve local-config serve-local token db-up db-down
+.PHONY: help setup sync hooks lint lint-fix test test-changed test-integration test-repositories coverage coverage-html coverage-all perf perf-api perf-api-baseline perf-api-breakpoint k6 api-check api-diff openapi serve local-config serve-local token db-up db-down
 
 help:
 	@echo "Targets ($(notdir $(CURDIR))):"
@@ -34,6 +34,7 @@ help:
 	@echo "  make perf-api-breakpoint — reader ramp to find where the API stops holding (not gated)"
 	@echo "  make k6               — fetch the pinned k6 binary into .perf/bin (perf-api dep)"
 	@echo "  make api-check        — build the REST API's OpenAPI document (.openapi/openapi.json)"
+	@echo "  make api-diff BASE=…   — fail on breaking OpenAPI changes vs BASE's merge-base (ALLOW_BREAKING=1 to allow)"
 	@echo "  make openapi          — build the OpenAPI document and show where Swagger UI serves it"
 	@echo "  make serve            — traust-server on 127.0.0.1:8080 (CONFIG=path for a config file)"
 	@echo "  make serve-local      — traust-server with a local development config ($(LOCAL_CONFIG), SQLite)"
@@ -138,6 +139,53 @@ api-check:
 
 openapi: api-check
 	@echo "Swagger UI: 'make serve', then http://127.0.0.1:$${PORT:-8080}/docs (ReDoc /redoc, raw /openapi.json)"
+
+BASE ?= origin/development
+OASDIFF_VERSION ?= 1.41.0
+OASDIFF ?= .openapi/oasdiff/$(OASDIFF_VERSION)/oasdiff
+UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+ifeq ($(UNAME_S),Darwin)
+OASDIFF_PLATFORM := Darwin
+OASDIFF_ASSET := oasdiff_$(OASDIFF_VERSION)_darwin_all.tar.gz
+else ifeq ($(UNAME_S)-$(UNAME_M),Linux-x86_64)
+OASDIFF_PLATFORM := Linux-x86_64
+OASDIFF_ASSET := oasdiff_$(OASDIFF_VERSION)_linux_amd64.tar.gz
+else ifeq ($(UNAME_S)-$(UNAME_M),Linux-aarch64)
+OASDIFF_PLATFORM := Linux-aarch64
+OASDIFF_ASSET := oasdiff_$(OASDIFF_VERSION)_linux_arm64.tar.gz
+endif
+# per-platform release checksums: https://github.com/oasdiff/oasdiff/releases/tag/v$(OASDIFF_VERSION)
+OASDIFF_SHA256_Darwin := 0452671a98a290ab7c5e49b274fdc77b34c5cdb595b4305cfdb64ae011f7f1ee
+OASDIFF_SHA256_Linux-x86_64 := 96365453163118e6503eb71742643d9ee67f91aedbaadd1a1ce9c6213e3b71c7
+OASDIFF_SHA256_Linux-aarch64 := 8d4b8ddd467440885675db918e229ab8db330111c6428eb864e7eb766a7f4071
+OASDIFF_SHA256 := $(OASDIFF_SHA256_$(OASDIFF_PLATFORM))
+
+$(OASDIFF):
+	@test -n "$(OASDIFF_ASSET)" || { echo "api-diff: unsupported platform $(UNAME_S)/$(UNAME_M)" >&2; exit 2; }
+	@mkdir -p $(dir $(OASDIFF))
+	@tmp=$$(mktemp -d); curl -fsSL -o "$$tmp/$(OASDIFF_ASSET)" https://github.com/oasdiff/oasdiff/releases/download/v$(OASDIFF_VERSION)/$(OASDIFF_ASSET); \
+	if command -v sha256sum >/dev/null 2>&1; then sum="sha256sum"; args=""; else sum="shasum"; args="-a 256"; fi; \
+	echo "$(OASDIFF_SHA256)  $$tmp/$(OASDIFF_ASSET)" | $$sum $$args -c -; \
+	tar -xzf "$$tmp/$(OASDIFF_ASSET)" -C $(dir $(OASDIFF)) oasdiff && rm -rf "$$tmp"; \
+	$(OASDIFF) --version
+
+api-diff: $(OASDIFF)
+	@set -e; \
+	git rev-parse --verify -q $(BASE)^{commit} >/dev/null || { echo "api-diff: unknown ref $(BASE)" >&2; exit 2; }; \
+	MB=$$(git merge-base HEAD $(BASE)); \
+	echo "api-diff: merge-base of HEAD and $(BASE): $$MB"; \
+	$(MAKE) --no-print-directory api-check; \
+	WT=$$(mktemp -d "$${TMPDIR:-/tmp}/traust-api-diff.XXXXXX"); \
+	git worktree add --detach --quiet "$$WT" "$$MB"; \
+	trap 'rm -rf "$$WT"; git worktree prune' EXIT; \
+	( cd "$$WT" && $(MAKE) --no-print-directory api-check ); \
+	$(OASDIFF) breaking --fail-on ERR "$$WT/.openapi/openapi.json" .openapi/openapi.json && st=0 || st=$$?; \
+	if [ "$$st" = 1 ] && [ "$(ALLOW_BREAKING)" = 1 ]; then \
+		echo "api-diff: breaking changes above allowed (ALLOW_BREAKING=1)"; \
+	elif [ "$$st" = 1 ]; then \
+		echo "api-diff: breaking changes against $(BASE) — /v1 only grows; make the change additive or set ALLOW_BREAKING=1" >&2; exit 1; \
+	elif [ "$$st" != 0 ]; then exit "$$st"; fi
 
 serve:
 	uv run traust-server $(if $(CONFIG),--config $(CONFIG)) $(if $(WORKERS),--workers $(WORKERS))
