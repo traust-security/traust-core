@@ -5,13 +5,16 @@ import pytest
 
 from tests.v1.fixtures import TRIAGE
 from traust_core.v1 import contracts
-from traust_core.v1.errors import DocumentError
+from traust_core.v1.errors import ConfigError, DocumentError
+from traust_core.v1.models.analysis_results import ResultKind
 from traust_core.v1.models.artifacts import (
     ArtifactDocument,
+    ArtifactKind,
     ReportArtifact,
     RepoStateArtifact,
     TriageArtifact,
     ValidationPlanArtifact,
+    media_type,
 )
 from traust_core.v1.models.vocabulary import ComparisonStatus, Severity, Verdict
 
@@ -159,3 +162,22 @@ def test_retained_snapshot_cannot_change_when_its_input_is_reused() -> None:
     ]
     assert original.payload == payload
     assert TriageArtifact.parse(payload).findings[0].title == original.findings[0].title
+
+
+def test_the_artifact_kinds_are_every_kind_core_records() -> None:
+    values = {kind.value for kind in ArtifactKind}
+    assert set(contracts.schema_names()) <= values
+    assert {result.value for result in ResultKind} <= values
+    assert {"feed", "sbom"} <= values
+
+
+def test_media_type_follows_the_kind_and_fails_closed() -> None:
+    assert media_type(ArtifactKind.REPORT, "artifacts/report/abc.json") == "application/json"
+    assert (
+        media_type(ArtifactKind.REMEDIATION_PATCH_DIFF, "artifacts/remediation/abc-x.diff")
+        == "text/x-diff"
+    )
+    assert media_type(ArtifactKind.SBOM, "sboms/abc.json.gz") == "application/gzip"
+    assert media_type(ArtifactKind.FEED, "feeds/osv/abc/changes.csv") == "text/csv"
+    with pytest.raises(ConfigError, match="no media type"):
+        media_type(ArtifactKind.FEED, "feeds/osv/abc/blob.bin")

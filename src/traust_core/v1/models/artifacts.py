@@ -3,12 +3,17 @@ from __future__ import annotations
 import json
 from abc import ABC
 from collections.abc import Iterator, Mapping, Sequence
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, ClassVar, Self
+from uuid import UUID
 
 from traust_core.v1 import contracts
+from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.analysis_results import ResultKind
+from traust_core.v1.models.base import Model
 
 Node = tuple[str, Mapping[str, Any]]
 
@@ -105,6 +110,67 @@ def describe(nodes: Sequence[Node], depth: int = 0, max_depth: int = 4) -> list[
 class RenderFormat(StrEnum):
     MARKDOWN = "md"
     HTML = "html"
+
+
+def _kind_members() -> dict[str, str]:
+    """Every kind an artifact row records, from the sources core records them by."""
+    members: dict[str, str] = {}
+    values = (
+        *contracts.schema_names(),
+        *(result.value for result in ResultKind),
+        "feed",
+        "sbom",
+    )
+    for value in values:
+        member = value.upper().replace("-", "_").replace(".", "_")
+        if member in members and members[member] != value:
+            raise ConfigError(f"ambiguous artifact kind member: {value!r}")
+        members[member] = value
+    return members
+
+
+ArtifactKind = StrEnum("ArtifactKind", _kind_members())
+"""What an artifact is: a contract schema name, a companion kind, a feed or an SBOM."""
+
+_SCHEMA_KINDS = frozenset(contracts.schema_names())
+_MEDIA_TYPES: MappingProxyType[str, str] = MappingProxyType(
+    {
+        "json": "application/json",
+        "md": "text/markdown",
+        "diff": "text/x-diff",
+        "csv": "text/csv",
+        "gz": "application/gzip",
+    }
+)
+CONTENT_MEDIA_TYPES: tuple[str, ...] = tuple(dict.fromkeys(_MEDIA_TYPES.values()))
+
+
+def media_type(kind: ArtifactKind, uri: str) -> str:
+    """The Content-Type the kind's stored bytes are served as."""
+    if kind.value in _SCHEMA_KINDS:
+        return "application/json"
+    if kind is ArtifactKind.SBOM:
+        return "application/gzip"
+    stored = uri.rsplit("/", 1)[-1] if kind is ArtifactKind.FEED else kind.value
+    try:
+        return _MEDIA_TYPES[stored.rpartition(".")[2]]
+    except KeyError:
+        raise ConfigError(
+            f"artifact kind {kind.value} stored as {stored!r}: no media type"
+        ) from None
+
+
+class ArtifactView(Model):
+    """An artifact as the API states it: what it is, never where core keeps the bytes."""
+
+    id: UUID
+    assessment_id: UUID | None = None
+    run_order_id: UUID | None = None
+    kind: ArtifactKind
+    digest: str
+    media_type: str
+    size: int
+    created_at: datetime | None = None
 
 
 class ArtifactDocument(ABC):

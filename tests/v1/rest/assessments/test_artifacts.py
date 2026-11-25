@@ -51,7 +51,7 @@ def test_the_listing_serves_every_document_in_creation_order(
     )
     assert response.status_code == 200, response.text
     assert response.json() == world.artifacts
-    # the metadata, pluralized: the same fields GetArtifact serves, never the bytes
+    # the assessment's artifact rows, never the bytes
     assert set(response.json()[0]) == {
         "id",
         "assessment_id",

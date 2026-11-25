@@ -17,6 +17,7 @@ from traust_core.v1.providers.correlation import (
     correlation_scope,
     safe_request_id,
 )
+from traust_core.v1.rest.artifacts.openapi import add_contract_components
 from traust_core.v1.rest.common.problems import problem, safe_method, safe_order_id
 from traust_core.v1.rest.docs import DESCRIPTION, TAGS
 from traust_core.v1.rest.domains import DOMAINS
@@ -66,6 +67,7 @@ def create_app(context: Context, role: Role = Role.ALL) -> FastAPI:
             for method, operation in item.items():
                 if method in _OPERATION_KEYS:
                     operation["x-traust-role"] = serving_role(path, method)
+        add_contract_components(spec)
         return spec
 
     app.openapi = openapi

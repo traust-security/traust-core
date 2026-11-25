@@ -15,6 +15,7 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
+from traust_core.v1.models.artifacts import ArtifactKind
 from traust_core.v1.models.dependencies import AffectedDependency, NoManifestSbomError
 from traust_core.v1.models.inventory import RepositoryRef
 from traust_core.v1.models.vocabulary import Ecosystem
@@ -22,7 +23,7 @@ from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.feeds import FeedProvider
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects import InMemoryObjectStore, ObjectKey, ObjectRef
-from traust_core.v1.services.exposure import SBOM_ARTIFACT_KIND, ExposureService
+from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings import FindingIntake, IdentityPolicy, TaxonomyPolicy
 from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService
 
@@ -63,7 +64,7 @@ def test_ingest_keeps_the_document_its_packages_and_the_commits_manifest(engine:
     with SqlTraustUnitOfWork(engine) as uow:
         assert uow.repository_refs.get(commit.id).manifest_sbom_id == sbom.id
         assert sbom.id is not None and sbom.artifact_id is not None
-        assert uow.artifacts.get(sbom.artifact_id).kind == SBOM_ARTIFACT_KIND
+        assert uow.artifacts.get(sbom.artifact_id).kind == ArtifactKind.SBOM
         rows = {
             (uow.packages.get(d.package_id).name, d.version, d.direct)
             for d in uow.dependencies.list_for_sbom(sbom.id)
