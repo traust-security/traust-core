@@ -126,3 +126,34 @@ def test_list_by_prefix(store: ObjectStore) -> None:
     store.put(ObjectKey.parse("b/y.json"), b"2")
     assert [str(k) for k in store.list("a")] == ["a/x.json"]
     assert len(list(store.list())) == 2
+
+
+def test_delete_removes_the_object(store: ObjectStore) -> None:
+    ref = store.put(KEY, b'{"ok": true}')
+    store.delete(KEY)
+    assert not store.exists(KEY)
+    with pytest.raises(NotFoundError):
+        store.stat(KEY)
+    with pytest.raises(NotFoundError):
+        store.get(ref)
+    assert KEY not in {str(k) for k in store.list()}
+
+
+def test_delete_of_missing_key_is_silent(store: ObjectStore) -> None:
+    store.delete(KEY)
+    assert not store.exists(KEY)
+
+
+def test_delete_then_put_writes_new_bytes(store: ObjectStore) -> None:
+    store.put(KEY, b"v1")
+    store.delete(KEY)
+    ref = store.put(KEY, b"v2")
+    assert store.get(ref) == b"v2"
+
+
+def test_local_store_delete_keeps_the_directory_tree(tmp_path: Path) -> None:
+    store = LocalObjectStore(tmp_path)
+    key = ObjectKey.parse("artifacts/report/x.json")
+    store.put(key, b"{}")
+    store.delete(key)
+    assert (tmp_path / "artifacts/report").is_dir()

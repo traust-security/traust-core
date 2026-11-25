@@ -45,6 +45,7 @@ class ObjectStore(Protocol):
     def read(self, key: ObjectKey, sha256: str) -> bytes: ...
     def stat(self, key: ObjectKey) -> ObjectRef: ...
     def exists(self, key: ObjectKey) -> bool: ...
+    def delete(self, key: ObjectKey) -> None: ...
     def list(self, prefix: str = "") -> Iterator[ObjectKey]: ...
 
 
@@ -55,6 +56,10 @@ def _verified(ref: ObjectRef, data: bytes) -> bytes:
 
 
 class LocalObjectStore:
+    # NEED(artifacts: shard by digest prefix): a schema's every object lands in one
+    # flat directory, and an estate's cadence observations put tens of thousands of
+    # entries in it, degrading list()'s sorted walk. Sharding keys is a store change
+    # with a migration; until then, retention (which deletes) keeps the count bounded.
     def __init__(self, root: Path) -> None:
         self._root = root
 
@@ -122,6 +127,12 @@ class LocalObjectStore:
     def exists(self, key: ObjectKey) -> bool:
         return self._path(key).is_file()
 
+    def delete(self, key: ObjectKey) -> None:
+        try:
+            self._path(key).unlink(missing_ok=True)
+        except OSError as e:
+            raise RepositoryError(f"LocalObjectStore: delete {key} failed") from e
+
     def list(self, prefix: str = "") -> Iterator[ObjectKey]:
         start = self._root / prefix
         for path in sorted(start.rglob("*")) if start.is_dir() else ():
@@ -160,6 +171,9 @@ class InMemoryObjectStore:
 
     def exists(self, key: ObjectKey) -> bool:
         return key in self._blobs
+
+    def delete(self, key: ObjectKey) -> None:
+        self._blobs.pop(key, None)
 
     def list(self, prefix: str = "") -> Iterator[ObjectKey]:
         scope = f"{prefix.rstrip('/')}/" if prefix else ""
