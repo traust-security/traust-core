@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterator
 from pathlib import Path
 from uuid import uuid4
@@ -220,16 +221,52 @@ def _refs(node: object) -> Iterator[str]:
             yield from _refs(value)
 
 
-def _resolves(spec: dict, ref: str) -> bool:
-    node: object = spec
-    for raw in ref.removeprefix("#/").split("/"):
-        part = raw.replace("~1", "/").replace("~0", "~")
-        if not isinstance(node, dict) or part not in node:
-            return False
-        node = node[part]
-    return True
+_COMPONENT_REF = re.compile(r"^#/components/schemas/[A-Za-z0-9_-]+$")
 
 
-def test_every_ref_in_the_spec_resolves(client: TestClient) -> None:
+def test_every_ref_in_the_spec_names_one_top_level_component(client: TestClient) -> None:
+    """Generators resolve #/components/schemas/<Name> and nothing deeper. The name class
+    admits pydantic's own shapes (Page_Event_, ViewFilter-Input); the artifact side is
+    held to plain alphanumerics by the test below."""
     spec = client.get("/openapi.json").json()
-    assert [ref for ref in _refs(spec) if not _resolves(spec, ref)] == []
+    refs = list(_refs(spec))
+    assert [ref for ref in refs if not _COMPONENT_REF.fullmatch(ref)] == []
+    names = spec["components"]["schemas"]
+    assert [ref for ref in refs if ref.rsplit("/", 1)[-1] not in names] == []
+
+
+def test_every_artifact_component_name_is_plain_alphanumerics(client: TestClient) -> None:
+    """The components the artifact documents reach are named <Word><Word>…, no separators:
+    generators turn the names into type names."""
+    schemas = client.get("/openapi.json").json()["components"]["schemas"]
+    reached: set[str] = set()
+    pending = {name for name, schema in schemas.items() if "x-traust-artifact-kind" in schema}
+    while pending:
+        name = pending.pop()
+        if name in reached:
+            continue
+        reached.add(name)
+        pending |= {ref.rsplit("/", 1)[-1] for ref in _refs(schemas[name])} - reached
+    assert all(re.fullmatch(r"[A-Za-z0-9]+", name) for name in reached)
+
+
+def test_the_schemas_definitions_are_hoisted_into_top_level_components(
+    client: TestClient,
+) -> None:
+    """No component keeps its definitions: each is a component a generator can name."""
+    schemas = client.get("/openapi.json").json()["components"]["schemas"]
+    assert all("$defs" not in schema and "definitions" not in schema for schema in schemas.values())
+    assert schemas["ReportArtifact"]["properties"]["findings"]["items"] == {
+        "$ref": "#/components/schemas/ReportArtifactFinding"
+    }
+    assert "x-traust-artifact-kind" in schemas["ReportArtifact"]
+    assert "x-traust-artifact-kind" not in schemas["ReportArtifactFinding"]
+
+
+def test_a_definition_property_is_one_shared_component(client: TestClient) -> None:
+    """A ref below a definition hoists its target once and shares it: the definition and
+    every referrer (adapter-result's findings) hold the same named type."""
+    schemas = client.get("/openapi.json").json()["components"]["schemas"]
+    shared = {"$ref": "#/components/schemas/ReportArtifactFindingSeverity"}
+    assert schemas["ReportArtifactFinding"]["properties"]["severity"] == shared
+    assert schemas["AdapterResultArtifactAdapterFinding"]["properties"]["severity"] == shared
