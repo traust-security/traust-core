@@ -650,8 +650,12 @@ class ArtifactPublisher:
 
     def describe(self, artifact_id: UUID) -> ArtifactView:
         """The API's view of one artifact: what it is, never where the bytes live."""
-        row = self.metadata(artifact_id)
-        return self._view(row, self._objects.stat(ObjectKey.parse(row.uri)).size)
+        (view,) = self.views([self.metadata(artifact_id)])
+        return view
+
+    def views(self, rows: Sequence[Artifact]) -> list[ArtifactView]:
+        """The API's view of artifact rows already read."""
+        return [self._view(row, self._objects.stat(ObjectKey.parse(row.uri)).size) for row in rows]
 
     def content(self, artifact_id: UUID) -> tuple[ArtifactView, bytes]:
         """The API's view with the digest-verified bytes, in one read."""

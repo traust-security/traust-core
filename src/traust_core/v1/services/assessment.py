@@ -25,6 +25,8 @@ from traust_core.v1.errors import (
 )
 from traust_core.v1.models import candidate_formats
 from traust_core.v1.models.artifacts import (
+    ArtifactKind,
+    ArtifactView,
     AssessmentArtifact,
     CloudConfigAuditArtifact,
     FindingIntakeArtifact,
@@ -917,10 +919,16 @@ class AssessmentService:
     def get(self, assessment_id: UUID) -> Assessment:
         return self._read(self._log.get(assessment_id))
 
-    def list_artifacts(self, assessment_id: UUID, kind: str | None = None) -> list[Artifact]:
-        """An assessment's documents, oldest first: metadata only (the content door serves
-        the bytes). An unknown assessment is a 404; a known one with none answers []."""
-        return self._log.list_artifacts(assessment_id, kind)
+    def list_artifacts(
+        self, assessment_id: UUID, kind: ArtifactKind | None = None
+    ) -> list[ArtifactView]:
+        """An assessment's documents, oldest first: what each is, never where its bytes live
+        (the content door serves them). An unknown assessment is a 404; a known one with
+        none answers []."""
+        if self._publisher is None:
+            raise ConfigError("listing artifacts as views needs the artifact publisher")
+        rows = self._log.list_artifacts(assessment_id, kind.value if kind else None)
+        return self._publisher.views(rows)
 
     def latest(
         self,

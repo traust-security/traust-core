@@ -17,7 +17,7 @@ _CONTENT_HEADERS = {
         "schema": {"type": "integer"},
     },
     "ETag": {
-        "description": "The artifact's digest (sha256, hex).",
+        "description": "The artifact's digest (sha256, hex), quoted as an entity tag.",
         "schema": {"type": "string"},
     },
     "Traust-Artifact-Kind": {
@@ -55,5 +55,5 @@ def get_artifact_content(artifact_id: UUID, artifacts: Artifacts, _: Caller) -> 
     return Response(
         content=payload,
         media_type=view.media_type,
-        headers={"ETag": view.digest, "Traust-Artifact-Kind": view.kind.value},
+        headers={"ETag": f'"{view.digest}"', "Traust-Artifact-Kind": view.kind.value},
     )

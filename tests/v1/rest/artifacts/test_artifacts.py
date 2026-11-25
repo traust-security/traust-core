@@ -61,7 +61,7 @@ def test_authenticated_metadata_and_content_are_the_existing_publishers_results(
     assert content.status_code == 200, content.text
     assert served_type(content.headers["content-type"]) == "application/json"
     assert content.headers["traust-artifact-kind"] == "report"
-    assert content.headers["etag"] == published.digest
+    assert content.headers["etag"] == f'"{published.digest}"'
     assert content.content == publisher.payload(published.id) == REPORT.payload
     assert client.get(path).status_code == 401
     assert client.get(f"{path}/content").status_code == 401
@@ -104,7 +104,7 @@ def test_a_companions_content_is_served_as_its_kind(context: Context, client: Te
     assert content.status_code == 200, content.text
     assert served_type(content.headers["content-type"]) == "text/x-diff"
     assert content.headers["traust-artifact-kind"] == "remediation-patch.diff"
-    assert content.headers["etag"] == sha256_hex(DIFF)
+    assert content.headers["etag"] == f'"{sha256_hex(DIFF)}"'
     assert content.headers["content-length"] == str(len(DIFF))
     assert content.content == DIFF
 
@@ -143,7 +143,7 @@ def test_feed_and_sbom_content_is_served_in_its_stored_format(
     assert content.status_code == 200, content.text
     assert served_type(content.headers["content-type"]) == media_type
     assert content.headers["traust-artifact-kind"] == kind.value
-    assert content.headers["etag"] == stored.sha256
+    assert content.headers["etag"] == f'"{stored.sha256}"'
     assert content.content == payload
 
 
