@@ -164,7 +164,7 @@ OASDIFF_SHA256 := $(OASDIFF_SHA256_$(OASDIFF_PLATFORM))
 $(OASDIFF):
 	@test -n "$(OASDIFF_ASSET)" || { echo "api-diff: unsupported platform $(UNAME_S)/$(UNAME_M)" >&2; exit 2; }
 	@mkdir -p $(dir $(OASDIFF))
-	@tmp=$$(mktemp -d); curl -fsSL -o "$$tmp/$(OASDIFF_ASSET)" https://github.com/oasdiff/oasdiff/releases/download/v$(OASDIFF_VERSION)/$(OASDIFF_ASSET); \
+	@set -e; tmp=$$(mktemp -d); curl -fsSL -o "$$tmp/$(OASDIFF_ASSET)" https://github.com/oasdiff/oasdiff/releases/download/v$(OASDIFF_VERSION)/$(OASDIFF_ASSET); \
 	if command -v sha256sum >/dev/null 2>&1; then sum="sha256sum"; args=""; else sum="shasum"; args="-a 256"; fi; \
 	echo "$(OASDIFF_SHA256)  $$tmp/$(OASDIFF_ASSET)" | $$sum $$args -c -; \
 	tar -xzf "$$tmp/$(OASDIFF_ASSET)" -C $(dir $(OASDIFF)) oasdiff && rm -rf "$$tmp"; \
