@@ -142,6 +142,18 @@ class S3ObjectStore:
         data = self._read(key)
         return ObjectRef(key, sha256_hex(data), len(data))
 
+    def size(self, key: ObjectKey) -> int:
+        """The stored size alone: listings state it without reading the bytes."""
+        try:
+            head = self._client.head_object(Bucket=self._bucket, Key=self._name(key))
+        except ClientError as e:
+            if self._is_missing(e, key):
+                raise NotFoundError(f"artifact {key}") from e
+            raise RepositoryError(f"S3ObjectStore: size {key} failed") from e
+        except BotoCoreError as e:
+            raise RepositoryError(f"S3ObjectStore: size {key} failed") from e
+        return int(head["ContentLength"])
+
     def exists(self, key: ObjectKey) -> bool:
         try:
             self._client.head_object(Bucket=self._bucket, Key=self._name(key))

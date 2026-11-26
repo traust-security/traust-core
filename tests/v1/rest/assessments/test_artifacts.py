@@ -77,6 +77,25 @@ def test_the_listing_serves_every_document_in_creation_order(
     assert all("uri" not in doc for doc in response.json())
 
 
+def test_the_listing_serves_a_validation_assessments_recorded_companion(
+    context: Context, client: TestClient
+) -> None:
+    """A validation recording is no contract schema, but its row belongs to the assessment:
+    one such companion must not take the whole listing down with it."""
+    world = seed(context, ("report", "validation-recording"))
+    response = client.get(
+        f"/v1/assessments/{world.assessment_id}/artifacts", headers=bearer(context)
+    )
+    assert response.status_code == 200, response.text
+    assert [doc["kind"] for doc in response.json()] == ["report", "validation-recording"]
+    assert [doc["media_type"] for doc in response.json()] == [
+        "application/json",
+        "application/json",
+    ]
+    assert set(response.json()[0]) == VIEW_FIELDS
+    assert all("uri" not in doc for doc in response.json())
+
+
 def test_the_listing_serves_one_kind_on_request(context: Context, client: TestClient) -> None:
     world = seed(context, ("report", "remediation-patch.diff"))
     response = client.get(

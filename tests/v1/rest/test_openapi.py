@@ -17,6 +17,15 @@ def test_swagger_redoc_and_the_spec_are_served(client: TestClient) -> None:
     assert client.get("/openapi.json").status_code == 200
 
 
+def test_the_spec_is_served_more_than_once_in_one_process(client: TestClient) -> None:
+    """The contract components are inserted into the cached document: a second request
+    must answer the same spec, not trip the component-clash check on the cached dict."""
+    first = client.get("/openapi.json")
+    again = client.get("/openapi.json")
+    assert (first.status_code, again.status_code) == (200, 200)
+    assert again.json() == first.json()
+
+
 def test_the_spec_documents_auth_and_the_domains(client: TestClient) -> None:
     spec = client.get("/openapi.json").json()
     assert spec["info"]["description"] and spec["info"]["summary"]

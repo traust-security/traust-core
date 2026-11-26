@@ -148,6 +148,47 @@ def test_feed_and_sbom_content_is_served_in_its_stored_format(
     assert content.content == payload
 
 
+@pytest.mark.parametrize(
+    ("kind", "key", "payload", "media_type"),
+    [
+        (
+            ArtifactKind.VALIDATION_RECORDING,
+            "artifacts/validation-recording/{}.json",
+            b"{}",
+            "application/json",
+        ),
+        (ArtifactKind.REPORT_INPUT, "reports/inputs/{}.json", b"{}", "application/json"),
+        (ArtifactKind.REPORT, "reports/{}/report.md", b"# heading\n", "text/markdown"),
+        (ArtifactKind.REPORT, "reports/{}/report.html", b"<h1>heading</h1>", "text/html"),
+        (ArtifactKind.FEED, "feeds/custom/{}/feed", b"opaque", "application/octet-stream"),
+    ],
+)
+def test_every_recorded_kind_is_served_in_its_stored_format(
+    context: Context,
+    client: TestClient,
+    kind: ArtifactKind,
+    key: str,
+    payload: bytes,
+    media_type: str,
+) -> None:
+    """The kinds core records that no contract schema names — and a built report, whose
+    kind is `report` but whose bytes are its rendered format — state and serve honestly."""
+    stored = context.object_store.put(ObjectKey.parse(key.format(sha256_hex(payload))), payload)
+    with SqlTraustUnitOfWork(context.database) as uow:
+        row = record_artifact(
+            uow, Artifact(digest=stored.sha256, kind=kind.value, uri=str(stored.key))
+        )
+        uow.commit()
+    described = client.get(f"/v1/artifacts/{row.id}", headers=bearer(context))
+    assert described.status_code == 200, described.text
+    assert described.json()["kind"] == kind.value
+    assert described.json()["media_type"] == media_type
+    content = client.get(f"/v1/artifacts/{row.id}/content", headers=bearer(context))
+    assert content.status_code == 200, content.text
+    assert served_type(content.headers["content-type"]) == media_type
+    assert content.content == payload
+
+
 @pytest.mark.parametrize("suffix", ["", "/content"])
 def test_missing_artifact_reads_return_native_problem_details(
     context: Context, client: TestClient, suffix: str

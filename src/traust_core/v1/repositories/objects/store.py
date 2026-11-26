@@ -44,6 +44,7 @@ class ObjectStore(Protocol):
     def get(self, ref: ObjectRef) -> bytes: ...
     def read(self, key: ObjectKey, sha256: str) -> bytes: ...
     def stat(self, key: ObjectKey) -> ObjectRef: ...
+    def size(self, key: ObjectKey) -> int: ...
     def exists(self, key: ObjectKey) -> bool: ...
     def list(self, prefix: str = "") -> Iterator[ObjectKey]: ...
 
@@ -119,6 +120,15 @@ class LocalObjectStore:
         data = self._read(key)
         return ObjectRef(key, sha256_hex(data), len(data))
 
+    def size(self, key: ObjectKey) -> int:
+        """The stored size alone: listings state it without reading the bytes."""
+        try:
+            return self._path(key).stat().st_size
+        except FileNotFoundError:
+            raise NotFoundError(f"artifact {key}") from None
+        except OSError as e:
+            raise RepositoryError(f"LocalObjectStore: size {key} failed") from e
+
     def exists(self, key: ObjectKey) -> bool:
         return self._path(key).is_file()
 
@@ -157,6 +167,10 @@ class InMemoryObjectStore:
     def stat(self, key: ObjectKey) -> ObjectRef:
         data = self._read(key)
         return ObjectRef(key, sha256_hex(data), len(data))
+
+    def size(self, key: ObjectKey) -> int:
+        """The stored size alone: listings state it without reading the bytes."""
+        return len(self._read(key))
 
     def exists(self, key: ObjectKey) -> bool:
         return key in self._blobs

@@ -31,8 +31,8 @@ def _navigate(node: Any, parts: Sequence[str], where: str) -> Any:
     for part in parts:
         try:
             node = node[int(part)] if isinstance(node, list) else node[part]
-        except (KeyError, IndexError, TypeError, ValueError):
-            raise ConfigError(f"artifact schema ref does not resolve: {where!r}") from None
+        except (KeyError, IndexError, TypeError, ValueError) as e:
+            raise ConfigError(f"artifact schema ref does not resolve: {where!r}") from e
     return node
 
 

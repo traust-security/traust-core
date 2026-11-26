@@ -655,7 +655,7 @@ class ArtifactPublisher:
 
     def views(self, rows: Sequence[Artifact]) -> list[ArtifactView]:
         """The API's view of artifact rows already read."""
-        return [self._view(row, self._objects.stat(ObjectKey.parse(row.uri)).size) for row in rows]
+        return [self._view(row, self._objects.size(ObjectKey.parse(row.uri))) for row in rows]
 
     def content(self, artifact_id: UUID) -> tuple[ArtifactView, bytes]:
         """The API's view with the digest-verified bytes, in one read."""
@@ -666,8 +666,8 @@ class ArtifactPublisher:
     def _view(self, row: Artifact, size: int) -> ArtifactView:
         try:
             kind = ArtifactKind(row.kind)
-        except ValueError:
-            raise ConfigError(f"unknown artifact kind {row.kind!r}") from None
+        except ValueError as e:
+            raise ConfigError(f"unknown artifact kind {row.kind!r}") from e
         assert row.id is not None
         return ArtifactView(
             id=row.id,

@@ -62,12 +62,15 @@ def create_app(context: Context, role: Role = Role.ALL) -> FastAPI:
     default_openapi = app.openapi
 
     def openapi() -> dict[str, Any]:
+        if app.openapi_schema is not None:
+            return app.openapi_schema
         spec = default_openapi()
         for path, item in spec["paths"].items():
             for method, operation in item.items():
                 if method in _OPERATION_KEYS:
                     operation["x-traust-role"] = serving_role(path, method)
         add_contract_components(spec)
+        app.openapi_schema = spec
         return spec
 
     app.openapi = openapi

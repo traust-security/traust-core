@@ -112,6 +112,10 @@ class RenderFormat(StrEnum):
     HTML = "html"
 
 
+VALIDATION_RECORDING = "validation-recording"
+REPORT_INPUT = "report-input"
+
+
 def _kind_members() -> dict[str, str]:
     """Every kind an artifact row records, from the sources core records them by."""
     members: dict[str, str] = {}
@@ -120,6 +124,8 @@ def _kind_members() -> dict[str, str]:
         *(result.value for result in ResultKind),
         "feed",
         "sbom",
+        VALIDATION_RECORDING,
+        REPORT_INPUT,
     )
     for value in values:
         member = value.upper().replace("-", "_").replace(".", "_")
@@ -130,34 +136,33 @@ def _kind_members() -> dict[str, str]:
 
 
 ArtifactKind = StrEnum("ArtifactKind", _kind_members())
-"""What an artifact is: a contract schema name, a companion kind, a feed or an SBOM."""
+"""What an artifact is: a contract schema name, a companion kind, a feed, an SBOM, a
+validation recording or a report input."""
 
-_SCHEMA_KINDS = frozenset(contracts.schema_names())
 _MEDIA_TYPES: MappingProxyType[str, str] = MappingProxyType(
     {
         "json": "application/json",
         "md": "text/markdown",
+        "html": "text/html",
         "diff": "text/x-diff",
         "csv": "text/csv",
         "gz": "application/gzip",
     }
 )
-CONTENT_MEDIA_TYPES: tuple[str, ...] = tuple(dict.fromkeys(_MEDIA_TYPES.values()))
+CONTENT_MEDIA_TYPES: tuple[str, ...] = (*_MEDIA_TYPES.values(), "application/octet-stream")
 
 
 def media_type(kind: ArtifactKind, uri: str) -> str:
-    """The Content-Type the kind's stored bytes are served as."""
-    if kind.value in _SCHEMA_KINDS:
-        return "application/json"
-    if kind is ArtifactKind.SBOM:
-        return "application/gzip"
-    stored = uri.rsplit("/", 1)[-1] if kind is ArtifactKind.FEED else kind.value
-    try:
-        return _MEDIA_TYPES[stored.rpartition(".")[2]]
-    except KeyError:
-        raise ConfigError(
-            f"artifact kind {kind.value} stored as {stored!r}: no media type"
-        ) from None
+    """The Content-Type the stored bytes are served as: the format the kind names when it
+    names one (a companion kind carries its format), else the format the stored name
+    records; a feed whose name carries no known format is served as opaque bytes."""
+    stored = uri.rsplit("/", 1)[-1]
+    for name in (kind.value, stored):
+        if media := _MEDIA_TYPES.get(name.rpartition(".")[2]):
+            return media
+    if kind is ArtifactKind.FEED:
+        return "application/octet-stream"
+    raise ConfigError(f"artifact kind {kind.value} stored as {stored!r}: no media type")
 
 
 class ArtifactView(Model):

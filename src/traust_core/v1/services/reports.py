@@ -13,6 +13,7 @@ from datetime import timedelta
 from uuid import UUID
 
 from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
+from traust_core.v1.models.artifacts import REPORT_INPUT
 from traust_core.v1.models.assessment import Artifact
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import sha256_hex
@@ -40,7 +41,6 @@ from traust_core.v1.services.operations import OpsService
 log = logging.getLogger(__name__)
 
 REPORT_ASSET = AssetName("report")
-INPUT_KIND = "report-input"
 FILE_KIND = "report"
 _PRIORITY = 100  # lower runs sooner; reports queue behind the engine's work
 _IN_FLIGHT = frozenset({OrderState.PLANNED, OrderState.QUEUED, OrderState.LEASED})
@@ -95,12 +95,12 @@ class ReportService:
         digest = sha256_hex(payload)
         with self._uow as uow:
             # one request at a time per input: two callers share one build, never race two
-            self._log.serialize_imported(f"{INPUT_KIND}:{digest}")
+            self._log.serialize_imported(f"{REPORT_INPUT}:{digest}")
             stored = self._log.imported(digest)
             if stored is None:
                 ref = self._objects.put(ObjectKey.parse(f"reports/inputs/{digest}.json"), payload)
                 stored = self._log.keep_imported(
-                    Artifact(digest=digest, kind=INPUT_KIND, uri=str(ref.key))
+                    Artifact(digest=digest, kind=REPORT_INPUT, uri=str(ref.key))
                 )
             assert stored.id is not None
             latest = self._ops.latest_with_input(REPORT_ASSET, stored.id)

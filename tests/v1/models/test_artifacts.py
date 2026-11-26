@@ -168,10 +168,10 @@ def test_the_artifact_kinds_are_every_kind_core_records() -> None:
     values = {kind.value for kind in ArtifactKind}
     assert set(contracts.schema_names()) <= values
     assert {result.value for result in ResultKind} <= values
-    assert {"feed", "sbom"} <= values
+    assert {"feed", "sbom", "validation-recording", "report-input"} <= values
 
 
-def test_media_type_follows_the_kind_and_fails_closed() -> None:
+def test_media_type_follows_the_format_the_stored_name_records() -> None:
     assert media_type(ArtifactKind.REPORT, "artifacts/report/abc.json") == "application/json"
     assert (
         media_type(ArtifactKind.REMEDIATION_PATCH_DIFF, "artifacts/remediation/abc-x.diff")
@@ -179,5 +179,26 @@ def test_media_type_follows_the_kind_and_fails_closed() -> None:
     )
     assert media_type(ArtifactKind.SBOM, "sboms/abc.json.gz") == "application/gzip"
     assert media_type(ArtifactKind.FEED, "feeds/osv/abc/changes.csv") == "text/csv"
+
+
+def test_a_built_report_is_served_as_its_rendered_format_not_its_kind() -> None:
+    assert media_type(ArtifactKind.REPORT, "reports/abc/report.md") == "text/markdown"
+    assert media_type(ArtifactKind.REPORT, "reports/abc/report.html") == "text/html"
+    assert media_type(ArtifactKind.REPORT, "reports/abc/report.csv") == "text/csv"
+
+
+def test_a_companion_kind_names_its_own_format_wherever_it_is_stored() -> None:
+    assert (
+        media_type(ArtifactKind.REMEDIATION_PATCH_DIFF, "artifacts/remediation/abc.json")
+        == "text/x-diff"
+    )
+
+
+def test_a_feed_whose_stored_name_carries_no_known_format_is_served_as_opaque_bytes() -> None:
+    assert media_type(ArtifactKind.FEED, "feeds/osv/abc/feed") == "application/octet-stream"
+    assert media_type(ArtifactKind.FEED, "feeds/osv/abc/blob.bin") == "application/octet-stream"
+
+
+def test_a_kind_core_names_fails_closed_without_a_media_type() -> None:
     with pytest.raises(ConfigError, match="no media type"):
-        media_type(ArtifactKind.FEED, "feeds/osv/abc/blob.bin")
+        media_type(ArtifactKind.REPORT, "artifacts/report/abc.xyz")
