@@ -3,12 +3,17 @@ from __future__ import annotations
 import json
 from abc import ABC
 from collections.abc import Iterator, Mapping, Sequence
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, ClassVar, Self
+from uuid import UUID
 
 from traust_core.v1 import contracts
+from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.analysis_results import ResultKind
+from traust_core.v1.models.base import Model
 
 Node = tuple[str, Mapping[str, Any]]
 
@@ -105,6 +110,72 @@ def describe(nodes: Sequence[Node], depth: int = 0, max_depth: int = 4) -> list[
 class RenderFormat(StrEnum):
     MARKDOWN = "md"
     HTML = "html"
+
+
+VALIDATION_RECORDING = "validation-recording"
+REPORT_INPUT = "report-input"
+
+
+def _kind_members() -> dict[str, str]:
+    """Every kind an artifact row records, from the sources core records them by."""
+    members: dict[str, str] = {}
+    values = (
+        *contracts.schema_names(),
+        *(result.value for result in ResultKind),
+        "feed",
+        "sbom",
+        VALIDATION_RECORDING,
+        REPORT_INPUT,
+    )
+    for value in values:
+        member = value.upper().replace("-", "_").replace(".", "_")
+        if member in members and members[member] != value:
+            raise ConfigError(f"ambiguous artifact kind member: {value!r}")
+        members[member] = value
+    return members
+
+
+ArtifactKind = StrEnum("ArtifactKind", _kind_members())
+"""What an artifact is: a contract schema name, a companion kind, a feed, an SBOM, a
+validation recording or a report input."""
+
+_MEDIA_TYPES: MappingProxyType[str, str] = MappingProxyType(
+    {
+        "json": "application/json",
+        "md": "text/markdown",
+        "html": "text/html",
+        "diff": "text/x-diff",
+        "csv": "text/csv",
+        "gz": "application/gzip",
+    }
+)
+CONTENT_MEDIA_TYPES: tuple[str, ...] = (*_MEDIA_TYPES.values(), "application/octet-stream")
+
+
+def media_type(kind: ArtifactKind, uri: str) -> str:
+    """The Content-Type the stored bytes are served as: the format the kind names when it
+    names one (a companion kind carries its format), else the format the stored name
+    records; a feed whose name carries no known format is served as opaque bytes."""
+    stored = uri.rsplit("/", 1)[-1]
+    for name in (kind.value, stored):
+        if media := _MEDIA_TYPES.get(name.rpartition(".")[2]):
+            return media
+    if kind is ArtifactKind.FEED:
+        return "application/octet-stream"
+    raise ConfigError(f"artifact kind {kind.value} stored as {stored!r}: no media type")
+
+
+class ArtifactView(Model):
+    """An artifact as the API states it: what it is, never where core keeps the bytes."""
+
+    id: UUID
+    assessment_id: UUID | None = None
+    run_order_id: UUID | None = None
+    kind: ArtifactKind
+    digest: str
+    media_type: str
+    size: int
+    created_at: datetime | None = None
 
 
 class ArtifactDocument(ABC):

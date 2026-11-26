@@ -28,6 +28,7 @@ from traust_core.v1.errors import (
 )
 from traust_core.v1.models.artifacts import (
     ArtifactDocument,
+    ArtifactKind,
     ImpactAnalysisArtifact,
     ManifestCoverageArtifact,
 )
@@ -179,7 +180,6 @@ from traust_core.v1.services.repo_checkout import RepoCheckoutService
 if TYPE_CHECKING:
     from traust_core.v1.services.findings.service import FindingService
 
-FEED_ARTIFACT_KIND = "feed"
 # the per-identifier sources an advisory's names are kept from, and which names each takes
 _ADVISORY_DOCUMENT_SOURCES = {"cve-list": "cve", "nvd": "cve", "rh-cve": "cve", "ghsa": "ghsa"}
 _SCORES_OF: dict[str, Callable[..., tuple[CvssScore, ...]]] = {
@@ -209,7 +209,6 @@ _TITLE_STOP = frozenset(
         "the a an of to in on for and or with without via is are not no by from at as it its cve",
     )
 )
-SBOM_ARTIFACT_KIND = "sbom"
 IMPACT_ASSESSOR = "impact-analysis"
 SUPPLY_CHAIN = "supply-chain"
 DEEP_SCAN_CAP = 100  # more commits than this: SBOM evidence now, deep scans staged by an operator
@@ -346,7 +345,7 @@ class ExposureService:
         ref = self._objects.put(key, result.data)
         with self._uow as uow:
             artifact = record_artifact(
-                uow, Artifact(digest=ref.sha256, kind=FEED_ARTIFACT_KIND, uri=str(ref.key))
+                uow, Artifact(digest=ref.sha256, kind=ArtifactKind.FEED.value, uri=str(ref.key))
             )
             latest = uow.feed_snapshots.latest(feed)
             retried = (
@@ -425,7 +424,7 @@ class ExposureService:
             ObjectKey.parse(f"sboms/{sha256_hex(raw)}.json.gz"), gzip.compress(raw, mtime=0)
         )
         artifact = record_artifact(
-            uow, Artifact(digest=stored.sha256, kind=SBOM_ARTIFACT_KIND, uri=str(stored.key))
+            uow, Artifact(digest=stored.sha256, kind=ArtifactKind.SBOM.value, uri=str(stored.key))
         )
         sbom = uow.sboms.get_or_add(Sbom(digest=contents.digest, artifact_id=artifact.id))
         assert sbom.id is not None
@@ -2167,7 +2166,7 @@ class ExposureService:
         ref = self._objects.put(key, raw)
         with self._uow as uow:
             artifact = record_artifact(
-                uow, Artifact(digest=ref.sha256, kind=FEED_ARTIFACT_KIND, uri=str(ref.key))
+                uow, Artifact(digest=ref.sha256, kind=ArtifactKind.FEED.value, uri=str(ref.key))
             )
             assert artifact.id is not None
             latest = uow.feed_snapshots.latest(feed)

@@ -58,6 +58,15 @@ def test_missing_key_raises_not_found(store: ObjectStore) -> None:
         store.stat(KEY)
 
 
+def test_size_states_the_stored_size_without_reading_the_bytes(store: ObjectStore) -> None:
+    """Listings state an artifact's size object by object: `size` must not read and
+    re-hash every body the way `stat` does."""
+    ref = store.put(KEY, b"payload")
+    assert store.size(KEY) == ref.size
+    with pytest.raises(NotFoundError):
+        store.size(ObjectKey.parse("absent/x.json"))
+
+
 def test_overwrite_returns_new_ref(store: ObjectStore) -> None:
     first = store.put(KEY, b"v1")
     second = store.put(KEY, b"v2")

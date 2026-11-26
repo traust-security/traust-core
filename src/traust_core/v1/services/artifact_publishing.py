@@ -23,7 +23,10 @@ from traust_core.v1.models.analysis_results import ResultKind
 from traust_core.v1.models.artifacts import (
     ARTIFACT_FOR_SCHEMA,
     ArtifactDocument,
+    ArtifactKind,
+    ArtifactView,
     RemediationArtifact,
+    media_type,
 )
 from traust_core.v1.models.assessment import Artifact, Assessment, CensusAssessment
 from traust_core.v1.models.base import Dto
@@ -644,6 +647,38 @@ class ArtifactPublisher:
     def payload_of(self, row: Artifact) -> bytes:
         """The recorded bytes of an artifact row already read: the batched `payload`."""
         return stored_bytes(self._objects, row)
+
+    def describe(self, artifact_id: UUID) -> ArtifactView:
+        """The API's view of one artifact: what it is, never where the bytes live."""
+        (view,) = self.views([self.metadata(artifact_id)])
+        return view
+
+    def views(self, rows: Sequence[Artifact]) -> list[ArtifactView]:
+        """The API's view of artifact rows already read."""
+        return [self._view(row, self._objects.size(ObjectKey.parse(row.uri))) for row in rows]
+
+    def content(self, artifact_id: UUID) -> tuple[ArtifactView, bytes]:
+        """The API's view with the digest-verified bytes, in one read."""
+        row = self.metadata(artifact_id)
+        payload = stored_bytes(self._objects, row)
+        return self._view(row, len(payload)), payload
+
+    def _view(self, row: Artifact, size: int) -> ArtifactView:
+        try:
+            kind = ArtifactKind(row.kind)
+        except ValueError as e:
+            raise ConfigError(f"unknown artifact kind {row.kind!r}") from e
+        assert row.id is not None
+        return ArtifactView(
+            id=row.id,
+            assessment_id=row.assessment_id,
+            run_order_id=row.run_order_id,
+            kind=kind,
+            digest=row.digest,
+            media_type=media_type(kind, row.uri),
+            size=size,
+            created_at=row.created_at,
+        )
 
     def read(
         self, artifact_id: UUID, artifact: type[A], *, read_budget: RecordBudget | None = None

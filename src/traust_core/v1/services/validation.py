@@ -17,6 +17,7 @@ from traust_core.v1.errors import (
     ValidationError,
 )
 from traust_core.v1.models.artifacts import (
+    VALIDATION_RECORDING,
     ValidationArtifact,
     ValidationAuthorizationArtifact,
     ValidationPlanArtifact,
@@ -62,7 +63,6 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 VALIDATION_SYSTEM = "traust.validation"
-VALIDATION_RECORDING = "validation-recording"
 _EVIDENCE_ERRORS = (IntegrityError, NotFoundError, ValidationError, ModelValidationError)
 
 
