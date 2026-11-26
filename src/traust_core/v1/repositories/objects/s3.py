@@ -46,6 +46,7 @@ class S3Client(Protocol):
     def put_object(self, *, Bucket: str, Key: str, Body: bytes) -> object: ...
     def get_object(self, *, Bucket: str, Key: str) -> _S3Read: ...
     def head_object(self, *, Bucket: str, Key: str) -> object: ...
+    def delete_object(self, *, Bucket: str, Key: str) -> object: ...
     def get_paginator(self, operation_name: Literal["list_objects_v2"]) -> _S3Paginator: ...
 
 
@@ -152,6 +153,14 @@ class S3ObjectStore:
         except BotoCoreError as e:
             raise RepositoryError(f"S3ObjectStore: head {key} failed") from e
         return True
+
+    def delete(self, key: ObjectKey) -> None:
+        # S3 deletes are idempotent by design: a missing key answers success, so a
+        # concurrent pass that already took the object is not an error here.
+        try:
+            self._client.delete_object(Bucket=self._bucket, Key=self._name(key))
+        except (BotoCoreError, ClientError) as e:
+            raise RepositoryError(f"S3ObjectStore: delete {key} failed") from e
 
     def list(self, prefix: str = "") -> Iterator[ObjectKey]:
         scope = f"{self._base}{prefix.rstrip('/')}/" if prefix else self._base
