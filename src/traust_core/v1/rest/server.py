@@ -10,6 +10,7 @@ import signal
 import socket
 import sys
 import threading
+from datetime import timedelta
 from pathlib import Path
 
 from traust_core.v1.context import Config, Context, StoreState
@@ -17,7 +18,7 @@ from traust_core.v1.context.serve import hand_config, hand_role, handed_config, 
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.operations import WorkerId
 from traust_core.v1.rest.roles import Role
-from traust_core.v1.services.reports import ReportWorker
+from traust_core.v1.services.reports import REPORT_LEASE, ReportWorker, heartbeat_age
 
 _REST_EXTRA = {"fastapi", "starlette", "uvicorn"}
 _UNTRUSTED = "this config does not trust its local issuer: set identity.trust_local: true"
@@ -36,6 +37,8 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "db":
         raise SystemExit(_db_upgrade(Context(config), args))
+    if args.command == "reports-alive":
+        raise SystemExit(_reports_alive(args.heartbeat, args.max_age))
     if args.role == Role.REPORTS:
         raise SystemExit(_report_worker(config, args.config, args.heartbeat))
     try:
@@ -116,6 +119,26 @@ def _report_worker(config: Config, config_path: Path | None, heartbeat: Path | N
         signal.signal(signum, lambda *_: stop.set())
     log.info("serving role reports", extra={"operation": "server.role", "outcome": "reports"})
     worker.run(stop)
+    return 0
+
+
+def _reports_alive(heartbeat: Path | None, max_age: float) -> int:
+    """A liveness check for a supervisor, with no shell needed (the image ships none): 0 when
+    the report worker touched its heartbeat within max_age seconds, 1 when it is older or was
+    never written, 2 without a path."""
+    if heartbeat is None:
+        print("reports-alive needs --heartbeat (the reports role's file)", file=sys.stderr)
+        return 2
+    age = heartbeat_age(heartbeat)
+    if age is None:
+        print(f"no report worker heartbeat at {heartbeat}", file=sys.stderr)
+        return 1
+    seconds = age.total_seconds()
+    if seconds > max_age:
+        print(
+            f"report worker heartbeat is {seconds:.0f}s old (max {max_age:.0f}s)", file=sys.stderr
+        )
+        return 1
     return 0
 
 
@@ -230,6 +253,23 @@ def _parser() -> argparse.ArgumentParser:
         "supervisor's liveness check can read a wedged worker from the file's age",
     )
     commands = parser.add_subparsers(dest="command")
+    alive = commands.add_parser(
+        "reports-alive",
+        help="exit 0 while the report worker's --heartbeat is fresh (an exec liveness probe)",
+    )
+    alive.add_argument(
+        "--heartbeat",
+        type=Path,
+        default=argparse.SUPPRESS,  # also accepted before the command, as the worker takes it
+        help="the heartbeat file the reports role touches",
+    )
+    alive.add_argument(
+        "--max-age",
+        type=float,
+        default=(REPORT_LEASE + timedelta(minutes=5)).total_seconds(),
+        help="seconds a heartbeat may age; default: the report lease plus five minutes, since "
+        "a build longer than its lease has lost its order",
+    )
     token = commands.add_parser("token", help="print a token from this server's local issuer")
     token.add_argument("identity", help="a person's email, or a runner's name with --machine")
     token.add_argument("--machine", action="store_true", help="a machine (runner) identity")

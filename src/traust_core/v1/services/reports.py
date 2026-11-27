@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from datetime import timedelta
 from pathlib import Path
 from uuid import UUID
@@ -200,7 +201,7 @@ class ReportWorker:
     With a heartbeat path, every pass of the loop touches it before claiming, so a process
     supervisor can tell a live worker from a wedged one by the file's age: a healthy worker
     touches it at least once per idle wait or per build, and a build longer than the lease has
-    lost its order anyway."""
+    lost its order anyway (`traust-server reports-alive`)."""
 
     def __init__(
         self,
@@ -252,3 +253,12 @@ class ReportWorker:
                 self._heartbeat.touch()
             if self.run_once() is None:
                 stop.wait(idle)
+
+
+def heartbeat_age(path: Path) -> timedelta | None:
+    """How long ago a report worker last touched its heartbeat, or None when it never has."""
+    try:
+        touched = path.stat().st_mtime
+    except FileNotFoundError:
+        return None
+    return timedelta(seconds=max(0.0, time.time() - touched))

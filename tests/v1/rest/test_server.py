@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 
@@ -235,6 +237,39 @@ def test_the_reports_role_hands_the_worker_its_heartbeat(
     with pytest.raises(SystemExit):
         server.main(["--config", str(config), "--role", "reports", "--heartbeat", str(beat)])
     assert ran["worker"]._heartbeat == beat
+
+
+@pytest.mark.parametrize(
+    ("age", "argv", "code"),
+    [
+        (None, [], 1),  # never written: the worker never ran a pass
+        (5.0, [], 0),
+        (5.0, ["--max-age", "1"], 1),
+        ((30 + 4) * 60.0, [], 0),  # within the report lease plus its margin
+        ((30 + 6) * 60.0, [], 1),
+    ],
+    ids=["missing", "fresh", "older than --max-age", "inside the lease", "past the lease"],
+)
+def test_reports_alive_reads_the_heartbeats_age(
+    tmp_path: Path, age: float | None, argv: list[str], code: int
+) -> None:
+    beat = tmp_path / "reports.alive"
+    if age is not None:
+        beat.touch()
+        then = time.time() - age
+        os.utime(beat, (then, then))
+    with pytest.raises(SystemExit) as exited:
+        server.main(["reports-alive", "--heartbeat", str(beat), *argv])
+    assert exited.value.code == code
+    with pytest.raises(SystemExit) as before:  # the worker's own spelling, before the command
+        server.main(["--heartbeat", str(beat), "reports-alive", *argv])
+    assert before.value.code == code
+
+
+def test_reports_alive_needs_a_heartbeat_path() -> None:
+    with pytest.raises(SystemExit) as exited:
+        server.main(["reports-alive"])
+    assert exited.value.code == 2
 
 
 def test_the_report_context_registers_the_feeds_the_api_path_gets(tmp_path: Path) -> None:

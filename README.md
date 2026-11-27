@@ -761,7 +761,13 @@ The reports role serves no routes, so it has no HTTP health check. With `--heart
 the worker touches that file on every pass of its loop (before each claim: at least once per
 idle wait or per build), so a supervisor can restart a worker that is running but wedged when
 the file grows older than the 30-minute report lease (a build that runs past its lease has
-lost its order anyway).
+lost its order anyway). The image ships no shell, so the check is a command an exec probe runs
+directly:
+
+```bash
+traust-server --config traust.yaml --role reports --heartbeat /tmp/reports.alive
+traust-server reports-alive --heartbeat /tmp/reports.alive   # 0 live; 1 stale or missing
+```
 
 | Route | What |
 |---|---|
