@@ -106,6 +106,7 @@ from traust_core.v1.models.dependencies import (
     Version,
     VexStatus,
     VulnerableSymbol,
+    evidence_rank,
     is_advisory_identifier,
     package_name,
     parse_advisory_identifier,
@@ -374,6 +375,13 @@ class ExposureService:
         self._advisories = advisories
         self._portfolio = portfolio
         self._clock = clock or SystemClock()
+        for analyzer in analyzers:
+            # its ceiling grades what it observes; one without it would fail mid-preparation
+            if not isinstance(getattr(analyzer, "level", None), DependencyEvidenceLevel):
+                raise ConfigError(
+                    f"impact analyzer {getattr(analyzer, 'name', analyzer)!r} declares no "
+                    "evidence level"
+                )
         self._analyzers = tuple(analyzers)
         self._sources = sources
         self._hosts = hosts
@@ -981,9 +989,11 @@ class ExposureService:
                 else SymbolResolution(status=SymbolStatus.DEGRADED, note=SHARED_FIX)
             )
             symbols = _with_judged(found, judged)
+            installed = in_manifest or in_images
             query = ImpactQuery(
                 advisory=scoped,
                 package=package,
+                version=Version(installed[0].version) if installed else None,
                 symbols=tuple(s.symbol for s in symbols.symbols) if symbols else (),
             )
             evidence, ran = self._analyze(query, checkout, evidence)
@@ -1021,9 +1031,13 @@ class ExposureService:
             evidence = evidence.model_copy(update=observed)
             notes.append(found.notes)
             ran.append(analyzer.tier)
-            levels.append(analyzer.level)  # the ladder, not tool order: max observed wins
-        # Evidence carried in (the L1 read's manifest fields) floors the grade; an analyzer
-        # that ran observes at its own declared level even when it found nothing.
+            # The ladder, not tool order: the highest level it actually observed (an explicit
+            # negative counts), capped at its declared one. Running and finding nothing to
+            # measure (no symbols to search, an empty document) grades nothing.
+            seen = found.observed_level()
+            if seen is not None:
+                levels.append(min(seen, analyzer.level, key=evidence_rank))
+        # Evidence carried in (the L1 read's manifest fields) floors the grade.
         if evidence.manifest_scan or evidence.source_import_scan == (
             ImpactSourceImportScan.IMPORTS_FOUND
         ):

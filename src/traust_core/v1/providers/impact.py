@@ -11,7 +11,13 @@ from typing import Any
 
 from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.candidate_formats import govulncheck_records
-from traust_core.v1.models.dependencies import ImpactEvidence, ImpactQuery
+from traust_core.v1.models.dependencies import (
+    CORE_EVIDENCE_FIELDS,
+    EVIDENCE_FIELD_LEVEL,
+    ImpactEvidence,
+    ImpactQuery,
+    evidence_rank,
+)
 from traust_core.v1.models.vocabulary import (
     DependencyEvidenceLevel,
     Ecosystem,
@@ -179,6 +185,10 @@ class SourceScanAnalyzer:
         return Result(evidence, Acquisition(provider=self.name, acquired_at=self._clock.now()))
 
 
+# A plug-in prints one evidence document; anything past this is refused, never buffered whole.
+MAX_PLUGIN_OUTPUT_BYTES = 1 << 20
+
+
 class CommandAnalyzer:
     """A deployment-declared plug-in behind the same interface: a command that prints one
     impact-evidence document for one query, capped at its declared level. Reachability is the
@@ -208,24 +218,40 @@ class CommandAnalyzer:
         return self._process.readiness(self._run[0])
 
     def evidence(self, query: ImpactQuery, request: ToolRequest) -> Result[ImpactEvidence]:
+        # The query's operands follow `--`: the package name comes from advisory and SBOM data,
+        # never the deployment, so a plug-in parsing options must not read it as one. The
+        # version operand is empty when the commit's SBOMs hold none.
         argv = [
             *self._run,
+            "--",
             query.package.ecosystem.value,
             query.package.name,
+            str(query.version or ""),
             str(request.checkout()),
         ]
-        run = self._process.run(argv, check=False)
+        run = self._process.run(argv, check=False, max_output_bytes=MAX_PLUGIN_OUTPUT_BYTES)
         if run.returncode != 0:
             tail = run.stderr.decode(errors="replace").strip()[-300:] or "no stderr"
             raise ServiceError(f"{self.name} exited {run.returncode}: {tail}")
         try:
             doc = ImpactEvidence.model_validate(json.loads(run.stdout.decode(errors="replace")))
         except ValueError as e:
-            raise ValidationError(f"{self.name} printed no impact evidence: {e}") from e
-        if doc.govulncheck is not None and self.level is not DependencyEvidenceLevel.SYMBOL:
+            # the parser's message quotes the rejected value: the plug-in's output stays out of
+            # the answer (the cause keeps it for the logs)
+            raise ValidationError(
+                f"plug-in {self.name} printed no valid impact-evidence document"
+            ) from e
+        refused = sorted(
+            field
+            for field in doc.model_dump(exclude_none=True)
+            if field in CORE_EVIDENCE_FIELDS
+            or evidence_rank(EVIDENCE_FIELD_LEVEL[field]) > evidence_rank(self.level)
+        )
+        if refused:
             raise ValidationError(
                 f"plug-in {self.name} declares {self.level.value} evidence but emitted "
-                "reachability: a sub-symbol plug-in can never claim `affected`"
+                f"{', '.join(refused)}: a plug-in can never claim more than its declared level "
+                "(a sub-symbol plug-in never says `affected`) or state core's own fields"
             )
         acquisition = Acquisition(
             provider=self.name,

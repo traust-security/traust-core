@@ -466,6 +466,43 @@ class VexStatus(StrEnum):
     UNDER_INVESTIGATION = "under_investigation"
 
 
+_L = DependencyEvidenceLevel
+# The evidence ladder each observed field speaks at. An analyzer's grade is the highest field it
+# actually observed (an explicit negative counts), never just its declared level; a plug-in may
+# emit only fields at or below its declared level. The L1, SBOM and grade fields are core's own.
+EVIDENCE_FIELD_LEVEL: Mapping[str, DependencyEvidenceLevel] = {
+    "govulncheck": _L.SYMBOL,
+    "govulncheck_trace": _L.SYMBOL,
+    "feature_pattern_matches": _L.SYMBOL,  # a positive match alone says affected
+    "symbol_usage_scan": _L.SYMBOL_USAGE,
+    "l4_package_imported": _L.SYMBOL_USAGE,
+    "l4_packages_found": _L.SYMBOL_USAGE,
+    "binary_string_scan": _L.BINARY,
+    "binary_linked_library": _L.BINARY,
+    "binary_symbol_scan": _L.BINARY,
+    "source_import_scan": _L.SYMBOL_USAGE,  # an import is a first-party code reference
+    "manifest_scan": _L.MANIFEST,
+    "notes": _L.NONE,
+    "needs_manual_trace": _L.NONE,
+}
+CORE_EVIDENCE_FIELDS = frozenset(
+    {
+        "l1_depends_on",
+        "l1_version_in_range",
+        "manifest_version",
+        "sbom_scan",
+        "sbom_shipped_version",
+        "evidence_level",
+    }
+)
+_LADDER = (_L.NONE, _L.MANIFEST, _L.BINARY, _L.SYMBOL_USAGE, _L.SYMBOL)
+
+
+def evidence_rank(level: DependencyEvidenceLevel) -> int:
+    """A level's place on the ladder: symbol > symbol-usage > binary > manifest > none."""
+    return _LADDER.index(level)
+
+
 class ImpactEvidence(Model):
     """What each tier observed for one commit, unobserved is None; the impact-analysis
     schema's evidence block."""
@@ -489,6 +526,21 @@ class ImpactEvidence(Model):
     binary_symbol_scan: ImpactBinarySymbolScan | None = None
     sbom_scan: ImpactSbomScan | None = None
     sbom_shipped_version: Version | None = None
+
+    def observed(self) -> dict[str, Any]:
+        """The analysis fields this document states (None is unobserved), core's own excluded."""
+        return {
+            k: v
+            for k, v in self.model_dump(exclude_none=True).items()
+            if k not in CORE_EVIDENCE_FIELDS
+        }
+
+    def observed_level(self) -> DependencyEvidenceLevel | None:
+        """The highest ladder level a stated field speaks at; None when nothing is observed
+        (notes alone measure nothing)."""
+        levels = [EVIDENCE_FIELD_LEVEL[k] for k in self.observed()]
+        graded = [lv for lv in levels if lv is not _L.NONE]
+        return max(graded, key=evidence_rank) if graded else None
 
     def classification(self, ecosystem: Ecosystem = Ecosystem.GO) -> ImpactClassification:
         """The rubric: reachability (govulncheck) decides `affected`; manifest, import and
@@ -796,10 +848,14 @@ class SymbolResolution(Model):
 
 
 class ImpactQuery(Model):
-    """What an analyzer looks for in a checkout: the advisory's package and symbols."""
+    """What an analyzer looks for in a checkout: the advisory's package, the installed version
+    this preparation is for, and the symbols. A commit holding several versions of the package
+    is prepared once per version, so each query names exactly one; None when the commit's SBOMs
+    hold no version of it (its coverage unknown)."""
 
     advisory: AdvisoryRecord
     package: AffectedPackage
+    version: Version | None = None
     symbols: tuple[str, ...] = ()
 
 
