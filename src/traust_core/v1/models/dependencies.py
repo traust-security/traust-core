@@ -952,6 +952,7 @@ class ImpactAnswer(Model):
     caveats: tuple[str, ...] = ()
     complete: bool = True
     fixable: int = 0
+    # the oldest time a tracked line's head was last confirmed (named at import or observation)
     as_of: datetime | None = None
 
 

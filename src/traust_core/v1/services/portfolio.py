@@ -1161,6 +1161,33 @@ class PortfolioService:
             uow.commit()
             return ref
 
+    def name_line_head(self, repository_id: UUID, sha: GitSha, branch: RefName) -> RepositoryRef:
+        """A tracked branch line's head as the forge names it now: the ref is added when absent,
+        and its naming time is stamped anew either way. The naming time orders a line's refs
+        (`list_lines`), so a line moved back to an earlier commit ranks that commit as its head
+        again, and it records when the head was last confirmed (the impact answer's as_of)."""
+        require_uuid(repository_id, "repository_ref.repository_id")
+        with self._uow as uow:
+            named = _named_at(self._clock.now())
+            ref = uow.repository_refs.get_or_add(
+                RepositoryRef(
+                    repository_id=repository_id,
+                    name=branch,
+                    kind=RefKind.BRANCH,
+                    default_named_at=named,
+                    sha=str(sha),
+                )
+            )
+            if (ref.name, ref.kind) != (branch, RefKind.BRANCH):
+                raise ConflictError(
+                    f"ref {branch}@{sha.value} of repository {repository_id} is already "
+                    f"recorded as a {ref.kind or 'bare commit'}; a line has one kind"
+                )
+            if ref.default_named_at != named:
+                ref = uow.repository_refs.update(ref.model_copy(update={"default_named_at": named}))
+            uow.commit()
+            return ref
+
     def mark_default_branch(
         self, repository_id: UUID, sha: GitSha, branch: RefName
     ) -> RepositoryRef:
@@ -2142,7 +2169,7 @@ class PortfolioSync:
         line = self._portfolio.inventory.default_line(repository_id)
         if line is not None and line.name == branch:
             return self._portfolio.mark_default_branch(repository_id, head, branch)
-        return self._portfolio.register_ref(repository_id, head, branch, RefKind.BRANCH)
+        return self._portfolio.name_line_head(repository_id, head, branch)
 
     def attach_branch(self, repository_id: UUID, branch: RefName) -> RepositoryRef:
         """Attach a branch line to track, by repository id: the commit it points at now is

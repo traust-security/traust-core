@@ -253,7 +253,10 @@ def test_import_branch_registers_the_commit_the_branch_points_at(
     again = sync(portfolio, forge).import_branch(
         repository.id, url("example-org/api"), RefName("main")
     )
-    assert again == ref
+    # the same row, its head confirmed again (the naming time is stamped anew)
+    assert (again.id, again.sha) == (ref.id, ref.sha)
+    assert again.default_named_at is not None and ref.default_named_at is not None
+    assert again.default_named_at >= ref.default_named_at
 
 
 def test_a_default_line_the_forge_couldnt_give_fails_the_import_and_a_retry_imports_it(

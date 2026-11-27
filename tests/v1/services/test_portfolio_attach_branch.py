@@ -3,7 +3,7 @@ current head at the forge (the Snyk-style "scan this branch")."""
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy.engine import Engine
@@ -193,3 +193,57 @@ def test_a_forge_error_attaching_stays_an_error(engine: Engine, seed: Seed) -> N
             Forge(head_error=malformed),  # type: ignore[arg-type]
             clock=FixedClock(T0),
         ).attach_branch(repo.id, RefName("release-4.16"))  # type: ignore[arg-type]
+
+
+class _Ticking:
+    """A clock a minute further on at each read: every naming is strictly later."""
+
+    def __init__(self) -> None:
+        self.at = T0
+
+    def now(self) -> datetime:
+        self.at += timedelta(minutes=1)
+        return self.at
+
+
+def _sync(engine: Engine, forge: Forge, clock: _Ticking) -> PortfolioSync:
+    return PortfolioSync(
+        PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy(), clock=clock),  # type: ignore[arg-type]
+        forge,  # type: ignore[arg-type]
+        clock=clock,  # type: ignore[arg-type]
+    )
+
+
+def test_a_line_reset_to_an_earlier_commit_takes_that_commit_as_its_head(
+    engine: Engine, seed: Seed
+) -> None:
+    # A -> B -> A: the reused A row is named anew, so the line's head is A, not B
+    repo = seed.repository(url="https://github.com/org/tooling")
+    seed.uow.commit()
+    forge, clock = Forge(heads={"release-4.16": SHA}), _Ticking()
+    line = RefName("release-4.16")
+    _sync(engine, forge, clock).attach_branch(repo.id, line)  # type: ignore[arg-type]
+    forge.heads = {"release-4.16": MOVED}
+    _sync(engine, forge, clock).attach_branch(repo.id, line)  # type: ignore[arg-type]
+    forge.heads = {"release-4.16": SHA}
+    _sync(engine, forge, clock).attach_branch(repo.id, line)  # type: ignore[arg-type]
+    service = PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy())
+    [head] = service.tracked_refs_of(repo.id)  # type: ignore[arg-type]
+    assert head.sha == SHA
+
+
+def test_re_observing_an_unchanged_line_refreshes_when_its_head_was_confirmed(
+    engine: Engine, seed: Seed
+) -> None:
+    repo = seed.repository(url="https://github.com/org/tooling")
+    seed.uow.commit()
+    forge, clock = Forge(heads={"release-4.16": SHA}), _Ticking()
+    first = _sync(engine, forge, clock).attach_branch(repo.id, RefName("release-4.16"))  # type: ignore[arg-type]
+    sync = _sync(engine, forge, clock)
+    report = sync.observe_lines(repo.id, HttpsRepoUrl.parse(repo.url, HOSTS))  # type: ignore[arg-type]
+    assert report.observed == (RefName("release-4.16"),)
+    service = PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy())
+    [head] = service.tracked_refs_of(repo.id)  # type: ignore[arg-type]
+    assert head.id == first.id
+    assert first.default_named_at is not None and head.default_named_at is not None
+    assert head.default_named_at > first.default_named_at  # the impact answer's as_of moves
