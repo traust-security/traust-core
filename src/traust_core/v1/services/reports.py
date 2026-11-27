@@ -10,6 +10,7 @@ import json
 import logging
 import threading
 from datetime import timedelta
+from pathlib import Path
 from uuid import UUID
 
 from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
@@ -188,21 +189,32 @@ class ReportService:
         return ReportInput.model_validate_json(raw)
 
 
+# How long a report build may hold its order; a build still running past it has lost the order.
+REPORT_LEASE = timedelta(minutes=30)
+
+
 class ReportWorker:
     """The reports role's loop: claim a report order, build it, complete it. One build at a
-    time per process - report usage is controlled by how many report workers run."""
+    time per process - report usage is controlled by how many report workers run.
+
+    With a heartbeat path, every pass of the loop touches it before claiming, so a process
+    supervisor can tell a live worker from a wedged one by the file's age: a healthy worker
+    touches it at least once per idle wait or per build, and a build longer than the lease has
+    lost its order anyway."""
 
     def __init__(
         self,
         ops: OpsService,
         reports: ReportService,
         worker: WorkerId,
-        lease_for: timedelta = timedelta(minutes=30),
+        lease_for: timedelta = REPORT_LEASE,
+        heartbeat: Path | None = None,
     ) -> None:
         self._ops = ops
         self._reports = reports
         self._worker = worker
         self._lease_for = lease_for
+        self._heartbeat = heartbeat
 
     def run_once(self) -> UUID | None:
         """Build the next queued report, if any: the order it completed, or None when idle or
@@ -236,5 +248,7 @@ class ReportWorker:
 
     def run(self, stop: threading.Event, idle: float = 2.0) -> None:
         while not stop.is_set():
+            if self._heartbeat is not None:
+                self._heartbeat.touch()
             if self.run_once() is None:
                 stop.wait(idle)

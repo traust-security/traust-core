@@ -222,6 +222,21 @@ def test_the_reports_role_runs_the_report_worker_and_no_server(
     assert isinstance(ran["worker"], ReportWorker) and "uvicorn" not in ran
 
 
+def test_the_reports_role_hands_the_worker_its_heartbeat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traust_core.v1.services.reports import ReportWorker
+
+    config = tmp_path / "traust.yaml"
+    config.write_text(f"home: {tmp_path}\n")
+    beat = tmp_path / "reports.alive"
+    ran: dict[str, Any] = {}
+    monkeypatch.setattr(ReportWorker, "run", lambda self, stop: ran.update(worker=self))
+    with pytest.raises(SystemExit):
+        server.main(["--config", str(config), "--role", "reports", "--heartbeat", str(beat)])
+    assert ran["worker"]._heartbeat == beat
+
+
 def test_the_report_context_registers_the_feeds_the_api_path_gets(tmp_path: Path) -> None:
     context = server._report_context(Config(home=tmp_path), None)
     assert context.feed_sources.names()  # a freshness report names its feed sources

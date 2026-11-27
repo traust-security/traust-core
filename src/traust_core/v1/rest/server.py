@@ -37,7 +37,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "db":
         raise SystemExit(_db_upgrade(Context(config), args))
     if args.role == Role.REPORTS:
-        raise SystemExit(_report_worker(config, args.config))
+        raise SystemExit(_report_worker(config, args.config, args.heartbeat))
     try:
         import uvicorn
     except ModuleNotFoundError as e:
@@ -102,11 +102,14 @@ def _report_context(config: Config, config_path: Path | None) -> Context:
     return context
 
 
-def _report_worker(config: Config, config_path: Path | None) -> int:
+def _report_worker(config: Config, config_path: Path | None, heartbeat: Path | None = None) -> int:
     context = _report_context(config, config_path)
     services = context.services()
     worker = ReportWorker(
-        services.ops, services.reports, WorkerId(f"reports-{socket.gethostname()}-{os.getpid()}")
+        services.ops,
+        services.reports,
+        WorkerId(f"reports-{socket.gethostname()}-{os.getpid()}"),
+        heartbeat=heartbeat,
     )
     stop = threading.Event()
     for signum in (signal.SIGTERM, signal.SIGINT):
@@ -219,6 +222,12 @@ def _parser() -> argparse.ArgumentParser:
         default=Role.ALL.value,
         help="serve one role: query (reads), command (writes), ops (run orders), reports (the "
         "report-building worker, no routes); all serves every route",
+    )
+    parser.add_argument(
+        "--heartbeat",
+        type=Path,
+        help="with --role reports: a file the worker touches on every pass of its loop, so a "
+        "supervisor's liveness check can read a wedged worker from the file's age",
     )
     commands = parser.add_subparsers(dest="command")
     token = commands.add_parser("token", help="print a token from this server's local issuer")

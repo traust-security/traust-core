@@ -757,6 +757,12 @@ artifacts. Serving splits by role so a slow read can never starve a write:
 traust-server --config traust.yaml --role query|command|ops|reports   # default: all
 ```
 
+The reports role serves no routes, so it has no HTTP health check. With `--heartbeat PATH`
+the worker touches that file on every pass of its loop (before each claim: at least once per
+idle wait or per build), so a supervisor can restart a worker that is running but wedged when
+the file grows older than the 30-minute report lease (a build that runs past its lease has
+lost its order anyway).
+
 | Route | What |
 |---|---|
 | `POST /v1/dashboards:query` | one metrics query over the finding's stamped current answer (state, effective severity, decided, category, and the shipped product's slug — `findings` groups and filters by `product`; a repository shipping in several products counts in each product's row and once under a multi-product filter, `None` when nothing ships it). Subjects: `findings`, `review_items`. Every query takes the repository filter (empty = the whole estate); `group_by` ≤ 3, row cap 1,000 |

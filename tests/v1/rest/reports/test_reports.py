@@ -6,6 +6,7 @@ the same build until `refresh` asks for a new one."""
 from __future__ import annotations
 
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -241,3 +242,31 @@ def test_a_late_report_losing_its_lease_does_not_stop_the_worker(
     assert "lost its lease before completion" in caplog.text
     assert report["order_id"] in caplog.text
     assert worker.run_once() is None  # nothing else queued: the worker idles, it doesn't stop
+
+
+def test_the_report_worker_touches_its_heartbeat_on_every_pass(tmp_path: Path) -> None:
+    """A supervisor reads the worker's liveness from the heartbeat's age: every pass of the
+    loop touches it before claiming, idle or not."""
+    import os
+    import threading
+    from types import SimpleNamespace
+
+    beat = tmp_path / "reports.alive"
+    assert not beat.exists()
+    stop = threading.Event()
+    passes: list[float] = []
+
+    def claim(*_: object) -> None:
+        passes.append(beat.stat().st_mtime)  # touched before this claim
+        os.utime(beat, (0, 0))  # age it, so the next pass must touch it again
+        if len(passes) == 2:
+            stop.set()
+
+    worker = ReportWorker(
+        SimpleNamespace(claim=claim),  # type: ignore[arg-type]
+        SimpleNamespace(),  # type: ignore[arg-type]
+        WorkerId("reports-test"),
+        heartbeat=beat,
+    )
+    worker.run(stop, idle=0)
+    assert len(passes) == 2 and all(p > 0 for p in passes)  # each pass touched it afresh
