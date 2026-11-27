@@ -3,6 +3,8 @@ manifest parser."""
 
 from __future__ import annotations
 
+import ast
+import configparser
 import json
 import os
 import re
@@ -227,6 +229,60 @@ def _unpinned_requirements(text: str) -> bool:
     return False
 
 
+_SETUP_KEYS = ("install_requires", "extras_require", "setup_requires", "tests_require")
+
+
+def _setup_py_unpinned(text: str) -> bool:
+    """A setup.py whose requirements syft can't read whole: syft keeps only exact (`==`) pins
+    listed literally in the setup() call; a range, or any requirement built at run time (a
+    variable, a call), is dropped. Parsed with `ast`, never executed; unparsable is unknown."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return True
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg not in _SETUP_KEYS:
+                continue
+            value = keyword.value
+            groups = value.values if isinstance(value, ast.Dict) else [value]
+            for group in groups:
+                if not isinstance(group, (ast.List, ast.Tuple)):
+                    return True  # built at run time: syft can't see it
+                for item in group.elts:
+                    if not (isinstance(item, ast.Constant) and isinstance(item.value, str)):
+                        return True
+                    if _unpinned_requirements(item.value):
+                        return True
+    return False
+
+
+def _setup_cfg_deps(text: str) -> bool:
+    """A setup.cfg declaring requirements: syft catalogs none of them, pinned or not."""
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        parser.read_string(text)
+    except configparser.Error:
+        return True
+    return any(
+        value.strip()
+        for section, keys in (
+            ("options", ("install_requires", "setup_requires", "tests_require")),
+            (
+                "options.extras_require",
+                tuple(parser["options.extras_require"])
+                if parser.has_section("options.extras_require")
+                else (),
+            ),
+        )
+        if parser.has_section(section)
+        for key in keys
+        if (value := parser.get(section, key, fallback=""))
+    )
+
+
 def _requirements(name: str) -> bool:
     return name.endswith(".txt") and "requirements" in name
 
@@ -416,6 +472,11 @@ _RULES = (
           above=False),
     _Rule(Ecosystem.PYPI, _requirements, _unpinned_requirements,
           reason=ManifestCoverageReason.UNPINNED),
+    _Rule(Ecosystem.PYPI, lambda n: n == "setup.py", _setup_py_unpinned,
+          frozenset({"poetry.lock", "uv.lock", "pdm.lock"}),
+          reason=ManifestCoverageReason.UNPINNED),
+    _Rule(Ecosystem.PYPI, lambda n: n == "setup.cfg", _setup_cfg_deps,
+          frozenset({"poetry.lock", "uv.lock", "pdm.lock"}), reason="unsupported-manifest"),
     _Rule(Ecosystem.CARGO, lambda n: n == "Cargo.toml", _cargo_deps, frozenset({"Cargo.lock"})),
     _Rule(Ecosystem.RUBY, lambda n: n == "Gemfile", lambda text: bool(_GEM.search(text)),
           frozenset({"Gemfile.lock"}), above=False),
