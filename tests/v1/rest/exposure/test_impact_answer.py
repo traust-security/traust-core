@@ -9,6 +9,9 @@ from fastapi.testclient import TestClient
 
 from tests.v1.repositories.tables.conftest import Seed
 from tests.v1.rest.conftest import bearer, same_as_in_process
+
+# the advisory source stub, alias lookups (related) included
+from tests.v1.services.test_exposure_impact import Lookup
 from traust_core.v1.context import Context
 from traust_core.v1.models.dependencies import (
     AdvisoryIdentifier,
@@ -19,7 +22,6 @@ from traust_core.v1.models.dependencies import (
     Version,
 )
 from traust_core.v1.models.vocabulary import Ecosystem
-from traust_core.v1.providers.base import Acquisition, Result
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 
 AT = datetime(2026, 11, 3, tzinfo=UTC)
@@ -35,16 +37,6 @@ LODASH = AdvisoryRecord(
         ),
     ),
 )
-
-
-class Lookup:
-    name = "osv"
-
-    def __init__(self, *records: AdvisoryRecord) -> None:
-        self.records = {r.identifier: r for r in records}
-
-    def record(self, identifier: AdvisoryIdentifier) -> Result[AdvisoryRecord | None]:
-        return Result(self.records.get(identifier), Acquisition(provider="osv", acquired_at=AT))
 
 
 def seeded(context: Context, *, with_sbom: bool, count: int = 1) -> list[UUID]:
@@ -101,11 +93,12 @@ def test_the_fill_door_queues_one_batch(context: Context, client: TestClient) ->
     batch = filled.json()
     orders = client.get("/v1/orders", params={"run_batch_id": batch["id"]}, headers=bearer(context))
     assert orders.status_code == 200
+    # planned until the engine's admission queues them (c129551d)
     assert sorted((o["asset"], o["state"]) for o in orders.json()["items"]) == [
-        ("manifest_sbom", "queued"),
-        ("manifest_sbom", "queued"),
-        ("repo_state", "queued"),
-        ("repo_state", "queued"),
+        ("manifest_sbom", "planned"),
+        ("manifest_sbom", "planned"),
+        ("repo_state", "planned"),
+        ("repo_state", "planned"),
     ]
     again = client.post(f"/v1/advisories/{CVE}/impact/fill", headers=bearer(context))
     assert again.json()["id"] == batch["id"]
