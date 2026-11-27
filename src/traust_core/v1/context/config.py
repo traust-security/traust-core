@@ -23,6 +23,7 @@ from traust_core.v1.models.operations import (
     RecordKind,
 )
 from traust_core.v1.models.vocabulary import DependencyEvidenceLevel, Ecosystem, ImpactTier
+from traust_core.v1.providers.analysis import IMPACT_ARSENAL
 from traust_core.v1.services.findings.rating import RatingConfig
 from traust_core.v1.services.findings.review import ReviewConfig
 from traust_core.v1.services.identity import IdentityConfig
@@ -336,6 +337,13 @@ class ImpactConfig(_Model):
 
     analyzers: tuple[str, ...] = ()
     plugins: tuple[ImpactPluginConfig, ...] = ()
+
+    @pydantic.field_validator("analyzers")
+    @classmethod
+    def _arsenal_names(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if unknown := sorted(set(value) - IMPACT_ARSENAL):
+            raise ValueError(f"impact.analyzers names no arsenal tool: {unknown}")
+        return value
 
 
 class OverridesConfig(_Model):

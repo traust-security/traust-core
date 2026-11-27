@@ -429,3 +429,24 @@ def test_a_channel_error_in_the_control_surface_is_a_config_error(
     monkeypatch.setattr(contracts, "run_db_upgrades", refuse)
     with pytest.raises(ConfigError, match="upgrade channel refused this store"):
         context.apply_db_upgrades()
+
+
+def test_an_unknown_impact_analyzer_refuses_the_config_before_any_request(
+    tmp_path: Path,
+) -> None:
+    # loading fails, so create_app never starts serving with a name no arsenal tool carries
+    with pytest.raises(ConfigError, match="impact"):
+        Config.from_file(
+            _write(tmp_path, f"home: {tmp_path / 'home'}\nimpact:\n  analyzers: [govulncheq]\n")
+        )
+    known = Config.from_file(
+        _write(tmp_path, f"home: {tmp_path / 'home'}\nimpact:\n  analyzers: [govulncheck]\n")
+    )
+    assert known.impact.analyzers == ("govulncheck",)
+
+
+def test_the_arsenal_names_are_the_analyzers_context_builds() -> None:
+    from traust_core.v1.providers.analysis import IMPACT_ARSENAL
+    from traust_core.v1.providers.impact import GovulncheckAnalyzer, SourceScanAnalyzer
+
+    assert {GovulncheckAnalyzer.name, SourceScanAnalyzer.name} == IMPACT_ARSENAL
