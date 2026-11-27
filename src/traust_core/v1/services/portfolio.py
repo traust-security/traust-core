@@ -2044,6 +2044,15 @@ def _registered(doc: CorpusRegistryArtifact, product: Product) -> CorpusSubject:
     return subject
 
 
+def _forge_status(error: SourceError) -> int | None:
+    """The HTTP status under a forge read's SourceError wrappers (head() wraps the read's own
+    one again): the first non-SourceError cause, when it is a ServiceError carrying one."""
+    cause: BaseException | None = error
+    while isinstance(cause, SourceError):
+        cause = cause.__cause__
+    return cause.status if isinstance(cause, ServiceError) else None
+
+
 class PortfolioSync:
     """Brings forge listings and the declared ownership source into the portfolio."""
 
@@ -2146,8 +2155,7 @@ class PortfolioSync:
         try:
             return self.import_branch(repository_id, url, branch)
         except SourceError as e:
-            cause = e.__cause__
-            if not (isinstance(cause, ServiceError) and cause.status == 404):
+            if _forge_status(e) != 404:
                 raise
             raise NotFoundError(f"branch {branch} of {url}: the forge has no such branch") from e
 

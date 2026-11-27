@@ -8,6 +8,8 @@ from datetime import UTC, datetime
 import pytest
 from sqlalchemy.engine import Engine
 
+from tests.v1.observation_support import HOSTS
+from tests.v1.providers.test_forge import github_source
 from tests.v1.repositories.tables import conftest as table_fixtures
 from tests.v1.repositories.tables.conftest import SHA, Seed
 from tests.v1.services.test_portfolio_sync import Forge
@@ -136,6 +138,24 @@ def test_a_branch_the_forge_answers_404_for_is_not_found(engine: Engine, seed: S
             PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy()),
             Forge(head_error=gone),  # type: ignore[arg-type]
             clock=FixedClock(T0),
+        ).attach_branch(repo.id, RefName("release-4.16"))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(("status", "raised"), [(404, NotFoundError), (409, SourceError)])
+def test_the_real_forge_heads_404_is_not_found_through_its_wrappers(
+    engine: Engine, seed: Seed, status: int, raised: type[Exception]
+) -> None:
+    # head() wraps the forge's SourceError (itself from the HTTP 404) in a second one; the
+    # 404 is found down the chain, and no other status (409: an empty repository) becomes it
+    repo = seed.repository(url="https://github.com/org/tooling")
+    seed.uow.commit()
+    provider, _ = github_source("not found", status=status)
+    with pytest.raises(raised):
+        PortfolioSync(
+            PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy()),
+            provider,
+            clock=FixedClock(T0),
+            hosts=HOSTS,
         ).attach_branch(repo.id, RefName("release-4.16"))  # type: ignore[arg-type]
 
 
