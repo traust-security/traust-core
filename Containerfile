@@ -42,7 +42,7 @@ RUN uv pip install --no-deps /app/dist/*.whl
 # downloading a release at build time: no network fetch in the build.
 # Ledger signing (Config.ledger) shells out to it; deployments without
 # signing never execute it.
-FROM registry.access.redhat.com/hi/cosign:latest@sha256:b093a3ec46fab423d25333ca1a9466ccf21799c94008eaf1b9fdbd23e7ee25a2 AS cosign
+FROM registry.access.redhat.com/hi/cosign:latest@sha256:a64a815e27be23817d46425c97cb93db9e70b8bb2d4170e7d6b015d82b1576b8 AS cosign
 
 # ── Runtime stage ───────────────────────────────────────────────────
 # Minimal hardened Python runtime. Runs as a non-root user (UID 65532) by
