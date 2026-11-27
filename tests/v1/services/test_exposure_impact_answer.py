@@ -133,9 +133,8 @@ def filled(
     ops = OpsService(
         uow,
         FixedClock(AT),
-        ArtifactPublisher(
-            PublishSpecs(PublishSpec(RunManifestArtifact)), objects, SqlTraustUnitOfWork(engine)
-        ),
+        # the run manifest publishes inside the order transaction: one unit of work
+        ArtifactPublisher(PublishSpecs(PublishSpec(RunManifestArtifact)), objects, uow),
         inventory=Inventory(SqlTraustUnitOfWork(engine)),
     )
     return exposure(engine, tool, objects, *records, ops=ops)
@@ -320,8 +319,9 @@ def test_fill_queues_the_gap_orders_in_one_batch(engine: Engine, tmp_path: Path)
     assert answer.fixable == 2
     batch = service.fill(CVE, OPERATOR)
     assert batch is not None and batch.id is not None
+    # a submitted order is planned until the engine's admission queues it (c129551d)
     expected = sorted(
-        (asset, repo.id, "queued")
+        (asset, repo.id, "planned")
         for repo in (gap_repo, other_gap)
         for asset in ("repo_state", "manifest_sbom")
     )
@@ -438,8 +438,8 @@ def test_a_repository_the_policy_wont_take_is_skipped_not_fatal(
     batch = service.fill(CVE, OPERATOR)
     assert batch is not None and batch.id is not None
     assert sorted(batch_orders(engine, batch.id)) == [
-        ("manifest_sbom", good.id, "queued"),
-        ("repo_state", good.id, "queued"),
+        ("manifest_sbom", good.id, "planned"),
+        ("repo_state", good.id, "planned"),
     ]  # the never-onboarded repository's gap stays, never blocking the fill
 
 

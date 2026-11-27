@@ -42,6 +42,7 @@ class ObjectRef:
 class ObjectStore(Protocol):
     def put(self, key: ObjectKey, data: bytes) -> ObjectRef: ...
     def get(self, ref: ObjectRef) -> bytes: ...
+    def read(self, key: ObjectKey, sha256: str) -> bytes: ...
     def stat(self, key: ObjectKey) -> ObjectRef: ...
     def exists(self, key: ObjectKey) -> bool: ...
     def list(self, prefix: str = "") -> Iterator[ObjectKey]: ...
@@ -109,6 +110,11 @@ class LocalObjectStore:
     def get(self, ref: ObjectRef) -> bytes:
         return _verified(ref, self._read(ref.key))
 
+    def read(self, key: ObjectKey, sha256: str) -> bytes:
+        """The bytes at `key`, checked against a digest recorded elsewhere: one read."""
+        data = self._read(key)
+        return _verified(ObjectRef(key, sha256, len(data)), data)
+
     def stat(self, key: ObjectKey) -> ObjectRef:
         data = self._read(key)
         return ObjectRef(key, sha256_hex(data), len(data))
@@ -142,6 +148,11 @@ class InMemoryObjectStore:
 
     def get(self, ref: ObjectRef) -> bytes:
         return _verified(ref, self._read(ref.key))
+
+    def read(self, key: ObjectKey, sha256: str) -> bytes:
+        """The bytes at `key`, checked against a digest recorded elsewhere: one read."""
+        data = self._read(key)
+        return _verified(ObjectRef(key, sha256, len(data)), data)
 
     def stat(self, key: ObjectKey) -> ObjectRef:
         data = self._read(key)

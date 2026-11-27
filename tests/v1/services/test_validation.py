@@ -172,6 +172,7 @@ def harness(engine: Engine) -> ValidationHarness:
         clock=FixedClock(NOW),
         objects=objects,
         review=review_policy,
+        rating=RatingPolicy(RatingConfig()),
     )
     review = FindingReview(
         shared, review_policy, decisions, FindingViewQuery(RatingPolicy(RatingConfig()))
@@ -268,6 +269,19 @@ def snapshot(engine: Engine) -> dict[str, tuple[tuple[object, ...], ...]]:
             )
             for name in TABLES
         }
+
+
+def test_unbound_decisions_writer_cannot_stamp_a_report_with_a_run_order(
+    harness: ValidationHarness,
+) -> None:
+    before = snapshot(harness.engine)
+    objects = tuple(harness.objects.list())
+    with pytest.raises(TypeError, match="run_order_id"):
+        harness.decisions.record_validation(
+            report(harness), PROVENANCE, harness.bindings(), run_order_id=RUN_ID
+        )
+    assert snapshot(harness.engine) == before
+    assert tuple(harness.objects.list()) == objects
 
 
 def test_record_confirms_e0_without_rerating_or_fabricating_occurrences(

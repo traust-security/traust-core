@@ -16,9 +16,11 @@ from pydantic import Field
 from traust_core.v1 import contracts
 from traust_core.v1.errors import ConflictError, ForbiddenError, ValidationError
 from traust_core.v1.models import candidate_formats
+from traust_core.v1.models.artifacts import SchemaView
 from traust_core.v1.models.base import AppendOnly, Entity, Model
 from traust_core.v1.models.candidate_formats import SuppressionStatus
 from traust_core.v1.models.common import CodeHash, CodeSpan, RepoPath
+from traust_core.v1.models.cvss import CvssSource, CvssStatement, SelectedCvss
 from traust_core.v1.models.finding_claims import ClaimLocation
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import canonical_json, sha256_hex
@@ -119,6 +121,9 @@ class IdentityMove(Model):
     matched_by: AliasMatchedBy
     similarity: float | None = None
     path_overlap: float | None = None
+    # the candidate's advisory when its identity is an exposure key: the finding takes the
+    # advisory link with the identity, so its views select the advisory's authority score
+    advisory_id: UUID | None = None
 
 
 class IntakeResult(Model):
@@ -152,6 +157,50 @@ class RecordDecision(Model):
     fixed_repository_ref_id: UUID | None = None
     artifact_id: UUID | None = None
     occurred_at: datetime | None = None
+
+
+class OccurrenceClaim(Model):
+    """A CVSS claim one occurrence's report stated, declared for recording: the finding
+    by its fingerprint, the assessment whose report stated the claim, and the claim
+    itself — the vector and the score, both present."""
+
+    repository_id: UUID
+    fingerprint_algo: str = Field(min_length=1, max_length=64)
+    fingerprint: str = Field(min_length=1, max_length=512)
+    assessment_id: UUID
+    cvss_vector: str = Field(min_length=1, max_length=512)
+    cvss_score: Decimal = Field(ge=0, le=10)
+
+
+class OccurrenceClaimOutcome(StrEnum):
+    """What the claim door did with one declared claim."""
+
+    RECORDED = "recorded"  # the governed statement is appended
+    ALREADY_RECORDED = "already_recorded"  # the same claim statement exists (idempotent)
+    ALREADY_CARRIED = "already_carried"  # the occurrence's own columns state it
+    CONFLICTING = "conflicting"  # the occurrence carries a different claim
+    UNKNOWN_FINDING = "unknown_finding"  # no finding under the declared fingerprint
+    UNREPORTED = "unreported"  # the assessment did not report the finding
+    INVALID = "invalid"  # the claim fails core's CVSS discipline
+
+
+class OccurrenceClaimResult(Model):
+    """One declared claim's answer: the outcome, the finding and occurrence it bound to,
+    and the decision that recorded it (the audit trail, none when nothing was written)."""
+
+    claim: OccurrenceClaim
+    outcome: OccurrenceClaimOutcome
+    finding_id: UUID | None = None
+    occurrence_id: UUID | None = None
+    decision_id: UUID | None = None
+
+
+class OccurrenceClaimReport(Model):
+    """The batch's answers, one row per declared claim in declaration order, with the
+    count per outcome."""
+
+    results: tuple[OccurrenceClaimResult, ...]
+    counts: Mapping[OccurrenceClaimOutcome, int]
 
 
 class ReviewCaseKind(StrEnum):
@@ -190,16 +239,23 @@ class FindingState(StrEnum):
 
 
 def finding_state(kind: str | None, disposition: Disposition | None) -> FindingState:
-    """The state classification a view serves and a census counts: closed by validity,
-    then by resolution; open splits off hardening (posture debt)."""
+    """The state classification a view serves and a census counts, along the workflow
+    (identified -> verify -> remediate | accept risk | false positive): closed by validity,
+    then by resolution; hardening is a verified defense-in-depth gap - a judged weakness, or
+    the historical hardening validity. Kind alone never decides: an unjudged weakness is
+    identified, so open (contracts: "kind alone does not establish confirmation")."""
     d = disposition
-    if d is not None and d.validity in _CLOSED_VALIDITY:
+    if d is None:
+        return FindingState.OPEN
+    if d.validity in _CLOSED_VALIDITY:
         return FindingState.FALSE_POSITIVE
-    if d is not None and d.resolution == DispositionResolution.RESOLVED:
+    if d.resolution == DispositionResolution.RESOLVED:
         return FindingState.RESOLVED
-    if d is not None and d.resolution == DispositionResolution.RISK_ACCEPTED:
+    if d.resolution == DispositionResolution.RISK_ACCEPTED:
         return FindingState.ACCEPTED
-    if kind == FindingKind.WEAKNESS or (d is not None and d.validity == Validity.HARDENING):
+    if d.validity == Validity.HARDENING or (
+        kind == FindingKind.WEAKNESS and d.validity in _AFFIRMED_VALIDITY
+    ):
         return FindingState.HARDENING
     return FindingState.OPEN
 
@@ -282,13 +338,6 @@ class SortDirection(StrEnum):
 
     ASC = "asc"
     DESC = "desc"
-
-
-class FindingCount(Model):
-    """The filtered total a paged listing's pager reads: one number, from one bounded
-    fold that holds no views."""
-
-    total: int
 
 
 class FindingRollup(Model):
@@ -434,11 +483,12 @@ class ExposureKey(Model):
     package: str
 
 
-def _owasp_llm(entry: Any) -> tuple[OwaspLlmCategory, ...]:
-    # Only report findings declare the field; a verification's regressions don't.
-    if "owasp_llm_references" not in dir(entry):
-        return ()
-    return tuple(OwaspLlmCategory(c) for c in entry.owasp_llm_references)
+def _owasp_llm(entry: SchemaView) -> tuple[OwaspLlmCategory, ...]:
+    try:
+        references = entry.owasp_llm_references
+    except AttributeError as exc:
+        raise ValidationError("report finding schema must declare owasp_llm_references") from exc
+    return tuple(OwaspLlmCategory(category) for category in references)
 
 
 class Suppression(Model):
@@ -549,37 +599,53 @@ class FindingCandidate(Model):
         return out
 
     @classmethod
-    def of_report(cls, entries: Iterable[Any], repository_id: UUID) -> list[FindingCandidate]:
-        """The findings a contracts report states (`findings[]`, a verification's `regressions[]`),
-        rated as the report rates them; a location keeps its first line."""
-        return [
-            cls(
-                label=Label(e.id),
-                repository_id=repository_id,
-                title=e.title,
-                kind=getattr(e, "kind", None),
-                description=e.description,
-                cwes=tuple(CweId(c) for c in e.cwes),
-                category=Category(e.category) if e.category else None,
-                owasp_llm_references=_owasp_llm(e),
-                locations=tuple(
-                    CodeSpan(
-                        path=RepoPath(loc.path),
-                        line=_first_line(loc.lines),
-                    )
-                    for loc in e.locations
-                ),
-                reported_severity=ScannerSeverity(e.severity),
-                cvss_vector=e.cvss.vector if e.cvss else None,
-                cvss_score=Decimal(str(e.cvss.score)) if e.cvss else None,
-            )
-            for e in entries
-        ]
+    def of_report(
+        cls, entries: Iterable[SchemaView], repository_id: UUID
+    ) -> list[FindingCandidate]:
+        """The findings an authored report states, rated as the report rates them."""
+        return [cls._report_entry(e, repository_id, _owasp_llm(e)) for e in entries]
+
+    @classmethod
+    def of_regressions(
+        cls, entries: Iterable[SchemaView], repository_id: UUID
+    ) -> list[FindingCandidate]:
+        """Verification regressions use a schema without OWASP LLM references."""
+        return [cls._report_entry(e, repository_id, ()) for e in entries]
+
+    @classmethod
+    def _report_entry(
+        cls,
+        entry: SchemaView,
+        repository_id: UUID,
+        owasp_llm_references: tuple[OwaspLlmCategory, ...],
+    ) -> FindingCandidate:
+        return cls(
+            label=Label(entry.id),
+            repository_id=repository_id,
+            title=entry.title,
+            kind=getattr(entry, "kind", None),
+            description=entry.description,
+            cwes=tuple(CweId(c) for c in entry.cwes),
+            category=Category(entry.category) if entry.category else None,
+            owasp_llm_references=owasp_llm_references,
+            locations=tuple(
+                CodeSpan(path=RepoPath(loc.path), line=_first_line(loc.lines))
+                for loc in entry.locations
+            ),
+            reported_severity=ScannerSeverity(entry.severity),
+            cvss_vector=entry.cvss.vector if entry.cvss else None,
+            cvss_score=(
+                Decimal(str(entry.cvss.score))
+                if entry.cvss and entry.cvss.score is not None
+                else None
+            ),
+        )
 
     @classmethod
     def of_scan(cls, entries: Iterable[Any], repository_id: UUID) -> list[FindingCandidate]:
         """The unverified findings a vuln-scan states (vuln-findings `findings[]`), rated as the
-        scan rates them; `known_findings` are the baseline's and stay out."""
+        scan rates them, an advisory's `cvss` kept as the report's is; `known_findings` are the
+        baseline's and stay out."""
         return [
             cls(
                 label=Label(e.id),
@@ -591,6 +657,10 @@ class FindingCandidate(Model):
                 locations=(CodeSpan(path=RepoPath(e.file), line=e.line),),
                 reported_severity=ScannerSeverity(e.severity),
                 confidence=Confidence(e.confidence),
+                cvss_vector=e.cvss.vector if e.cvss else None,
+                cvss_score=(
+                    Decimal(str(e.cvss.score)) if e.cvss and e.cvss.score is not None else None
+                ),
             )
             for e in entries
         ]
@@ -727,6 +797,15 @@ class Decision(AppendOnly):
     ticket: str | None = None
     auto_accept_tier: bool = False
     occurred_at: datetime
+
+    # The state projection: stamped at insert, never updated, storage only
+    # (serialization-excluded; the repository writes them at insert).
+    folded_state: str | None = Field(default=None, exclude=True)
+    folded_severity: str | None = Field(default=None, exclude=True)
+    folded_decided: bool | None = Field(default=None, exclude=True)
+    folded_proven: bool | None = Field(default=None, exclude=True)
+    folded_unverified: bool | None = Field(default=None, exclude=True)
+    folded_policy_version: str | None = Field(default=None, exclude=True)
 
 
 class CensusDecision(NamedTuple):
@@ -899,6 +978,8 @@ _JUDGEMENTS = {
     "severity": frozenset(Severity),
 }
 _CLOSED_VALIDITY = frozenset({Validity.FALSE_POSITIVE, "not_affected"})
+# a verified claim: what makes a weakness a hardening finding rather than an identified one
+_AFFIRMED_VALIDITY = frozenset({Validity.CONFIRMED, Validity.TRUE_POSITIVE, Validity.CORRECTED})
 _CLOSED_RESOLUTION = frozenset(
     {DispositionResolution.RESOLVED, DispositionResolution.RISK_ACCEPTED}
 )
@@ -956,9 +1037,21 @@ def kind_of(kind: str | None, validities: Iterable[str | None]) -> str | None:
     return folded
 
 
+_PROJECTION_FIELDS = (
+    "folded_state",
+    "folded_severity",
+    "folded_decided",
+    "folded_proven",
+    "folded_unverified",
+    "folded_policy_version",
+)
+
+
 def normalize_decision(decision: Decision) -> Decision:
     """Interpret historical classifiers without changing the saved statement or its key."""
     values = decision.model_dump()
+    # serialization-excluded projection columns ride along unchanged
+    values.update({field: getattr(decision, field) for field in _PROJECTION_FIELDS})
     values.update(
         {
             field: classifier
@@ -1057,7 +1150,7 @@ def effective_decisions(
 
 
 def folded_resolutions(
-    decisions: Sequence[Decision], on_default_line: Mapping[UUID, bool]
+    decisions: Sequence[Decision], on_default_line: Mapping[UUID | None, bool]
 ) -> list[Decision]:
     """The resolving decisions `Disposition.fold` reads resolution from: the default line's,
     else the line-free ones."""
@@ -1082,9 +1175,9 @@ def _strongest(statements: Sequence[_Statement], field: str) -> _Statement | Non
     return next(s for s in reversed(candidates) if s.strength == strength)
 
 
-def _on_line(said: Sequence[_Statement], lines: Mapping[UUID, bool]) -> list[_Statement]:
+def _on_line(said: Sequence[_Statement], lines: Mapping[UUID | None, bool]) -> list[_Statement]:
     resolving = [s for s in said if s.decision.resolution in _JUDGEMENTS["resolution"]]
-    default = [s for s in resolving if s.decision.id is not None and lines.get(s.decision.id)]
+    default = [s for s in resolving if lines.get(s.decision.id)]
     return default or [s for s in resolving if s.decision.id not in lines]
 
 
@@ -1138,7 +1231,7 @@ class Disposition(Model):
         cls,
         finding_id: UUID,
         decisions: Sequence[Any],
-        on_default_line: Mapping[UUID, bool] | None = None,
+        on_default_line: Mapping[UUID | None, bool] | None = None,
         *,
         normalize: Callable[[Any], Any] = normalize_decision,
     ) -> Disposition:
@@ -1241,11 +1334,52 @@ class Precedent(Model):
     reason: PrecedentReason
 
 
+class SeverityBasis(StrEnum):
+    """Which source won a finding's severity label: the CVSS band the vector computes, the
+    scanner's word for an unscored finding, a judgement's re-rating, or nothing."""
+
+    COMPUTED = "computed"
+    SCANNER = "scanner"
+    JUDGEMENT = "judgement"
+    UNRATED = "unrated"
+    AUTHORITY = "authority"
+
+
+class FindingCvss(Model):
+    """A finding's CVSS as consumers render it: the occurrence's score and vector, the severity
+    the vector computes, which source won the effective severity, and every authority's say."""
+
+    score: Decimal | None
+    vector: str | None
+    severity: Severity | None
+    basis: SeverityBasis
+    authority_scores: tuple[CvssStatement, ...] = ()
+    selected: SelectedCvss | None = None
+    conflict: bool = False
+
+    @property
+    def effective_score(self) -> Decimal | None:
+        """The score the finding counts at: the selected statement's, else the occurrence's."""
+        return self.selected.score if self.selected is not None else self.score
+
+    @property
+    def effective_source(self) -> CvssSource | None:
+        if self.selected is not None:
+            return self.selected.source
+        return CvssSource.SCANNER if self.score is not None else None
+
+    @pydantic.field_serializer("score", when_used="json")
+    def _score(self, value: Decimal | None) -> str | None:
+        # the same exact score from every backend: SQLite reads 0E-10 and 7.5000000000
+        return canonical_decimal(value)
+
+
 class FindingView(Model):
     finding: Finding
     occurrence: Occurrence | None = None
     disposition: Disposition | None = None
     effective_severity: Severity | None = None
+    cvss: FindingCvss | None = None
     sla_due: datetime | None = None
     # When the reporting assessments ran (the occurrence→assessment join, the
     # same clock the census reads for its SLA `first`): None only on a finding
@@ -1259,6 +1393,20 @@ class FindingView(Model):
     locations: tuple[Location | ClaimLocation, ...] = ()
     cwes: tuple[str, ...] = ()
     labels: tuple[FindingLabel, ...] = ()
+
+    @property
+    def cvss_score(self) -> Decimal | None:
+        """The score it counts at: the selected statement's, else the occurrence's own."""
+        if self.cvss is not None:
+            return self.cvss.effective_score
+        return self.occurrence.cvss_score if self.occurrence is not None else None
+
+    @property
+    def cvss_source(self) -> CvssSource | None:
+        """Who stated `cvss_score`; None exactly when it is None."""
+        if self.cvss is not None:
+            return self.cvss.effective_source
+        return CvssSource.SCANNER if self.cvss_score is not None else None
 
     def label(self, taxonomy: str) -> str | None:
         return next((fl.label for fl in self.labels if fl.taxonomy == taxonomy), None)
@@ -1286,7 +1434,7 @@ class FindingView(Model):
         return "open"
 
     def state(self) -> FindingState:
-        """Closed by validity, then by resolution; open splits off hardening (posture debt)."""
+        """The workflow state (`finding_state`): kind alone never decides."""
         return finding_state(self.finding.kind, self.disposition)
 
 

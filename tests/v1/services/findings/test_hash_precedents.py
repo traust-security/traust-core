@@ -35,6 +35,7 @@ from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.identity import IdentityPolicy
 from traust_core.v1.services.findings.intake import FindingIntake
 from traust_core.v1.services.findings.precedents import FindingPrecedents
+from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
 from traust_core.v1.services.findings.review import ReviewPolicy
 from traust_core.v1.services.findings.taxonomy import TaxonomyPolicy
 from traust_core.v1.services.lint import Lint
@@ -83,6 +84,7 @@ class World:
             clock=FixedClock(T0),
             objects=InMemoryObjectStore(),
             review=ReviewPolicy(),
+            rating=RatingPolicy(RatingConfig()),
         )
 
     def report(self, *, prior: bool, source: Path, hashed: bool = True) -> tuple:

@@ -5,6 +5,7 @@ Query plans at production volume, on Postgres. Continuous ops issues these queri
 ```bash
 make db-up && make perf     # first run seeds ~20s; reruns reuse the database
 PERF_SCALE=2 make perf     # the estate at twice the volume (its own database; shape constants hold)
+make db-up && make perf-load  # duress: dashboard reads beside the stamped write door (mutates the rig; gated by TRAUST_PERF_LOAD)
 ```
 
 `.perf/report.md` lists each statement's plan key line and execution time, ready for the PR (quality checklist item 8).
@@ -13,7 +14,8 @@ PERF_SCALE=2 make perf     # the estate at twice the volume (its own database; s
 |---|---|
 | `seed.py` | volumes (`REPOSITORIES`, `RUN_ORDERS`, …) and the bulk-insert SQL; the database name carries a digest of DDL + seed, so a change to either rebuilds it |
 | `harness.py` | `profile(engine, call)`: runs a repository or service call, captures every statement it issues, replays each under `EXPLAIN (ANALYZE, BUFFERS)`, rolls back |
-| `queries/test_<section>.py` | one case per named query on that section's tables |
+| `queries/test_<section>.py` | one case per named query on that section's tables; the dashboard query's statement is `queries/test_dashboard_facts.py` — the facts fixture the duress readers drive |
+| `load.py`, `test_load.py` | the duress apparatus (`make perf-load`): dashboard readers past the engine pool's size beside the stamped write door, a full rescan, and the steady spread (findings pages, a report build, writes); mutates the rig, so it is gated by `TRAUST_PERF_LOAD` |
 
 ## Add a case
 
@@ -37,6 +39,7 @@ Not in CI per PR (seeding is slow); run it when a query changes.
 | Layer | Asks | Where |
 |---|---|---|
 | query | does each repository query use its index at volume? | `queries/` (this) |
+| duress | do the dashboard reads hold their budget beside the write door, a rescan, and the steady spread? | `load.py`, `test_load.py` (`make perf-load`) |
 | API | does `traust serve` hold the runners and a year of data (p95, throughput)? | `api/`, k6, nightly, committed baseline (performance harness, XWING-2441) |
 
 Both layers seed from `seed.py`. API scenarios commit, so they run against a fresh copy of the seeded database per run.

@@ -6,6 +6,9 @@ import { Counter, Rate, Trend } from 'k6/metrics';
 export const BASE = __ENV.BASE_URL || 'http://127.0.0.1:8080';
 export const RUNNER = { headers: { Authorization: `Bearer ${__ENV.RUNNER_TOKEN}`, 'Content-Type': 'application/json' } };
 export const READER = { headers: { Authorization: `Bearer ${__ENV.READER_TOKEN}` } };
+export const READER_JSON = {
+  headers: { Authorization: `Bearer ${__ENV.READER_TOKEN}`, 'Content-Type': 'application/json' },
+};
 
 export const claimOk = new Rate('claim_ok');
 export const claimLatency = new Trend('claim_latency', true);
@@ -15,10 +18,52 @@ export const feedLatency = new Trend('feed_latency', true);
 export const claimReqs = new Counter('claim_requests');
 export const listReqs = new Counter('list_requests');
 export const feedReqs = new Counter('feed_requests');
-export const insightLatency = new Trend('insight_latency', true);
-export const insightReqs = new Counter('insight_requests');
+export const reportLatency = new Trend('report_latency', true);
+export const reportReqs = new Counter('report_requests');
 export const consumerLatency = new Trend('consumer_latency', true);
 export const consumerReqs = new Counter('consumer_requests');
+export const dashboardLatency = new Trend('dashboard_latency', true);
+export const dashboardReqs = new Counter('dashboard_requests');
+
+// Per-persona metrics: k6 only accepts metrics declared in the init context, so ops.js
+// declares its personas' pairs at load time; this module only knows the names it is given.
+// Metric names allow only letters, digits and underscores; persona names are kebab-case.
+export function personaKey(name) {
+  return `persona_${name.replace(/-/g, '_')}`;
+}
+const personaMetrics = {};
+export function declarePersonaMetrics(names) {
+  for (const name of names) {
+    personaMetrics[name] = {
+      latency: new Trend(`${personaKey(name)}_latency`, true),
+      requests: new Counter(`${personaKey(name)}_requests`),
+    };
+  }
+}
+
+// One dashboard persona's request: the body setup built for the persona this scenario group
+// names in its PERSONA env, POSTed to the metrics query route. The aggregate pair gates the
+// run; the per-persona pair gives baseline.json a row per persona.
+export function queryDashboard(data) {
+  const name = __ENV.PERSONA;
+  const res = http.post(`${BASE}/v1/dashboards:query`, JSON.stringify(data.bodies[name]), READER_JSON);
+  dashboardLatency.add(res.timings.duration);
+  dashboardReqs.add(1);
+  const persona = personaMetrics[name];
+  persona.latency.add(res.timings.duration);
+  persona.requests.add(1);
+  if (res.status !== 200) {
+    console.log(`dashboard ${name} ${res.status} ${String(res.body).slice(0, 200)}`);
+  }
+  check(res, { 'dashboard is 200': (r) => r.status === 200 });
+}
+
+// The fleet's repository ids, fetched once per run: the persona grants are slices of these.
+export function repositoryIds() {
+  const res = http.get(`${BASE}/v1/repositories?limit=1000`, READER);
+  check(res, { 'repositories page is 200': (r) => r.status === 200 });
+  return (res.json('items') || []).map((r) => r.id);
+}
 
 // The consumer read family: a hot repository's findings paged by cursor, its summary and
 // timeline, and the review queue — the shapes SCI and the CLI read under load.
@@ -75,8 +120,8 @@ export function claim() {
   check(res, { 'claim is 200 or 204': () => ok });
   if (res.status === 200) {
     // finish the lease so the queue keeps flowing and a later claim can reach the head
-    const id = res.json('id');
-    const done = { result: { outcome: 'succeeded' } };
+    const { id, lease_generation } = res.json();
+    const done = { lease_generation, result: { outcome: 'succeeded' } };
     http.post(`${BASE}/v1/orders/${id}/complete`, JSON.stringify(done), RUNNER);
   }
 }
@@ -103,7 +148,7 @@ export function setup() {
   check(res, { 'products list is 200': (r) => r.status === 200 });
   const product = res.json('items.0.id');
   if (!product) {
-    throw new Error('no product to scope the insight read to');
+    throw new Error('no product to scope the report request to');
   }
   // a repository with findings to page: the first the products page's scope admits, else the
   // fleet's first — the scenarios only need a real, non-empty read shape
@@ -115,35 +160,40 @@ export function setup() {
   return { product, repository };
 }
 
-// The dashboard's heaviest view family: an insight built on demand. Scoped to one product so
-// the read is request-shaped (the whole-portfolio cost is bounded by perf/queries, which sees
-// the statements); unscoped at fixture volume the build runs to minutes, not a gateable request.
-export function readInsight(data) {
-  const res = http.get(`${BASE}/v1/insights/findings-rollup?product_id=${data.product}`, READER);
-  insightLatency.add(res.timings.duration);
-  insightReqs.add(1);
+// A report request: the last ready build of the same request (200) or the build queued or in
+// flight (202) - never the build itself, which the reports role runs in its own process.
+export function requestReport(data) {
+  const body = { report: 'findings-rollup', scope: { product_ids: [data.product] } };
+  const res = http.post(`${BASE}/v1/reports`, JSON.stringify(body), READER_JSON);
+  reportLatency.add(res.timings.duration);
+  reportReqs.add(1);
   if (res.status !== 200) {
-    console.log(`insight ${res.status} ${JSON.stringify(res.error)} ${String(res.body).slice(0, 200)}`);
+    console.log(`report ${res.status} ${JSON.stringify(res.error)} ${String(res.body).slice(0, 200)}`);
   }
-  check(res, { 'insight is 200': (r) => r.status === 200 });
+  check(res, { 'report request is 200 or 202': (r) => r.status === 200 || r.status === 202 });
 }
 
 // Latency plus per-scenario request rates, so a run that collapsed to near-zero throughput
 // cannot pass on flat latency alone.
+export const p95Of = (data, metric) => (data.metrics[metric] ? data.metrics[metric].values['p(95)'] : null);
+export const rateOf = (data, metric) => (data.metrics[metric] ? data.metrics[metric].values.rate : null);
+
 export function summary(data, extra = {}) {
-  const p95 = (m) => (data.metrics[m] ? data.metrics[m].values['p(95)'] : null);
-  const rate = (m) => (data.metrics[m] ? data.metrics[m].values.rate : null);
+  const p95 = (m) => p95Of(data, m);
+  const rate = (m) => rateOf(data, m);
   return {
     claim_p95_ms: p95('claim_latency'),
     list_p95_ms: p95('list_latency'),
     feed_p95_ms: p95('feed_latency'),
-    insight_p95_ms: p95('insight_latency'),
+    report_p95_ms: p95('report_latency'),
     consumer_p95_ms: p95('consumer_latency'),
+    dashboard_p95_ms: p95('dashboard_latency'),
     claim_rps: rate('claim_requests'),
     list_rps: rate('list_requests'),
     feed_rps: rate('feed_requests'),
-    insight_rps: rate('insight_requests'),
+    report_rps: rate('report_requests'),
     consumer_rps: rate('consumer_requests'),
+    dashboard_rps: rate('dashboard_requests'),
     http_reqs_rate: rate('http_reqs'),
     ...extra,
   };

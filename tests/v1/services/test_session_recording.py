@@ -18,6 +18,7 @@ from tests.v1.services.test_operations import (
     manifest,
     ops,
     publisher,
+    reclaim_at_same_clock,
     seeded,
     stored,
 )
@@ -27,6 +28,7 @@ from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.operations import (
     JobResult,
     OrderProgress,
+    RunOrder,
     SessionRecord,
     SessionResult,
     SessionTask,
@@ -34,6 +36,7 @@ from traust_core.v1.models.operations import (
 from traust_core.v1.models.vocabulary import SourceType
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.traust_ops.run_order import SqlRunOrderRepository
+from traust_core.v1.services.operations import Change
 
 
 def entry(**changes: object) -> SessionRecord:
@@ -42,6 +45,7 @@ def entry(**changes: object) -> SessionRecord:
             "skill": "dependency-watch",
             "mode": "below-range",
             "executor_session": "executor-1",
+            "lease_generation": 1,
             "models": {"reviewer_a": "review-model"},
             "task_sha256": "a" * 64,
             "inputs": [{"path": "input/index.json", "bytes": 12, "sha256": "b" * 64}],
@@ -51,11 +55,13 @@ def entry(**changes: object) -> SessionRecord:
     )
 
 
-def test_task_and_result_parse_the_installed_contracts() -> None:
+@pytest.mark.parametrize("generation", [None, 2], ids=["manual", "ordered"])
+def test_task_and_result_parse_the_installed_contracts(generation: int | None) -> None:
     task = SessionTask.from_document(
         {
             "schema_version": "1",
-            "run_id": None,
+            "run_id": str(UUID(int=1)) if generation is not None else None,
+            **({"lease_generation": generation} if generation is not None else {}),
             "skill": "dependency-watch",
             "mode": "below-range",
             "args": [],
@@ -64,7 +70,9 @@ def test_task_and_result_parse_the_installed_contracts() -> None:
             "output": {"path": "output/verdicts.json", "schema": "below-range-verdicts"},
         }
     )
-    assert SessionTask.parse(task.payload).output.path == "output/verdicts.json"
+    parsed = SessionTask.parse(task.payload)
+    assert parsed.output.path == "output/verdicts.json"
+    assert parsed.lease_generation == generation
     result = SessionResult.from_document({"session": "executor-1", "usage": [], "error": None})
     assert SessionResult.parse(result.payload).session == "executor-1"
     with pytest.raises(DocumentError):
@@ -74,25 +82,31 @@ def test_task_and_result_parse_the_installed_contracts() -> None:
 def test_recording_appends_immutable_evidence_and_retries_are_idempotent(engine: Engine) -> None:
     service = ops(engine)
     order = leased(engine)
-    before = service.save_progress(order.id, OrderProgress(step=2))
+    generation = order.lease_generation
+    before = service.save_progress(
+        order.id, OrderProgress(step=2), worker=W1, lease_generation=generation
+    )
     previous = publisher(engine).get(before).payload
     audit = entry()
-    first = service.record_session(order.id, W1, audit)
-    assert service.record_session(order.id, W1, audit) == first
+    first = service.record_session(order.id, W1, audit, lease_generation=generation)
+    assert service.record_session(order.id, W1, audit, lease_generation=generation) == first
     assert publisher(engine).get(before).payload == previous
     assert manifest(engine, order)["progress"]["step"] == 2
     assert service.manifest(order.id).sessions == (audit,)
     second = entry(executor_session="executor-2")
-    last = service.record_session(order.id, W1, second)
+    last = service.record_session(order.id, W1, second, lease_generation=generation)
     assert last != first
     assert service.manifest(order.id).sessions == (audit, second)
 
 
 def test_an_executor_cannot_replace_its_recorded_evidence(engine: Engine) -> None:
     order = leased(engine)
-    first = ops(engine).record_session(order.id, W1, entry())
+    generation = order.lease_generation
+    first = ops(engine).record_session(order.id, W1, entry(), lease_generation=generation)
     with pytest.raises(ConflictError, match="evidence changed"):
-        ops(engine).record_session(order.id, W1, entry(task_sha256="d" * 64))
+        ops(engine).record_session(
+            order.id, W1, entry(task_sha256="d" * 64), lease_generation=generation
+        )
     assert stored(engine, order).artifact_id == first
 
 
@@ -104,14 +118,76 @@ def test_only_the_unexpired_lease_holder_can_append(
 ) -> None:
     order = leased(engine)
     with pytest.raises(ConflictError):
-        ops(engine, at).record_session(order.id, worker, entry())
-    assert stored(engine, order).artifact_id is None
+        ops(engine, at).record_session(
+            order.id, worker, entry(), lease_generation=order.lease_generation
+        )
+    assert stored(engine, order) == order
+
+
+def test_same_worker_cannot_append_or_replay_stale_evidence_after_reclaim(engine: Engine) -> None:
+    service = ops(engine)
+    first = leased(engine)
+    audit = entry(lease_generation=first.lease_generation)
+    service.record_session(first.id, W1, audit, lease_generation=first.lease_generation)
+    current = reclaim_at_same_clock(engine, first)
+    before = stored(engine, current)
+    pending = entry(executor_session="executor-2", lease_generation=first.lease_generation)
+    for session in (audit, pending):
+        for generation in (first.lease_generation, current.lease_generation):
+            with pytest.raises(ConflictError):
+                service.record_session(first.id, W1, session, lease_generation=generation)
+            assert stored(engine, current) == before
+            assert service.manifest(current.id).sessions == (audit,)
+    second = entry(executor_session="executor-2", lease_generation=current.lease_generation)
+    service.record_session(current.id, W1, second, lease_generation=current.lease_generation)
+    assert service.manifest(current.id).sessions == (audit, second)
+
+
+def test_legacy_evidence_without_a_generation_can_be_read_but_not_submitted(engine: Engine) -> None:
+    legacy = SessionRecord.model_validate(entry().model_dump(exclude={"lease_generation"}))
+    assert legacy.lease_generation is None
+    order = leased(engine)
+    with pytest.raises(ConflictError):
+        ops(engine).record_session(order.id, W1, legacy, lease_generation=order.lease_generation)
+    assert stored(engine, order) == order
+
+
+@pytest.mark.parametrize("transition", ["session", "progress", "complete"])
+def test_reclaim_during_manifest_publication_fences_the_old_writer(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, transition: str
+) -> None:
+    first = leased(engine)
+    service = ops(engine)
+    stage = service._stage_manifest
+    current: RunOrder | None = None
+
+    def stage_then_reclaim(prior: UUID | None, change: Change):
+        nonlocal current
+        staged = stage(prior, change)
+        current = reclaim_at_same_clock(engine, first)
+        return staged
+
+    monkeypatch.setattr(service, "_stage_manifest", stage_then_reclaim)
+    generation = first.lease_generation
+    with pytest.raises(ConflictError):
+        if transition == "session":
+            audit = entry(lease_generation=generation)
+            service.record_session(first.id, W1, audit, lease_generation=generation)
+        elif transition == "progress":
+            service.save_progress(
+                first.id, OrderProgress(step=1), worker=W1, lease_generation=generation
+            )
+        else:
+            result = JobResult.partly({"unreachable": 1})
+            service.complete(first.id, W1, result, lease_generation=generation)
+    assert current is not None and stored(engine, first) == current
+    assert current.artifact_id is None
 
 
 def test_a_queued_order_cannot_receive_session_evidence(engine: Engine) -> None:
     order = seeded(engine)
     with pytest.raises(ConflictError):
-        ops(engine).record_session(order.id, W1, entry())
+        ops(engine).record_session(order.id, W1, entry(), lease_generation=1)
     assert stored(engine, order).artifact_id is None
 
 
@@ -119,7 +195,9 @@ def test_a_queued_order_cannot_receive_session_evidence(engine: Engine) -> None:
 def test_an_omitted_holder_cannot_bypass_lease_checks(engine: Engine, worker: str | None) -> None:
     order = leased(engine)
     with pytest.raises(ValidationError, match="requires the lease holder"):
-        ops(engine).record_session(order.id, worker, entry())
+        ops(engine).record_session(
+            order.id, worker, entry(), lease_generation=order.lease_generation
+        )
     assert stored(engine, order).artifact_id is None
 
 
@@ -139,7 +217,7 @@ def test_a_lease_expiring_during_recording_rolls_back_the_manifest(
 
     service._clock = ExpiringClock()
     with pytest.raises(ConflictError, match="lease expired"):
-        service.record_session(order.id, W1, entry())
+        service.record_session(order.id, W1, entry(), lease_generation=order.lease_generation)
     assert stored(engine, order).artifact_id is None
 
 
@@ -148,16 +226,19 @@ def test_a_concurrent_progress_update_is_preserved(
 ) -> None:
     order = leased(engine)
     service = ops(engine)
-    publish = service._publish
+    stage = service._stage_manifest
 
     def race(prior, change):
-        artifact_id = publish(prior, change)
-        ops(engine).save_progress(order.id, OrderProgress(step=7))
-        return artifact_id
+        # another writer moves the manifest between staging and the order lock
+        staged = stage(prior, change)
+        ops(engine).save_progress(
+            order.id, OrderProgress(step=7), worker=W1, lease_generation=order.lease_generation
+        )
+        return staged
 
-    monkeypatch.setattr(service, "_publish", race)
+    monkeypatch.setattr(service, "_stage_manifest", race)
     with pytest.raises(ConflictError, match="manifest changed"):
-        service.record_session(order.id, W1, entry())
+        service.record_session(order.id, W1, entry(), lease_generation=order.lease_generation)
     assert manifest(engine, order)["progress"]["step"] == 7
     assert ops(engine).manifest(order.id).sessions == ()
 
@@ -167,6 +248,7 @@ def test_the_final_manifest_read_serializes_competing_writers(
     engine: Engine, monkeypatch: pytest.MonkeyPatch, transition: str
 ) -> None:
     order = leased(engine)
+    generation = order.lease_generation
     read, release, attempted, finished = (threading.Event() for _ in range(4))
     failures = []
     original = SqlRunOrderRepository.get_for_update
@@ -187,16 +269,20 @@ def test_the_final_manifest_read_serializes_competing_writers(
 
     def record():
         try:
-            ops(engine).record_session(order.id, W1, entry())
+            ops(engine).record_session(order.id, W1, entry(), lease_generation=generation)
         except Exception as error:
             failures.append(error)
 
     def compete():
         try:
             if transition == "complete":
-                ops(engine).complete(order.id, W1, JobResult.succeeded())
+                ops(engine).complete(
+                    order.id, W1, JobResult.succeeded(), lease_generation=generation
+                )
             else:
-                ops(engine).save_progress(order.id, OrderProgress(step=7))
+                ops(engine).save_progress(
+                    order.id, OrderProgress(step=7), worker=W1, lease_generation=generation
+                )
         except ConflictError:
             if transition != "progress":
                 raise
@@ -223,7 +309,9 @@ def test_the_final_manifest_read_serializes_competing_writers(
     if transition == "complete":
         assert stored(engine, order).state == "succeeded"
     else:
-        ops(engine).save_progress(order.id, OrderProgress(step=7))
+        ops(engine).save_progress(
+            order.id, OrderProgress(step=7), worker=W1, lease_generation=generation
+        )
         assert manifest(engine, order)["progress"]["step"] == 7
     assert ops(engine).manifest(order.id).sessions == (entry(),)
 
@@ -232,6 +320,7 @@ def test_a_heartbeat_read_cannot_erase_session_evidence(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     order = leased(engine)
+    generation = order.lease_generation
     read, release, attempted, finished = (threading.Event() for _ in range(4))
     failures = []
     original = SqlRunOrderRepository.get_for_update
@@ -252,13 +341,15 @@ def test_a_heartbeat_read_cannot_erase_session_evidence(
 
     def heartbeat():
         try:
-            ops(engine, timedelta(minutes=1)).heartbeat(order.id, W1, LEASE)
+            ops(engine, timedelta(minutes=1)).heartbeat(
+                order.id, W1, LEASE, lease_generation=generation
+            )
         except Exception as error:
             failures.append(error)
 
     def record():
         try:
-            ops(engine).record_session(order.id, W1, entry())
+            ops(engine).record_session(order.id, W1, entry(), lease_generation=generation)
         except Exception as error:
             failures.append(error)
         finally:
@@ -297,7 +388,7 @@ def test_failed_sessions_can_audit_missing_output(engine: Engine) -> None:
         executor_session=None,
         output={"path": "output/verdicts.json", "sha256": None, "artifact_id": None},
     )
-    ops(engine).record_session(order.id, W1, audit)
+    ops(engine).record_session(order.id, W1, audit, lease_generation=order.lease_generation)
     assert ops(engine).manifest(order.id).sessions == (audit,)
 
 

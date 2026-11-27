@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from enum import StrEnum
 
 
 class TraustError(Exception):
@@ -69,6 +70,29 @@ class ServiceError(TraustError):
         # repository's unreachable disposition counts on (foundry plan
         # repo-unreachable: only the gone-class counts, never the transient classes).
         self.endpoint_unreachable = endpoint_unreachable
+
+
+class ScannerFailure(StrEnum):
+    TIMEOUT = "scan_timeout"
+    EXIT = "opengrep_failed"
+    OUTPUT = "invalid_output"
+
+
+class ScannerError(ServiceError):
+    """A scanner process failed without exposing its private input or output."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: ScannerFailure,
+        exit_code: int | None = None,
+        timeout_seconds: int | None = None,
+    ) -> None:
+        super().__init__(message, status=exit_code, operation="opengrep.scan")
+        self.reason = reason
+        self.exit_code = exit_code
+        self.timeout_seconds = timeout_seconds
 
 
 @dataclass(frozen=True, slots=True)

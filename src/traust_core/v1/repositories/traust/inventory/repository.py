@@ -42,8 +42,10 @@ class RepositoryRepository(MutableRecordRepository[Repository], Protocol):
     def get_or_add(self, record: Repository) -> Repository: ...
     def get_or_add_with_status(self, record: Repository) -> tuple[Repository, bool]: ...
     def find_by_url(self, url: str) -> Repository | None: ...
+    def find_by_urls(self, urls: Collection[str]) -> list[Repository]: ...
     def get_for_update(self, repository_id: UUID) -> Repository: ...
     def find_by_url_casefold(self, url: str) -> Repository | None: ...
+    def find_by_urls_casefold(self, urls: Collection[str]) -> list[Repository]: ...
     def lock_url(self, url: str) -> None: ...
     def find_private_mirror(self, upstream_id: UUID) -> Repository | None: ...
     def list_by_upstream(self, upstream_id: UUID) -> list[Repository]: ...
@@ -75,6 +77,10 @@ class SqlRepositoryRepository(SqlMutableRepository[Repository]):
     def find_by_url(self, url: str) -> Repository | None:
         return self._one(f"find {url}", self.table.c.url == url)
 
+    def find_by_urls(self, urls: Collection[str]) -> list[Repository]:
+        """The rows registered at these URLs, exact spellings, in bounded batches."""
+        return self._many_in(f"find {len(urls)} by url", self.table.c.url, urls)
+
     def get_for_update(self, repository_id: UUID) -> Repository:
         """The row a metadata write reads, locked until the transaction ends (Postgres; SQLite's
         caller holds its write lock), so two writers can't put back a stale value."""
@@ -90,6 +96,23 @@ class SqlRepositoryRepository(SqlMutableRepository[Repository]):
         # repository table, like find_private_mirror.
         found = self._many(f"find casefold {url}", sa.func.lower(self.table.c.url) == url.lower())
         return found[0] if found else None
+
+    def find_by_urls_casefold(self, urls: Collection[str]) -> list[Repository]:
+        """Every repository whose URL matches one of these spellings ignoring case, in
+        bounded batches (the callers fold only github-kind hosts' spellings). Several
+        rows may share one folded key; the caller lists them, never picks."""
+        folded = {url.lower() for url in urls}
+        if not folded:
+            return []
+        found: list[Repository] = []
+        for batch in self._batches(folded):
+            found.extend(
+                self._many(
+                    f"find casefold {len(batch)} urls",
+                    sa.func.lower(self.table.c.url).in_(batch),
+                )
+            )
+        return found
 
     def lock_url(self, url: str) -> None:
         """Hold, until the transaction ends, a Postgres advisory lock covering this URL in any

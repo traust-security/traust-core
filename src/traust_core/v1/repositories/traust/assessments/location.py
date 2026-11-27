@@ -13,6 +13,7 @@ from traust_core.v1.repositories.tables import (
     RecordRepository,
     SqlAppendOnlyRepository,
     TableSpec,
+    batches,
     text_column,
     uuid_column,
 )
@@ -37,6 +38,7 @@ class LocationRepository(RecordRepository[Location], Protocol):
     def list_for_occurrences(
         self, occurrence_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
     ) -> list[Location]: ...
+    def located(self, occurrence_ids: Collection[UUID]) -> set[UUID]: ...
     def list_with_symbols(self, symbols: Collection[str]) -> list[Location]: ...
     def list_with_symbols_page(
         self, symbols: Collection[str], limit: int, after: tuple[str, UUID] | None = None
@@ -65,6 +67,16 @@ class SqlLocationRepository(SqlAppendOnlyRepository[Location]):
             order_by=(c.occurrence_id, c.path, c.line_start),
             read_budget=read_budget,
         )
+
+    def located(self, occurrence_ids: Collection[UUID]) -> set[UUID]:
+        """Which of the occurrences have at least one location: their ids only, never the rows,
+        one read per batch of ids."""
+        c = self.table.c
+        found: set[UUID] = set()
+        for batch in batches(occurrence_ids):
+            stmt = sa.select(c.occurrence_id).where(_of(c, c.occurrence_id.in_(batch))).distinct()
+            found.update(row[0] for row in self._execute(f"located of {len(batch)}", stmt))
+        return found
 
     def list_with_symbols(self, symbols: Collection[str]) -> list[Location]:
         return self._many(

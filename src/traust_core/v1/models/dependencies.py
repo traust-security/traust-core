@@ -6,7 +6,6 @@ detail live in artifacts (scanner output, impact analysis), not columns.
 
 from __future__ import annotations
 
-import math
 import re
 from collections import Counter
 from collections.abc import Mapping, Sequence
@@ -21,6 +20,7 @@ from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import ImpactAnalysisArtifact
 from traust_core.v1.models.base import AppendOnly, Entity, Model
 from traust_core.v1.models.common import RepoPath
+from traust_core.v1.models.cvss import cvss_base_score
 from traust_core.v1.models.findings import SkillInput
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.vocabulary import (
@@ -362,43 +362,6 @@ class AffectedPackage(Model):
 def malicious_id(identifier: str) -> bool:
     """An OSV malicious-packages id (MAL-): malware by its identifier alone."""
     return identifier.startswith("MAL-")
-
-
-_CVSS_AV = {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2}
-_CVSS_AC = {"L": 0.77, "H": 0.44}
-_CVSS_PR_UNCHANGED = {"N": 0.85, "L": 0.62, "H": 0.27}
-_CVSS_PR_CHANGED = {"N": 0.85, "L": 0.68, "H": 0.5}
-_CVSS_UI = {"N": 0.85, "R": 0.62}
-_CVSS_CIA = {"H": 0.56, "L": 0.22, "N": 0.0}
-
-
-def _cvss_roundup(value: float) -> float:
-    i = round(value * 100000)
-    return i / 100000.0 if i % 10000 == 0 else (math.floor(i / 10000) + 1) / 10.0
-
-
-def cvss_base_score(vector: str) -> float | None:
-    """A `CVSS:3.0/` or `CVSS:3.1/` vector's base score, rounded as its version specifies;
-    None for any other, or for a scope that is neither U nor C."""
-    if not vector.startswith(("CVSS:3.0/", "CVSS:3.1/")):
-        return None
-    try:
-        m = dict(part.split(":", 1) for part in vector.split("/")[1:])
-        if m["S"] not in ("U", "C"):
-            return None
-        changed = m["S"] == "C"
-        pr = (_CVSS_PR_CHANGED if changed else _CVSS_PR_UNCHANGED)[m["PR"]]
-        iss = 1 - (1 - _CVSS_CIA[m["C"]]) * (1 - _CVSS_CIA[m["I"]]) * (1 - _CVSS_CIA[m["A"]])
-        impact = 7.52 * (iss - 0.029) - 3.25 * (iss - 0.02) ** 15 if changed else 6.42 * iss
-        exploitability = 8.22 * _CVSS_AV[m["AV"]] * _CVSS_AC[m["AC"]] * pr * _CVSS_UI[m["UI"]]
-    except (KeyError, ValueError):
-        return None
-    if impact <= 0:
-        return 0.0
-    total = 1.08 * (impact + exploitability) if changed else impact + exploitability
-    if vector.startswith("CVSS:3.0/"):  # 3.0's Roundup is a plain ceiling to one decimal
-        return math.ceil(min(total, 10) * 10) / 10
-    return _cvss_roundup(min(total, 10))
 
 
 class AdvisoryRecord(Model):

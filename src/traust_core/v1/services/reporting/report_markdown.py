@@ -4,6 +4,7 @@ document, never a second source."""
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Any
 
 Report = dict[str, Any]
@@ -36,7 +37,16 @@ def _clean_block(text: Any) -> str:
 
 
 def _cell(text: Any) -> str:
-    return _clean_inline(text).replace("|", "\\|")
+    """One table cell: each pipe ends up after an odd run of backslashes, so it stays escaped
+    in or out of a code span; nothing else changes, so content's own escapes stay inert."""
+    out: list[str] = []
+    run = 0
+    for ch in _clean_inline(text):
+        if ch == "|" and run % 2 == 0:
+            out.append("\\")
+        out.append(ch)
+        run = run + 1 if ch == "\\" else 0
+    return "".join(out)
 
 
 def _fence_for(code: str) -> str:
@@ -221,6 +231,48 @@ def _dependency_audit(dep: Report, n: int) -> str:
     return "\n".join(parts)
 
 
+@dataclass(frozen=True, slots=True)
+class _NotAffectedRow:
+    """One not_affected entry as the table shows it, read once from the validated report."""
+
+    advisory: str
+    module: str
+    installed_version: str
+    evidence: str
+    rationale: str
+    source: str
+
+    @classmethod
+    def of(cls, entry: Report) -> _NotAffectedRow:
+        dep = entry["dependency"]
+        evidence = dep.get("classification", "")
+        if dep.get("evidence_level"):
+            evidence += f" ({dep['evidence_level']})"
+        return cls(
+            advisory=dep["advisory"],
+            module=dep["module"],
+            installed_version=dep.get("installed_version", ""),
+            evidence=evidence,
+            rationale=entry["rationale"],
+            source=dep.get("impact_artifact") or entry.get("reference", ""),
+        )
+
+
+def _not_affected(entries: list[Report], n: int) -> str:
+    rows = [
+        [r.advisory, r.module, r.installed_version, r.evidence, r.rationale, r.source]
+        for r in map(_NotAffectedRow.of, entries)
+    ]
+    headers = ["Advisory", "Module", "Installed", "Evidence", "Rationale", "Source"]
+    return "\n".join(
+        [
+            f"## {n}. Not Affected (Eliminated with Evidence)\n",
+            "Matched advisories eliminated as not affected: recorded, not filed as findings.\n",
+            _table(headers, rows),
+        ]
+    )
+
+
 def _negative_results(results: list[Report], n: int) -> str:
     parts = [f"## {n}. Negative Results (Verified Clean)\n"]
     for r in results:
@@ -314,6 +366,7 @@ def render_report(report: Report) -> str:
     n = 6
     for key, section in (
         ("dependency_audit", _dependency_audit),
+        ("not_affected", _not_affected),
         ("negative_results", _negative_results),
         ("peach_isolation_review", _peach_isolation_review),
         ("asvs_coverage", _asvs_coverage),

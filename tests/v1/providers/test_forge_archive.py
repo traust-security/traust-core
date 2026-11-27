@@ -23,7 +23,7 @@ from traust_core.v1.models.values import GitSha
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.forge_archive import ArchiveCheckout
 from traust_core.v1.providers.sources import CheckoutRequest
-from traust_core.v1.providers.syft import MANIFESTS
+from traust_core.v1.providers.syft import MANIFESTS, unresolved_manifests
 
 SHA = "a" * 40
 REF = GitSha.parse(SHA)
@@ -93,6 +93,11 @@ def test_only_the_kept_files_land_and_release_removes_them() -> None:
         {
             "go.mod": GO_MOD,
             "web/package-lock.json": PACKAGE_LOCK,
+            "build/Dockerfile.release": b"FROM base:1.2.3\n",
+            "build/images/Dockerfile": b"FROM scratch\nCOPY --from=base:1.2.3 /tool /\n",
+            "build/package.json": b'{"dependencies": {"generated": "^1"}}',
+            "build/output/requirements.txt": b"generated>=1\n",
+            "nested/Containerfile": b"FROM base:1.2.3\n",
             ".github/workflows/ci.yml": b"on: push\n",
             "docs/ci.yml": b"not a workflow\n",
             "main.go": b"package main\n",
@@ -104,7 +109,22 @@ def test_only_the_kept_files_land_and_release_removes_them() -> None:
         CheckoutRequest(repo="https://github.com/o/r", ref=REF, keep=MANIFESTS)
     ).data
     assert workspace.sha == REF
-    assert files(workspace.path) == {"go.mod", "web/package-lock.json", ".github/workflows/ci.yml"}
+    assert files(workspace.path) == {
+        "go.mod",
+        "web/package-lock.json",
+        "build/Dockerfile.release",
+        "build/images/Dockerfile",
+        "build/package.json",
+        "build/output/requirements.txt",
+        "nested/Containerfile",
+        ".github/workflows/ci.yml",
+    }
+    gaps = unresolved_manifests(workspace.path)
+    assert [(gap.ecosystem, gap.path, gap.reason) for gap in gaps] == [
+        ("docker", "build/Dockerfile.release", "unsupported-manifest"),
+        ("docker", "build/images/Dockerfile", "unsupported-manifest"),
+        ("docker", "nested/Containerfile", "unsupported-manifest"),
+    ]
     archive.release(workspace)
     assert not workspace.path.exists()
 

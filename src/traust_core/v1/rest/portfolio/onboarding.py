@@ -10,14 +10,14 @@ from traust_core.v1.rest.portfolio.service import Onboarding
 router = APIRouter()
 
 
-@router.post("/v1/onboarding", responses=PROBLEMS(401, 422))
+@router.post("/v1/onboarding", responses=PROBLEMS(401, 404, 422, 502))
 def onboard(request: OnboardingRequest, onboarding: Onboarding, caller: Caller) -> OnboardingResult:
     """Add inventory: register the product and its repositories (refs, teams) and plan the
     baseline orders. Re-running is a no-op apart from refs whose branch moved."""
     return onboarding.onboard(request, caller)
 
 
-@router.post("/v1/onboarding/plan", responses=PROBLEMS(401, 422))
+@router.post("/v1/onboarding/plan", responses=PROBLEMS(401, 422, 502))
 def plan_onboarding(
     request: OnboardingRequest, onboarding: Onboarding, _: Caller
 ) -> OnboardingPlan:

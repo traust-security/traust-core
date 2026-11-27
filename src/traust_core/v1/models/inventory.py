@@ -237,6 +237,19 @@ class LinesReport(Model):
     unobserved: tuple[RefName, ...] = ()
 
 
+class RepositoryResolution(Model):
+    """One asked-for URL spelling's answer: the repository core knows under it, plus
+    the upstream edge as the hint when the matched row carries one (a fork or mirror:
+    the caller's to judge). A URL correction's vacated spelling follows its edge to
+    the repository that moved. Several rows under one case-folded spelling answer as
+    candidates, oldest first; no row at all is the honest absence."""
+
+    url: str
+    repository: Repository | None = None
+    alias_of: UUID | None = None
+    candidates: tuple[Repository, ...] = ()
+
+
 class RepositoryFilter(Model):
     """Every repository, or the one registered at `url`.
 

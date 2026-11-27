@@ -5,15 +5,19 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
 
 from tests.v1.rest.conftest import bearer
 from tests.v1.rest.ops.conftest import runner
-from traust_core.v1.context import Context
+from traust_core.v1.context import Config, Context
+from traust_core.v1.context.config import RecordingConfig
+from traust_core.v1.errors import PreflightError
 from traust_core.v1.providers.correlation import current_correlation
 from traust_core.v1.rest.app import create_app
+from traust_core.v1.services.ledger import LedgerConfig
 
 TRACE = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 
@@ -82,6 +86,7 @@ def test_created_and_selected_order_ids_reach_service_and_access_events(
             json={"order": {"asset": "command_result", "priority": 1}},
             headers={**bearer(context), "X-Request-ID": "submit-1"},
         ).json()
+        context.services().ops.admit(UUID(submitted["id"]))  # the engine's admission tick
         claimed = client.post(
             "/v1/orders/claim",
             json={"lease_seconds": 300},
@@ -92,7 +97,7 @@ def test_created_and_selected_order_ids_reach_service_and_access_events(
         json.loads(line) for line in (tmp_path / "logs" / "traust.log").read_text().splitlines()
     ]
     for request_id, outcome, actor_kind in (
-        ("submit-1", "queued", "human"),
+        ("submit-1", "planned", "human"),
         ("claim-1", "leased", "machine"),
     ):
         service = next(
@@ -173,3 +178,64 @@ def test_openapi_documents_the_routes_and_their_problems(client: TestClient) -> 
     assert {"/v1/healthz", "/v1/whoami"} <= set(spec["paths"])
     unauthorized = spec["paths"]["/v1/whoami"]["get"]["responses"]["401"]
     assert "application/problem+json" in unauthorized["content"]
+
+
+def test_read_only_startup_needs_no_signer_verifier_or_salt(tmp_path: Path) -> None:
+    ctx = Context(Config(home=tmp_path))
+    create_app(ctx)
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("kind", ["assessment", "validation", "verification"])
+def test_non_triage_writer_requires_verification_not_review_salt(
+    context: Context, kind: str
+) -> None:
+    recording = RecordingConfig.model_validate({kind: ["writer"]})
+    cfg = context.config.model_copy(update={"recording": recording, "ledger": LedgerConfig()})
+    ctx = Context(cfg)
+    with pytest.raises(PreflightError, match="no usable local JWKS"):
+        create_app(ctx)
+    ctx.local_issuer.mint("writer", machine=True)
+    create_app(ctx)
+    assert "database" not in ctx.__dict__
+
+
+def test_a_query_role_starts_without_the_recording_doors_capabilities(context: Context) -> None:
+    """Only the roles that serve recording routes check the writer's ledger, identity and salt:
+    a query or reports process sharing the config starts with those gaps."""
+    from traust_core.v1.rest.roles import Role
+
+    recording = RecordingConfig.model_validate({"validation": ["writer"]})
+    ctx = Context(
+        context.config.model_copy(update={"recording": recording, "ledger": LedgerConfig()})
+    )
+    for role in (Role.QUERY, Role.REPORTS, Role.OPS):
+        create_app(ctx, role)
+    for role in (Role.COMMAND, Role.ALL):
+        with pytest.raises(PreflightError, match="no usable local JWKS"):
+            create_app(ctx, role)
+
+
+def test_a_remote_issuers_unreachable_keys_do_not_stop_the_server_booting(
+    context: Context,
+) -> None:
+    """At boot a remote issuer's JWKS isn't fetched, so a transient IdP outage doesn't
+    crash-loop the API; the full preflight still reports the unreachable keys."""
+    from traust_core.v1.context.config import IdentityConfig
+    from traust_core.v1.context.preflight import check_recording_server
+    from traust_core.v1.models.identity import TrustedIssuer
+
+    unreachable = TrustedIssuer(
+        issuer="https://idp.example", jwks_url="http://127.0.0.1:9/jwks", audience="traust"
+    )
+    identity = IdentityConfig(trust_local=True, issuers=(unreachable,))
+    recording = RecordingConfig.model_validate({"validation": ["writer"]})
+    ctx = Context(
+        context.config.model_copy(
+            update={"recording": recording, "ledger": LedgerConfig(), "identity": identity}
+        )
+    )
+    ctx.local_issuer.mint("writer", machine=True)
+    create_app(ctx)
+    with pytest.raises(PreflightError, match="cannot reach configured JWKS"):
+        check_recording_server(ctx)

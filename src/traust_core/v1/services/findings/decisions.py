@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -56,7 +57,7 @@ from traust_core.v1.models.findings import (
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
-from traust_core.v1.models.operations import REMEDIATE_FINDING, RecordKind
+from traust_core.v1.models.operations import REMEDIATE_FINDING, RecordKind, RunOrder
 from traust_core.v1.models.validation import (
     ValidationAttempt,
     ValidationFilter,
@@ -87,7 +88,9 @@ from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
 from traust_core.v1.services.artifact_publishing import AssessmentLog, record_artifact, stored_bytes
+from traust_core.v1.services.findings import state_history
 from traust_core.v1.services.findings.precedents import FindingPrecedents
+from traust_core.v1.services.findings.rating import RatingPolicy
 from traust_core.v1.services.findings.records import FindingRecords
 from traust_core.v1.services.findings.restatement import RestatementPolicy
 from traust_core.v1.services.findings.review import ReviewPolicy, request
@@ -102,6 +105,7 @@ from traust_core.v1.services.validation import (
 )
 
 if TYPE_CHECKING:
+    from traust_core.v1.services.exposure import AdvisoryCvssReader
     from traust_core.v1.services.operations import OpsService
 
 
@@ -140,13 +144,16 @@ class FindingDecisions:
         clock: Clock,
         objects: ObjectStore,
         review: ReviewPolicy,
+        rating: RatingPolicy,
         restatement: RestatementPolicy | None = None,
         validation_records: ValidationRecords | None = None,
         source: SourceProvider | None = None,
         hosts: Collection[str] = DEFAULT_FORGE_HOSTS,
         recording: OpsService | None = None,
+        cvss: AdvisoryCvssReader | None = None,
     ) -> None:
         self._uow = uow
+        self._cvss = cvss
         self._inventory = Inventory(uow)
         self._log = AssessmentLog(uow)
         self._records = FindingRecords(uow)
@@ -156,6 +163,7 @@ class FindingDecisions:
         self._clock = clock
         self._objects = objects
         self._review = review
+        self._rating = rating
         self._restatement = restatement or RestatementPolicy()
         self._source = source
         self._hosts = hosts
@@ -197,6 +205,7 @@ class FindingDecisions:
             if same is not None:
                 return normalize_decision(same)
             Disposition.admit(self._admission_history(draft, history), draft, principal, now)
+            draft = state_history.stamp(draft, uow, self._rating, history=history, cvss=self._cvss)
             saved = uow.decisions.add_statement(draft)
             if self._ledger is not None:
                 self._ledger.append_decision(saved, finding.repository_id)
@@ -302,6 +311,21 @@ class FindingDecisions:
         if self._ledger is not None:
             self._ledger.require_signable()
 
+    def require_order_ledger(self, *, signed: bool = False) -> None:
+        """Admit a decision-producing order against this writer's ledger, not its planner's."""
+        ledger = self._ledger
+        LedgerService.require_order_config(ledger.config if ledger else None, signed=signed)
+        if (ledger is not None and ledger._uow is not self._uow) or (
+            self._recording is not None and self._recording._uow is not self._uow
+        ):
+            raise ConfigError("order-bound decisions, proof and lease must share a unit of work")
+
+    def _require_assessment_ledger(self, assessment_id: UUID) -> None:
+        if self._log.get(assessment_id).run_order_id is not None:
+            self.require_order_ledger()
+        else:
+            self.require_signable()
+
     def statement_key(self, decision: Decision) -> StatementKey:
         return statement_key(decision)
 
@@ -366,6 +390,7 @@ class FindingDecisions:
                 if same.rationale != draft.rationale:
                     raise ConflictError("this claim decision already has a different rationale")
                 return same
+            draft = state_history.stamp(draft, uow, self._rating, cvss=self._cvss)
             saved = uow.decisions.add_statement(draft)
             for approver in sorted(approvers):
                 uow.decision_approvers.add(
@@ -374,6 +399,46 @@ class FindingDecisions:
             if self._ledger is not None:
                 self._ledger.append_decision(saved, finding.repository_id)
             return saved
+
+    def append_occurrence_claim(
+        self,
+        finding_id: UUID,
+        principal: Principal,
+        *,
+        ticket: str,
+        rationale: str,
+    ) -> tuple[Decision, bool]:
+        """Append a recorded occurrence claim's audit record: a data_error statement
+        under the person's authority, judging no validity, resolution or severity (the
+        disposition fold reads none of it). Returns the decision and whether this call
+        appended it (False: the same statement already stood — idempotent)."""
+        if not principal.is_verified_human():
+            raise ForbiddenError("an occurrence claim needs a verified human")
+        if not ticket.strip() or len(rationale.strip()) < RATIONALE_MIN_LENGTH:
+            raise ValidationError("an occurrence claim requires a ticket and meaningful rationale")
+        with self._uow as uow:
+            finding = uow.findings.get_for_update(finding_id)
+            if self._ledger is not None:
+                self._ledger.require_intact(finding.repository_id)
+            draft = Decision(
+                finding_id=finding_id,
+                statement_key="pending",
+                reason=DecisionReason.DATA_ERROR,
+                actor=principal.ref,
+                ticket=ticket.strip(),
+                rationale=rationale.strip(),
+                source_channel=SourceChannel.INTERACTIVE,
+                occurred_at=self._clock.now(),
+            )
+            draft = draft.model_copy(update={"statement_key": self.statement_key(draft)})
+            same = self._same(draft)
+            if same is not None:
+                return same, False
+            saved = uow.decisions.add_statement(draft)
+            if self._ledger is not None:
+                self._ledger.append_decision(saved, finding.repository_id)
+            uow.commit()
+            return saved, True
 
     def restate(self, restatement: Restatement, principal: Principal) -> Decision:
         """An administrator's correction: a new decision that replaces the one it restates."""
@@ -423,6 +488,7 @@ class FindingDecisions:
             )
             if self._ledger is not None:
                 self._ledger.require_intact(finding.repository_id)
+            draft = state_history.stamp(draft, uow, self._rating, cvss=self._cvss)
             saved = uow.decisions.add_statement(draft)
             for approver in sorted(approvers):
                 ref = f"{ActorKind.HUMAN}:{approver}"
@@ -487,7 +553,17 @@ class FindingDecisions:
         checkout: Path | None = None,
     ) -> list[Decision]:
         """The decisions from recording a triage of one assessment."""
-        return self._record_triage(assessment_id, doc, provenance, checkout).decisions
+        doc = TriageArtifact.parse(doc.payload)
+        triaged = self._log.get(assessment_id)
+        lint_clean = self._triage_lint_clean(triaged, doc, checkout)
+        self.require_signable()
+        # Unbound, unsigned imports can resume by verdict. A required seal commits the batch.
+        atomic = self._ledger is not None and self._ledger.config.required
+        with self._uow.write() if atomic else nullcontext() as batch:
+            result = self._store_triage(triaged, doc, provenance, None, lint_clean)
+            if batch is not None:
+                batch.commit()
+            return result.decisions
 
     def record_triage(
         self,
@@ -497,6 +573,7 @@ class FindingDecisions:
         *,
         run_order_id: UUID,
         principal: Principal,
+        lease_generation: int,
         checkout: Path | None = None,
     ) -> TriageRecordResult:
         """Record triage under a live triage lease, never a remediation run's lease."""
@@ -505,17 +582,62 @@ class FindingDecisions:
 
         triaged = self._log.get(assessment_id)
         repository_id = self._inventory.get_ref(triaged.repository_ref_id).repository_id
-        with self._recording.recording(
-            run_order_id, principal, RecordKind.TRIAGE, repository_id, provenance
-        ) as order:
-            if order.asset == REMEDIATE_FINDING:
-                raise ForbiddenError(
-                    f"order {run_order_id}: triage recording requires a triage order,"
-                    f" not {order.asset}"
-                )
-            return self._record_triage(
-                assessment_id, doc, provenance, checkout, run_order_id=run_order_id
+        order = self._recording.check_recording(
+            run_order_id,
+            principal,
+            RecordKind.TRIAGE,
+            repository_id,
+            provenance,
+            lease_generation=lease_generation,
+        )
+        self._require_triage_order(order)
+        lint_clean = None
+        if (
+            self._log.recorded_order(
+                run_order_id, TRIAGE, triaged.repository_ref_id, doc, baseline_id=assessment_id
             )
+            is None
+        ):
+            doc = TriageArtifact.parse(doc.payload)
+            lint_clean = self._triage_lint_clean(triaged, doc, checkout)
+        with self._recording.recording(
+            run_order_id,
+            principal,
+            RecordKind.TRIAGE,
+            repository_id,
+            provenance,
+            lease_generation=lease_generation,
+        ) as order:
+            self._require_triage_order(order)
+            replay = self._log.recorded_order(
+                run_order_id, TRIAGE, triaged.repository_ref_id, doc, baseline_id=assessment_id
+            )
+            if replay is None:
+                if lint_clean is None:
+                    raise IntegrityError(f"order {run_order_id}: recorded triage disappeared")
+                result = self._store_triage(triaged, doc, provenance, run_order_id, lint_clean)
+                triage_id, artifact_id = result.assessment_id, result.artifact_id
+            else:
+                triage, artifact = replay
+                assert triage.id is not None and artifact.id is not None
+                triage_id, artifact_id = triage.id, artifact.id
+                stored_bytes(self._objects, artifact)
+            return TriageRecordResult(
+                assessment_id=triage_id,
+                artifact_id=artifact_id,
+                decisions=[
+                    d
+                    for d in self.for_assessments([triage_id])
+                    if d.artifact_id == artifact_id and d.actor is None
+                ],
+            )
+
+    def _require_triage_order(self, order: RunOrder) -> None:
+        if order.asset == REMEDIATE_FINDING:
+            raise ForbiddenError(
+                f"order {order.id}: triage recording requires a triage order, not {order.asset}"
+            )
+        self.require_order_ledger(signed=True)
 
     def intake_bindings(self, assessment_id: UUID) -> AssessmentIntakeBindings:
         """Stored triage row labels joined only to findings reported by its baseline assessment."""
@@ -564,21 +686,13 @@ class FindingDecisions:
             )
         return [(verdict, finding) for verdict, finding in verdicts if finding is not None]
 
-    def _record_triage(
-        self,
-        assessment_id: UUID,
-        doc: TriageArtifact,
-        provenance: Provenance,
-        checkout: Path | None,
-        *,
-        run_order_id: UUID | None = None,
-    ) -> TriageRecordResult:
-        doc = TriageArtifact.parse(doc.payload)
-        triaged = self._log.get(assessment_id)
+    def _triage_lint_clean(
+        self, triaged: Assessment, doc: TriageArtifact, checkout: Path | None
+    ) -> set[str]:
         if checkout is None:
             if self._source is None:
                 raise ConfigError("triage recording without a checkout needs a source provider")
-            subject = self._inventory.subject(triaged.repository_ref_id, assessment_id)
+            subject = self._inventory.subject(triaged.repository_ref_id, triaged.id)
             files = ForgeFiles(
                 self._source,
                 HttpsRepoUrl.parse(subject.repository_url, self._hosts),
@@ -587,8 +701,18 @@ class FindingDecisions:
             checked = self._lint.run(doc, LintContext(files=files))
         else:
             checked = self.check(doc, checkout)
-        lint_clean = {f.id for f in doc.findings} - {v.item for v in checked.violations}
-        self.require_signable()
+        return {f.id for f in doc.findings} - {v.item for v in checked.violations}
+
+    def _store_triage(
+        self,
+        triaged: Assessment,
+        doc: TriageArtifact,
+        provenance: Provenance,
+        run_order_id: UUID | None,
+        lint_clean: set[str],
+    ) -> TriageRecordResult:
+        assert triaged.id is not None
+        assessment_id = triaged.id
         with self._uow as uow:
             verdicts = self._triage_findings(assessment_id, doc)
             triage, artifact, new_triage = self._triage_assessment(
@@ -601,7 +725,7 @@ class FindingDecisions:
                             finding.model_copy(update={"kind": FindingKind(verdict.kind)})
                         )
             uow.commit()
-        recorded = []
+        recorded, repositories = [], set()
         for verdict, finding in verdicts:
             with self._uow.write() as uow:
                 decision = self._record_verdict(
@@ -615,8 +739,9 @@ class FindingDecisions:
                 uow.commit()
             if decision is not None:
                 recorded.append(decision)
+                repositories.add(finding.repository_id)
         if self._ledger is not None:
-            for repository_id in sorted({f.repository_id for _, f in verdicts if f}, key=str):
+            for repository_id in sorted(repositories):
                 self._ledger.seal(repository_id)  # one signature for the whole triage
         if new_triage:
             count = len(recorded)
@@ -641,8 +766,8 @@ class FindingDecisions:
         if recorded := self._log.find_recorded(
             [triaged.repository_ref_id], TRIAGE, TRIAGE, digest, baseline_id=triaged.id
         ):
-            if run_order_id is not None and recorded[0][0].run_order_id != run_order_id:
-                raise ConflictError("triage replay belongs to a different or unbound run order")
+            if recorded[0][0].run_order_id != run_order_id:
+                raise ConflictError("triage replay has a different run order binding")
             return *recorded[0], False
         contracts.validate_json("triage#/$defs/canonical_write", doc.payload)
         triage = self._log.open(
@@ -719,11 +844,13 @@ class FindingDecisions:
         """An assessor's own judgments on what it reported (finding id, judgment), one decision
         each, with a review item where it asks a person; its document is the evidence.
         Re-recording changes nothing and reopens no review."""
-        self.require_signable()
+        if not judgments:
+            return []
         recorded, repositories = [], set()
         created = 0
-        for finding_id, judgment in judgments:
-            with self._uow as uow:
+        with self._uow.write() as uow:
+            self._require_assessment_ledger(assessment_id)
+            for finding_id, judgment in judgments:
                 if uow.occurrences.find(finding_id, assessment_id) is None:
                     raise ValidationError(
                         f"assessment {assessment_id} didn't report finding {finding_id}"
@@ -743,12 +870,13 @@ class FindingDecisions:
                 created += new
                 if new and judgment.review is not None:
                     request(uow, finding_id, judgment.review, saved.id)
-                uow.commit()
-            recorded.append(saved)
-            repositories.add(finding.repository_id)
-        if self._ledger is not None:
-            for repository_id in sorted(repositories, key=str):
-                self._ledger.seal(repository_id)
+                recorded.append(saved)
+                if new:
+                    repositories.add(finding.repository_id)
+            if self._ledger is not None:
+                for repository_id in sorted(repositories, key=str):
+                    self._ledger.seal(repository_id)
+            uow.commit()
         if created:
             self._uow.after_commit(
                 lambda: log.info("assessment %s: %d assessed decisions", assessment_id, created)
@@ -775,11 +903,13 @@ class FindingDecisions:
             resolution is not None or any(r is not None for r in (resolutions or {}).values())
         ):
             raise ValidationError("a statement is a validity or a resolution, never both")
-        self.require_signable()
+        if not finding_ids:
+            return []
         recorded, repositories = [], set()
         created = 0
-        for finding_id in finding_ids:
-            with self._uow as uow:
+        with self._uow.write() as uow:
+            self._require_assessment_ledger(assessment_id)
+            for finding_id in finding_ids:
                 finding = uow.findings.get(finding_id)
                 draft = Decision(
                     finding_id=finding_id,
@@ -797,11 +927,12 @@ class FindingDecisions:
                 saved, new = self._state(uow, draft, finding.repository_id)
                 recorded.append(saved)
                 created += new
-                uow.commit()
-            repositories.add(finding.repository_id)
-        if self._ledger is not None:
-            for repository_id in sorted(repositories, key=str):
-                self._ledger.seal(repository_id)
+                if new:
+                    repositories.add(finding.repository_id)
+            if self._ledger is not None:
+                for repository_id in sorted(repositories, key=str):
+                    self._ledger.seal(repository_id)
+            uow.commit()
         if created:
             self._uow.after_commit(
                 lambda: log.info(
@@ -817,6 +948,7 @@ class FindingDecisions:
         draft = draft.model_copy(update={"statement_key": self.statement_key(draft)})
         if (same := self._same(draft)) is not None:
             return normalize_decision(same), False
+        draft = state_history.stamp(draft, uow, self._rating, cvss=self._cvss)
         saved = uow.decisions.add_statement(draft)
         if (reason := self._review.needs_signoff(saved)) is not None:
             request(uow, saved.finding_id, reason, saved.id)
@@ -831,6 +963,8 @@ class FindingDecisions:
         bindings: ValidationRecordInput,
         run_order_id: UUID,
         principal: Principal,
+        *,
+        lease_generation: int,
     ) -> ValidationRecordResult:
         if self._recording is None:
             raise ConfigError("validation recording requires operations authorization")
@@ -847,19 +981,30 @@ class FindingDecisions:
             raise ForbiddenError("validation recording exceeds a single order's repository scope")
         (repository_id,) = repositories
         with self._recording.recording(
-            run_order_id, principal, RecordKind.VALIDATION, repository_id, provenance
+            run_order_id,
+            principal,
+            RecordKind.VALIDATION,
+            repository_id,
+            provenance,
+            lease_generation=lease_generation,
         ):
-            return self.record_validation(doc, provenance, bindings, run_order_id=run_order_id)
+            return self._record_validation(doc, provenance, bindings, run_order_id)
 
     def record_validation(
         self,
         doc: ValidationArtifact,
         provenance: Provenance,
         bindings: ValidationRecordInput,
-        *,
-        run_order_id: UUID | None = None,
     ) -> ValidationRecordResult:
-        """Record one bound machine run atomically, including review-only evidence."""
+        return self._record_validation(doc, provenance, bindings, None)
+
+    def _record_validation(
+        self,
+        doc: ValidationArtifact,
+        provenance: Provenance,
+        bindings: ValidationRecordInput,
+        run_order_id: UUID | None,
+    ) -> ValidationRecordResult:
         doc = ValidationArtifact.parse(doc.payload)
         provenance = Provenance.model_validate_json(provenance.model_dump_json())
         bindings = ValidationRecordInput.model_validate_json(bindings.model_dump_json())
@@ -868,8 +1013,10 @@ class FindingDecisions:
         if provenance.occurred_at.tzinfo is None or provenance.occurred_at.utcoffset() is None:
             raise ValidationError("validation recording requires timezone-aware provenance")
         outcomes = bindings.outcomes(doc)
-        if self._ledger is not None:
-            self._ledger.require_signable()
+        if run_order_id is not None:
+            self.require_order_ledger()
+        else:
+            self.require_signable()
         with self._uow.write() as uow:
             sources, findings = self._validation_bindings(uow, doc, bindings)
             for finding_id in sorted(findings, key=str):
@@ -1049,6 +1196,41 @@ class FindingDecisions:
     ) -> tuple[Assessment, Artifact, Artifact, bool]:
         raw = evidence.model_dump_json().encode()
         digest = sha256_hex(raw)
+        if run_order_id is not None:
+            # An ordered record replays by its order and source (`recorded_order_subject`), as
+            # triage's does by its order: a reclaimed lease resubmits the same report with a
+            # fresh provenance time, which changes the evidence digest but never makes a second
+            # assessment for that order and source.
+            assert source.id is not None
+            replay = self._log.recorded_order_subject(
+                run_order_id,
+                AssessmentKind.VALIDATION,
+                source.repository_ref_id,
+                doc,
+                baseline_id=source.id,
+            )
+            if replay is not None:
+                assessment, artifact = replay
+                companions = [
+                    row for _, row in self._log.documents([assessment], [VALIDATION_RECORDING])
+                ]
+                if len(companions) != 1:
+                    raise IntegrityError(
+                        "validation replay is missing its retained recording evidence"
+                    )
+                stored_bytes(self._objects, artifact)
+                retained = ValidationRecordingEvidence.model_validate_json(
+                    stored_bytes(self._objects, companions[0])
+                )
+                # A replay may differ only in its provenance time: different bindings,
+                # outcomes, run, source or artifact are a different validation, refused rather
+                # than recorded under evidence that describes the first submission.
+                only_time = {"provenance": {"occurred_at"}}
+                if retained.model_dump(exclude=only_time) != evidence.model_dump(exclude=only_time):
+                    raise ConflictError(
+                        f"order {run_order_id}: already recorded different validation evidence"
+                    )
+                return assessment, artifact, companions[0], False
         known = self._log.find_recorded(
             [source.repository_ref_id],
             AssessmentKind.VALIDATION,
@@ -1058,8 +1240,8 @@ class FindingDecisions:
         )
         if known:
             assessment, companion = known[0]
-            if run_order_id is not None and assessment.run_order_id != run_order_id:
-                raise ConflictError("validation replay belongs to a different or unbound run order")
+            if assessment.run_order_id != run_order_id:
+                raise ConflictError("validation replay has a different run order binding")
             artifact = next(
                 (
                     row
@@ -1152,6 +1334,7 @@ class FindingDecisions:
             same := self._same(draft, uow.decisions.list_for_finding(draft.finding_id))
         ) is not None:
             return normalize_decision(same), False
+        draft = state_history.stamp(draft, uow, self._rating, cvss=self._cvss)
         saved = uow.decisions.add_statement(draft)
         if self._ledger is not None:
             self._ledger.append_decision(saved, repository_id, sign=False)
@@ -1166,10 +1349,10 @@ class FindingDecisions:
         kept = {f: digest for f, digest in reproducers.items() if digest}
         if not kept:
             return []
-        self.require_signable()
         recorded, appended = [], set()
         created_count = 0
         with self._uow.write() as uow:
+            self._require_assessment_ledger(assessment.id)
             findings = {f: uow.findings.get_for_update(f) for f in sorted(kept, key=str)}
             for finding_id in findings:
                 if uow.occurrences.find(finding_id, assessment.id) is None:

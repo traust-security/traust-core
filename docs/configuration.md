@@ -40,6 +40,12 @@ identity:                                 # absent: no caller can be verified (R
 | `identity.restatement_approvers` | how many approvers besides its author a correction must name |
 | `identity.login` | the provider `traust auth` logs in against; tokens are kept in `<home>/credentials.json` (owner-only) |
 
+A server with report-recording asset bindings probes its own identity verifier
+at startup; a planner passing preflight is not evidence that the writer is ready.
+Decision writers need a ledger. A triage writer also needs a working required
+signing pair and a nonblank secret in the variable named by `review.valve_salt_env`.
+A read-only server with no recording bindings does not require these credentials.
+
 ## From traust-ledger's service settings
 
 | traust-ledger (env) | traust-core |
@@ -79,12 +85,62 @@ identity:                                 # absent: no caller can be verified (R
 | Key | Effect |
 |---|---|
 | `feeds.osv_access` | `api` (default) queries the OSV API; `air-gapped` reads exported OSV records only (`Context.use_exported_advisories`). The feeds registry no longer carries this switch |
-| `feeds.api_keys` | feed source -> the environment variable holding its API key (`{nvd: NVD_API_KEY}`). Optional: a source not named goes keyless at its lower rate limit, with no warnings; a named variable that is unset is a config error. See [Feed API keys](#feed-api-keys) |
+| `feeds.api_keys` | feed source -> the environment variable holding its API key (`{nvd: NVD_API_KEY}`). Optional: a source not named goes keyless at its lower rate limit, with no warnings; a named variable that is unset or empty logs an error and the source goes keyless. See [Feed API keys](#feed-api-keys) |
 | `execution.sandbox` | `none` (default) or `podman`: how lanes run a target's own build and test code |
 | `campaign.tracking_reference`, `campaign.display_name` | the tracking key and title reports cite |
-| `remediation.fork_org`, `remediation.patch_prefix`, `remediation.private_forge_hosts` | where fixes are pushed: the mirror org, the patch-repository name prefix the convention computes (`patch-` by default; a deployment running SCI's provisioner sets `sci-patch-`), and the deployment's own forge hosts |
+| `remediation.fork_org`, `remediation.patch_prefix`, `remediation.private_forge_hosts` | where fixes are pushed: the mirror org, the patch-repository name prefix the convention computes (`patch-` by default), and the deployment's own forge hosts |
+| `remediation.committer` | the machine identity fix commits are authored under (`traust-remediation` by default; a name ending in `-remediation`, email `<name>@localhost`), handed to the skill with the fork |
 | `forge_tokens` | forge host -> the environment variable holding its API token, beside `forge_hosts` |
-| `overrides.rule_pack_allowlist` | enables supplemental rule packs; absent: none. The only override: tool pins, safe-exec profiles and the feeds registry are the project's and ship in `context/shipped/` (`Context.register_toolchain()` / `register_feeds()` read them) |
+| `overrides.rule_pack_allowlist` | enables explicitly selected supplemental rule packs; absent: none. Sources may be local directories relative to the allowlist or HTTPS Git repositories pinned to a 40-hex commit. Enabled packs must pass the same native quality gates as the shipped rules |
+
+## Adopter Opengrep rules
+
+Set `overrides.rule_pack_allowlist` to an adopter-owned allowlist. For example:
+
+```yaml
+packs:
+  acme:
+    enabled: true
+    source: rules/acme
+    rules: [acme-authentication-check]
+```
+
+The source above resolves beside the allowlist file, not the process's working directory.
+Keep native Opengrep fixtures beside their rule YAML, sharing its basename; every authored
+rule requires both `ruleid:` and `ok:` cases. A pinned HTTPS Git source uses the existing
+checkout and rules-subtree convention and must carry those fixtures too. Relative local
+sources cannot select a single file: an enabled local pack is a directory.
+
+For YAML targets use native test names such as `policy.test.yaml` or `policy.test.yml`
+beside `policy.yaml`; proposal examples and staged `rule.skeleton.yaml` drafts follow
+the same `.test.yaml` / `.test.yml` convention.
+
+Only fixture paths present in each rule's native `check.matches` count toward coverage.
+Expected autofix outputs such as `policy.fixed.py` cannot supply missing negative cases.
+
+`opengrep_quality_report` checks without a database. Actual scans run native validation
+and strict native tests over private snapshots and then consume those same snapshots.
+Missing fixtures, skipped/unreported tests, unknown test IDs, duplicate rule IDs, failed
+assertions, abnormal native exits, or invalid enabled sources refuse the run; there is no
+validation bypass or silent fallback to only the public pack. Per-rule selection still
+limits reported supplemental hits, but the supplied pack must pass quality checks.
+These checks establish fixture behavior, not real application exploitability.
+
+Adopter packs are additive. Portfolio/ledger mining, regression drafts, proposal checks,
+calibration and corpus sweeps remain available; custom packs do not replace those lanes.
+A sweep runs quality before checking out or iterating repositories, then reuses that
+operation's private snapshot. Resumable results include a digest of its rule and fixture
+paths and bytes; legacy rule-quality failures and changed inputs are rescanned. Each
+independent operation still performs native validation and strict tests: no process-global
+cache can reuse a receipt for mutable local inputs or a different runner.
+
+Reports list only `supplemental_packs.applied`; invalid packs fail instead of appearing
+as skipped supplements. Scanner transport failures raise `traust_core.v1.errors.ScannerError`;
+its `ScannerFailure` reason distinguishes `scan_timeout`, `opengrep_failed` and
+`invalid_output`, with configured timeout or exit code when available. Diagnostics contain
+bounded classifications, not native stdout/stderr or parser source excerpts. Proposal
+scan failures retain passed native receipts and fail the examples or explosion check
+with the actual scan cause.
 
 ## Feed API keys
 
@@ -106,10 +162,14 @@ feeds:
     nvd: NVD_API_KEY   # the variable's name; set NVD_API_KEY from your secret store
 ```
 
-Core reads every named variable before it registers any feed (`Context.register_feeds`),
-so a retry after setting a missing one starts clean. It refuses a key at load, never at
-the first request, when:
-- the variable is unset or empty;
+Core reads every named variable before it registers any feed (`Context.register_feeds`).
+A named variable that is unset or empty is logged at error level
+(`operation: feeds.api_key`, `outcome: keyless`), and the source keeps working keyless at
+its lower rate limit. When that source then answers 403 or 429, its error and readiness
+detail say it was sent keyless, naming the unset variable, and is most likely rate-limited.
+A new context picks the key up once the variable is set.
+
+Core refuses a key at load, never at the first request, when:
 - the source isn't registered, or declares no `api_key_header`;
 - the key holds anything but visible ASCII.
 

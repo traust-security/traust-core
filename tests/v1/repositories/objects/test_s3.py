@@ -43,6 +43,15 @@ def test_bytes_changed_behind_the_store_fail_the_digest(client: BaseClient) -> N
     assert store.stat(KEY).sha256 != ref.sha256
 
 
+def test_a_read_by_digest_fetches_the_object_once(client: BaseClient) -> None:
+    store = S3ObjectStore("traust", client=client)
+    ref = store.put(KEY, b"original")
+    calls: list[str] = []
+    client.meta.events.register("before-call.s3.*", lambda model, **_: calls.append(model.name))
+    assert store.read(KEY, ref.sha256) == b"original"
+    assert calls == ["GetObject"]
+
+
 def test_list_matches_whole_segments_and_skips_foreign_keys(client: BaseClient) -> None:
     store = S3ObjectStore("traust", client=client)
     store.put(ObjectKey.parse("a/x.json"), b"1")

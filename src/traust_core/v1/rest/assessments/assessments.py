@@ -141,5 +141,6 @@ def record_assessment(
         body.assessor_version,
         body.provenance,
         run_order_id=body.run_order_id,
+        lease_generation=body.lease_generation,
         principal=caller,
     )

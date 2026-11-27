@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from datetime import timedelta
+from decimal import Decimal
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -67,6 +68,45 @@ def record_container(
     )
     assert saved.id is not None
     return saved.id
+
+
+def test_the_container_rows_cvss_describes_its_own_occurrence(
+    context: Context, engine: Engine
+) -> None:
+    """The row shows the container family's occurrence, so its cvss block must describe
+    that occurrence — not the repository-wide latest a plain view would fold. A later
+    source-code report scoring the finding 9.8 must not reach the container row's chain."""
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        ref = seed.repository_ref()
+        uow.commit()
+    assert ref.id is not None
+    # findings[0] is the report's scored one: cvss 8.1, a high band
+    container = record_container(
+        context, ref.id, "registry.example:5000/apps/widget@sha256:aaa", 0, (0,)
+    )
+    (finding_id,) = {
+        o.finding_id for o in context.services().findings.occurrences(assessment_id=container)
+    }
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        later = seed.assessment(ref, kind="secure-code", occurred_at=T0 + 4 * DAY)
+        seed.occurrence(
+            uow.findings.get(finding_id),
+            later,
+            severity="critical",
+            cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+            cvss_score=Decimal("9.8"),
+        )
+        uow.commit()
+    scope = ViewFilter(assessment_id=container, report_stem="widget-container-audit")
+    model = context.services().insight.build(ViewName.CONTAINER_FINDINGS, scope)
+    assert isinstance(model, ContainerFindings)
+    (row,) = model.findings
+    assert row.view.occurrence.assessment_id == container
+    assert row.view.cvss is not None
+    assert (row.view.cvss.score, row.view.cvss.severity) == (Decimal("8.1"), "high")
+    assert row.view.effective_severity == "high"  # the container occurrence's band
 
 
 def test_container_population_is_cumulative_image_scoped_and_decision_driven(

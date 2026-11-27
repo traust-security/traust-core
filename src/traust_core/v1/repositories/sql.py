@@ -37,8 +37,24 @@ def _compact_json(value: Any) -> str:
 
 
 def create_database_engine(url: str | sa.URL) -> Engine:
-    engine = sa.create_engine(url, json_serializer=_compact_json, hide_parameters=True)
-    if engine.dialect.name != "sqlite":
+    postgres = sa.make_url(url).get_backend_name() == "postgresql"
+    engine = sa.create_engine(
+        url,
+        json_serializer=_compact_json,
+        hide_parameters=True,
+        # The audit's 1.24 GB sort spill guard (work_mem) and the contract schemas on the
+        # search path, so raw-text SQL reaches traust.finding whatever the database role's
+        # name (the dev rig's role happening to match the schema masked this). Both are
+        # libpq options, not connect-time statements — a statement leaves the
+        # connection in a transaction, and the upgrade runner needs to reach
+        # autocommit on a freshly checked-out connection.
+        connect_args={
+            "options": ("-c work_mem=64MB -c search_path=traust,traust_ops,traust_ledger,public")
+        }
+        if postgres
+        else {},
+    )
+    if postgres:
         return engine
 
     @sa.event.listens_for(engine, "connect")
@@ -285,6 +301,11 @@ class SqlUnitOfWork:
         self.connection.rollback()
         self.connection.info[_WRITE_INTENT] = False
         self._rollback_only = False
+
+    def independent(self) -> SqlUnitOfWork:
+        """A sibling scope over the same engine: its own connection and transaction, so
+        batched work commits without joining a caller's open transaction."""
+        return type(self)(self._engine)
 
 
 class SqlRepository:

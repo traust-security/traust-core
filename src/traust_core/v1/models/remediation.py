@@ -415,12 +415,14 @@ class RemediationItem(Model):
 
 
 class RemediationInput(SkillInput):
-    """What the skill patches: the work item, its findings, where to push."""
+    """What the skill patches: the work item, its findings, where to push, and the machine
+    identity the fix commit is authored under."""
 
     work_item: WorkItem
     items: tuple[RemediationItem, ...]
     fork: Fork
     fix_branch: str
+    committer: str
 
 
 class CheckOutcome(StrEnum):
@@ -1015,4 +1017,4 @@ class VerifySweep(Model):
 
 def regression_candidates(doc: Any, repository_id: UUID) -> list[FindingCandidate]:
     """The new vulnerabilities a verification found, for intake as findings of its own."""
-    return FindingCandidate.of_report(doc.regressions, repository_id)
+    return FindingCandidate.of_regressions(doc.regressions, repository_id)

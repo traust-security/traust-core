@@ -29,7 +29,7 @@ def yaml_documents(text: str) -> list[object]:
     try:
         return list(yaml.safe_load_all(text))
     except yaml.YAMLError as e:
-        raise ValidationError(f"unparseable YAML: {e}") from e
+        raise ValidationError("unparseable YAML") from e
 
 
 def yaml_documents_with_lines(text: str) -> list[object]:
@@ -38,7 +38,7 @@ def yaml_documents_with_lines(text: str) -> list[object]:
     try:
         return list(yaml.load_all(text, Loader=_LineLoader))
     except yaml.YAMLError as e:
-        raise ValidationError(f"unparseable YAML: {e}") from e
+        raise ValidationError("unparseable YAML") from e
 
 
 def yaml_text(document: object) -> str:

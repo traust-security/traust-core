@@ -3,6 +3,7 @@ from __future__ import annotations
 from uuid import UUID
 
 from fastapi import APIRouter
+from pydantic import Field
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.artifacts import TriageArtifact
@@ -18,6 +19,7 @@ router = APIRouter()
 
 class TriageRecordBody(Model):
     run_order_id: UUID
+    lease_generation: int = Field(strict=True, gt=0)
     payload: str
     provenance: Provenance
 
@@ -44,4 +46,5 @@ def record_triage(
         body.provenance,
         run_order_id=body.run_order_id,
         principal=caller,
+        lease_generation=body.lease_generation,
     )

@@ -51,6 +51,8 @@ from traust_core.v1.models.code_facts import (
     SymbolQuery,
 )
 from traust_core.v1.models.common import CodeSpan, Cursor, Page, PageRequest
+from traust_core.v1.models.dependencies import UnresolvedManifest
+from traust_core.v1.models.inventory import RepositoryRef
 from traust_core.v1.models.validation import (
     ScopeDecision,
     ValidationAction,
@@ -69,7 +71,7 @@ from traust_core.v1.providers.tools import FactEnumerator, ToolRequest
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.crypto_packages import CryptoPackagePolicy
-from traust_core.v1.services.exposure import ExposureService
+from traust_core.v1.services.exposure import ExposureService, ManifestScanCoverage
 
 log = logging.getLogger(__name__)
 
@@ -323,9 +325,7 @@ class CodeFactsService:
         return fork.model_copy(update={"upstreams": tuple(upstreams), "network": "ok"})
 
     def crypto(self, repository_ref_id: UUID, request: ToolRequest) -> list[CryptoFact]:
-        """The commit's crypto census, recording nothing: what its checkout (`request`) configures,
-        then the crypto packages of its manifest SBOM. `NoManifestSbomError` if none was
-        ingested, raised before the checkout is read."""
+        """Observed checkout configuration and crypto packages, not a coverage verdict."""
         packages = self.packages(repository_ref_id)
         configured = self.enumerate(CodeFactKind.CRYPTO, request)
         crypto = [f for f in configured if isinstance(f, CryptoFact)]
@@ -336,11 +336,30 @@ class CodeFactsService:
         return crypto + packages
 
     def packages(self, repository_ref_id: UUID) -> list[CryptoFact]:
-        """The crypto packages of the commit's manifest SBOM, no checkout needed.
-        `NoManifestSbomError` if none was ingested."""
+        """Observed crypto packages only; unlisted packages are unknown without coverage."""
+        return self.package_observations(repository_ref_id)[1]
+
+    def package_observations(
+        self, repository_ref_id: UUID
+    ) -> tuple[RepositoryRef, list[CryptoFact]]:
+        """Observed crypto packages and the snapshot defining their manifest coverage."""
+        ref, rows = self._crypto_exposure().manifest_dependencies(repository_ref_id)
+        return ref, self._packages.facts(rows)
+
+    def package_coverage(
+        self, refs: Collection[RepositoryRef]
+    ) -> dict[UUID, tuple[UnresolvedManifest, ...] | None]:
+        return self._crypto_exposure().manifest_coverage(refs)
+
+    def package_scan_coverage(
+        self, refs: Collection[RepositoryRef]
+    ) -> dict[UUID, ManifestScanCoverage]:
+        return self._crypto_exposure().manifest_scan_coverage(refs)
+
+    def _crypto_exposure(self) -> ExposureService:
         if self._exposure is None:
             raise ConfigError("the crypto census needs the exposure service's dependency rows")
-        return self._packages.facts(self._exposure.dependencies(repository_ref_id))
+        return self._exposure
 
     def image_crypto(self, digest: str, request: ImageRequest) -> ImageCensus:
         """The image's crypto census, recording nothing: what it ships (linked libraries, certs,

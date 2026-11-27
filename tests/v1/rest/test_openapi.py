@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import re
 
+import pytest
 from fastapi.testclient import TestClient
+
+from traust_core.v1.models.insight import ReportFormat
+from traust_core.v1.rest.roles import serving_role
 
 
 def test_swagger_redoc_and_the_spec_are_served(client: TestClient) -> None:
@@ -42,3 +46,60 @@ def test_finding_report_times_remain_nullable_datetimes_in_the_sdk_contract(
     for name in ("first_reported_at", "last_reported_at"):
         assert {"type": "string", "format": "date-time"} in properties[name]["anyOf"]
         assert {"type": "null"} in properties[name]["anyOf"]
+
+
+_OPERATIONS = frozenset({"get", "put", "post", "delete", "options", "head", "patch", "trace"})
+
+
+def _operations(spec: dict) -> list[tuple[str, str, dict]]:
+    """Every (method, path, operation) the spec documents."""
+    return [
+        (method, path, operation)
+        for path, item in spec["paths"].items()
+        for method, operation in item.items()
+        if method in _OPERATIONS
+    ]
+
+
+def test_every_operation_carries_exactly_one_serving_role(client: TestClient) -> None:
+    spec = client.get("/openapi.json").json()
+    operations = _operations(spec)
+    assert len(operations) > 50  # the real route list, not an empty one
+    for method, path, operation in operations:
+        stamped = [value for key, value in operation.items() if key == "x-traust-role"]
+        assert stamped == [serving_role(path, method)], (method, path)
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "role"),
+    [
+        ("get", "/v1/healthz", "every"),  # health and identity serve in every role
+        ("get", "/v1/whoami", "every"),
+        ("get", "/v1/repositories/{repository_id}/findings", "query"),
+        ("post", "/v1/dashboards:query", "query"),
+        ("post", "/v1/findings/{finding_id}/decisions", "command"),
+        ("post", "/v1/orders/claim", "ops"),
+        ("get", "/v1/orders", "ops"),
+    ],
+)
+def test_a_sample_operation_from_each_role(
+    client: TestClient, method: str, path: str, role: str
+) -> None:
+    operation = client.get("/openapi.json").json()["paths"][path][method]
+    assert operation["x-traust-role"] == role
+
+
+def test_the_report_file_route_declares_the_media_types_the_handler_serves(
+    client: TestClient,
+) -> None:
+    """Every format the route can return is typed, so an SDK can type the download: json is
+    the report document (an object; its shape varies by report), the rest are text renders."""
+    response = client.get("/openapi.json").json()["paths"]["/v1/reports/{order_id}/file"]["get"][
+        "responses"
+    ]["200"]
+    assert set(response["content"]) == {f.media_type for f in ReportFormat}
+    assert next(iter(response["content"])) == "application/json"  # generators read the first
+    assert response["content"]["application/json"]["schema"] == {"type": "object"}
+    for media in ("text/markdown", "text/html", "text/csv"):
+        assert response["content"][media]["schema"] == {"type": "string"}
+    assert "Content-Disposition" in response["headers"]

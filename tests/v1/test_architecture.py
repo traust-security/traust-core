@@ -21,6 +21,7 @@ SERVICES = SRC / "services"
 # The section each service writes. A service imports only its own section's unit of work.
 SERVICE_SECTION = {
     "portfolio": "traust.inventory",
+    "dashboards": "traust.findings",
     "onboarding": "traust.inventory",
     "assessment": "traust.assessments",
     "artifact_publishing": "traust.assessments",
@@ -35,6 +36,7 @@ SERVICE_SECTION = {
 }
 # Use cases that write several sections in one transaction declare TraustUnitOfWork.
 SPANS_SECTIONS = {
+    "dashboards",
     "findings",
     "exposure",
     "validation",
@@ -223,6 +225,16 @@ def test_only_the_s3_store_imports_boto() -> None:
         if any(name.split(".")[0] in {"boto3", "botocore"} for name in _imported_modules(path))
     )
     assert importers == ["repositories/objects/s3.py"]
+
+
+def test_only_the_cvss_model_imports_the_cvss_library() -> None:
+    """FIRST's formulas are a pure computation on one value: the CVSS model holds them."""
+    importers = sorted(
+        str(path.relative_to(SRC))
+        for path in SRC.rglob("*.py")
+        if any(name.split(".")[0] == "cvss" for name in _imported_modules(path))
+    )
+    assert importers == ["models/cvss.py"]
 
 
 def test_only_the_syntax_module_imports_tree_sitter() -> None:

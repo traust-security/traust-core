@@ -10,12 +10,12 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Errors** | `errors` | the exception hierarchy every layer raises (`ValidationError`, `NotFoundError`, …) | ad hoc exceptions |
 | **Models** | `models` | one model per contract table, grouped by section — `inventory`, `dependencies`, `assessment`, `findings`, `operations`, `ledger` (fields = columns) — next to that section's service types; `base` (`Model` strict, `Dto` tolerant, `Entity` with a database-generated UUIDv4 id, `AppendOnly` for tables that are never updated), `values` (`HttpsRepoUrl`, `GitSha`, `CveId`, `to_rfc3339` / `TimestampError`: the contracts' one RFC 3339 rule), `integrity` | dicts passed between scripts |
 | **Validation rules** | `models.validation` | `ValidationScope.permits(action, target, as_of=…)`, `ValidationPlan.requires_approval()`, `ValidationAttempt.soundness()` — pure scope, approval and refutation rules | duplicated harness scope and soundness rules |
-| **CVSS sources** | `models.cvss`, `services.findings.cvss`, `models.feed_documents`, `services.exposure` | the per-source documents kept daily (`exposure.refresh_documents`: one manifest snapshot per source, a failed fetch keeping the last document; `exposure.stored_document` reads one back, digest-checked); `exposure.advisory_names` is the batched door every advisory join goes through (canonical name plus aliases, CVEs split out), and `exposure.refresh_advisory_documents` keeps every linked advisory's documents; each advisory source's CVSS from its stored document (`cve_list_scores`, `nvd_scores`, `osv_scores`, `rh_cve_scores`, `csaf_scores`, `scanner_score`; `score_of` refuses a malformed vector, a version that disagrees with it, a score outside 0–10 or one its vector doesn't compute), and the one a finding shows: `effective(scores)` ranks NIST > GitHub-reviewed GHSA > CNA > ADP > Red Hat > scanner, takes a source's 3.1 before its 3.0, and keeps 4.0 alongside, never ranked | `AdvisoryRecord.cvss_score`, which reads only one feed's 3.x vectors |
-| **Validation recording** | `services.validation`, `models.validation` | `record_order(doc, provenance, bindings, run_order_id, principal)` binds machine reports to a live order lease; trusted-local `record(doc, provenance, bindings)` and `evidence(artifact_id)` retain their existing semantics | re-running probes, interpreting source labels as database IDs |
+| **CVSS sources** | `models.cvss`, `services.findings.cvss`, `models.feed_documents`, `services.exposure` | the per-source documents kept daily (`exposure.refresh_documents`: one manifest snapshot per source, a failed fetch keeping the last document; `exposure.stored_document` reads one back, digest-checked); `exposure.advisory_names` is the batched door every advisory join goes through (canonical name plus aliases, CVEs split out), and `exposure.refresh_advisory_documents` keeps every linked advisory's documents, then ranks their scores into the daily `advisory-cvss` build that every finding view reads (`exposure.AdvisoryCvssReader`); each advisory source's CVSS from its stored document (`cve_list_scores`, `nvd_scores`, `osv_scores`, `rh_cve_scores`, `csaf_scores`, `scanner_score`; `score_of` refuses a malformed vector, a version that disagrees with it, a score outside 0–10 or one its vector doesn't compute; FIRST's 3.x and 4.0 formulas through the `cvss` library), and the one a finding shows: `effective(scores)` ranks NIST > GitHub-reviewed GHSA > CNA > ADP > Red Hat > scanner, takes a source's 3.1 before its 3.0, and a 4.0 score only when no source has a 3.x one (the highest-ranked 4.0 shown alongside) | `AdvisoryRecord.cvss_score`, which reads only one feed's 3.x vectors |
+| **Validation recording** | `services.validation`, `models.validation` | `record_order(doc, provenance, bindings, run_order_id, principal, lease_generation=…)` binds machine reports to a live order lease; trusted-local `record(doc, provenance, bindings)` and `evidence(artifact_id)` retain their existing semantics | re-running probes, interpreting source labels as database IDs |
 | **Artifacts** | `models.artifacts` | the `ArtifactDocument` base + `SchemaView` (fields from the installed schema, `doc.findings[0].verdict`, unknown names raise) and the named documents (`TriageArtifact`, `SecurityAuditArtifact`, …, `Verdict`, `Severity`) | `json.load` + `.get("key")` |
 | **Artifact publishing** | `services.artifact_publishing` | `ctx.artifact_publisher(specs).publish(name, raw)` or `.publish_artifact(artifact)`: exact gate → content-addressed objects → an artifact UUID on SQLite and Postgres; `get(artifact_id)` verifies the persisted digest; `list_for_assessment(id, kind=…)` reads metadata | writing `analysis-results` files by hand or optional indexing |
 | **Code facts** | `services.code_facts`, `models.code_facts`, `providers.crypto`, `providers.crypto_image`, `providers.crypto_cluster`, `providers.route_guards`, `providers.route_ownership`, `providers.django_routes`, `providers.python_guards`, `providers.express_routes`, `providers.java_routes`, `providers.go_routes`, `providers.python_ownership`, `providers.express_ownership`, `providers.ruby_ownership`, `providers.rust_ownership`, `providers.go_ownership`, `providers.syntax`, `providers.grpc_guards`, `providers.llm_app`, `providers.config_matrix`, `providers.sanitizers`, `providers.fork_lag`, `providers.priv_profile`, `providers.tree`, `models.elf_formats`, `models.crypto_formats` | `ctx.services().code_facts.collect/list/symbols/language_stats` over the latest `tool_scan` assessment's `CodeFactsArtifact`; measured LoC, exact symbol filters and snapshot-bound pagination. `code_facts.enumerate(kind, ToolRequest)` runs a deterministic `FactEnumerator` over a checkout (`CryptoProbe`: toolchains, images, policies a checkout configures; the secure-code pre-scans `RouteGuardMatrix` (Go's net/http, gorilla/mux, chi, gin, echo and fiber routers through their groups, mounts and the places they are served, a guard credited only where it surely runs (`providers.go_routes`); Django and DRF through each urlconf's `include()` chain and routers (`providers.django_routes`), Flask with its blueprint and API prefixes, FastAPI, aiohttp; a Django, DRF or Flask guard counts only when it is a known auth library guard that no checkout definition shadows, never checkout decorators, mixins, permission classes or hooks (`providers.python_guards`); Express, Spring, JAX-RS and Go parsed with tree-sitter grammars loaded by `providers.syntax`), `GrpcGuardMatrix` (Go gRPC servers, their interceptors, the services registered on them and their methods), `LlmAppDetector` (whether a checkout is an LLM, agent or MCP application and which files use it, from imports, direct manifest declarations and prompt templates), `ConfigMatrix`, `SanitizerDiscovery` and `ForkDetector`, over `providers.tree`'s symlink-safe file walk); `code_facts.route_guards(ToolRequest, resolve_handlers=)` places handlers through the symbol index; route rows carry `ownership` on authenticated id routes (`providers.route_ownership`: scoped, checked, caller-blind, unchecked, none, unknown or n/a, with the spans behind it; caller-blind and unchecked rows are judged; filled for Spring and JAX-RS from each handler's path variables, caller, lookups by id, checks and one same-repository hop, for FastAPI (`providers.python_ownership`) from the handler and the dependencies handed a path id, for Express (`providers.express_ownership`) from the handler, the checkout middleware in its chain and the functions it calls, and for Rails (`providers.ruby_ownership`) from the action, its `before_action` callbacks, models, Pundit policies and the CanCanCan `Ability`, and for axum and actix-web (`providers.rust_ownership`, which judges the handler's reads by id but never credits a route as protected) from the handler, its auth extractors and one same-crate hop, through sqlx, diesel, sea-orm and in-memory stores, and for Go (`providers.go_ownership`, which judges a read by the path id alone and credits nothing) from the handler the route matrix resolved and one checkout call deep); `code_facts.grpc_guards(ToolRequest)` is the gRPC service x interceptor matrix; `code_facts.coverage(ToolRequest, repository_ref_id=)` compares the repository's latest threat-model entry points (`assessment.threat_model_entry_points`) and what the pre-scans detected against the pre-scan for each entry-point kind, as covered, uncovered or unexplained; `code_facts.llm_app(ToolRequest)` is the LLM-application detection that gates the LLM review; `code_facts.priv_profile(ToolRequest, repo)` is the operator privilege profile (`PrivProfiler`: SCC requests, securityContexts, namespaces and install modes, every RBAC rule, and the shipped RBAC no `+kubebuilder:rbac` marker declares) as the contract `PrivProfileArtifact`; `code_facts.fork_lag(ToolRequest, offline=)` adds each tracked upstream version's advisories (`exposure.package_advisories`), a failed read being the result's `network` error; `code_facts.crypto(ref_id, ToolRequest)` adds the crypto packages of the ref's ingested manifest SBOM (`services.crypto_packages.CryptoPackagePolicy` over `exposure.dependencies`; `NoManifestSbomError` when none was ingested). `code_facts.image_crypto(digest, ImageRequest)` is the image tier (podman/docker inspect, create and `cp` through `ProcessRunner`, never running the image; DT_NEEDED from `models.elf_formats`) plus the crypto packages of the image's SBOM (`exposure.image_dependencies`; `NoImageSbomError`); `code_facts.cluster_crypto(ClusterRequest, ValidationScope)` is the cluster tier (`oc exec`, `openssl s_client` parsed by `models.crypto_formats`), every exec namespace gated by `ValidationScope.decide(k8s, exec)` and logged. Nothing is recorded: the facts are re-derivable from the commit | source scans at read time, a side symbol database, byte-based LoC estimates, `traust_engine.adapters.crypto_probe`, `crypto_audit` image/cluster tiers, `_util/elf.py` (linked libraries), traust secure-code-audit `enumerate_route_guards.py`, `traust_engine.adapters.llm_app`, `expand_config_matrix.py`, `probe_sanitizers.py` discovery, `run_fork_advisory_lag.py`, operator-priv-profile `build_priv_profile.py` |
-| **Detection quality** | `services.detection_quality`, `services.rule_mining`, `models.detection_quality`, `models.rule_mining`, `models.validation_benchmark`, `providers.rule_drafts` | `ctx.services().detection_quality`: `record(BenchmarkTargetArtifact, provenance)` stores the recall-benchmark answer key (newest version scored; duplicate ids and held-out seeded targets refused); `run_benchmark({target_id: [assessment_id, rerun_id]})` scores each `benchmark_audit` report with the match ladder (fingerprint → advisory id + path → CWE + path ≥ 0.5 → near miss), injection canaries and rerun stability, `score_reports({target_id: [report, rerun]}, auditor_version)` scores unrecorded reports (canary runs on local repositories) the same way, derived on demand and storing nothing; `scorecards(BenchmarkFilter)` scores every recorded benchmark audit per auditor version; `BenchmarkRun.scorecard()` cuts recall by CWE/severity/provenance/language/split; `screen_injection(artifact_id)` flags obeyed-injection shapes in an audit report; `mine_rules(RulePack)` clusters confirmed findings by (primary CWE, language) against a pack, with per-rule precision from `occurrence.rule` and the calibration worklist; `regression_pairs(RegressionPairFilter)` gives each confirmed finding a decision recorded fixed on a later commit its files on the commit last reported and on the fix commit (read at the forge; nothing stored), the fixtures of a regression-rule draft; `sweep_cards(CardDeck.parse(doc).cards, ToolRequest)` runs each semantic precedent card's code-facts enumerator over a checkout and returns the rows its predicate matches as triage candidates (cards that are prose, not recipes, are rejected by `CardDeck.parse` with every reason); the class-generalization sweep: `sweep_collect(force)` classifies every confirmed finding rule-expressible or not (with why) into (CWE, language) classes, `sweep_drafts()` stages a candidate rule per class no pack rule or held draft covers, `sweep_rule(RuleSweepRequest)` runs one authored rule over the repositories with a completed secure-code audit on their default line (resumable per repository), `emit_sweep(rule, force)` turns the hits into triage candidates (never findings) with a summary, each stage's state kept in the object store; `propose_rule(RuleProposal)` is the gate for a rule inference proposes for an uncovered shape (`services.rule_proposals`: one well-formed rule, no catch-all pattern or path glob, no backreference, lookbehind or nested quantifier, its `ruleid:`/`ok:` examples firing exactly, and a capped hit count on the checkout); an admitted proposal is staged as a draft for the same calibrate-and-sweep path; `stage_regression_drafts(filter, skip_existing)` stages `regression_pairs` as drafts; `rule_lane(RuleLaneRequest)` runs the weekly rule-mining lane (mine → collect/draft → regression drafts → delta against the previous run, Stage-A gate reachability per watched pack, allowlisted-rule precision) with `RuleLane.exit_code` 0 quiet, 1 attention, 2 failed; drafts are written to the adopter's `locations.rule_drafts` by `providers.rule_drafts.RuleDraftDirectory` (`ctx.register_rule_drafts(root)`); the validation-lane benchmark: `benchmark_worklist(ValidationBenchmark)` (claims, validity unanswered), `score_benchmark(bench, run, variant, report)` onto `benchmark_scorecard()`, `benchmark_trigger(ToolRequest, since)` | `recall-benchmark/{match_benchmark,screen_injection}.py`, `traust_engine.sweep.{mining,engine,rule_lane,benchmark,calibration}`, traust `ops/compile_precedent_cards.py`, mine-ledger `emit_rule_drafts.py` |
+| **Detection quality** | `services.detection_quality`, `services.rule_mining`, `models.detection_quality`, `models.rule_mining`, `models.validation_benchmark`, `providers.rule_drafts` | `ctx.services().detection_quality`: `record(BenchmarkTargetArtifact, provenance)` stores the recall-benchmark answer key (newest version scored; duplicate ids and held-out seeded targets refused); `run_benchmark({target_id: [assessment_id, rerun_id]})` scores each `benchmark_audit` report with the match ladder (fingerprint → advisory id + path → CWE + path ≥ 0.5 → near miss), injection canaries and rerun stability, `score_reports({target_id: [report, rerun]}, auditor_version)` scores unrecorded reports (canary runs on local repositories) the same way, derived on demand and storing nothing; `scorecards(BenchmarkFilter)` scores every recorded benchmark audit per auditor version; `BenchmarkRun.scorecard()` cuts recall by CWE/severity/provenance/language/split; `screen_injection(artifact_id)` flags obeyed-injection shapes in an audit report; `mine_rules(RulePack)` clusters confirmed findings by (primary CWE, language) against a pack, with per-rule precision from `occurrence.rule` and the calibration worklist; `regression_pairs(RegressionPairFilter)` gives each confirmed finding a decision recorded fixed on a later commit its files on the commit last reported and on the fix commit (read at the forge; nothing stored), the fixtures of a regression-rule draft; `sweep_cards(CardDeck.parse(doc).cards, ToolRequest)` runs each semantic precedent card's code-facts enumerator over a checkout and returns the rows its predicate matches as triage candidates (cards that are prose, not recipes, are rejected by `CardDeck.parse` with every reason); the class-generalization sweep: `sweep_collect(force)` classifies every confirmed finding rule-expressible or not (with why) into (CWE, language) classes, `sweep_drafts()` stages a candidate rule per class no pack rule or held draft covers, `sweep_rule(RuleSweepRequest)` runs one authored rule over the repositories with a completed secure-code audit on their default line (resumable per repository), `emit_sweep(rule, force)` turns the hits into triage candidates (never findings) with a summary, each stage's state kept in the object store; `propose_rule(RuleProposal)` is the gate for a rule inference proposes for an uncovered shape (`models.rule_checks`: one well-formed rule, no catch-all pattern or path glob, no backreference, lookbehind or nested quantifier, its `ruleid:`/`ok:` examples firing exactly, and a capped hit count on the checkout); an admitted proposal is staged as a draft for the same calibrate-and-sweep path; `stage_regression_drafts(filter, skip_existing)` stages `regression_pairs` as drafts; `rule_lane(RuleLaneRequest)` runs the weekly rule-mining lane (mine → collect/draft → regression drafts → delta against the previous run, Stage-A gate reachability per watched pack, allowlisted-rule precision) with `RuleLane.exit_code` 0 quiet, 1 attention, 2 failed; drafts are written to the adopter's `locations.rule_drafts` by `providers.rule_drafts.RuleDraftDirectory` (`ctx.register_rule_drafts(root)`); the validation-lane benchmark: `benchmark_worklist(ValidationBenchmark)` (claims, validity unanswered), `score_benchmark(bench, run, variant, report)` onto `benchmark_scorecard()`, `benchmark_trigger(ToolRequest, since)` | `recall-benchmark/{match_benchmark,screen_injection}.py`, `traust_engine.sweep.{mining,engine,rule_lane,benchmark,calibration}`, traust `ops/compile_precedent_cards.py`, mine-ledger `emit_rule_drafts.py` |
 | **Tool runs and audits** | `services.assessment`, `models.cloud_config`, `services.cloud_config` | `assessment.run_tools(checkout, [CHECKOV])` over `ctx.tools` (every tool ready first); `CloudConfigFacts.of(CheckovScan)` turns Checkov output into cited facts, fact ids, gaps and a snapshot id; `assessment.check_audit(doc)` then `record_audit(doc, ref, provenance)`: the report gate, a `cloud-config` assessment (degraded with gaps), every finding it states and its judgment on each as a decision (`FindingDecisions.record_assessed`) | `run_checkov.py`'s normalizer, gap register and `--validate-report` |
 | **Table repositories** | `repositories.traust.*`, `repositories.traust_ops`, `repositories.traust_ledger`, `repositories.contract` | one repository per contract table (`uow.findings.find_by_fingerprint(...)`, `uow.run_orders.claim(...)`); `SqlTraustUnitOfWork(engine)` opens all 33 on one connection — one transaction across sections | `sqlite3.connect`, inline SQL, per-script tables |
 | **Product definitions** | `models.product_definitions`, `providers.product_definitions`, `services.portfolio` | `ctx.product_lookup.resolve_products(ctx.product_definitions(cache_dir).read(), mappings, packages=, repo_urls=, product_ids=)` (never opens the record store; `ctx.services().portfolio.resolve_products` is the same answer; `mappings` is the recorded product map, `portfolio.product_mappings()`, recorded with `portfolio.record_product_map(doc, provenance)`): ownership context from the cached product-definitions registry, a candidate generator never an owner: match tier (mapped > repo-url > advisory slug > none), the contact ladder (only `private_tracker_cc` is embargo-cleared; non-kerberos values dropped and recorded), the lifecycle window on the clock's day; a missing or malformed cache is `unavailable`, never no-match. Serialise with `model_dump(mode="json", exclude_unset=True)` | `traust_engine.registry.products`, `registry/feeds.py` (reads) |
@@ -46,10 +46,18 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Providers** | `providers` | the outside world: `base` (`Provider`, `Readiness`, `Provenance`, registry), `tools`, `sources`, `feeds` (`FeedProvider`, `HttpFileFeed` for single-file feeds, `validate_payload`), `http` (`HttpFetcher` + `RetryPolicy`, the outbound HTTP path), `correlation` (`correlation_scope`: scoped request/order/run IDs passed to HTTP and subprocesses), `depsdev` (`DepsDevResolver`: deps.dev graphs and default versions through the feeds registry's `deps_dev` source, answers cached a day in the object store; `ctx.deps_dev`), `process` (`ProcessRunner`, the only subprocess path), `report_files` (`ReportFiles`: the report files a caller names on disk), `clock`, `model_catalog` (`ctx.model_catalog`: list prices and cost, plus roles: `list_roles()`, `resolve_role(role, tier)` (never below the floor), `resolve_routing(role, tier)` (the model plus its provider section and that provider's connection — wire type, `base_url`, harness, credential source — the default, the Anthropic wire and the environment's credential, when the section declares none; an unroutable connection, or a model id two provider sections list, refuses the config load), `validate()`, `stamp(role, model)` for a report's `model_routing`), `transcripts` (`ctx.session_transcripts.source(workspace, skills)`: Claude Code transcripts as a `SpendSource` for `SpendService.collect` and `usage_summary`, each request's skill inferred from the session's signals) | ad hoc `subprocess`/`git`/fetch code, 22 private `run` wrappers |
 | **Tools** | `providers.tools`, `providers.tools.toolchain`, `providers.tools.safe_exec`, `providers.tools.elf`, `providers.tools.adapter`, `providers.tools.fleet_fix`, `providers.tools.compliance_sources`, `providers.tools.detection_quality`, `providers.tools.opengrep`, `providers.tools.osv_manifests`, `context.tools` | `ctx.register_toolchain(external_tools, safe_exec_profiles)` reads both files on first use; `ctx.toolchain` (`Toolchain`: `external-tools.yaml`'s `ToolPin`s, `version`, `database`, `populate`, `check` / `preflight` and `preflight_failures`, `freeze_env` / `freeze_flags`) probes only the pinned binaries; `ctx.safe_exec` (`SafeExec`: the deployment's profiles, `validate_argv`, `vet_command_string`, `run`, `run_segments` through `ProcessRunner`, pipelines with no shell); `ElfAnalyzer` (header, linked libraries through `models.elf_formats`, byte patterns); `AdapterTool` wraps a scanner adapter's `scan()` as a `ToolProvider`, and core's scanners are registered by name from `context.tools.scanner_tools`, each one's floor the pin of its binary. `ctx.register_fleet_fix()` (`GitFleetFixApplier`: https-only clone, `git ls-remote`, ast-grep, diffs; also the golden runner), `ctx.register_compliance_sources()` (`GithubAdrSource`, `RedHatDocSource`) and `ctx.register_detection_quality(pack_version, canary_sources, canary_repos)` (`OpengrepRulePacks` over the pack `ctx.register_rule_pack(pack, allowlist)` registered and the `rule-pack-allowlist` supplements cloned under `providers.tools.opengrep`'s cache, read on first use; `GitCanaryMaterializer`; `OpengrepRuleSweep`, one rule over many checkouts, shallow https clones through `GitCheckout.clone`) set the non-scanner providers; rule packs and allowlists stay pack config passed by path; `osv_manifests` holds the osv scan's lockfile and manifest readers (only `providers/tools/osv*` reads them: the portfolio SBOM is syft's) | `traust_engine.toolchain`, `_util/safe_exec.py`, `_util/elf.py`, `adapters/tools.py`, `adapters/{fleet_fix,compliance_sources,detection_quality}.py`, `portfolio/parsers.py` (for osv), `depsdev/` |
 | **Tool reports** | `context.tool_reports` | the documents `traust adapters <tool>` and `traust util elf` write, one function per tool, each on the binary and timeout the caller passes: `opengrep_report`, `govulncheck_report`, `gitleaks_report`, `yara_report`, `k8s_hardening_report`, `joern_report`, `osv_report` / `osv_sbom_report` (OSV API through `ctx.advisories` and `ctx.deps_dev`, or offline osv-scanner), `elf_report`; `populatable_tools`, `toolchain_failures`, `tool_stamp` for `traust admin toolchain`. Interim: the tool execution API reshapes them | traust-engine `adapters/*` CLI entry points (`_execute_opengrep_scan`, `_run_govulncheck`, `_run_gitleaks`, `_execute_yara_scan`, `checkov.Scanner`, `_run_joern_scan`, `osv.scan_api` / `run_scanner`, `osv_sbom.*`), `_util/elf.py` |
-| **Code scanners** | `providers.tools.opengrep`, `providers.tools.govulncheck`, `providers.tools.joern` | registered as the `opengrep`, `govulncheck` and `joern` tools; each `scan()` returns an `AdapterResultArtifact` built by `adapter.adapter_result`. `ctx.register_rule_pack(pack, allowlist=None)` names the opengrep rule pack and the `rule-pack-allowlist.yaml` enabling its supplemental packs per rule (`ctx.rule_pack`, `ctx.rule_pack_supplements`; security content stays pack config, passed by path); `opengrep.execute_scan` is the full facts report (rules with pins and licenses, supplements applied and skipped, the allowlist, coverage by language), `context.tools.load_rule_allowlist` parses `--rule-allow`; `govulncheck.run_govulncheck` runs under the `go-scan` safe-exec profile and `parse_stream` gives one candidate per OSV at its most specific reachability; `joern.run_scan` is the call-site facts document over a `SymbolQuery` (`with_soundness` states the evidence asymmetry) | `traust_engine.adapters.{opengrep,govulncheck,joern}` |
+| **Code scanners** | `providers.tools.opengrep`, `providers.tools.govulncheck`, `providers.tools.joern` | registered as the `opengrep`, `govulncheck` and `joern` tools; each `scan()` returns an `AdapterResultArtifact` built by `adapter.adapter_result`. `ctx.register_rule_pack(pack, allowlist=None)` names the opengrep rule pack and the `rule-pack-allowlist.yaml` enabling its supplemental packs per rule (`ctx.rule_pack`, `ctx.rule_pack_supplements`; security content stays pack config, passed by path); `opengrep.execute_scan` is the full facts report (rules with pins and licenses, `supplemental_packs.applied`, the allowlist, coverage by language), `context.tools.load_rule_allowlist` parses `--rule-allow`; scanner process failures raise `errors.ScannerError` with `ScannerFailure` reason, exit code or timeout, never private native output. `govulncheck.run_govulncheck` runs under the `go-scan` safe-exec profile and `parse_stream` gives one candidate per OSV at its most specific reachability; `joern.run_scan` is the call-site facts document over a `SymbolQuery` (`with_soundness` states the evidence asymmetry) | `traust_engine.adapters.{opengrep,govulncheck,joern}` |
+| **Opengrep rule quality** | `providers.tools.opengrep_quality`, `models.rule_mining.RuleQualityReport` | `context.tool_reports.opengrep_quality_report(ctx, paths)` runs native `opengrep validate` and `opengrep test --json --strict` over a private rule/fixture snapshot, requires positive and negative cases for every rule, rejects missing tests and mismatched results, and opens no record store. Every Opengrep scan consumes only checked snapshots; invalid enabled supplements fail closed. A rule sweep validates once before repository iteration and reuses only that operation's snapshot; resumable results carry its rule/fixture digest, and obsolete or rule-level failures cannot suppress rescans. Independent invocations always revalidate mutable inputs; there is no global quality cache | treating zero exit status or zero executed tests as proof; claiming fixture matching proves application exploitability |
+| **Optional Opengrep rules** | `models.rule_checks`, `providers.tools.opengrep_additions` | `context.tool_reports.intake_opengrep_rules(ctx, sources, destination, *, pack=None, timeout=300, binary="opengrep")` captures local files/directories or pinned HTTPS sources privately, applies shared static/collision policy, and runs native `validate` plus `test --json --strict` over the complete captured pack. Ordinary fixtures run as one batch; directory fixtures use explicit single-target checks, and every required check must pass. Only success atomically publishes the captured rules, paired fixtures and attribution into a new destination (`admitted`, `destination`, `quality_checks`, `content_digest`); refusals publish nothing and existing packs are never overwritten. Publication requires macOS/Linux atomic no-replace rename support and fails typed if unavailable. Multiple inputs are isolated under `source-0`, `source-1`, etc.; VCS metadata is omitted and links/special inputs are refused. Admission is not calibration or exploitability proof. Set `locations.opengrep_adopter_rules` to the published directory to add its checked rules to both facts reports and the registered `opengrep` tool used by assessments, alongside the baseline and enabled supplements. Direct callers use `opengrep.scan(..., additive=(str(published_directory),))`; explicit `rules=` replaces the baseline and cannot be combined with `additive=`. Every invocation re-vets its inputs. Facts reports retain baseline facts and degrade on optional-rule refusal; registered artifact scans instead raise a sanitized `ScannerError` when coverage is degraded or native rules are skipped. Language-inapplicable optional rules are normal skips, not failures. Origin stays in facts only. | replacing the baseline with optional rules; treating admission as calibration or exploitability proof; CI-dependent or model-only admission |
 | **IaC, secrets, malware scanners** | `providers.tools.cloud_config`, `providers.tools.k8s_hardening`, `providers.tools.gitleaks`, `providers.tools.yara` | registered tools `checkov` (`CheckovProvider`: the pinned Checkov, offline, as `CloudConfigFacts`), `gitleaks` / `gitleaks-history` (`Gitleaks`: secret-free candidates over the rules `locations.gitleaks_config` names) and `yara` (`Yara`: known-malware-family facts over a pinned rule pack); `k8s_hardening.Scanner` (the KHS-* manifest checks and tenancy signals); `adapter_result` builds any adapter's `AdapterResultArtifact` | traust-engine `adapters/cloud_config.py`, `checkov.py`, `gitleaks.py`, `yara.py`, `_contract_bridge.py` |
 | **Deps and SBOM scanners** | `providers.tools.osv`, `providers.tools.osv_sbom`, `providers.tools.grype` | registered by `scanner_tools`: `grype` over a checkout or SBOM path, database frozen by default; `osv`, a checkout's declared packages looked up through `ctx.advisories` with coverage reported, `osv.scan_api(..., resolver=ctx.deps_dev)` for the full candidates document; `osv_sbom`, an image's syft JSON language packages not installed by an OS package, with `mark_grype_duplicates` / `grype_os_installed_matches` and the air-gapped osv-scanner path; CVSS through `models.dependencies.cvss_base_score` | `adapters/{osv,osv_sbom,grype}.py`, `osv/` (client: reuses `providers.osv`) |
 | **Config + Context** | `context`, `context.documents` (the YAML codec: `yaml_documents`, `yaml_documents_with_lines`, `yaml_text`, passed to providers, which don't import yaml), `context.preflight` | one `traust.yaml`; `Context` builds everything ([ledger and identity sections](docs/configuration.md)). The deployment config home: `resolve_config_home(explicit)` (`$TRAUST_CONFIG_HOME`, else `~/.traust/config` when it exists), `config_path(name)` (`DeploymentConfigMissing` naming the file and its template), `optional_config_path(name)`, `config_completeness_audit()` (`(errors, warnings)` for `install_traust --doctor`). `Context.preflight(requirements)` (`context.preflight`): one readiness door the engine's start gate, the platform doors and `traust doctor` call — a `Requirement` (`models.operations`, the pack schema's `requires:` vocabulary: tools, config keys, recorded facts, feed sources, secrets) is checked against `Toolchain.preflight`, the traust.yaml keys `Config.provided` records, the recorded facts, the enabled feed sources, the environment and the config home audit, raising `PreflightError` with every gap and its fix; `schema_dir()` / `schema_path(name)` / `validate_config(name, document)` and the ops types consumers annotate with (`OpsService`, `SpendService`, `FeedQuery`, `Router`, `Clock`) re-exported for consumers | `os.environ`, scattered config files, `traust_contracts.config` |
+
+Optional rule sources have bounded discovery, capture and staging budgets.
+Native vetting shares a deadline and process-call allowance; failed batches are
+isolated by bisection. Inapplicable languages are skipped, not degraded failures.
+Target parse warnings preserve healthy matches and remain visible in report errors.
+An admission refusal returns `admitted: false` without publishing; it is not success.
 
 Repository authority reads stay server-owned:
 `GET /v1/repositories/{repository_id}/refs/current-default` (OpenAPI
@@ -129,6 +137,11 @@ historical patches cannot be recovered from a producer-local `diff_path` alone.
 Merged progress does not prove a finding fixed: that remains a resolution decision.
 
 ## Historical reads and reporting correctness
+
+The `/v1/insights/*` HTTP routes are **removed** (with `/v1/findings/count` and
+`/v1/findings/summaries`): dashboards are `POST /v1/dashboards:query` and the views are
+requested as report jobs — see [Dashboards and reports](#dashboards-and-reports). The
+`InsightService` views below remain, as the report builders those jobs run.
 
 The native consumer doors above remain owned by their existing services and models.
 The remaining correctness changes are:
@@ -382,17 +395,22 @@ order with a usable CVSS 3.x score wins:
 | 5 | Red Hat (`red-hat`) | the Security Data CVE record (`rh_cve_scores`), then CSAF VEX (`csaf_scores`) | `cvss3`; `vulnerabilities[].scores[].cvss_v3` |
 | 6 | Scanner (`scanner`) | the occurrence (`scanner_score`) | the vector the scanner reported |
 
-- **Version.** Within the winning source, its CVSS 3.1 score, else its 3.0 score. A 4.0 score is
-  kept and shown alongside (`EffectiveCvss.v4`, the highest-ranked one) but never sets the
-  score, so no 4.0 calculator ranks findings. CVSS 2 is not read.
-- **Ties.** Two 3.x scores from the same source and version: the higher one.
+- **Version.** Within the winning source, its CVSS 3.1 score, else its 3.0 score. Any source's
+  3.x score beats every 4.0 score. Only when no source has a 3.x score does a 4.0 score set it,
+  taken in the same source order. The highest-ranked 4.0 score is also shown alongside
+  (`EffectiveCvss.v4`). CVSS 2 is not read.
+- **Ties.** Two scores from the same source and version: the higher one.
 - **Trust.** `score_of` refuses rather than guesses. It refuses:
   - a key or value outside FIRST's CVSS 3.0/3.1 or 4.0 metric tables, or a missing base metric;
   - a 4.0 vector whose metrics are out of the spec's order;
   - a version that disagrees with the vector, or a repeated metric;
   - a stated score outside 0–10, or anything but a plain decimal;
-  - a stated 3.x score that isn't exactly what its vector computes.
-  A 3.x score is always the one its vector computes (FIRST's formula, with 3.0's own rounding).
+  - a stated score that isn't exactly what its vector computes, 3.x or 4.0.
+  A score is always the one its vector computes: FIRST's formulas for 3.0 (with its own
+  rounding), 3.1 and 4.0, from Red Hat Product Security's `cvss` library (LGPLv3+, pinned
+  exactly; only `models.cvss` imports it). A source that states a vector without a score,
+  as OSV's GHSA records often do for 4.0, gets the computed one. The 4.0 score is over the whole
+  vector, threat and supplemental metrics included, as CNAs and NVD state it.
 - **Shape.** Each parser takes the stored document's bytes and validates them into a typed shape;
   a document that doesn't fit it, including a present score block without its vector, is a
   `ValidationError`, never a silently missing score.
@@ -401,7 +419,7 @@ order with a usable CVSS 3.x score wins:
   `osv:GHSA-…`, `rh-cve:CVE-…`, `csaf:…`) and who scored it, so a reader sees what every
   source said. A CNA or ADP score that both the CVE List and NVD carry appears once per
   document; ranking is unaffected, since both are the same source.
-- **Unscored.** No usable 3.x score anywhere is `None`, never 0.
+- **Unscored.** No usable 3.x or 4.0 score anywhere is `None`, never 0.
 
 A finding's own audit-authored vector (a code finding) is not ranked against feeds; only
 advisory-backed findings take the feed-ranked score. No view reads the ranking yet: the
@@ -434,6 +452,13 @@ in the object store at `feeds/<source>/documents/<sha256>.json`, one copy per di
   artifact insert, which serializes writers, so concurrent refreshes see each other. A new
   snapshot always sorts after the last one, even when the clock stepped back.
 
+- **Freshness.** Once a source has a kept manifest, `exposure.feed_statuses()` lists it as
+  `<source>-documents` with the source's `max_age_hours` (default 24), so the freshness view
+  (`feeds:<source>-documents`) flags a document refresh that stopped working. A source never
+  refreshed isn't listed: before the first refresh, a failed run shows only as a degraded order.
+  Freshness is per source, not per document: one advisory whose fetch keeps failing while the
+  others succeed leaves the row fresh, and shows as each run's degraded `error` count and log.
+
 `exposure.stored_document(source, identifier)` reads the latest manifest's document back,
 checked against its digest (`IntegrityError` on a mismatch); `None` when the manifest doesn't
 name it. Reads never fetch.
@@ -457,6 +482,66 @@ that fails keeps its last manifest and says why (`AdvisoryDocumentsRefresh.ok` f
 `error`); the others still refresh. When every source asked fails, the refresh raises
 `ServiceError` naming each one's reason, so an outage never reads as a finished refresh. A
 failure's text never carries a URL's credentials or query string.
+
+### The daily CVSS build
+
+After the documents, the refresh ranks what they state (`exposure.refresh_advisory_cvss`, also
+callable on its own): for each linked advisory, every authority's scores from its CVEs' `cve-list`,
+`nvd` and `rh-cve` documents and its GHSAs' `ghsa` document, in `effective`'s order, each with its
+document and fetch time. One build (`models.cvss.AdvisoryCvss`, keyed by canonical advisory and
+by every advisory id a finding names, so a view reads it with no advisory lookup) is a
+`feed` artifact plus a `feed_snapshot` named `advisory-cvss`, with the documents' retry rules; an
+unchanged day is the same bytes, so one artifact. Views read this build, never the documents.
+
+- **Only when a source is registered.** With none, the refresh builds nothing and
+  `refresh_advisory_cvss` raises `ConfigError`.
+- **An unreadable document scores nothing.** A kept document that doesn't parse, that the store
+  lost, or that is another record's or names none (a source can answer one id with another's
+  record, NVD with an empty reply; every document must name the record asked for, scored or not) is named in `AdvisoryCvss.unreadable`
+  and logged; the rest still score. So is a source with names to score that has kept no documents yet
+  (`<source>-documents`).
+- **A store failure keeps the documents' outcome.** When the build itself fails on the store,
+  the document refresh raises `AdvisoryCvssNotBuilt` (a `ServiceError`) carrying each source's
+  outcome (`outcomes`); the documents are kept and the last build stays served.
+- **Reads.** `exposure.AdvisoryCvssReader` (and `exposure.advisory_cvss(advisory_ids)`) returns
+  `AdvisoryCvssRead`: each asked advisory's ranked scores and `built_at`. An advisory no
+  authority scored, or that no finding named when it was built, is absent; before the first
+  build, `built_at` is None. It reads the latest snapshot (and, once per publication, its
+  artifact); the build is parsed once per publication by the Context's `advisory_cvss_cache`,
+  which outlives the per-request services. An unreadable build is logged, read as
+  `unreadable`, and remembered until the next one; a store failure reading it is logged and
+  never kept, so the next read retries (the read runs outside the cache's lock). Inside
+  `FindingService.shared()` (a composed build), the reader pins which build it reads, so every
+  load counts at one.
+- **Freshness.** Once built, `feed_statuses()` lists `advisory-cvss` with the shortest document
+  source's `max_age_hours`, its refresh being the document refresh. It is as old as its oldest
+  source's documents, so a source that stopped refreshing makes it stale; an unreadable build, or
+  one missing a source's documents, has no fresh time and says why (`last_error`); drift-watch
+  shows it stale with that reason.
+
+### The score and severity a finding counts at
+
+Every finding view reads the build (`exposure.AdvisoryCvssReader`, through `FindingFacts`), so the views, the census, the rollup, the trend, the SLA, sorting, the risk
+index and SARIF all count the same score. For a reported finding, `selection` ranks every
+authority's statement for its advisory together with the latest report's own vector (the
+scanner's) by `effective`'s order.
+
+- **The cvss block.** `FindingCvss` keeps the report's `score`, `vector` and computed
+  `severity`, and adds `authority_scores` (every authority's statement, ranked, each with its
+  FIRST band), `selected` (the one chosen, `reason: precedence`; the scanner's only when its
+  report stated a score its vector computes) and `conflict` (two different authorities' scored
+  statements of one 3.x version in different bands).
+- **The effective severity.** When an authority's statement is selected, the finding counts at
+  its band (`basis: authority`), unless a severity decision stands (`judgement`, D20); otherwise
+  the order is as before: the computed band of the report's vector, a judgement, the scanner's
+  word, unrated. Evidence-only admission of decisions is the CVSS remediation plan's step 7.
+- **The score.** `FindingView.cvss_score` is the selected statement's score, else the report's;
+  `cvss_source` says who stated it, null exactly when the score is. `sla_due` (with its CVSS
+  floor), sorting, the risk index (today's scores in every bucket), the rollup's top findings
+  (`cvss_source`), the trend's accepted register (`cvss_source`), the SLA profile and SARIF's
+  `traust/cvss` (with its `source`) read it.
+- **No build, no change.** Before the first build, or while the latest is unreadable, nothing
+  is authority-selected and every finding counts as it did before.
 
 **Set an NVD API key.** This refresh asks NVD for every linked CVE every day. Without a key NVD
 allows about 5 requests per 30 seconds, so a few thousand CVEs take hours. A key is free
@@ -530,7 +615,7 @@ sustain a refutation unless a deployment, control or differential gate invalidat
 
 Trusted in-process callers may use
 `ctx.services().validation.record(ValidationArtifact.parse(raw), provenance, bindings)`.
-Remote runners use `record_order(doc, provenance, bindings, run_order_id, principal)`,
+Remote runners use `record_order(doc, provenance, bindings, run_order_id, principal, lease_generation=…)`,
 the same protected service entry point as REST. Supply real `Provenance`
 (`run_id`, `source=SourceType.VALIDATION_REPORT`, `occurred_at`) from the producing order;
 recording does not invent a run, timestamp or execution plan, or execute live probes.
@@ -630,7 +715,17 @@ store is never migrated behind an open's back: a local store applies pending upg
 open (opening the new version is the consent), a configured database refuses until its
 deployment applies them.
 
-On upgrade day, an operator plans, looks, then applies:
+On upgrade day, an operator plans, looks, then applies — the command the deployment's
+own entrypoint carries:
+
+```bash
+traust-server --config traust.yaml db upgrade            # plan: names, hashes, destructive reasons
+traust-server --config traust.yaml db upgrade --apply    # the deliberate call
+```
+
+Exit 0: current, applied, or no local store yet (a local open creates it; a configured
+database is its deployment's to provision). Exit 1: pending without
+`--apply`, version 0, or a channel refusal. The Python behind it, for embedders:
 
 ```python
 ctx = Context.from_file(Path("traust.yaml"))
@@ -641,16 +736,46 @@ applied = ctx.apply_db_upgrades()  # the deliberate call
 ```
 
 A script that declares a destructive reason (`-- destructive: …` in its header) applies
-only when acknowledged: `ctx.apply_db_upgrades(allow_destructive=True)`, after the
-refusal has named what would run and why. The `traust db upgrades` CLI wraps plan and
-apply for operators who do not embed Python.
+only when acknowledged: `--allow-destructive` on the command,
+`ctx.apply_db_upgrades(allow_destructive=True)` in Python, after the refusal has named
+what would run and why.
 
-A database created before the upgrade channel (no `db_upgrade` stamp table) is version
-0: its shape is unknown, so both the open gate and the surface refuse it. Until adoption
-ships (verify the live schema against the baseline, then stamp), the path is to recreate
-the store: export what must survive (decisions and findings are the durable history —
-re-derive the rest from artifacts), create the new store at the current contract, and
-re-import. A version-0 store whose history must not be touched should wait for adoption.
+A database created before the upgrade channel is presumed current and starts on it at
+the head: the first `db upgrade --apply` stamps every shipped script as applied — nothing
+runs, nothing re-runs — and from then on the store is on the routine. A local store is
+brought on by its first open; a configured database refuses until its deployment brings it
+on. Nothing is verified about a database someone hand-changed — a later script refuses what
+does not fit, transactionally, and that refusal is the operator's to resolve with the
+contract's owners.
+
+## Dashboards and reports
+
+Dashboards are fast, filtered aggregates over the facts; reports are jobs that produce
+artifacts. Serving splits by role so a slow read can never starve a write:
+
+```bash
+traust-server --config traust.yaml --role query|command|ops|reports   # default: all
+```
+
+| Route | What |
+|---|---|
+| `POST /v1/dashboards:query` | one metrics query over the finding's stamped current answer (state, effective severity, decided, category, and the shipped product's slug — `findings` groups and filters by `product`; a repository shipping in several products counts in each product's row and once under a multi-product filter, `None` when nothing ships it). Subjects: `findings`, `review_items`. Every query takes the repository filter (empty = the whole estate); `group_by` ≤ 3, row cap 1,000 |
+| `POST /v1/reports` | request a report as a job: the last ready build answers 200, a queued or in-flight build 202 |
+| `GET /v1/reports/{order_id}` | the report order's status |
+| `GET /v1/reports/{order_id}/file` | the rendered file from object storage (the cache is the product: no cache layer) |
+
+The dashboard vocabulary (subjects, dimensions, measures) lives in `models/dashboard.py`, the
+single source; the SDK generates from the published models. State is the stamped fold, written
+by the same function the reads use — never recomputed on the request path.
+
+Budgets (the seeded rig, 350k findings, `make perf-load`): the dashboard query holds **40 ms
+p95** under duress beside the stamped write door (the findings rollup it replaced measured
+86 s on the same rig); a page herd — 50 users loading a whole page, five cards each, 250
+queries at once — holds **662 ms p95 with zero failures**.
+
+Removed with these routes: `/v1/insights/*`, `/v1/findings/count`, `/v1/findings/summaries`.
+The dashboard query answers count and summaries; the insight views live on as the report
+builders behind `POST /v1/reports` (relocating them into the reports domain is a follow-up).
 
 ## Run the REST API locally
 
@@ -679,7 +804,7 @@ triage = publisher.get(published.artifact_id)
 ```
 
 `POST /v1/verification-records` requires a verified machine bearer token and a strict
-`{"payload": "<original JSON text>", "provenance": {...}, "run_order_id": "<order UUID>"}`
+`{"payload": "<original JSON text>", "provenance": {...}, "run_order_id": "<order UUID>", "lease_generation": 1}`
 body. The report is parsed as `VerificationArtifact` without reserializing its evidence
 bytes. `VerificationService.record_order` admits only the live lease holder of an order
 for the report's repository and an asset in the server's `recording.verification`
@@ -692,8 +817,9 @@ event envelopes and layer IDs are not request fields. Authentication is not a hu
 countersign: report verdicts remain machine-assessment judgments under the owner's policy.
 
 `POST /v1/validation-records` requires a verified machine bearer and a strict JSON body
-with `run_order_id` (UUID), `payload` (the original UTF-8 JSON text), `provenance`
-(`Provenance`) and `bindings` (`ValidationRecordInput`). The service locks that order
+with `run_order_id` (UUID), `lease_generation` (positive integer from claim/start),
+`payload` (the original UTF-8 JSON text), `provenance` (`Provenance`) and `bindings`
+(`ValidationRecordInput`). The service locks that order
 through recording and requires its live lease to belong to the actual caller. Its asset
 must appear in the server's `recording.validation` allowlist (empty by default), and
 every source assessment must belong to the order's one non-null repository.
@@ -727,6 +853,28 @@ manifest SBOM first (`syft scan dir:<checkout> -o cyclonedx-json`, then
 (`syft scan <name>@<digest> -o cyclonedx-json`, then `exposure.ingest_image_sbom(raw, digest)`).
 Other enumerator-specific fact kinds remain with their
 skill-port slices.
+
+`exposure.record_manifest_sbom(ref_id)` is the requeue door for an unchanged head.
+The `manifest_sbom` assessment identifies Core's coverage probe (`traust-manifest-coverage`,
+version `2`); the bound `manifest-coverage` document's `tool` still identifies the SBOM
+cataloger and its real version. Older assessments identified only the cataloger. Their
+empty coverage maps cannot rule out Docker dependencies. Requeue selected refs after
+upgrading the producer and readers: each old scan needs a new assessment, not a new SHA
+or SBOM ID. Subsequent requeues reuse that assessment. A failed refresh leaves the old
+scan attached and its Docker negative unknown; document-only imports still have no coverage.
+Dependency-reach and PQC portfolio reports use legacy gaps for non-Docker ecosystems and
+separately count legacy scans with unknown Docker coverage, missing scans, and unrecognized
+probes. The older `manifest_coverage` and `package_coverage` tuple-or-None APIs, and the
+dependency-reach `with_coverage` sidecar, remain conservative: they treat a legacy scan as
+unknown across ecosystems rather than imply complete Docker coverage.
+Requeue repairs missing or duplicate coverage only for a ref's own completed manifest scan;
+duplicates must each have a valid binding. Readers still reject damaged coverage, and requeue
+does not suppress invalid bindings, malformed artifacts, or unrelated scan identities.
+Do not use pre-upgrade readers to certify historical Docker negatives. Do not deploy this
+producer or requeue scans until an approved contracts revision admitting
+`unsupported-manifest` in both the reason enum and coverage schema is merged and pinned.
+The current pin admits neither; an external Docker image fails the entire manifest ingest
+before Syft runs. Skipping Docker coverage would falsely certify it as complete.
 
 Java route ownership credits resolver receivers only when they resolve to declared
 injected fields with admitted injection initialization and no later field writes
@@ -773,16 +921,29 @@ later default-branch changes do not affect the paired contents.
 ## Leased report-recording authority
 
 `OpsService.recording` is the service-owned guard for native report mutations.
-It requires a verified machine principal, its own active leased order, the same
-repository, a server-authorized asset for the report kind, and provenance whose
-`run_id` equals the order UUID and whose source matches that kind. The order row
+It requires a verified machine principal, its own active leased order, the positive
+`lease_generation` returned by claim or start, the same repository, a server-authorized
+asset for the report kind, and matching provenance (`run_id` and source). The order row
 stays locked through the report transaction; expiry is checked again before the
 outer commit. A caller cannot gain recording authority from a bearer token alone.
+Every assessment, triage, validation, remediation (including a patch `diff`), and
+verification recording body carries `lease_generation` as a top-level JSON integer,
+not a provenance field. A missing or non-positive value is a 422; an older generation
+is a 409 even for a byte-for-byte replay by the same worker. No report response changes.
+
+`PortfolioService.record_forge_facts` and `ExposureService.record_manifest_sbom`
+accept `run_order_id`, `worker`, and `lease_generation` together for scheduled runs.
+They check the claim before acquisition and again under the order lock before the
+shared database transaction commits, including cache hits. Omit all three for a
+manual observation or scan. Attribution-only feed snapshots and below-range scans
+do not grant or renew a lease.
 
 An already-dispatched worker can obtain its native order with `POST /v1/orders/start`
 and `{"order": {"asset": "verify", "priority": 1, "repository_id": "<registered repository UUID>"}, "lease_seconds": 300}`.
-The strict `StartRecordingRequest` returns the persisted `RunOrder`, including the
-database's timestamp precision and timezone representation. The lease holder comes
+The strict `StartRecordingRequest` returns the persisted `RunOrder`. Its `lease_generation`
+increments on each grant, not on heartbeat or expiry. Hold on to that generation and pass it
+unchanged on heartbeat, completion and order-bound writes, even if the same machine gets the
+order again. Only the completing worker and generation may replay its outcome. The lease holder comes
 from the verified machine caller, never the body. `OpsService.start_recording` checks the
 asset's report-recording allowlist and a matching `recording.start` capability before
 delegating to the existing `start` owner. Each capability has `principal` (the verified
@@ -832,7 +993,7 @@ Existing native verification inputs are available through
 `VerificationService.prepare` consumes an existing native work item.
 
 `POST /v1/assessment-records` is the explicit secure-code claim-intake workflow.
-Its strict `AssessmentRecordRequest` contains `run_order_id`, `repository_ref_id`,
+Its strict `AssessmentRecordRequest` contains `run_order_id`, `lease_generation`, `repository_ref_id`,
 `payload` (the original UTF-8 report JSON), `provenance`, and `assessor_version`.
 `AssessmentService.record_secure_code` authorizes through `OpsService.recording`
 with the default-deny `recording.assessment` capability and existing
@@ -843,17 +1004,27 @@ then shares assessment/artifact recording and existing
 or resolution becomes a decision. `AssessmentRecordResult` returns native
 `assessment_id`, `artifact_id`, and `intake` (`IntakeResult`, whose `findings` maps
 original labels to native UUIDs and `created` names newly admitted findings).
-The raw bytes are retained unchanged, the assessment binds its order at creation,
-and replay cannot adopt an unbound or differently bound assessment. Plain
-`AssessmentService.record` remains document-only for secure-code reports;
-`record_scan` remains third-party scanner intake only.
+`provenance.occurred_at` is immutable event data, not lease authority. Capture the
+generation before execution; never read the current lease to stamp an earlier
+attempt's output. Under the lease lock,
+the same order, subject (ref for authored; source assessment for triage), and
+exact bytes replay the recorded IDs. Changing the subject or bytes conflicts.
+The order cannot adopt an unbound or differently bound assessment.
+
+An authored report may omit `metadata.commit`; if supplied it must exactly match
+the selected inventory ref's SHA. Unstamped rows go through native intake. A
+supplied fingerprint must match the native calculation, as must its algorithm
+when named. A mismatch or an algorithm without a fingerprint refuses the report;
+Core neither rewrites the artifact nor guesses another identity epoch. These
+checks do not redefine historical imports or third-party scanner intake.
 
 `GET /v1/assessments/{assessment_id}/intake` returns
 `AssessmentIntakeBindings` (`{"findings": {"<original label>": "<native UUID>"}}`),
 with no `created` history. For secure-code assessments, the read verifies the retained
 report's digest, derives its candidates through the same report model, and resolves
-them through the finding-intake identity owner. Every match must belong to that
-assessment's occurrence set.
+them through the finding-intake identity owner. Only matches with an occurrence
+on this assessment are returned; a row held for rebaseline has no binding until
+admitted. An occurrence that no report row identifies is an integrity error.
 
 For triage assessments, `AssessmentService` delegates to
 `FindingDecisions.intake_bindings`. That owner verifies the original triage artifact
@@ -1023,9 +1194,10 @@ decision. A verified defense-in-depth gap uses `verdict: true_positive` and
 finding kind. An undetermined or manual-test outcome remains review-only,
 including when its kind is known.
 
-Explicit kind changes commit with new triage and artifact admission, before
-per-finding decision writes. Interrupted recording can resume without losing a
-kind that admission accepted; replay still cannot overwrite a later judgment.
+For unbound triage with optional signing, kind changes commit with triage and
+artifact admission, so an interrupted import can resume by verdict. When signing
+is required, the batch commits only after the repository's new root is signed.
+Replay cannot overwrite a later judgment.
 
 Summary and rendering keep weaknesses separate from actionable vulnerabilities.
 Broken weakness citations retain the re-vote requirement. Historical
@@ -1038,7 +1210,7 @@ Prepublishing a legacy artifact does not authorize a new deprecated write.
 `GET /v1/assessments/{assessment_id}/triage-input` returns the existing
 `TriageInput`, including native finding and occurrence bindings.
 `POST /v1/assessments/{assessment_id}/triage-records` accepts strict
-`{"run_order_id": "<owned order UUID>", "payload": "<original UTF-8 JSON text>", "provenance": {...}}` and calls
+`{"run_order_id": "<owned order UUID>", "lease_generation": 1, "payload": "<original UTF-8 JSON text>", "provenance": {...}}` and calls
 `FindingDecisions.record_triage`. Its `TriageRecordResult` always includes the
 recorded assessment/artifact UUIDs, even when every finding queues review and
 `decisions` is empty. The in-process `record` decision-list projection remains
@@ -1056,6 +1228,21 @@ Authentication alone does not authorize recording. The service requires the
 caller's own active repository-scoped order lease, an explicitly authorized
 server asset for triage, and provenance bound to that order. New assessments
 retain their native `run_order_id`; replay cannot adopt another or an unbound run.
+
+The recording server checks **its own** `ledger:` configuration before serving
+decision-producing recording capabilities. A triage asset requires
+`ledger.required: true`, `key_path` and `public_key_path` for a working cosign
+pair. The leased writer checks again: each decision, its event, the batch
+signature, review items and assessment metadata commit together. A refused
+record leaves no published database state; unreferenced content-addressed bytes
+may remain after a late failure. A review-only triage creates no layer.
+
+Order-bound validation, remediation (the `remediate_finding` alias on the
+triage allowlist), verification, cloud-audit judgments and fuzz confirmations
+require ledger events but do not themselves mandate signed roots. An enabled
+pack asset can additionally require signing in deployment preflight. Unjudged
+assessment intake, read-only servers and standalone decisions do not inherit
+the triage signing requirement.
 
 ### Registry reader review candidate
 
@@ -1124,7 +1311,7 @@ Services own their domain's use cases and declare the section unit of work they 
 | Findings: what's wrong and every decision on it | `services.findings` · `FindingService` + `intake`, `decisions`, `review`, `precedents`, `cvss` (which source's CVSS a finding shows); `FindingViewQuery` shares rich views/history; `IdentityPolicy`, `RatingPolicy` | `TraustUnitOfWork` (finding, cwe, finding_cwe, finding_label, finding_external_ref, decision, decision_approver, review_item); `Disposition.fold` interprets historical classifiers and explicit evidence strength |
 | Attestation: human sign-off | `services.attestation` · `AttestationService` | `FindingsUnitOfWork` — a human answer is a `decision` that resolves a `review_item` |
 | Identity: who is acting | `services.identity` · `IdentityService`; `models.identity` (`Principal`, `Role`) | none: principals come from `providers.identity` (OIDC, local user, directory) |
-| Operations: orders, leases, spend | `services.operations` · `OpsService`, `SpendService`, `SpendViews` (`ctx.spend_views.usage_summary(source, window, group_by)`: a source's usage per day, skill and model at list prices, unrecorded; it never opens the record store, and `SpendService.usage_summary` is the same answer); `FeedQuery` (the ops feed: orders that stopped or finished, new assessments and recorded releases after a `(timestamp, id)` cursor, oldest first; composes `OpsService`, `AssessmentService` and `PortfolioService`, whose `recorded_release` gives the router a release's repositories and change) | `OpsUnitOfWork` (run_batch, run_order, spend_event, feed_snapshot, assessment_input; composed `OrderQueryReader` for history) |
+| Operations: orders, leases, spend | `services.operations` · `OpsService` (`submit` stores a person's order as planned — the engine's admission (pack menu, approval holds, budget) is the one path that queues it; a door-only asset (`remediate_finding`) is refused there and queued only by `POST /v1/remediations`; `start` never takes over an order awaiting approval), `SpendService`, `SpendViews` (`ctx.spend_views.usage_summary(source, window, group_by)`: a source's usage per day, skill and model at list prices, unrecorded; it never opens the record store, and `SpendService.usage_summary` is the same answer); `FeedQuery` (the ops feed: orders that stopped or finished, new assessments and recorded releases after a `(timestamp, id)` cursor, oldest first; composes `OpsService`, `AssessmentService` and `PortfolioService`, whose `recorded_release` gives the router a release's repositories and change) | `OpsUnitOfWork` (run_batch, run_order, spend_event, feed_snapshot, assessment_input; composed `OrderQueryReader` for history) |
 | Ledger: proof of decisions | `services.ledger` · `LedgerService`: an append grows the layer's tree from its stored frontier (O(log n), never rereads events); `decide` / `restate` sign their append, `record` seals once per triage; `verify` / `checkpoint` recompute from events; `audit` verifies every layer, for the scheduled `ledger_audit` asset | `LedgerUnitOfWork` (layers, events) |
 | PQC, code facts, compliance, detection quality | `services.pqc`, `services.code_facts`, `services.compliance`, `services.detection_quality` | `AssessmentsUnitOfWork` — content is read from the assessment's artifacts, never tables |
 | Validation: supplied machine reports | `services.validation` · `ValidationService.record`, `evidence` | `TraustUnitOfWork` — source/baseline assessments, artifacts, findings decisions and evidence external refs; no live execution |
@@ -1314,7 +1501,7 @@ Existing indexed `GET /v1/orders` filters and its cursor contract remain unchang
 
 `models.operations` exports the contract-backed `SessionTask` and `SessionResult`, plus
 `SessionRecord` for runner-computed file digests. `OpsService.record_session(order_id,
-worker, session)` appends an immutable manifest under the current, unexpired lease;
+worker, session, lease_generation=…)` appends immutable evidence bearing that same generation;
 identical evidence is idempotent and changed evidence for the same executor session conflicts.
 `ops.manifest` returns session entries when present and preserves the empty-manifest response.
 `BelowRangeService.record` accepts an explicit optional `run_order_id` independently of legacy

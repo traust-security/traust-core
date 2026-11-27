@@ -5,11 +5,11 @@ import json
 import logging
 from collections import Counter, defaultdict
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from functools import cmp_to_key
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
@@ -42,7 +42,6 @@ from traust_core.v1.models.findings import (
     Finding,
     FindingCandidate,
     FindingClock,
-    FindingCount,
     FindingDimension,
     FindingFilter,
     FindingFix,
@@ -57,6 +56,8 @@ from traust_core.v1.models.findings import (
     Label,
     Location,
     Occurrence,
+    OccurrenceClaim,
+    OccurrenceClaimReport,
     ReviewItem,
     SortDirection,
     SurfaceCoverage,
@@ -86,9 +87,13 @@ from traust_core.v1.services.artifact_publishing import (
     PublishSpecs,
     stored_bytes,
 )
-from traust_core.v1.services.findings.census import FindingCensus, FindingCensusRow
+from traust_core.v1.services.findings.census import (
+    FindingCensus,
+    FindingCensusRow,
+)
 from traust_core.v1.services.findings.claims import FindingClaims, retained_claim_artifact
 from traust_core.v1.services.findings.decisions import FindingDecisions
+from traust_core.v1.services.findings.exposures import with_exposures
 from traust_core.v1.services.findings.facts import FindingFacts
 from traust_core.v1.services.findings.identity import primary_cwe
 from traust_core.v1.services.findings.intake import (
@@ -97,6 +102,7 @@ from traust_core.v1.services.findings.intake import (
     REBASELINE_MAPPING,
     FindingIntake,
 )
+from traust_core.v1.services.findings.occurrence_claims import OccurrenceClaims
 from traust_core.v1.services.findings.precedents import FindingPrecedents
 from traust_core.v1.services.findings.rating import RatingPolicy
 from traust_core.v1.services.findings.records import FindingRecords
@@ -104,6 +110,9 @@ from traust_core.v1.services.findings.review import FindingReview, request
 from traust_core.v1.services.findings.views import FindingViewQuery
 from traust_core.v1.services.findings.windows import WindowMemo, memo_keys
 from traust_core.v1.services.portfolio import Inventory
+
+if TYPE_CHECKING:
+    from traust_core.v1.services.exposure import AdvisoryCvssReader, StoredAdvisories
 
 log = logging.getLogger(__name__)
 
@@ -138,13 +147,12 @@ def _rated(view: FindingView) -> str:
 
 
 def _scored(view: FindingView) -> float | None:
-    """The occurrence's CVSS score as a number, or None when no occurrence reports one a
-    consumer could parse — the column sorts unscored rows last, the severity tiebreak
-    reads them as zero (SCI's derefFloat of a nil score)."""
-    if view.occurrence is None or view.occurrence.cvss_score is None:
+    """The finding's CVSS score (`FindingView.cvss_score`) as a number, or None when unscored:
+    the column sorts unscored rows last, the severity tiebreak reads them as zero."""
+    if (score := view.cvss_score) is None:
         return None
     try:
-        return float(view.occurrence.cvss_score)
+        return float(score)
     except (TypeError, ValueError, ArithmeticError):
         return None
 
@@ -252,14 +260,17 @@ class FindingService:
         objects: ObjectStore,
         *,
         windows: WindowMemo | None = None,
+        advisory_cvss: AdvisoryCvssReader | None = None,
+        advisories: StoredAdvisories | None = None,  # settling held moves: dependency identity
     ) -> None:
         self._uow = uow
+        self._advisories = advisories
         self._inventory = Inventory(uow)
         self._log = AssessmentLog(uow)
         self.records = FindingRecords(uow)
         self._rating = rating
-        self._views = FindingViewQuery(rating, objects)
-        self._census = FindingCensus(rating, objects)
+        self._views = FindingViewQuery(rating, objects, advisory_cvss)
+        self._census = FindingCensus(rating, objects, advisory_cvss)
         self._objects = objects
         self._windows = windows
         self._shared_depth = 0
@@ -283,6 +294,21 @@ class FindingService:
         self.review = review
         self.precedents = precedents
         self._claims = FindingClaims(uow, objects, self.artifacts, intake, decisions)
+        self._occurrence_claims = OccurrenceClaims(uow, decisions)
+
+    def record_occurrence_claims(
+        self,
+        claims: Sequence[OccurrenceClaim],
+        *,
+        ticket: str,
+        rationale: str,
+        principal: Principal,
+    ) -> OccurrenceClaimReport:
+        """A batch of declared CVSS claims, validated and recorded as governed
+        statements."""
+        return self._occurrence_claims.record(
+            claims, ticket=ticket, rationale=rationale, principal=principal
+        )
 
     def request_claim_correction(
         self,
@@ -371,7 +397,12 @@ class FindingService:
                 if not found:
                     return []
                 facts = FindingFacts.load(
-                    uow, found, None, repository_ref_id, read_budget=read_budget
+                    uow,
+                    found,
+                    None,
+                    repository_ref_id,
+                    read_budget=read_budget,
+                    cvss=self._views.cvss,
                 )
             return self._views.views(uow, found, as_of=None, facts=facts, read_budget=read_budget)
 
@@ -474,7 +505,11 @@ class FindingService:
             key=lambda pair: (pair[0].created_at, pair[0].occurred_at),
         ):
             doc = _HELD_DOCUMENTS[artifact.kind].parse(stored_bytes(self._objects, artifact))
-            candidates = REPORTED_FINDINGS[AssessmentKind(assessment.kind)](doc, repository_id)
+            candidates = with_exposures(
+                doc,
+                REPORTED_FINDINGS[AssessmentKind(assessment.kind)](doc, repository_id),
+                self._advisories,
+            )
             by_label = {c.label: c for c in candidates}
             assert assessment.id is not None
             held += [
@@ -608,34 +643,6 @@ class FindingService:
         window = heapq.nsmallest(page.limit, survivors(), key=cmp_to_key(order.compare))
         return Page(items=tuple(window), next=None)
 
-    def count_in(self, filter: FindingSetFilter) -> FindingCount:
-        """The filtered total a paged listing's pager reads: the same keep rule as
-        `list_in`, counted in one census fold — counting views, no locations or cwes
-        read, nothing held — so the number under a worklist's pager costs one bounded
-        walk, not a consumer's page-by-page count of every row.
-
-        Outside a `shared()` build the count rides the process memo the windows ride, so
-        the pager's number and the page's window of one scope cost one fold together
-        instead of one each — what the worklist issues on every refresh. A cold count
-        therefore reads the locations a census skips; the trade is a shared fold for a
-        narrower one, and the memo's TTL bounds how long it is paid."""
-        if self._windows is not None and not self._shared_depth:
-            return FindingCount(
-                total=sum(
-                    1
-                    for view in self._window_views(filter.repository_ids, filter.as_of, census=True)
-                    if filter.keeps(view)
-                )
-            )
-        total = 0
-
-        def tally(batch: Mapping[UUID, Sequence[FindingView]]) -> None:
-            nonlocal total
-            total += sum(1 for views in batch.values() for view in views if filter.keeps(view))
-
-        self.census_fold(filter.repository_ids, tally, as_of=filter.as_of)
-        return FindingCount(total=total)
-
     def _window_views(
         self, repository_ids: Collection[UUID], as_of: datetime | None, *, census: bool = False
     ) -> Iterator[FindingView]:
@@ -710,57 +717,6 @@ class FindingService:
                 held[repository_id] = views
                 memo.deposit(repository_id, as_of, views, census=census)
 
-    def summary_in(
-        self, repository_ids: Collection[UUID], as_of: datetime | None = None
-    ) -> list[FindingRollup]:
-        """Several repositories' findings counted by state per repository — the batched
-        `summary` under its one set-scoped dimension (`group_by=repository`, the census a
-        consumer renders per repository row): `summary`'s own rule (never-reported
-        findings count nowhere), folded one bounded batch of whole repositories at a
-        time instead of one summary call per repository. A batch holds whole
-        repositories, so each repository's rollup is complete when its batch folds and
-        the views release — the census fold's own discipline, nothing held but the
-        running rollups. A repository with no findings has no row, exactly as `summary`
-        returns no group for one."""
-        by_repo: defaultdict[UUID, list[Finding]] = defaultdict(list)
-        with self._uow as uow:
-            for finding in uow.findings.list_for_repositories(repository_ids):
-                by_repo[finding.repository_id].append(finding)
-            rollups: dict[str, FindingRollup] = {}
-            batch: list[Finding] = []
-            size = 0
-            for findings in by_repo.values():
-                if batch and size + len(findings) > _FACTS_BATCH:
-                    self._summary_batch(uow, batch, as_of, rollups)
-                    batch, size = [], 0
-                batch.extend(findings)
-                size += len(findings)
-            if batch:
-                self._summary_batch(uow, batch, as_of, rollups)
-        return sorted(rollups.values(), key=lambda r: (-r.findings, r.key is None, r.key or ""))
-
-    def _summary_batch(
-        self,
-        uow: TraustUnitOfWork,
-        findings: Sequence[Finding],
-        as_of: datetime | None,
-        rollups: dict[str, FindingRollup],
-    ) -> None:
-        # one facts load per bounded batch of whole repositories, the fold's own
-        # discipline: a whole scope's ids at once would exceed the bind limit. The
-        # census mode loads no locations or cwes — the repository rollup counts
-        # states and effective severities, exactly what a tally reads.
-        facts = FindingFacts.load(uow, findings, until=as_of, objects=self._objects, census=True)
-        groups: defaultdict[str, list[FindingView]] = defaultdict(list)
-        for finding in findings:
-            if not facts.reported_by(finding.id, as_of):  # type: ignore[arg-type]
-                continue  # never reported: no severity, and no baseline holds it either
-            view = self._views.view(facts, finding, as_of, {})
-            if view is not None:
-                groups[str(view.finding.repository_id)].append(view)
-        for key, views in groups.items():
-            rollups[key] = finding_rollup(key, views)
-
     def all(self, filter: FindingFilter) -> list[FindingView]:
         """Every finding `list` pages through, newest first."""
         with self._uow as uow:
@@ -777,8 +733,10 @@ class FindingService:
         inside the block counts over the build's load instead of re-reading it. The memo
         lives only inside the outermost block — nothing outlives the build."""
         self._shared_depth += 1
+        pinned = self._views.cvss.pinned() if self._views.cvss is not None else nullcontext()
         try:
-            yield
+            with pinned:  # and every load counts at one advisory-cvss build
+                yield
         finally:
             self._shared_depth -= 1
             if not self._shared_depth:
@@ -828,6 +786,7 @@ class FindingService:
                 until=as_of,
                 objects=self._objects,
                 census=census,
+                cvss=self._views.cvss,
             )
 
     def all_in(
@@ -903,7 +862,9 @@ class FindingService:
             findings = uow.findings.list_for_repository(ref.repository_id)
             if not findings:
                 return []
-            facts = FindingFacts.load(uow, findings, None, repository_ref_id, objects=self._objects)
+            facts = FindingFacts.load(
+                uow, findings, None, repository_ref_id, objects=self._objects, cvss=self._views.cvss
+            )
             kept = [f for f in findings if not facts.off_line(f.id, line)]
             return self._views.views(uow, kept, facts=facts)
 
@@ -990,7 +951,9 @@ class FindingService:
     def _fixes(
         self, uow: TraustUnitOfWork, found: Sequence[Finding], validity: Validity
     ) -> list[FindingFix]:
-        facts = FindingFacts.load(uow, found, until=None, objects=self._objects)
+        facts = FindingFacts.load(
+            uow, found, until=None, objects=self._objects, cvss=self._views.cvss
+        )
         fixed: list[tuple[FindingView, Occurrence, Decision]] = []
         for view in self._views.views(uow, found, None, facts=facts):
             finding_id = view.finding.id
@@ -1047,7 +1010,9 @@ class FindingService:
         every line is the default."""
         with self._uow as uow:
             findings = uow.findings.list_for_repository(repository_id)
-            facts = FindingFacts.load(uow, findings, until=None, objects=self._objects)
+            facts = FindingFacts.load(
+                uow, findings, until=None, objects=self._objects, cvss=self._views.cvss
+            )
             line = default_line(self._inventory.list_refs(repository_id))
         views = (
             self._views.view(facts, f, None, {})
@@ -1065,7 +1030,9 @@ class FindingService:
         largest first. A finding counts in its primary CWE's group, and in each of its labels'."""
         with self._uow as uow:
             findings = uow.findings.list_for_repository(filter.repository_id)
-            facts = FindingFacts.load(uow, findings, until=filter.as_of, objects=self._objects)
+            facts = FindingFacts.load(
+                uow, findings, until=filter.as_of, objects=self._objects, cvss=self._views.cvss
+            )
         groups: defaultdict[str | None, list[FindingView]] = defaultdict(list)
         for finding in findings:
             if not facts.reported_by(finding.id, filter.as_of):  # type: ignore[arg-type]
@@ -1113,7 +1080,9 @@ class FindingService:
         disposition folds; human-only closures never qualify, even if a later report repeats it."""
         with self._uow as uow:
             findings = uow.findings.list_for_repository(filter.repository_id)
-            facts = FindingFacts.load(uow, findings, until=filter.as_of, objects=self._objects)
+            facts = FindingFacts.load(
+                uow, findings, until=filter.as_of, objects=self._objects, cvss=self._views.cvss
+            )
         groups: defaultdict[ScannerSeverity, list[float]] = defaultdict(list)
         for finding in findings:
             assert finding.id is not None
@@ -1154,7 +1123,9 @@ class FindingService:
         bucket's end; new, resolved, false positives and regressions happened within it."""
         with self._uow as uow:
             findings = uow.findings.list_for_repository(filter.repository_id)
-            facts = FindingFacts.load(uow, findings, until=filter.as_of, objects=self._objects)
+            facts = FindingFacts.load(
+                uow, findings, until=filter.as_of, objects=self._objects, cvss=self._views.cvss
+            )
         return _series(self, facts, findings, filter.keeps, bucket, filter.as_of)
 
     def timelines(
@@ -1191,7 +1162,9 @@ class FindingService:
         means first linked to a Jira issue."""
         with self._uow as uow:
             findings = uow.findings.list_for_repository(filter.repository_id)
-            facts = FindingFacts.load(uow, findings, until=filter.as_of, objects=self._objects)
+            facts = FindingFacts.load(
+                uow, findings, until=filter.as_of, objects=self._objects, cvss=self._views.cvss
+            )
             views = [
                 view
                 for view in self._views.views(uow, findings, filter.as_of, facts=facts)
@@ -1534,7 +1507,7 @@ class _Replay:
         if state is FindingState.OPEN:
             self.opened[severity] += 1
         if state in (FindingState.OPEN, FindingState.ACCEPTED):
-            weight = self.service._rating.risk_weight(view.occurrence, severity)
+            weight = self.service._rating.risk_weight(view.cvss_score, severity)
         self.states[state] += 1
         self.standing[finding_id] = (state, severity, weight)
 

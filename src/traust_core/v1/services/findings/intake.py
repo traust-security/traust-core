@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Collection, Iterable, Sequence
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from pydantic import ValidationError as ModelValidationError
@@ -10,6 +11,7 @@ from pydantic import ValidationError as ModelValidationError
 from traust_core.v1 import contracts
 from traust_core.v1.errors import ConfigError, ConflictError, ForbiddenError, ValidationError
 from traust_core.v1.models.common import CodeHash, CodeSpan
+from traust_core.v1.models.cvss import cvss_computed_score
 from traust_core.v1.models.dependencies import AdvisoryMatch
 from traust_core.v1.models.findings import (
     Cwe,
@@ -37,11 +39,16 @@ from traust_core.v1.models.vocabulary import (
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectStore
 from traust_core.v1.services.artifact_publishing import AssessmentLog
+from traust_core.v1.services.findings import state_history
 from traust_core.v1.services.findings.claims import approved_claims_for, retained_claim_artifact
 from traust_core.v1.services.findings.identity import IdentityPolicy
+from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
 from traust_core.v1.services.findings.review import request
 from traust_core.v1.services.findings.taxonomy import TaxonomyPolicy
 from traust_core.v1.services.portfolio import Inventory
+
+if TYPE_CHECKING:
+    from traust_core.v1.services.exposure import AdvisoryCvssReader
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +60,10 @@ REBASELINE_MAPPING = ReviewReason("rebaseline_mapping")
 CWE_IDENTIFIER = re.compile(r"CWE-\d{1,5}")
 
 
+# findings stamped per short transaction after an assessment commits (~5 ms each)
+_RESTAMP_BATCH = 100
+
+
 class FindingIntake:
     def __init__(
         self,
@@ -61,8 +72,12 @@ class FindingIntake:
         taxonomy: TaxonomyPolicy,
         *,
         objects: ObjectStore | None = None,
+        rating: RatingPolicy | None = None,
+        cvss: AdvisoryCvssReader | None = None,
     ) -> None:
         self._uow = uow
+        self._rating = rating or RatingPolicy(RatingConfig())
+        self._cvss = cvss
         self._inventory = Inventory(uow)
         self._log = AssessmentLog(uow)
         self._identity = identity
@@ -111,6 +126,7 @@ class FindingIntake:
             pending: dict[UUID, dict[tuple[str, int | None], CodeSpan]] = {}
             baselines: dict[UUID, set[tuple[str, int | None]]] = {}
             keys, kinds = self._fingerprints(repo, candidates, f"assessment {assessment_id}")
+            candidates = _scored_per_fingerprint(candidates, keys)
             identities, immutable_occurrences = self._claimed_identities(uow, repo.id)
             took = [
                 (
@@ -161,10 +177,35 @@ class FindingIntake:
                             )
                         )
             uow.commit()
+        self._restamp(finding_id for finding_id, _ in taken.values())
         return IntakeResult(
             findings={label: finding_id for label, (finding_id, _) in taken.items()},
             created=tuple(dict.fromkeys(f for f, new in taken.values() if new)),
         )
+
+    def restamp_advisories(self, advisory_ids: Collection[UUID]) -> None:
+        """Restamp the findings naming these advisories: a new authority build moves their
+        selected score, so their effective severity, with no write to the finding."""
+        with self._uow as uow:
+            named = [f.id for a in advisory_ids for f in uow.findings.list_for_advisory(a)]
+        self._restamp(f for f in named if f is not None)
+
+    def _restamp(self, finding_ids: Iterable[UUID]) -> None:
+        # after the commit, in short batches on their own connections: a rescan never holds
+        # a finding's row while a person decides on it, and the stamp never joins a caller's
+        # open transaction (the stamp is refolded from what is recorded: it trails, never
+        # diverges)
+        ids = list(dict.fromkeys(finding_ids))
+
+        def batches() -> None:
+            for start in range(0, len(ids), _RESTAMP_BATCH):
+                with self._uow.independent() as uow:
+                    for finding_id in ids[start : start + _RESTAMP_BATCH]:
+                        state_history.restamp(uow, self._rating, finding_id, self._cvss)
+                    uow.commit()
+
+        # a caller's open transaction owns the wait; with none open, the batches run now
+        self._uow.after_commit(batches)
 
     def check(self, repository_id: UUID, candidates: Sequence[FindingCandidate]) -> None:
         """Refuse, writing nothing, what `accept` would refuse: lets a caller check before it
@@ -259,7 +300,12 @@ class FindingIntake:
             raise ValidationError("invalid finding candidate") from error
         if candidate.kind is not None:
             contracts.validate_enum("finding_kind", candidate.kind)
-        return candidate.model_copy(update={"locations": locations, "exposure": exposure})
+        update: dict[str, object] = {"locations": locations, "exposure": exposure}
+        if candidate.cvss_vector is not None and candidate.cvss_score is None:
+            # the data model's cvss_score: computed from cvss_vector at intake (plan D14); a
+            # producer reports the vector, and a vector with no version prefix leaves it null
+            update["cvss_score"] = cvss_computed_score(candidate.cvss_vector)
+        return candidate.model_copy(update=update)
 
     def _fingerprints(
         self, repo: Repository, candidates: Sequence[FindingCandidate], examiner: str
@@ -314,6 +360,13 @@ class FindingIntake:
         if candidate.reported_severity is None:
             raise ValidationError(f"{candidate.label}: no severity reported")
         contracts.validate_enum("scanner_severity", candidate.reported_severity)
+        if candidate.cvss_vector is not None and candidate.cvss_score is not None:
+            computed = cvss_computed_score(candidate.cvss_vector)
+            if computed is None or candidate.cvss_score != computed:
+                raise ValidationError(
+                    f"{candidate.label}: cvss score {candidate.cvss_score} is not what its "
+                    "vector computes"
+                )
         if malformed := [c for c in candidate.cwes if not CWE_IDENTIFIER.fullmatch(c)]:
             raise ValidationError(f"{candidate.label}: not CWE identifiers: {malformed}")
         for span in candidate.locations:
@@ -542,9 +595,36 @@ class FindingIntake:
                 raise ConflictError(
                     f"finding {finding.id}: another finding already holds {move.fingerprint}"
                 )
-            moved = uow.findings.update(
-                finding.model_copy(update={"fingerprint_algo": key[0], "fingerprint": key[1]})
-            )
+            update: dict[str, object] = {"fingerprint_algo": key[0], "fingerprint": key[1]}
+            if move.advisory_id is not None and finding.advisory_id is None:
+                # moving onto an exposure identity links the advisory, as creation does
+                update |= {
+                    "advisory_id": move.advisory_id,
+                    "advisory_match": AdvisoryMatch.CONFIRMED,
+                }
+            moved = uow.findings.update(finding.model_copy(update=update))
             uow.commit()
         self._uow.after_commit(lambda: log.info("finding %s moved", finding.id))
         return [moved]
+
+
+def _scored_per_fingerprint(
+    candidates: Sequence[FindingCandidate], keys: Sequence[Fingerprint]
+) -> tuple[FindingCandidate, ...]:
+    """Candidates that share a fingerprint in one assessment are one occurrence, and an
+    occurrence is append-only: a candidate that states no CVSS at all takes the first stated
+    vector (and its calculator-computed score), so a later entry's score is never lost behind an
+    earlier unscored one. A candidate stating a vector or a score keeps its own."""
+    scored: dict[tuple[str, str], FindingCandidate] = {}
+    for candidate, key in zip(candidates, keys, strict=True):
+        if candidate.cvss_vector is not None:
+            scored.setdefault((key.algo, key.value), candidate)
+    out = []
+    for candidate, key in zip(candidates, keys, strict=True):
+        source = scored.get((key.algo, key.value))
+        if candidate.cvss_vector is None and candidate.cvss_score is None and source is not None:
+            candidate = candidate.model_copy(
+                update={"cvss_vector": source.cvss_vector, "cvss_score": source.cvss_score}
+            )
+        out.append(candidate)
+    return tuple(out)

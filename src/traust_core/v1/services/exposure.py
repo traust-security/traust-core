@@ -5,8 +5,10 @@ import gzip
 import json
 import logging
 import re
+import threading
 from collections import defaultdict
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -37,6 +39,15 @@ from traust_core.v1.models.assessment import (
 )
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.common import Page, PageRequest, Provenance, TimeBucket
+from traust_core.v1.models.cvss import (
+    AdvisoryCvss,
+    CvssScore,
+    cve_list_scores,
+    nvd_scores,
+    osv_scores,
+    record_ids,
+    rh_cve_scores,
+)
 from traust_core.v1.models.dependencies import (
     Advisory,
     AdvisoryIdentifier,
@@ -102,6 +113,7 @@ from traust_core.v1.models.dependencies import (
     version_key,
 )
 from traust_core.v1.models.feed_documents import (
+    AdvisoryCvssNotBuilt,
     AdvisoryDocumentsRefresh,
     DocumentFailure,
     DocumentRefresh,
@@ -111,7 +123,6 @@ from traust_core.v1.models.feed_documents import (
 )
 from traust_core.v1.models.findings import (
     Category,
-    ExposureKey,
     FindingCandidate,
     FindingContext,
     Label,
@@ -126,6 +137,7 @@ from traust_core.v1.models.operations import (
     OrderRequest,
     PreflightRequest,
     RunBatch,
+    WorkerId,
 )
 from traust_core.v1.models.sbom_formats import parse_sbom
 from traust_core.v1.models.values import CveId, GitSha, HttpsRepoUrl
@@ -168,18 +180,33 @@ from traust_core.v1.services.artifact_publishing import (
     record_artifact,
     stored_bytes,
 )
+from traust_core.v1.services.findings.cvss import effective
+from traust_core.v1.services.findings.exposures import exposure_key, stored_name
 from traust_core.v1.services.findings.intake import FindingIntake
 from traust_core.v1.services.findings.records import FindingRecords
 from traust_core.v1.services.operations import OpsService, PolicyDenied
+from traust_core.v1.services.order_binding import order_binding
 from traust_core.v1.services.portfolio import Inventory, PortfolioService
 from traust_core.v1.services.repo_checkout import RepoCheckoutService
 
 if TYPE_CHECKING:
     from traust_core.v1.services.findings.service import FindingService
+    from traust_core.v1.services.operations import OpsService
 
 FEED_ARTIFACT_KIND = "feed"
 # the per-identifier sources an advisory's names are kept from, and which names each takes
 _ADVISORY_DOCUMENT_SOURCES = {"cve-list": "cve", "nvd": "cve", "rh-cve": "cve", "ghsa": "ghsa"}
+_SCORES_OF: dict[str, Callable[..., tuple[CvssScore, ...]]] = {
+    "cve-list": cve_list_scores,
+    "nvd": nvd_scores,
+    "rh-cve": rh_cve_scores,
+    "ghsa": osv_scores,
+}
+# the record name each source's parser gives its scores' `document` (`osv:` for GHSA records)
+_DOCUMENT_PREFIX = {"cve-list": "cve-list", "nvd": "nvd", "rh-cve": "rh-cve", "ghsa": "osv"}
+_REFRESH_DOCUMENTS = "refresh the advisory documents (refresh_advisory_documents)"
+# the daily ranked build of every authority's scores the views read (`refresh_advisory_cvss`)
+ADVISORY_CVSS_FEED = "advisory-cvss"
 EPSS, KEV, RH_CVE = FeedName("epss"), FeedName("kev"), FeedName("rh-cve")
 # identifiers a source matches case-insensitively, kept in one spelling (`_canonical`)
 _CVE_ID = re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE)
@@ -197,6 +224,8 @@ _TITLE_STOP = frozenset(
     )
 )
 SBOM_ARTIFACT_KIND = "sbom"
+_MANIFEST_PROBE = "traust-manifest-coverage"
+_MANIFEST_PROBE_VERSION = "2"
 IMPACT_ASSESSOR = "impact-analysis"
 SUPPLY_CHAIN = "supply-chain"
 DEEP_SCAN_CAP = 100  # more commits than this: SBOM evidence now, deep scans staged by an operator
@@ -226,7 +255,7 @@ REACHED_THROUGH = "reached through a base image or an internal library; not list
 SURFACE = "{} surface: manifest-level, no reachability"
 UNRESOLVED = "not in the SBOM, but these manifests could not be resolved: {}"
 SHARED_FIX = "fix commits not mined: the advisory names several packages they can't tell apart"
-UNKNOWN_COVERAGE = "not in the SBOM, whose coverage is unknown: no manifest scan recorded it"
+UNKNOWN_COVERAGE = "not in the SBOM, whose coverage is unknown for this ecosystem"
 _UNORDERABLE = "a held version can't be ordered against the advisory's spans"
 # The skill's ceiling contract: manifest evidence caps at likely_affected; only a reachability
 # tier (govulncheck, joern) recorded at this head says affected.
@@ -279,6 +308,19 @@ _ITEM_KEYS = ("id", "fingerprint", "osv_id")
 log = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class ManifestScanCoverage:
+    """Gaps on a scan and whether its probe can assess Docker coverage."""
+
+    gaps: tuple[UnresolvedManifest, ...] | None
+    current_probe: bool
+
+    def for_ecosystem(self, ecosystem: Ecosystem) -> tuple[UnresolvedManifest, ...] | None:
+        if self.gaps is None or (ecosystem == Ecosystem.DOCKER and not self.current_probe):
+            return None
+        return tuple(m for m in self.gaps if m.ecosystem == ecosystem)
+
+
 class ExploitContext(Model):
     """An enrichment tagger's join: EPSS and KEV on every CVE-bearing item, the repository's
     product reach, and the feed snapshots read. Routes attention; never a severity or a verdict."""
@@ -317,9 +359,11 @@ class ExposureService:
         sbom_tool: ToolProvider[bytes] | None = None,
         findings: FindingService | None = None,
         checkout: RepoCheckoutService | None = None,
+        advisory_cvss: AdvisoryCvssCache | None = None,
         ops: OpsService | None = None,
     ) -> None:
         self._uow = uow
+        self._ops = ops
         self._inventory = Inventory(uow, hosts)
         self._log = AssessmentLog(uow)
         self._findings = FindingRecords(uow)
@@ -337,6 +381,7 @@ class ExposureService:
         self._checkout = checkout
         self._ops = ops
         self._finding_service = findings
+        self._advisory_cvss = AdvisoryCvssReader(objects, advisory_cvss or AdvisoryCvssCache())
 
     def refresh_feeds(
         self, feeds: Sequence[FeedName] | None = None, run_order_id: UUID | None = None
@@ -464,13 +509,32 @@ class ExposureService:
         )
         return sbom
 
-    def record_manifest_sbom(self, repository_ref_id: UUID) -> Sbom:
-        """The commit's manifest SBOM: the one recorded, else the SBOM tool's over the commit's
-        manifests, fetched from its forge (the fleet sweep's door; a re-run never fetches). A
-        recorded SBOM given as a document stays, with its coverage unknown."""
+    def record_manifest_sbom(
+        self,
+        repository_ref_id: UUID,
+        *,
+        run_order_id: UUID | None = None,
+        worker: WorkerId | None = None,
+        lease_generation: int | None = None,
+    ) -> Sbom:
+        """Reuse a document import or a current scan; refresh an old probe even at the same SHA."""
         ref, repository = self._inventory.resolve(repository_ref_id)
-        if ref.manifest_sbom_id is not None:
-            with self._uow as uow:
+        guard = order_binding(
+            self._ops,
+            self._uow,
+            run_order_id,
+            ref.repository_id,
+            worker,
+            lease_generation,
+            lock_at_commit=True,
+        )
+        if run_order_id is not None and self._require_portfolio()._uow is not self._uow:
+            raise ConfigError("order-bound manifest scans need a shared inventory transaction")
+        if ref.manifest_sbom_id is not None and (
+            ref.manifest_sbom_assessment_id is None
+            or self._probe_coverages([ref], requeue=True)[repository_ref_id].current_probe
+        ):
+            with guard, self._uow as uow:
                 return uow.sboms.get(ref.manifest_sbom_id)
         if self._checkout is None:
             raise ConfigError("record_manifest_sbom needs a checkout provider (Context wires one)")
@@ -479,7 +543,7 @@ class ExposureService:
             CheckoutRequest(repo=repository.url, ref=GitSha.parse(ref.sha), keep=MANIFESTS)
         ).data
         try:
-            self.ingest_dependencies(repository_ref_id, fetched.path)
+            self._ingest_dependencies(repository_ref_id, fetched.path, guard, run_order_id)
         finally:
             self._checkout.release(fetched)
         # a scan that read the tree before the current one records but doesn't become current
@@ -500,6 +564,15 @@ class ExposureService:
         one transaction with this scan's `manifest_sbom` assessment, its `manifest-coverage`
         record bound to both, and the commit's pointer to the scan: coverage is never read off
         another scan."""
+        return self._ingest_dependencies(repository_ref_id, checkout, nullcontext(), None)
+
+    def _ingest_dependencies(
+        self,
+        repository_ref_id: UUID,
+        checkout: Path,
+        guard: AbstractContextManager[object],
+        run_order_id: UUID | None,
+    ) -> DependencyIngest:
         sbom_tool = self._require_sbom_tool()
         portfolio = self._require_portfolio()
         unresolved = unresolved_manifests(checkout)
@@ -527,7 +600,7 @@ class ExposureService:
             for name in requirements_names(checkout)
         }
         contents = parse_sbom(scanned.data, frozenset(declared))
-        with self._uow as uow:
+        with guard, self._uow as uow:
             sbom = uow.sboms.find_by_digest(contents.digest) or self._add_sbom(
                 uow, scanned.data, contents
             )
@@ -543,10 +616,11 @@ class ExposureService:
             scan = self._log.open(
                 Assessment(
                     repository_ref_id=ref.id,
+                    run_order_id=run_order_id,
                     kind=AssessmentKind.MANIFEST_SBOM,
                     status=ASSESSMENT_COMPLETED,
-                    assessor=tool,
-                    assessor_version=version,
+                    assessor=_MANIFEST_PROBE,
+                    assessor_version=_MANIFEST_PROBE_VERSION,
                     occurred_at=read_at,
                 )
             )
@@ -575,34 +649,107 @@ class ExposureService:
     def unresolved_manifests(
         self, repository_ref_id: UUID
     ) -> tuple[UnresolvedManifest, ...] | None:
-        """The manifests the SBOM tool could not resolve on the commit, from the coverage of the
-        scan that recorded its current SBOM. None is unknown: no such scan (an SBOM given as a
-        document, or none). Coverage bound to another SBOM or scan raises."""
+        """All measured gaps on the current scan, or None if coverage is incomplete."""
         ref = self._inventory.get_ref(repository_ref_id)
-        if ref.manifest_sbom_assessment_id is None:
-            return None
-        scans = self._log.list_by_ids([ref.manifest_sbom_assessment_id])
-        held = self._log.documents(scans, [ManifestCoverageArtifact.schema])
-        if not held:
-            raise IntegrityError(
-                f"manifest scan {ref.manifest_sbom_assessment_id} of ref {ref.id} holds no coverage"
-            )
-        [(scan, artifact)] = held
+        return self.manifest_coverage([ref])[repository_ref_id]
+
+    def _manifest_coverage(self, ref: RepositoryRef) -> ManifestScanCoverage:
+        assert ref.id is not None
+        return self._probe_coverages([ref])[ref.id]
+
+    def manifest_coverage(
+        self, refs: Collection[RepositoryRef]
+    ) -> dict[UUID, tuple[UnresolvedManifest, ...] | None]:
+        """Scan-bound coverage for the same ref snapshots used to read package rows."""
+        return {
+            ref_id: scan.gaps if scan.current_probe else None
+            for ref_id, scan in self._probe_coverages(refs).items()
+        }
+
+    def manifest_scan_coverage(
+        self, refs: Collection[RepositoryRef]
+    ) -> dict[UUID, ManifestScanCoverage]:
+        """Scan-bound gaps and probe currency, including legacy non-Docker coverage."""
+        return self._probe_coverages(refs)
+
+    def _probe_coverages(
+        self, refs: Collection[RepositoryRef], *, requeue: bool = False
+    ) -> dict[UUID, ManifestScanCoverage]:
+        scan_ids = {
+            ref.manifest_sbom_assessment_id for ref in refs if ref.manifest_sbom_assessment_id
+        }
+        scans = self._log.list_by_ids(scan_ids) if scan_ids else []
+        scans_by_id = {scan.id: scan for scan in scans}
+        held: defaultdict[UUID | None, list[tuple[Assessment, Artifact]]] = defaultdict(list)
+        for scan, artifact in self._log.documents(scans, [ManifestCoverageArtifact.schema]):
+            held[scan.id].append((scan, artifact))
+        coverage: dict[UUID, ManifestScanCoverage] = {}
+        for ref in refs:
+            assert ref.id is not None
+            scan_id = ref.manifest_sbom_assessment_id
+            if scan_id is None:
+                coverage[ref.id] = ManifestScanCoverage(None, False)
+                continue
+            documents = held[scan_id]
+            if requeue and len(documents) != 1:
+                scan = scans_by_id.get(scan_id)
+                if (
+                    scan is not None
+                    and scan.repository_ref_id == ref.id
+                    and scan.kind == AssessmentKind.MANIFEST_SBOM
+                    and scan.status == ASSESSMENT_COMPLETED
+                ):
+                    # Only repair missing/duplicate documents of this ref's completed scan.
+                    # Validate every duplicate first: a bad binding or corrupt artifact is
+                    # unrelated corruption, not permission to silently replace the pointer.
+                    for held_scan, artifact in documents:
+                        self._scan_coverage(ref, held_scan, artifact)
+                    log.warning(
+                        "requeueing manifest scan %s of ref %s with %s coverage documents",
+                        scan_id,
+                        ref.id,
+                        len(documents),
+                    )
+                    coverage[ref.id] = ManifestScanCoverage(None, False)
+                    continue
+            if not documents:
+                raise IntegrityError(f"manifest scan {scan_id} of ref {ref.id} holds no coverage")
+            if len(documents) != 1:
+                raise IntegrityError(
+                    f"manifest scan {scan_id} of ref {ref.id} has duplicate coverage"
+                )
+            [(scan, artifact)] = documents
+            coverage[ref.id] = self._scan_coverage(ref, scan, artifact)
+        return coverage
+
+    def _scan_coverage(
+        self, ref: RepositoryRef, scan: Assessment, artifact: Artifact
+    ) -> ManifestScanCoverage:
         doc = json.loads(
             ManifestCoverageArtifact.parse(stored_bytes(self._objects, artifact)).payload
         )
         bound = (doc["sbom_id"], doc["assessment_id"])
-        if scan.repository_ref_id != ref.id or bound != (str(ref.manifest_sbom_id), str(scan.id)):
+        if (
+            scan.repository_ref_id != ref.id
+            or scan.kind != AssessmentKind.MANIFEST_SBOM
+            or scan.status != ASSESSMENT_COMPLETED
+            or bound != (str(ref.manifest_sbom_id), str(scan.id))
+        ):
             raise IntegrityError(
                 f"manifest coverage on ref {ref.id} is bound to sbom {bound[0]} and scan "
                 f"{bound[1]} of ref {scan.repository_ref_id}, not its current "
                 f"{ref.manifest_sbom_id} and {scan.id}"
             )
-        return tuple(
+        gaps = tuple(
             UnresolvedManifest.model_validate({"ecosystem": ecosystem, "path": path, "reason": why})
             for ecosystem, paths in doc["unresolved"].items()
             for path, why in paths.items()
         )
+        identity = scan.assessor, scan.assessor_version
+        if identity == (_MANIFEST_PROBE, _MANIFEST_PROBE_VERSION):
+            return ManifestScanCoverage(gaps, True)
+        legacy = identity == (doc["tool"]["name"], doc["tool"]["version"])
+        return ManifestScanCoverage(gaps if legacy else None, False)
 
     def resolve_symbols(self, advisory_id: UUID) -> SymbolResolution:
         """The functions the advisory's fix touched: what its source publishes (Go's OSV
@@ -690,7 +837,6 @@ class ExposureService:
                 raise NoManifestSbomError(repository_ref_id)
             images = uow.images.list_built_from(repository_ref_id)
             kept = [(p, uow.packages.find(p.ecosystem, p.name)) for p in record.affected]
-        held_sboms = self._held_sboms(repository_ref_id)
         candidates = [
             (
                 package,
@@ -709,17 +855,22 @@ class ExposureService:
             )
             for package, found in kept
         ]
-        coverage = self.unresolved_manifests(repository_ref_id)
-        if self._held_sboms(repository_ref_id) != held_sboms:
+        coverage = self._manifest_coverage(ref)
+        with self._uow as uow:
+            current = self._inventory.get_ref(repository_ref_id)
+            current_images = uow.images.list_built_from(repository_ref_id)
+        if (
+            current.manifest_sbom_id != ref.manifest_sbom_id
+            or current.manifest_sbom_assessment_id != ref.manifest_sbom_assessment_id
+            or {i.id for i in current_images} != {i.id for i in images}
+        ):
             # the walks above read one package each; a scan landing between them mixes snapshots
             raise ConflictError(
                 f"ref {repository_ref_id}: its SBOMs changed while it was prepared; prepare again"
             )
-        unread = None if coverage is None else {m.ecosystem for m in coverage}
+        gaps = {p.ecosystem: coverage.for_ecosystem(p.ecosystem) for p, _ in candidates}
         held = [
-            (package, rows)
-            for package, rows in candidates
-            if rows or unread is None or package.ecosystem in unread
+            (package, rows) for package, rows in candidates if rows or gaps[package.ecosystem] != ()
         ]
         prepared = []
         for package, rows in held if any(rows for _, rows in held) else candidates:
@@ -735,7 +886,14 @@ class ExposureService:
                 ]
                 prepared.append(
                     self._prepare(
-                        record, package, repository_ref_id, selected, checkout, judged, prepared_at
+                        record,
+                        package,
+                        repository_ref_id,
+                        selected,
+                        checkout,
+                        judged,
+                        prepared_at,
+                        gaps[package.ecosystem],
                     )
                 )
         members = tuple(item.scope_member for item in prepared)
@@ -743,6 +901,7 @@ class ExposureService:
             "prepared_at": prepared_at.isoformat(),
             "advisory": record.model_dump(mode="json", exclude={"advisory_id"}),
             "manifest_sbom_id": str(ref.manifest_sbom_id),
+            "manifest_sbom_assessment_id": str(ref.manifest_sbom_assessment_id),
             "images": sorted((str(image.id), str(image.sbom_id)) for image in images),
             "members": [member.model_dump(mode="json") for member in members],
         }
@@ -750,17 +909,6 @@ class ExposureService:
             digest=sha256_hex(json.dumps(snapshot, sort_keys=True).encode()), members=members
         )
         return tuple(item.model_copy(update={"preparation_scope": scope}) for item in prepared)
-
-    def _held_sboms(self, repository_ref_id: UUID) -> tuple[object, ...]:
-        """The commit's manifest SBOM and scan, and the SBOMs of the images built from it."""
-        with self._uow as uow:
-            ref = self._inventory.get_ref(repository_ref_id)
-            images = uow.images.list_built_from(repository_ref_id)
-        return (
-            ref.manifest_sbom_id,
-            ref.manifest_sbom_assessment_id,
-            sorted((str(i.id), str(i.sbom_id)) for i in images),
-        )
 
     def _prepare(
         self,
@@ -771,21 +919,21 @@ class ExposureService:
         checkout: Path | None,
         judged: Sequence[str],
         prepared_at: datetime,
+        gaps: tuple[UnresolvedManifest, ...] | None,
     ) -> ImpactInput:
         portfolio = self._require_portfolio()
         with self._uow as uow:
             subject = self._inventory.subject(repository_ref_id)
             scanned = any(i.sbom_id for i in uow.images.list_built_from(repository_ref_id))
         named = {r.dependency.package_id: package for r in rows if r.vulnerable}
-        coverage = () if rows else self.unresolved_manifests(repository_ref_id)
-        unread = [m.path for m in coverage or () if m.ecosystem == package.ecosystem]
+        unread = [m.path for m in gaps or ()] if not rows else []
         listed = any(r.image_id is None for r in rows)
         in_manifest = [r.dependency for r in rows if r.vulnerable and r.image_id is None]
         in_images = [r.dependency for r in rows if r.vulnerable and r.image_id is not None]
         in_range, shipped = _in_range(in_manifest, named), _in_range(in_images, named)
         pinned = in_manifest and package.ecosystem in _MANIFEST_TIER
         evidence = ImpactEvidence(
-            l1_depends_on=True if listed else None if rows or unread or coverage is None else False,
+            l1_depends_on=True if listed else None if rows or unread or gaps is None else False,
             l1_version_in_range=in_range,
             manifest_version=in_manifest[0].version if in_manifest else None,
             manifest_scan=None
@@ -809,7 +957,7 @@ class ExposureService:
                     REACHED_THROUGH if listed and not in_manifest else None,
                     SURFACE.format(package.ecosystem) if package.ecosystem in _SURFACES else None,
                     UNRESOLVED.format(", ".join(unread)) if unread else None,
-                    UNKNOWN_COVERAGE if coverage is None else None,
+                    UNKNOWN_COVERAGE if not rows and gaps is None else None,
                 )
                 if n
             )
@@ -1398,7 +1546,8 @@ class ExposureService:
         """Keep the documents for every advisory a finding names, from each registered source:
         CVE ids to the CVE List, NVD and Red Hat, GHSA ids to `ghsa`. A failed source keeps its
         last manifest and says why (`ok` false); when every source asked fails, it raises."""
-        names = self._names_of(self._findings.linked_advisory_ids()).values()
+        linked = self._names_of(self._findings.linked_advisory_ids())
+        names = list(linked.values())
         cves = sorted({c for n in names for c in n.cves})
         ghsas = sorted({g for n in names for g in n.ghsas})
         outcomes = []
@@ -1442,7 +1591,118 @@ class ExposureService:
             # nothing refreshed anywhere: an outage, never a result a caller could take as done
             reasons = "; ".join(f"{o.source}: {o.error}" for o in attempted)
             raise ServiceError(f"no advisory documents refreshed ({reasons})")
+        if outcomes:  # some source is registered: rank what the documents now say
+            self._build_after(outcomes, linked, run_order_id)
         return outcomes
+
+    def _build_after(
+        self,
+        outcomes: Sequence[AdvisoryDocumentsRefresh],
+        linked: Mapping[UUID, AdvisoryNames],
+        run_order_id: UUID | None,
+    ) -> None:
+        """Build the CVSS ranking; a store failure raises `AdvisoryCvssNotBuilt` carrying the
+        finished document refresh's outcomes (its documents kept, the last build served)."""
+        try:
+            self._record_advisory_cvss(linked, run_order_id)
+        except (RepositoryError, NotFoundError, IntegrityError) as e:
+            cause = type(e.__cause__).__name__ if e.__cause__ is not None else None
+            log.error(
+                "%s not built; documents kept error_type=%s cause=%s operation=%s",
+                ADVISORY_CVSS_FEED, type(e).__name__, cause, getattr(e, "operation", None),
+            )  # fmt: skip
+            raise AdvisoryCvssNotBuilt(
+                f"{ADVISORY_CVSS_FEED} not built ({type(e).__name__}: {_redacted(str(e))}); "
+                "the documents were kept",
+                outcomes,
+            ) from e
+
+    def refresh_advisory_cvss(self, run_order_id: UUID | None = None) -> AdvisoryCvss:
+        """Rank every authority's scores for each linked advisory from the kept documents and
+        store the build (`advisory-cvss`): the views read it, never the documents."""
+        if not self._document_sources():
+            raise ConfigError(f"{ADVISORY_CVSS_FEED}: no advisory document source is registered")
+        return self._record_advisory_cvss(
+            self._names_of(self._findings.linked_advisory_ids()), run_order_id
+        )
+
+    def advisory_cvss(self, advisory_ids: Collection[UUID]) -> AdvisoryCvssRead:
+        """Authority scores by advisory id from the latest build, which keys each canonical
+        advisory and every id a finding names; an advisory no authority scored is absent."""
+        with self._uow as uow:
+            return self._advisory_cvss.read(uow, advisory_ids)
+
+    def _document_sources(self) -> list[str]:
+        return [s for s in _ADVISORY_DOCUMENT_SOURCES if s in self._feed_sources.names()]
+
+    def _record_advisory_cvss(
+        self, linked: Mapping[UUID, AdvisoryNames], run_order_id: UUID | None
+    ) -> AdvisoryCvss:
+        """A store failure (`RepositoryError`) stops the build, so the last one stays served
+        rather than a partial one; an unreadable document or manifest only scores nothing."""
+        advisories = list({n.advisory_id: n for n in linked.values()}.values())
+        manifests: dict[str, FeedDocumentManifest] = {}
+        unreadable: list[str] = []
+        for source in self._document_sources():
+            try:
+                manifest = self.document_manifest(source)
+            except (ValidationError, NotFoundError, IntegrityError) as e:
+                log.warning("%s unreadable; it scores nothing: %s", _documents_feed(source), e)
+                unreadable.append(_documents_feed(source))
+                continue
+            if manifest is not None:
+                manifests[source] = manifest
+            elif any(_names_for(source, a) for a in advisories):
+                # it has names to score but has kept nothing yet: a gap, never a silent absence
+                log.warning("%s: none kept yet; it scores nothing", _documents_feed(source))
+                unreadable.append(_documents_feed(source))
+        parsed: dict[tuple[str, str], tuple[CvssScore, ...]] = {}
+
+        def stated(source: str, identifier: str) -> tuple[CvssScore, ...]:
+            key = (source, identifier)
+            entry = manifests[source].documents.get(identifier)
+            if key not in parsed and entry is not None:
+                try:
+                    parsed[key] = self._document_scores(source, identifier, entry)
+                except (ValidationError, NotFoundError, IntegrityError) as e:
+                    log.warning("%s:%s unreadable; it scores nothing: %s", source, identifier, e)
+                    unreadable.append(f"{source}:{identifier}")
+                    parsed[key] = ()
+            return parsed.get(key, ())
+
+        by_advisory: dict[UUID, tuple[CvssScore, ...]] = {}
+        for advisory in advisories:
+            found = [
+                score
+                for source in manifests
+                for identifier in _names_for(source, advisory)
+                for score in stated(source, identifier)
+            ]
+            if found:
+                by_advisory[advisory.advisory_id] = effective(found).scores
+        # keyed by every id a finding names too, so a view reads it with no advisory lookup
+        aliased = {
+            i: by_advisory[n.advisory_id] for i, n in linked.items() if n.advisory_id in by_advisory
+        }
+        build = AdvisoryCvss(scores=aliased | by_advisory, unreadable=tuple(sorted(unreadable)))
+        raw = build.to_bytes()
+        key = ObjectKey.parse(f"feeds/{ADVISORY_CVSS_FEED}/{sha256_hex(raw)}.json")
+        self._snapshot(ADVISORY_CVSS_FEED, key, raw, run_order_id)
+        self._intake.restamp_advisories(list(linked))  # their severity moved with the build
+        return build
+
+    def _document_scores(
+        self, source: str, identifier: str, entry: FeedDocument
+    ) -> tuple[CvssScore, ...]:
+        """The scores a kept document states: its bytes checked against the manifest's digest,
+        every score from the record asked for (a source can answer with another one)."""
+        raw = self._objects.read(_document_object(source, entry.digest), entry.digest)
+        named = record_ids(_DOCUMENT_PREFIX[source], raw)
+        if not named:  # an NVD reply with no vulnerability: the record asked for isn't in it
+            raise ValidationError(f"{source}: {identifier}: the document names no record")
+        if any(i.casefold() != identifier.casefold() for i in named):
+            raise ValidationError(f"{source}: {identifier}: the document is {', '.join(named)}'s")
+        return _SCORES_OF[source](raw, acquired_at=entry.acquired_at)
 
     def advisories_for(self, finding_id: UUID) -> list[Advisory]:
         """The advisory a finding is about, canonical first, then every alias (CVE, GHSA, OSV
@@ -1496,14 +1756,14 @@ class ExposureService:
             else FixUptakeState.PENDING
         )
         if state != FixUptakeState.PENDING and not any(i is None for i, _ in rows):
-            coverage = self.unresolved_manifests(repository_ref_id)
-            if coverage is None or any(m.ecosystem == ecosystem for m in coverage):
+            gaps = self._manifest_coverage(ref).for_ecosystem(ecosystem)
+            if gaps != ():
                 return FixUptake(state=FixUptakeState.NOT_OBSERVED, checked=checked)
         return FixUptake(state=state, checked=checked)
 
     def affected(self, advisory_id: UUID) -> list[AffectedDependency]:
-        """Commits and images whose SBOM reaches the advisory's packages: directly, through a
-        base image, or through an internal library another repository produces."""
+        """Observed SBOM paths to the advisory's packages (including through images and libraries).
+        Missing rows do not prove absence in a manifest with unknown coverage."""
         self._require_portfolio()
         with self._uow as uow:
             advisory = uow.advisories.get(advisory_id)
@@ -1919,11 +2179,17 @@ class ExposureService:
     def dependencies(self, repository_ref_id: UUID) -> list[RefDependency]:
         """The packages in the commit's manifest SBOM, by ecosystem, name and version. A commit
         with none ingested raises: unknown is never read as no dependencies."""
+        return self.manifest_dependencies(repository_ref_id)[1]
+
+    def manifest_dependencies(
+        self, repository_ref_id: UUID
+    ) -> tuple[RepositoryRef, list[RefDependency]]:
+        """Observed dependency rows with the ref snapshot that identifies their scan."""
         with self._uow as uow:
             ref = self._inventory.get_ref(repository_ref_id)
             if ref.manifest_sbom_id is None:
                 raise NoManifestSbomError(repository_ref_id)
-            return _sbom_packages(uow, ref.manifest_sbom_id)
+            return ref, _sbom_packages(uow, ref.manifest_sbom_id)
 
     def manifest_packages(self, refs: Collection[RepositoryRef]) -> dict[UUID, list[Package]]:
         """The distinct packages in each commit's manifest SBOM, by ref id, read in bounded
@@ -1956,8 +2222,9 @@ class ExposureService:
             return uow.packages.find(ecosystem, package_name(ecosystem, name))
 
     def dependents(self, package_id: UUID, version: str | None = None) -> list[UUID]:
-        """The commits whose SBOMs hold the package (at `version`, when given): directly,
-        through a base image, or through an internal library (`affected`'s walk)."""
+        """Commits observed holding the package (optionally at `version`), directly or through
+        images or libraries. Commits whose manifest coverage is `coverage_unknown` can be
+        missing."""
         with self._uow as uow:
             uow.packages.get(package_id)
         reached = self._reach({package_id}, version)
@@ -2199,7 +2466,57 @@ class ExposureService:
         return FeedStatus(name=feed, fetched_at=fetched_at, max_age=max_age)
 
     def feed_statuses(self) -> list[FeedStatus]:
-        return [self.feed_status(FeedName(f)) for f in self._feeds.names()]
+        """Every whole-file feed's age, then each advisory document source's kept manifest
+        (`<source>-documents`) once it has one: a refresh that stops working goes stale."""
+        feeds = [self.feed_status(FeedName(f)) for f in self._feeds.names()]
+        return [*feeds, *self._document_feed_statuses()]
+
+    def _document_feed_statuses(self) -> list[FeedStatus]:
+        sources = [s for s in _ADVISORY_DOCUMENT_SOURCES if s in self._feed_sources.names()]
+        with self._uow as uow:
+            latest = {s: uow.feed_snapshots.latest(_documents_feed(s)) for s in sources}
+            built = uow.feed_snapshots.latest(ADVISORY_CVSS_FEED) if sources else None
+        ages = {s: self._feed_sources.get(s).max_age for s in sources}
+        statuses = [
+            FeedStatus(
+                name=_documents_feed(source),
+                fetched_at=snapshot.retrieved_at,
+                max_age=ages[source],
+                refresh=_REFRESH_DOCUMENTS,
+            )
+            for source, snapshot in latest.items()
+            if snapshot is not None
+        ]
+        if built is not None:
+            statuses.append(self._build_status(built, latest, min(ages.values())))
+        return statuses
+
+    def _build_status(
+        self,
+        built: FeedSnapshot,
+        documents: Mapping[str, FeedSnapshot | None],
+        max_age: timedelta,
+    ) -> FeedStatus:
+        """The build is as old as its oldest source's documents; an unreadable build, or one a
+        source with names to score gave nothing, has no fresh time at all."""
+        with self._uow as uow:
+            build = self._advisory_cvss.parsed(uow, built)
+        missing = [] if build is None else [u for u in build.unreadable if u.endswith("-documents")]
+        error = (
+            "the latest build is unreadable"
+            if build is None
+            else f"no readable documents from {', '.join(missing)}"
+            if missing
+            else None
+        )
+        times = [built.retrieved_at, *(s.retrieved_at for s in documents.values() if s is not None)]
+        return FeedStatus(
+            name=ADVISORY_CVSS_FEED,
+            fetched_at=None if error else min(times),
+            max_age=max_age,
+            last_error=error,
+            refresh=_REFRESH_DOCUMENTS,
+        )
 
     def feed_payload(self, feed: FeedName) -> bytes | None:
         """The latest snapshot's bytes; None when the feed was never fetched."""
@@ -2325,8 +2642,9 @@ class ExposureService:
                 f"{source}: no document fetched ({len(failed)} failed, each logged; "
                 f"first: {failed[0].error})"
             )
-        manifest = FeedDocumentManifest(source=source, documents=documents)
-        self._snapshot_documents(source, manifest.to_bytes(), run_order_id)
+        raw = FeedDocumentManifest(source=source, documents=documents).to_bytes()
+        key = ObjectKey.parse(f"feeds/{source}/manifests/{sha256_hex(raw)}.json")
+        self._snapshot(_documents_feed(source), key, raw, run_order_id)
         return DocumentRefresh(
             source=source, fetched=tuple(fetched), failed=tuple(failed), carried=tuple(carried)
         )
@@ -2381,13 +2699,10 @@ class ExposureService:
         ref = self._objects.put(_document_object(source, sha256_hex(result.data)), result.data)
         return FeedDocument(digest=ref.sha256, acquired_at=result.acquisition.acquired_at)
 
-    def _snapshot_documents(self, source: str, raw: bytes, run_order_id: UUID | None) -> None:
-        """Record the manifest and its snapshot; the retry checks run after the artifact insert,
-        which serializes writers of the kind, so concurrent refreshes see each other."""
-        ref = self._objects.put(
-            ObjectKey.parse(f"feeds/{source}/manifests/{sha256_hex(raw)}.json"), raw
-        )
-        feed = _documents_feed(source)
+    def _snapshot(self, feed: str, key: ObjectKey, raw: bytes, run_order_id: UUID | None) -> None:
+        """Record the bytes and the feed's snapshot; the retry checks run after the artifact
+        insert, which serializes writers of the kind, so concurrent refreshes see each other."""
+        ref = self._objects.put(key, raw)
         with self._uow as uow:
             artifact = record_artifact(
                 uow, Artifact(digest=ref.sha256, kind=FEED_ARTIFACT_KIND, uri=str(ref.key))
@@ -2396,7 +2711,7 @@ class ExposureService:
             latest = uow.feed_snapshots.latest(feed)
             if run_order_id is not None and latest is not None:
                 if latest.run_order_id == run_order_id and latest.artifact_id == artifact.id:
-                    return  # a retry that kept the same documents
+                    return  # a retry that kept the same bytes
                 if latest.run_order_id != run_order_id and uow.feed_snapshots.for_run_order(
                     feed, run_order_id
                 ):
@@ -2656,6 +2971,39 @@ def _in_range(
     return True if True in verdicts else None if None in verdicts or not verdicts else False
 
 
+class StoredAdvisories:
+    """What core keeps about an advisory: a read, never a fetch. Report intake and the settling
+    of held moves use it to identify a report's dependency finding the way an impact analysis
+    identifies its own (`with_exposures`)."""
+
+    def __init__(self, uow: TraustUnitOfWork) -> None:
+        self._uow = uow
+
+    def canonical(self, identifier: str) -> Advisory | None:
+        """The canonical advisory a stored identifier or alias names."""
+        with self._uow as uow:
+            found = uow.advisories.find_by_identifier(identifier)
+            if found is None or found.alias_of_id is None:
+                return found
+            return uow.advisories.get(found.alias_of_id)
+
+    def ecosystem_of(self, advisory_id: UUID, module: str) -> str | None:
+        """The one ecosystem in which the stored advisory names `module`; None when it names
+        the module in none or in more than one, so an ecosystem is never guessed."""
+        with self._uow as uow:
+            packages = (
+                uow.packages.get(link.package_id)
+                for link in uow.advisory_packages.list_for_advisory(advisory_id)
+            )
+            ecosystems = {
+                p.ecosystem
+                for p in packages
+                if p is not None
+                and stored_name(p.ecosystem, p.name) == stored_name(p.ecosystem, module)
+            }
+        return ecosystems.pop() if len(ecosystems) == 1 else None
+
+
 def _exposure_candidate(
     repository_id: UUID, doc: ImpactAnalysisArtifact, record: AdvisoryRecord, canonical: Advisory
 ) -> FindingCandidate:
@@ -2674,12 +3022,7 @@ def _exposure_candidate(
         ),
         category=Category(SUPPLY_CHAIN),
         reported_severity=record.severity,
-        exposure=ExposureKey(
-            advisory_id=canonical.id,
-            advisory=canonical.identifier,
-            ecosystem=meta.ecosystem,
-            package=meta.module,
-        ),
+        exposure=exposure_key(canonical, meta.ecosystem, meta.module),
     )
 
 
@@ -2717,6 +3060,106 @@ def _with_judged(found: SymbolResolution | None, judged: Sequence[str]) -> Symbo
     return found.model_copy(
         update={"status": SymbolStatus.RESOLVED, "symbols": (*found.symbols, *extra)}
     )
+
+
+class AdvisoryCvssRead(Model):
+    """Authority scores by asked advisory id and when their build was made (None: none yet);
+    `unreadable`: the latest build can't be read, so nothing is scored until the next one."""
+
+    scores: Mapping[UUID, tuple[CvssScore, ...]]
+    built_at: datetime | None
+    unreadable: bool = False
+
+
+class AdvisoryCvssCache:
+    """The latest advisory CVSS build, parsed once per publication (its snapshot): the Context
+    owns it, so it outlives per-request services. An unreadable one is kept until the next."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._by_publication: tuple[UUID, AdvisoryCvss | None] | None = None
+
+    def parse(self, publication_id: UUID, read: Callable[[], bytes]) -> AdvisoryCvss | None:
+        """A store failure (`RepositoryError`) reads as no build and is never kept: the next
+        read retries. The read runs outside the lock, so a slow store blocks no other reader."""
+        with self._lock:
+            if self._by_publication is not None and self._by_publication[0] == publication_id:
+                return self._by_publication[1]
+        try:
+            raw = read()
+        except RepositoryError as e:
+            log.warning(
+                "advisory CVSS build %s not read (%s); no authority scores this read",
+                publication_id,
+                type(e).__name__,
+            )
+            return None
+        except (NotFoundError, IntegrityError) as e:
+            raw, lost = None, e
+        with self._lock:
+            if self._by_publication is not None and self._by_publication[0] == publication_id:
+                return self._by_publication[1]  # another reader parsed it meanwhile
+            try:
+                if raw is None:
+                    raise lost
+                parsed: AdvisoryCvss | None = AdvisoryCvss.from_bytes(raw)
+            except (ValidationError, NotFoundError, IntegrityError) as e:
+                log.error(
+                    "advisory CVSS build %s is unreadable (%s); no authority scores until the next",
+                    publication_id,
+                    type(e).__name__,
+                )
+                parsed = None
+            self._by_publication = (publication_id, parsed)
+            return parsed
+
+
+class AdvisoryCvssReader:
+    """The latest `advisory-cvss` build, read in the caller's transaction: the door every
+    view's authority scores come through; inside `pinned`, which build is read once."""
+
+    def __init__(self, objects: ObjectStore, cache: AdvisoryCvssCache) -> None:
+        self._objects = objects
+        self._cache = cache
+        self._pinned = 0
+        self._latest: tuple[FeedSnapshot | None] | None = None
+
+    @contextmanager
+    def pinned(self) -> Iterator[None]:
+        """A composed build's many facts loads count at one build; nothing outlives the block."""
+        self._pinned += 1
+        try:
+            yield
+        finally:
+            self._pinned -= 1
+            if not self._pinned:
+                self._latest = None
+
+    def read(self, uow: TraustUnitOfWork, advisory_ids: Collection[UUID]) -> AdvisoryCvssRead:
+        if self._latest is None or not self._pinned:
+            self._latest = (uow.feed_snapshots.latest(ADVISORY_CVSS_FEED),)
+        (latest,) = self._latest
+        if latest is None:
+            return AdvisoryCvssRead(scores={}, built_at=None)
+        build = self.parsed(uow, latest)
+        if build is None:
+            return AdvisoryCvssRead(scores={}, built_at=latest.retrieved_at, unreadable=True)
+        scores = {i: found for i in advisory_ids if (found := build.scores.get(i))}
+        return AdvisoryCvssRead(scores=scores, built_at=latest.retrieved_at)
+
+    def parsed(self, uow: TraustUnitOfWork, snapshot: FeedSnapshot) -> AdvisoryCvss | None:
+        def read() -> bytes:  # a lost artifact row reads as an unreadable build, like lost bytes
+            artifact = AssessmentLog(uow).get_artifact(snapshot.artifact_id)
+            return stored_bytes(self._objects, artifact)
+
+        assert snapshot.id is not None
+        # by publication, not artifact: an unchanged rebuild after a failed read reads again
+        return self._cache.parse(snapshot.id, read)
+
+
+def _names_for(source: str, advisory: AdvisoryNames) -> tuple[str, ...]:
+    """The advisory's names a document source is asked for: its CVEs, or its GHSAs."""
+    return advisory.cves if _ADVISORY_DOCUMENT_SOURCES[source] == "cve" else advisory.ghsas
 
 
 def _documents_feed(source: str) -> str:

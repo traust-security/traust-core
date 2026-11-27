@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import boto3
@@ -233,12 +234,14 @@ def test_the_adopter_fields_default_and_read(tmp_path: Path) -> None:
             "feeds: {osv_access: air-gapped}\n"
             "execution: {sandbox: podman}\n"
             "campaign: {tracking_reference: SEC-1, display_name: Q4}\n"
-            "remediation: {fork_org: mirrors, private_forge_hosts: [git.example.invalid]}\n",
+            "remediation: {fork_org: mirrors, private_forge_hosts: [git.example.invalid],"
+            " committer: sci-remediation}\n",
         )
     )
     assert (config.feeds.osv_access, config.execution.sandbox) == ("air-gapped", "podman")
     assert (config.campaign.tracking_reference, config.campaign.display_name) == ("SEC-1", "Q4")
     assert config.remediation.private_forge_hosts == ("git.example.invalid",)
+    assert config.remediation.committer == "sci-remediation"
 
 
 def test_forge_tokens_sit_beside_forge_hosts(
@@ -337,17 +340,26 @@ def test_no_api_keys_is_keyless(tmp_path: Path) -> None:
     assert ctx.feed_sources.get("nvd")._api_key is None
 
 
-def test_a_named_key_variable_that_is_unset_is_a_config_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("value", [None, ""])
+def test_a_named_key_variable_that_is_unset_or_empty_runs_keyless_and_logs_an_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    value: str | None,
 ) -> None:
-    monkeypatch.delenv("TEST_NVD_KEY", raising=False)
+    if value is None:
+        monkeypatch.delenv("TEST_NVD_KEY", raising=False)
+    else:
+        monkeypatch.setenv("TEST_NVD_KEY", value)
     registry = tmp_path / "feeds.yaml"
     registry.write_text(NVD_REGISTRY)
     ctx = Context(Config.from_home(_home(tmp_path, "feeds: {api_keys: {nvd: TEST_NVD_KEY}}\n")))
-    with pytest.raises(
-        ConfigError, match=r"feeds\.api_keys\.nvd names unset variable TEST_NVD_KEY"
-    ):
+    with caplog.at_level(logging.ERROR):
         ctx.register_feeds(registry)
+    nvd = ctx.feed_sources.get("nvd")
+    assert nvd._api_key is None and nvd._keyless is not None and "TEST_NVD_KEY" in nvd._keyless
+    (record,) = [r for r in caplog.records if getattr(r, "operation", None) == "feeds.api_key"]
+    assert record.levelno == logging.ERROR and "runs keyless" in record.getMessage()
 
 
 @pytest.mark.parametrize(
@@ -358,19 +370,38 @@ def test_feeds_api_keys_take_registry_names_and_variable_names(tmp_path: Path, t
         Config.from_home(_home(tmp_path, text))
 
 
-def test_a_retry_after_setting_the_key_registers_cleanly(
+def test_a_failed_registration_logs_no_keyless_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.delenv("TEST_NVD_KEY", raising=False)
+    registry = tmp_path / "feeds.yaml"
+    plain = (
+        "  plain:\n    tier: live\n    url_template: http://plain.test/{ident_upper}\n"
+        "    ident: cve\n"
+    )
+    registry.write_text(NVD_REGISTRY + plain)  # not https: the load fails
+    ctx = Context(Config.from_home(_home(tmp_path, "feeds: {api_keys: {nvd: TEST_NVD_KEY}}\n")))
+    with caplog.at_level(logging.ERROR), pytest.raises(ConfigError):
+        ctx.register_feeds(registry)
+    assert not [r for r in caplog.records if getattr(r, "operation", None) == "feeds.api_key"]
+    assert ctx.feed_sources.names() == []
+
+
+def test_a_key_set_after_a_keyless_run_is_used_by_the_next_context(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("TEST_NVD_KEY", raising=False)
     registry = tmp_path / "feeds.yaml"
     registry.write_text(NVD_REGISTRY)
-    ctx = Context(Config.from_home(_home(tmp_path, "feeds: {api_keys: {nvd: TEST_NVD_KEY}}\n")))
-    with pytest.raises(ConfigError, match="unset variable"):
-        ctx.register_feeds(registry)
-    assert ctx.feed_sources.names() == []  # nothing half-registered
+    home = _home(tmp_path, "feeds: {api_keys: {nvd: TEST_NVD_KEY}}\n")
+    keyless = Context(Config.from_home(home))
+    keyless.register_feeds(registry)
+    assert keyless.feed_sources.get("nvd")._api_key is None
     monkeypatch.setenv("TEST_NVD_KEY", "k-1")
-    ctx.register_feeds(registry)
-    assert ctx.feed_sources.get("nvd")._api_key is not None
+    keyed = Context(Config.from_home(home))
+    keyed.register_feeds(registry)
+    assert keyed.feed_sources.get("nvd")._api_key is not None
+    assert keyed.feed_sources.get("nvd")._keyless is None
 
 
 def test_a_malformed_key_fails_before_anything_registers(

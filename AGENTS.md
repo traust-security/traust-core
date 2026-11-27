@@ -58,9 +58,21 @@ Python 3.11+ library. The platform API lives in `traust_core.v1`. Overview: [REA
   - lists are paged with a cursor (`Page`); filters are query parameters on the collection
   - every request carries a request ID (accept `X-Request-ID` or W3C `traceparent`, else mint one), returned in the response and in every log line it causes
   - one structured access-log line per request: method, route, status, duration, request ID, caller
+- **Dashboards and reports are separate domains.** `services/dashboards/` answers `POST /v1/dashboards:query` with one SQL statement over the facts (`SqlDashboardFacts`) — catalog-bounded, repository-id-filtered, state read from the stamped fold (`decision.folded_state`), never recomputed per request; `dashboards/` never imports the fold (`all_in`, `census_fold`, the findings aggregation). `services/reports.py` runs reports as jobs: a request queues a `report` order, the reports role builds it in its own process, and the published artifact records its scope. The two domains never import each other
+- The dashboard catalog (subjects, dimensions, measures) is `models/dashboard.py` — the single source of truth; contracts holds no vocabulary, and the SDK generates from core's published models
+- **Serving splits by role** (`rest/roles.py`): `traust-server --role query|command|ops|reports`, default `all`. Every route belongs to exactly one role; health and identity serve in every role; the reports role serves no routes — it is the worker that builds report orders
 
 ## Contracts
 
+- **Store upgrades are core's, on the operator's call.** A store behind the db contract refuses
+  to open (a local dev store applies at open — opening the new version is the consent). The
+  operator path is `traust-server --config traust.yaml db upgrade` (plan; `--apply` to run,
+  `--allow-destructive` to acknowledge declared destructive work); embedders use
+  `Context.pending_db_upgrades()` / `apply_db_upgrades()` / `store_status()`. A database from
+  before the channel is presumed current: it starts on the channel at the head — the first
+  apply (or a local open) stamps every shipped script as applied, nothing re-runs. Never
+  hand-apply DDL or edit an applied script; a shape change lands as a channel script in
+  traust-contracts.
 - traust-contracts is a pinned dependency; read its data through `traust_core.v1.contracts` only, never import `traust_contracts`
 - Nothing from traust-contracts is copied or generated into this repo
 - Artifacts are named types in `models/artifacts.py` (`TriageArtifact`, ...); their fields come from the installed schema, never a hand-written copy

@@ -49,12 +49,13 @@ from traust_core.v1.models.common import ArtifactRef, Provenance
 from traust_core.v1.models.findings import FindingCandidate
 from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.integrity import sha256_hex
-from traust_core.v1.models.operations import OrderRequest, WorkerId
+from traust_core.v1.models.operations import OrderRequest, RunOrder, WorkerId
 from traust_core.v1.models.vocabulary import ActorKind, SourceType
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectKey
 from traust_core.v1.repositories.objects.store import ObjectRef
 from traust_core.v1.services.artifact_publishing import AssessmentLog, PublishSpec, PublishSpecs
+from traust_core.v1.services.ledger import LedgerConfig
 
 FIXTURES = Path(__file__).parents[2] / "fixtures"
 WHEN = datetime(2026, 10, 23, 9, tzinfo=UTC)
@@ -122,6 +123,12 @@ def context(engine: Engine, tmp_path: Path) -> Context:
     ctx = Context(Config(home=tmp_path))
     ctx.__dict__["database"] = engine
     return ctx
+
+
+def ledger_writer(context: Context) -> Context:
+    writer = Context(context.config.model_copy(update={"ledger": LedgerConfig()}))
+    writer.__dict__["database"] = context.database
+    return writer
 
 
 @pytest.fixture
@@ -807,7 +814,9 @@ OPERATOR = Principal(
 )
 
 
-def order(context: Context, ref: UUID | None, *, lease: bool = True, expired: bool = False) -> UUID:
+def order(
+    context: Context, ref: UUID | None, *, lease: bool = True, expired: bool = False
+) -> RunOrder:
     """An order on `ref`'s repository (None: fleet-wide), leased unless `lease` is false; an
     `expired` lease is still marked leased, as it is until the engine requeues it."""
     services = context.services()
@@ -816,8 +825,13 @@ def order(context: Context, ref: UUID | None, *, lease: bool = True, expired: bo
         OrderRequest(asset="full_audit", priority=1, repository_id=repository_id), OPERATOR
     )
     assert submitted.id is not None
-    if lease:
-        services.ops.claim(WorkerId("machine:runner"), timedelta(minutes=5), order_id=submitted.id)
+    services.ops.admit(submitted.id)  # the engine's admission tick queues the planned order
+    if not lease:
+        return submitted
+    held = services.ops.claim(
+        WorkerId("machine:runner"), timedelta(minutes=5), order_id=submitted.id
+    )
+    assert held is not None
     if expired:
         with SqlTraustUnitOfWork(context.database) as uow:
             leased = uow.run_orders.get(submitted.id)
@@ -825,7 +839,7 @@ def order(context: Context, ref: UUID | None, *, lease: bool = True, expired: bo
                 leased.model_copy(update={"lease_expires_at": datetime(2000, 1, 1, tzinfo=UTC)})
             )
             uow.commit()
-    return submitted.id
+    return held
 
 
 def test_an_assessment_recorded_for_a_leased_order_is_that_orders_result(
@@ -839,10 +853,14 @@ def test_an_assessment_recorded_for_a_leased_order_is_that_orders_result(
         "skill:test",
         "0.1.0",
         provenance(),
-        run_order_id=run,
+        run_order_id=run.id,
+        worker=WorkerId("machine:runner"),
+        lease_generation=run.lease_generation,
     )
-    assert saved.run_order_id == run
-    assert [a.id for a in context.services().assessment.list_for_order(run)] == [saved.id]
+    with pytest.raises(ConflictError, match=f"belongs to order {run.id}"):
+        record(context, REPORT, ref, AssessmentKind.CONTAINER)
+    assert saved.run_order_id == run.id
+    assert [a.id for a in context.services().assessment.list_for_order(run.id)] == [saved.id]
 
 
 def test_an_order_that_is_not_running_or_ran_elsewhere_takes_no_assessment(
@@ -856,12 +874,13 @@ def test_an_order_that_is_not_running_or_ran_elsewhere_takes_no_assessment(
         )
         uow.commit()
     assert other.id is not None
+    queued = order(context, ref, lease=False)
     cases = [
-        (order(context, ref, lease=False), ConflictError, "not leased"),
+        (queued, ConflictError, "not leased"),
         (order(context, other.id), ForbiddenError, "outside its scope"),
         (order(context, None), ForbiddenError, "outside its scope"),
         (order(context, ref, expired=True), ConflictError, "lease expired"),
-        (uuid4(), NotFoundError, ""),
+        (queued.model_copy(update={"id": uuid4()}), NotFoundError, ""),
     ]
     for run, error, match in cases:
         with pytest.raises(error, match=match):
@@ -872,20 +891,72 @@ def test_an_order_that_is_not_running_or_ran_elsewhere_takes_no_assessment(
                 "skill:test",
                 "0.1.0",
                 provenance(),
-                run_order_id=run,
+                run_order_id=run.id,
+                worker=WorkerId("machine:runner"),
+                lease_generation=run.lease_generation or 1,
             )
     with SqlTraustUnitOfWork(engine) as uow:
         assert uow.assessments.list_for_ref(ref) == []
 
 
+@pytest.mark.parametrize("audit", [False, True], ids=["record", "record-audit"])
+@pytest.mark.parametrize(
+    ("has_order", "has_worker", "has_generation"),
+    [
+        (True, False, False),
+        (False, True, False),
+        (False, False, True),
+        (True, True, False),
+        (True, False, True),
+        (False, True, True),
+    ],
+)
+def test_partial_lease_credentials_never_stage_an_assessment(
+    context: Context,
+    ref: UUID,
+    audit: bool,
+    has_order: bool,
+    has_worker: bool,
+    has_generation: bool,
+) -> None:
+    service = context.services().assessment
+    credentials = {
+        "run_order_id": uuid4() if has_order else None,
+        "worker": WorkerId("machine:runner") if has_worker else None,
+        "lease_generation": 1 if has_generation else None,
+    }
+    with pytest.raises(ValidationError):
+        if audit:
+            doc = CloudConfigAuditArtifact.parse(
+                fixture("cloud_config/myrepo-cloud-config-audit.json")
+            )
+            service.record_audit(doc, ref, provenance(), **credentials)
+        else:
+            service.record(
+                REPORT,
+                ref,
+                AssessmentKind.CONTAINER,
+                "skill:test",
+                "1",
+                provenance(),
+                **credentials,
+            )
+    assert not list(context.object_store.list())
+    with SqlTraustUnitOfWork(context.database) as uow:
+        assert not uow.assessments.list_for_ref(ref)
+
+
 @pytest.mark.parametrize("kind", [AssessmentKind.FUZZ, AssessmentKind.CLOUD_CONFIG_CANONICAL])
+@pytest.mark.parametrize("reclaim", [False, True])
 def test_slow_object_upload_does_not_hold_the_orders_write_lock(
     context: Context,
     engine: Engine,
     ref: UUID,
     kind: AssessmentKind,
+    reclaim: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    context = ledger_writer(context)
     subject = (
         FuzzReportArtifact.parse(fixture("assessments/widget-fuzz-report.json"))
         if kind == AssessmentKind.FUZZ
@@ -897,6 +968,7 @@ def test_slow_object_upload_does_not_hold_the_orders_write_lock(
             repository_id=target.repository_id,
             state="leased",
             lease_holder="stager",
+            lease_generation=1,
             lease_expires_at=context.clock.now() + timedelta(minutes=10),
             started_at=context.clock.now(),
         )
@@ -915,9 +987,24 @@ def test_slow_object_upload_does_not_hold_the_orders_write_lock(
         owner = context.services().assessment
         if kind == AssessmentKind.FUZZ:
             return owner.record(
-                subject, ref, kind, "skill:fuzz", "1", provenance(), run_order_id=order.id
+                subject,
+                ref,
+                kind,
+                "skill:fuzz",
+                "1",
+                provenance(),
+                run_order_id=order.id,
+                worker=WorkerId("stager"),
+                lease_generation=order.lease_generation,
             )
-        return owner.record_audit(subject, ref, provenance(), run_order_id=order.id)[0]
+        return owner.record_audit(
+            subject,
+            ref,
+            provenance(),
+            run_order_id=order.id,
+            worker=WorkerId("stager"),
+            lease_generation=order.lease_generation,
+        )[0]
 
     with ThreadPoolExecutor(max_workers=1) as pool:
         pending = pool.submit(publish)
@@ -929,14 +1016,34 @@ def test_slow_object_upload_does_not_hold_the_orders_write_lock(
                 else:
                     contender.connection.exec_driver_sql("PRAGMA busy_timeout = 250")
                 locked = contender.run_orders.get_for_update(order.id)
-                updated = contender.run_orders.update(
-                    locked.model_copy(update={"priority": locked.priority + 1})
+                changes = (
+                    {"lease_expires_at": locked.started_at}
+                    if reclaim
+                    else {"priority": locked.priority + 1}
                 )
-                assert updated.priority == order.priority + 1
+                contender.run_orders.update(locked.model_copy(update=changes))
                 assert contender.artifacts.latest_imported(subject.schema) is None
                 contender.commit()
+            if reclaim:
+                replacement = context.services().ops.claim(
+                    WorkerId("stager"), timedelta(minutes=5), order_id=order.id
+                )
+                assert replacement is not None
+                assert replacement.lease_generation == order.lease_generation + 1
         finally:
             release.set()
+        if reclaim:
+            with pytest.raises(ConflictError):
+                pending.result(timeout=20)
+            with SqlTraustUnitOfWork(engine) as uow:
+                assert not uow.assessments.list_for_run_order(order.id)
+                assert uow.artifacts.latest_imported(subject.schema) is None
+                assert not uow.findings.list_for_repository(order.repository_id)
+            return
         recorded = pending.result(timeout=20)
     assert recorded.run_order_id == order.id
     assert context.services().assessment.get(recorded.id).id == recorded.id
+    with SqlTraustUnitOfWork(engine) as uow:
+        decisions = uow.decisions.list_for_assessments([recorded.id])
+        assert decisions
+        assert all(uow.events.find_by_decision(d.id) is not None for d in decisions)

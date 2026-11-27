@@ -35,6 +35,34 @@ def test_lookups_by_natural_key(seed: Seed) -> None:
     assert u.releases.find(product.id, "9.9") is None
 
 
+def test_the_batch_url_lookup_answers_the_exact_spellings(seed: Seed) -> None:
+    """The resolution door's first tier: the rows registered at these URLs, one statement
+    per batch — misses answered by absence, never an error."""
+    u = seed.uow
+    one = seed.repository(url="https://github.com/org/one")
+    two = seed.repository(url="https://gitlab.com/org/two")
+    found = u.repositories.find_by_urls(
+        ["https://github.com/org/one", "https://github.com/org/missing", two.url]
+    )
+    assert same_rows(found, [one, two])
+    assert u.repositories.find_by_urls([]) == []
+
+
+def test_the_batch_casefold_lookup_answers_every_folded_row(seed: Seed) -> None:
+    """The resolution door's GitHub tier: every row whose URL matches one of the spellings
+    ignoring case — several rows under one folded key included (the door lists them as
+    candidates, never picks), oldest first."""
+    u = seed.uow
+    first = seed.repository(url="https://github.com/org/casey")
+    apart()  # separate the creation stamps: the candidates answer oldest first
+    second = seed.repository(url="https://github.com/Org/CASEY")
+    found = u.repositories.find_by_urls_casefold(
+        ["https://github.com/ORG/casey", "https://gitlab.com/ORG/OTHER"]
+    )
+    assert same_rows(found, [first, second])
+    assert u.repositories.find_by_urls_casefold([]) == []
+
+
 def test_releases_and_components_list_by_parent(seed: Seed) -> None:
     u = seed.uow
     product, other = seed.product(), seed.product()

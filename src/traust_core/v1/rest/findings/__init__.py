@@ -7,6 +7,7 @@ from fastapi import APIRouter
 from traust_core.v1.rest.findings import (
     decisions,
     findings,
+    occurrence_claims,
     repository_findings,
     review,
     triage_records,
@@ -18,6 +19,7 @@ router.include_router(review.router)
 router.include_router(findings.router)
 router.include_router(decisions.router)
 router.include_router(triage_records.router)
+router.include_router(occurrence_claims.router)
 router.include_router(repository_findings.router)
 
 __all__ = ["router"]

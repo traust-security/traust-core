@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from datetime import datetime
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from traust_core.v1.errors import IntegrityError, NotFoundError
@@ -22,16 +23,26 @@ from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectStore
 from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.findings.claims import claim_fold
+from traust_core.v1.services.findings.cvss import selection
 from traust_core.v1.services.findings.facts import FindingFacts
-from traust_core.v1.services.findings.rating import RatingPolicy
+from traust_core.v1.services.findings.rating import RatingPolicy, finding_cvss, rated_occurrence
+
+if TYPE_CHECKING:
+    from traust_core.v1.services.exposure import AdvisoryCvssReader
 
 
 class FindingViewQuery:
     """Batched finding context and normalized history, within the caller's transaction."""
 
-    def __init__(self, rating: RatingPolicy, objects: ObjectStore | None = None) -> None:
+    def __init__(
+        self,
+        rating: RatingPolicy,
+        objects: ObjectStore | None = None,
+        cvss: AdvisoryCvssReader | None = None,
+    ) -> None:
         self._rating = rating
         self._objects = objects
+        self.cvss = cvss  # every facts load a view folds from reads the authority scores
 
     def views(
         self,
@@ -53,6 +64,7 @@ class FindingViewQuery:
                 read_budget=read_budget,
                 objects=self._objects,
                 census=census,
+                cvss=self.cvss,
             )
         )
         return self._views(uow, findings, as_of, facts, read_budget=read_budget, census=census)
@@ -70,18 +82,33 @@ class FindingViewQuery:
         places: Mapping[UUID, Sequence[Location]] = {}
         if not census:
             # a census counts: the locations a tally never reads stay unread
-            latest_ids = [
-                seen[-1].id
+            reported = {
+                finding.id: seen
                 for finding in findings
                 if finding.id and (seen := facts.reported_by(finding.id, as_of)) and seen[-1].id
-            ]
+            }
             held: defaultdict[UUID, list[Location]] = defaultdict(list)
-            for location in (
-                uow.locations.list_for_occurrences(latest_ids, read_budget=read_budget)
-                if latest_ids
-                else ()
-            ):
-                held[location.occurrence_id].append(location)
+
+            def read(ids: list[UUID]) -> None:
+                for location in (
+                    uow.locations.list_for_occurrences(ids, read_budget=read_budget) if ids else ()
+                ):
+                    held[location.occurrence_id].append(location)
+
+            read([seen[-1].id for seen in reported.values() if seen[-1].id])
+            # a latest occurrence with no places (an impact analysis's): one ids-only read finds
+            # which earlier occurrences have places, then only the newest of them per finding
+            # is read, so neither the queries nor the rows grow with the history
+            unplaced = [seen for seen in reported.values() if seen[-1].id not in held]
+            earlier = [o.id for seen in unplaced for o in seen[:-1] if o.id]
+            placed = uow.locations.located(earlier) if earlier else set()
+            read(
+                [
+                    newest
+                    for seen in unplaced
+                    if (newest := next((o.id for o in reversed(seen[:-1]) if o.id in placed), None))
+                ]
+            )
             places = held
         return [
             view
@@ -95,7 +122,7 @@ class FindingViewQuery:
         if not items:
             return []
         findings = uow.findings.list_by_ids({item.finding_id for item in items})
-        facts = FindingFacts.load(uow, findings, until=None, objects=self._objects)
+        facts = FindingFacts.load(uow, findings, until=None, objects=self._objects, cvss=self.cvss)
         by_id = {view.finding.id: view for view in self._views(uow, findings, None, facts)}
         histories = {
             finding_id: tuple(normalize_decision(row) for row in rows)
@@ -195,8 +222,22 @@ class FindingViewQuery:
                 }
             )
         latest = reported[-1] if reported else None
+        # A later occurrence carrying no CVSS or no places (an impact analysis's, filed under
+        # a report's exposure identity) doesn't hide an earlier one's (`rated_occurrence`).
+        scored = rated_occurrence(reported)
+        located = next((o for o in reversed(reported) if o.id and places.get(o.id)), latest)
         disposition = facts.disposition(finding.id, as_of)
-        severity = self._rating.effective_severity(latest, disposition)
+        authority = facts.authority.get(finding.advisory_id, ()) if finding.advisory_id else ()
+        picked = selection(
+            authority,
+            scored.cvss_vector if scored is not None else None,
+            scored.cvss_score if scored is not None else None,
+            reported=scored is not None,
+            document=f"occurrence:{scored.id}" if scored is not None else "",
+        )
+        label = self._rating.severity_label(scored, disposition, picked.chosen)
+        severity = label.severity
+        cvss = finding_cvss(scored, label, picked)
         # the reporting assessments' own times — the occurrence→assessment
         # join the census reads for its SLA `first` — computed once here for
         # the view's date fields (facts.at already holds them for the fold)
@@ -205,13 +246,21 @@ class FindingViewQuery:
         due = None
         if latest is not None and (disposition is None or disposition.is_open()):
             opened = first_reported
-            due = self._rating.sla_due(severity, opened, latest.cvss_score)
+            score = (
+                cvss.effective_score
+                if cvss is not None
+                else scored.cvss_score
+                if scored is not None
+                else None
+            )
+            due = self._rating.sla_due(severity, opened, score)
         claim = folded.claim if folded is not None else None
         return FindingView(
             finding=finding,
             occurrence=latest,
             disposition=disposition,
             effective_severity=severity,
+            cvss=cvss,
             sla_due=due,
             first_reported_at=first_reported,
             last_reported_at=last_reported,
@@ -219,8 +268,8 @@ class FindingViewQuery:
             locations=(
                 claim.locations
                 if claim is not None
-                else tuple(places.get(latest.id, ()))
-                if latest and latest.id
+                else tuple(places.get(located.id, ()))
+                if located and located.id
                 else ()
             ),
             cwes=(

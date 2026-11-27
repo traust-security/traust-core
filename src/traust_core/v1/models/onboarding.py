@@ -58,9 +58,6 @@ class OnboardingPlan(Model):
 
 
 class OnboardingResult(Model):
-    """`skipped`: what onboarding couldn't refresh (a forge outage), each with its reason."""
-
     product_id: UUID
     repository_ids: tuple[UUID, ...] = ()
     order_ids: tuple[UUID, ...] = ()
-    skipped: tuple[str, ...] = ()

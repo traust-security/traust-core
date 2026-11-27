@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 
 import pydantic
 import pytest
+import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
@@ -310,6 +311,17 @@ def test_an_empty_report_records_nothing(engine: Engine, target: Target) -> None
     ("change", "message"),
     [
         ({"reported_severity": None}, "no severity"),
+        (
+            {
+                "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+                "cvss_score": Decimal("5.0"),
+            },
+            "is not what its vector computes",
+        ),
+        (
+            {"cvss_vector": "CVSS:3.1/AV:N/AC:L", "cvss_score": Decimal("5.0")},
+            "not what its vector computes",
+        ),
         ({"cwes": ("CWE89",)}, "not CWE identifiers"),
         ({"locations": ()}, "no usable location"),
         ({"repository_id": uuid4()}, "examined"),
@@ -520,6 +532,26 @@ def test_a_report_finding_carries_its_owasp_llm_categories(target: Target) -> No
     assert all(f.owasp_llm_references == () for f in found[1:])
 
 
+def test_verification_regression_without_llm_fields_still_enters_intake(target: Target) -> None:
+    from tests.v1.services.reporting.documents import valid_verification_report
+    from traust_core.v1.models.artifacts import VerificationArtifact
+    from traust_core.v1.models.remediation import regression_candidates
+
+    doc = VerificationArtifact.from_document(valid_verification_report())
+    [regression] = regression_candidates(doc, target.repository.id)
+    assert regression.label == doc.regressions[0].id
+    assert regression.owasp_llm_references == ()
+
+
+def test_report_conversion_refuses_a_schema_missing_llm_fields(target: Target) -> None:
+    from tests.v1.services.reporting.documents import valid_verification_report
+    from traust_core.v1.models.artifacts import VerificationArtifact
+
+    doc = VerificationArtifact.from_document(valid_verification_report())
+    with pytest.raises(ValidationError, match="schema must declare owasp_llm_references"):
+        FindingCandidate.of_report(doc.regressions, target.repository.id)
+
+
 def test_a_report_finding_carries_its_kind(target: Target) -> None:
     """The contracts report's `findings[].kind` is the kind the intake writes onto the
     finding row; `of_report` must not be where it drops off (the audit: only the newest
@@ -656,3 +688,39 @@ def test_a_moved_repositorys_findings_keep_their_identity(engine: Engine, target
         original.fingerprint,
     )
     assert [o.assessment_id for o in got["occurrences"]] == [first, second]
+
+
+def _stamp(engine: Engine, finding_id: UUID) -> tuple[str | None, str | None]:
+    with SqlTraustUnitOfWork(engine) as uow:
+        return uow.connection.execute(
+            sa.text("SELECT current_state, current_severity FROM finding WHERE id = :id"),
+            {"id": str(finding_id)},
+        ).one()
+
+
+def test_the_restamp_after_a_standalone_intake_commits(engine: Engine, target: Target) -> None:
+    """The stamp batches commit on their own connections, so a standalone intake's
+    restamp survives its scope."""
+    run = audit(engine, target)
+    result = intake(engine).accept(run, [candidate(target)])
+    finding_id = result.findings[Label("OPERATOR-abcdef0-001")]
+    assert _stamp(engine, finding_id) == ("open", "high")
+
+
+def test_the_restamp_never_joins_the_callers_open_transaction(
+    engine: Engine, target: Target
+) -> None:
+    """A rescan inside a caller's transaction: the stamp waits for that transaction's
+    commit and runs on its own connection, so its row locks never ride the caller's."""
+    run = audit(engine, target)
+    service = intake(engine)
+    with service._uow as uow:
+        result = service.accept(run, [candidate(target)])
+        finding_id = result.findings[Label("OPERATOR-abcdef0-001")]
+        mid = uow.connection.execute(
+            sa.text("SELECT current_severity FROM finding WHERE id = :id"),
+            {"id": str(finding_id)},
+        ).scalar_one()
+        assert mid is None  # not joined: the restamp waits for the commit
+        uow.commit()
+    assert _stamp(engine, finding_id) == ("open", "high")

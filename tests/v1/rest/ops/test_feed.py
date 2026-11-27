@@ -22,7 +22,10 @@ def test_a_finished_order_reaches_the_feed(context: Context, client: TestClient)
     oid = order.json()["id"]
     client.post(
         f"/v1/orders/{oid}/complete",
-        json={"result": {"outcome": "succeeded"}},
+        json={
+            "result": {"outcome": "succeeded"},
+            "lease_generation": order.json()["lease_generation"],
+        },
         headers=runner(context),
     )
     body = client.get("/v1/feed", headers=bearer(context)).json()

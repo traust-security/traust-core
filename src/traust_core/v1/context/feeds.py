@@ -94,7 +94,7 @@ class _Source(_Strict):
     file: str | None = None
     index_url: str | None = None
     index_file: str | None = None
-    max_age_hours: float = 24.0
+    max_age_hours: pydantic.PositiveFloat = 24.0
     # a per-identifier document's size cap, when the default (DOCUMENT_BYTES) is too small
     max_document_bytes: pydantic.PositiveInt | None = None
     paginate: _Paginate | None = None
@@ -297,6 +297,7 @@ def load_feed_sources(
     clock: Clock,
     api_keys: Mapping[str, str] | None = None,
     api_key_variables: Mapping[str, str] | None = None,
+    unset_api_keys: Mapping[str, str] | None = None,
 ) -> tuple[FeedSource, ...]:
     """A provider per source queried per identifier (a live source, or a cached one's documents)
     or carrying a probe: documents on demand, liveness from its probe. `access: disabled` opts a
@@ -304,8 +305,11 @@ def load_feed_sources(
     found = []
     registry = _load(path).sources
     keys = dict(api_keys or {})
-    check_api_key_sources(path, keys)
-    for name in keys:
+    # every configured source, its variable set or not: an unset one runs keyless only on a
+    # source that could carry the key
+    configured = {*keys, *(unset_api_keys or {})}
+    check_api_key_sources(path, configured)
+    for name in sorted(configured):
         source = registry[name]
         if source.role in _HOST_ROLES or source.access == "disabled":
             raise ConfigError(f"feeds.api_keys names {name}, which sends no API key")
@@ -348,7 +352,9 @@ def load_feed_sources(
                 post=post,
                 probe=probe,
                 api_key=_api_key(name, source, keys.get(name), (api_key_variables or {}).get(name)),
+                keyless=_keyless(source, name, keys, unset_api_keys or {}),
                 max_bytes=source.max_document_bytes or DOCUMENT_BYTES,
+                max_age=timedelta(hours=source.max_age_hours),
                 http=http,
                 probe_http=probe_http,
                 clock=clock,
@@ -377,6 +383,17 @@ def _valid_port(url: str) -> bool:
     except ValueError:
         return False
     return port != 0
+
+
+def _keyless(
+    source: _Source, name: str, keys: Mapping[str, str], unset: Mapping[str, str]
+) -> str | None:
+    """Why a source that takes a key is sent without one, for its rate-limit errors."""
+    if source.api_key_header is None or name in keys:
+        return None
+    if (variable := unset.get(name)) is not None:
+        return f"sent keyless because {variable} is unset or empty"
+    return f"sent keyless: no feeds.api_keys.{name} is configured"
 
 
 def _api_key(name: str, source: _Source, value: str | None, variable: str | None) -> ApiKey | None:

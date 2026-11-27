@@ -17,7 +17,12 @@ from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
 from traust_core.v1.models.common import Page, PageRequest
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.inventory import RepositoryRef
-from traust_core.v1.models.operations import REMEDIATE_FINDING, OrderRequest, RunOrder
+from traust_core.v1.models.operations import (
+    REMEDIATE_FINDING,
+    ConfigDigest,
+    OrderRequest,
+    RunOrder,
+)
 from traust_core.v1.models.remediation import OVER, Fork, WorkItem, furthest
 from traust_core.v1.models.remediation_scheduling import (
     RemediationFindingRequest,
@@ -161,6 +166,33 @@ class RemediationSchedulingService:
             order_id=order.id,
             scheduled_at=order.created_at,
         )
+
+    def reattempt(
+        self,
+        request: OrderRequest,
+        principal: Principal,
+        config: Sequence[ConfigDigest] = (),
+    ) -> RunOrder:
+        """Plan another attempt of a scheduled effort: `request` names its work item, and the
+        order carries the fork facts the effort already holds, re-checked against the fork
+        policy. The engine's remediation trigger asks through here (a routed plan: the effort's
+        target was authorized when it was scheduled); `remediate_finding` is never planned bare."""
+        if request.asset != REMEDIATE_FINDING or request.work_item_id is None:
+            raise ValidationError("a reattempt is a remediate_finding order naming its work item")
+        effort = self.get(request.work_item_id)
+        if request.repository_id not in (None, effort.repository_id):
+            raise ValidationError(
+                f"work item {request.work_item_id} patches repository {effort.repository_id}, "
+                f"not {request.repository_id}"
+            )
+        self._remediation.refuse_public(effort.fork_url)
+        if not self._remediation.accepts_fork(effort.repository_id, effort.fork_url):
+            raise ValidationError(
+                f"work item {request.work_item_id}: {effort.fork_url} is no longer the "
+                "repository's remediation fork"
+            )
+        routed = request.model_copy(update={"repository_id": effort.repository_id})
+        return self._ops.plan_fix(routed, principal, config, effort.fork_url, effort.fork_branch)
 
     def get(self, work_item_id: UUID) -> ScheduledEffort:
         """One scheduled effort: its work item (the effort itself) and the fork facts of the

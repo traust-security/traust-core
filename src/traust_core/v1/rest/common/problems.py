@@ -21,6 +21,7 @@ from traust_core.v1.errors import (
 from traust_core.v1.models.base import Dto
 from traust_core.v1.models.operations import DenyCode, DenyIssue
 from traust_core.v1.providers.correlation import correlation_scope
+from traust_core.v1.providers.sources import SourceError
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +35,9 @@ STATUS: tuple[tuple[type[Exception], HTTPStatus], ...] = (
     (NotFoundError, HTTPStatus.NOT_FOUND),
     (ConflictError, HTTPStatus.CONFLICT),
     (IntegrityError, HTTPStatus.CONFLICT),
+    # an upstream core depends on didn't answer (a repository's forge): ours to relay, not
+    # the caller's request and not an internal bug
+    (SourceError, HTTPStatus.BAD_GATEWAY),
     # before ValidationError: a view outside its own contract is Core's fault, not the request's
     (ViewContractError, HTTPStatus.INTERNAL_SERVER_ERROR),
     (ValidationError, HTTPStatus.UNPROCESSABLE_ENTITY),
@@ -77,7 +81,10 @@ def _error_source(exc: Exception) -> str | None:
 def problem(request: Request, exc: Exception) -> JSONResponse:
     """One error shape (RFC 9457): the typed core error decides the status, once, here."""
     status = status_of(exc)
-    if status == HTTPStatus.INTERNAL_SERVER_ERROR:
+    # a relayed upstream failure (SourceError's 502: a repository's forge didn't answer) is
+    # logged like a 500 — ours to see in the error log; the structured line carries no
+    # message, so a token the forge's error text might hold can never leak
+    if status == HTTPStatus.INTERNAL_SERVER_ERROR or isinstance(exc, SourceError):
         route = request.scope.get("route")
         with correlation_scope(
             request.state.request_id,

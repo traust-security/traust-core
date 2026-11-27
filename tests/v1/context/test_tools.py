@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from tests.v1.providers.tools.opengrep_fixtures import write_rule
 from traust_core.v1.context import Config, Context
 from traust_core.v1.context import context as context_module
 from traust_core.v1.context.config import Locations
@@ -17,7 +18,13 @@ from traust_core.v1.context.tools import (
     load_toolchain,
     scanner_tools,
 )
-from traust_core.v1.errors import ConfigError, ServiceError, ValidationError
+from traust_core.v1.errors import (
+    ConfigError,
+    ScannerError,
+    ScannerFailure,
+    ServiceError,
+    ValidationError,
+)
 from traust_core.v1.models.artifacts import AdapterResultArtifact
 from traust_core.v1.models.assessment import ToolName
 from traust_core.v1.models.common import SymbolQuery, ToolRequest
@@ -595,6 +602,57 @@ def test_opengrep_scans_with_the_registered_pack_and_supplements(
     assert seen["supplements"] == ctx.rule_pack_supplements and seen["clock"] is ctx.clock
     assert seen["runner"].allows("opengrep") and seen["runner"].allows("git")
     assert not seen["runner"].allows("curl")
+
+
+@pytest.mark.skipif(not shutil.which("opengrep"), reason="real Opengrep integration")
+@pytest.mark.parametrize("custom_state", ["valid", "malformed", "wrong-behavior", "inapplicable"])
+def test_registered_opengrep_requires_complete_configured_adopter_coverage(
+    tmp_path: Path, custom_state: str
+) -> None:
+    baseline = write_rule(tmp_path / "baseline", "baseline-rule")
+    custom = write_rule(tmp_path / "custom", "acme.security.rule")
+    supplement = write_rule(tmp_path / "supplement", "supplement-rule")
+    if custom_state == "malformed":
+        custom.write_text("rules: [PRIVATE_NATIVE_SENTINEL")
+    elif custom_state == "wrong-behavior":
+        fixture = custom.with_suffix(".py")
+        fixture.write_text(fixture.read_text().replace("safe(value)", "dangerous(value)"))
+    elif custom_state == "inapplicable":
+        custom.write_text(custom.read_text().replace("- python", "- ruby"))
+    allowlist = tmp_path / "allowlist.yaml"
+    allowlist.write_text(
+        f"packs:\n  extra:\n    enabled: true\n    source: {supplement.parent}\n"
+        "    rules: [supplement-rule]\n"
+    )
+    target = tmp_path / "checkout"
+    target.mkdir()
+    (target / "app.py").write_text("dangerous(value)\nsafe(value)\n")
+    ctx = Context(
+        Config(
+            home=tmp_path / "store",
+            locations=Locations(opengrep_adopter_rules=str(custom.parent)),
+        ),
+        clock=FixedClock(NOW),
+    )
+    ctx.register_toolchain(EXTERNAL_TOOLS, SAFE_EXEC)
+    ctx.register_rule_pack(baseline.parent, allowlist)
+    provider = ctx.tools.get("opengrep")
+    assert isinstance(provider, ToolProvider)
+    request = ToolRequest(workspace=target)
+    if custom_state in {"malformed", "wrong-behavior"}:
+        with pytest.raises(ScannerError, match="incomplete rule coverage") as caught:
+            provider.acquire(request)
+        assert caught.value.reason == ScannerFailure.OUTPUT
+        assert "PRIVATE_NATIVE_SENTINEL" not in str(caught.value)
+    else:
+        result = provider.acquire(request)
+        assert isinstance(result.data, AdapterResultArtifact)
+        expected = {"opengrep/baseline-rule", "opengrep/supplement-rule"}
+        if custom_state == "valid":
+            expected.add("opengrep/acme.security.rule")
+        assert {finding.id for finding in result.data.findings} == expected
+        assert result.data.scanned_at == "2026-10-24T12:00:00Z"
+        assert result.acquisition.acquired_at == NOW
 
 
 def test_govulncheck_scans_under_safe_exec_and_records_its_argv(

@@ -136,6 +136,9 @@ def test_a_reaudit_holds_a_finding_it_names_differently_instead_of_duplicating_i
     with SqlTraustUnitOfWork(engine) as uow:
         reported = {o.finding_id for o in uow.occurrences.list_for_assessment(again)}
     assert old.id not in reported and len(reported) == len(BODY["findings"]) - 1
+    bindings = services.assessment.intake_bindings(again).findings
+    assert set(bindings) == {f["id"] for f in BODY["findings"][1:]}
+    assert set(bindings.values()) == reported
     [item] = mapping_reviews(services, old.id)
     assert item.status == ReviewItemStatus.PENDING
     with pytest.raises(ConflictError, match="pending"):
@@ -246,3 +249,43 @@ def test_a_failed_settle_leaves_the_review_pending_for_a_retry(
     assert first_finding(engine, ref).fingerprint == old.fingerprint
     answer(services, item.id, old.id, AttestationDecision.CONFIRM)
     assert old.id in reported_by(engine, again)
+
+
+def _with_dependency(day: int) -> SecurityAuditArtifact:
+    body = json.loads(report(day).payload)
+    body["findings"][0]["dependency"] = {
+        "advisory": "GHSA-m425-mq94-257g",
+        "module": "google.golang.org/grpc",
+        "ecosystem": "go",
+    }
+    return SecurityAuditArtifact.from_document(body)
+
+
+def test_an_accepted_move_onto_an_exposure_identity_settles_the_held_audit(
+    services: Any, engine: Engine, ref: UUID
+) -> None:
+    """A finding recorded before its advisory was stored keeps its report identity; a re-audit
+    after the advisory lands mints the exposure identity, is held, and accepting the review
+    lands that audit's occurrence on the finding: settling rebuilds the held candidate with
+    the same exposure identity recording gave it."""
+    from traust_core.v1.models.dependencies import Advisory
+
+    record(services, ref, _with_dependency(20), 20)
+    old = first_finding(engine, ref)
+    assert old.fingerprint_algo != "exposure-v1"
+    with SqlTraustUnitOfWork(engine) as uow:
+        uow.advisories.get_or_add(Advisory(identifier="GHSA-m425-mq94-257g"))
+        uow.commit()
+    again = record(services, ref, _with_dependency(21), 21)
+    assert old.id not in reported_by(engine, again)
+    [item] = mapping_reviews(services, old.id)
+    answer(services, item.id, old.id, AttestationDecision.CONFIRM)
+    moved = first_finding(engine, ref)
+    assert (moved.id, moved.fingerprint_algo) == (old.id, "exposure-v1")
+    # the move links the advisory too, so the finding's views select its authority score
+    with SqlTraustUnitOfWork(engine) as uow:
+        stored = uow.advisories.find_by_identifier("GHSA-m425-mq94-257g")
+    assert stored is not None
+    assert (moved.advisory_id, moved.advisory_match) == (stored.id, "confirmed")
+    assert old.id in reported_by(engine, again)
+    assert len(findings(engine, ref)) == len(BODY["findings"])

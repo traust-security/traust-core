@@ -30,6 +30,7 @@ from traust_core.v1.models.operations import (
 from traust_core.v1.models.vocabulary import SourceType
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.identity import IdentityConfig
+from traust_core.v1.services.ledger import LedgerConfig
 
 URL = "/v1/orders/start"
 
@@ -51,6 +52,7 @@ def context(engine: Engine, tmp_path: Path) -> Context:
         Config(
             home=tmp_path,
             identity=IdentityConfig(trust_local=True),
+            ledger=LedgerConfig(),
             recording=RecordingConfig(
                 verification=("verify",),
                 start=(
@@ -63,6 +65,7 @@ def context(engine: Engine, tmp_path: Path) -> Context:
             ),
         )
     )
+    context.local_issuer.mint("runner-7", machine=True)
     context.__dict__["database"] = engine
     return context
 
@@ -145,20 +148,24 @@ def test_verified_machine_starts_its_scoped_run_and_can_record(
         occurred_at=order.started_at,
     )
     with context.services().ops.recording(
-        order.id, principal(context), RecordKind.VERIFICATION, order.repository_id, provenance
+        order.id,
+        principal(context),
+        RecordKind.VERIFICATION,
+        order.repository_id,
+        provenance,
+        lease_generation=response.json()["lease_generation"],
     ):
         pass
     assert context.services().ops.get(order.id) == order
 
 
-@pytest.mark.parametrize("state", ["planned", "queued"])
-def test_start_reuses_waiting_order_without_replacing_its_admission_fields(
-    context: Context, client: TestClient, state: str
+def test_start_reuses_a_queued_order_without_replacing_its_admission_fields(
+    context: Context, client: TestClient
 ) -> None:
     body = request(context)
     with SqlTraustUnitOfWork(context.database) as uow:
         held = Seed(uow).run_order(
-            asset="verify", repository_id=body.order.repository_id, state=state, priority=8
+            asset="verify", repository_id=body.order.repository_id, state="queued", priority=8
         )
         uow.commit()
     response = client.post(URL, json=body.model_dump(mode="json"), headers=runner(context))
@@ -170,7 +177,7 @@ def test_start_reuses_waiting_order_without_replacing_its_admission_fields(
     assert len(orders(context).items) == 1
 
 
-@pytest.mark.parametrize("state", ["leased", "awaiting_approval"])
+@pytest.mark.parametrize("state", ["leased", "awaiting_approval", "planned"])
 def test_start_never_steals_an_active_lease_or_bypasses_approval(
     context: Context, client: TestClient, state: str
 ) -> None:

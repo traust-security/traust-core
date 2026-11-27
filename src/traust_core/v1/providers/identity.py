@@ -10,11 +10,13 @@ from datetime import timedelta
 from functools import cached_property
 from pathlib import Path
 from typing import Protocol
+from urllib.parse import urlsplit
 
 import jwt
 import pydantic
+from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
 from traust_core.v1.errors import AuthenticationError, ConfigError, ServiceError, ValidationError
 from traust_core.v1.models.identity import (
@@ -28,7 +30,7 @@ from traust_core.v1.models.identity import (
     TrustedIssuer,
 )
 from traust_core.v1.models.vocabulary import ActorKind
-from traust_core.v1.providers.base import Readiness
+from traust_core.v1.providers.base import Readiness, on_path
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.http import HttpFetcher
 from traust_core.v1.providers.process import ProcessRunner
@@ -36,12 +38,31 @@ from traust_core.v1.providers.process import ProcessRunner
 log = logging.getLogger(__name__)
 
 _ALGORITHMS = ["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"]
+_JWKS_TIMEOUT_SECONDS = 3
+_JWKS_ERRORS = (
+    jwt.PyJWTError,
+    OSError,
+    ValueError,
+    TypeError,
+    AttributeError,
+    KeyError,
+    OverflowError,
+    RecursionError,
+)
 _RESULT = re.compile(r"^RESULT uid=(?P<uid>\S+) status=(?P<status>\S+)(?: auth=\S+)?$", re.M)
 UNAVAILABLE = "unavailable"
 
 
+def _http_url(value: str) -> bool:
+    try:
+        url = urlsplit(value)
+        return url.scheme in ("http", "https") and bool(url.hostname)
+    except ValueError:
+        return False
+
+
 class IdentityProvider(Protocol):
-    def check(self) -> Readiness: ...
+    def check(self, *, probe_remote: bool = True) -> Readiness: ...
 
     def authenticate(self, credential: Credential) -> Principal: ...
 
@@ -68,16 +89,83 @@ class TokenIdentityProvider:
         machine_claim: str = "azp",
     ) -> None:
         self._issuers: Mapping[str, TrustedIssuer] = {i.issuer: i for i in issuers}
-        self._remote = {i.issuer: jwt.PyJWKClient(i.jwks_url, cache_keys=True) for i in issuers}
+        self._remote = {
+            i.issuer: jwt.PyJWKClient(i.jwks_url, cache_keys=True, timeout=_JWKS_TIMEOUT_SECONDS)
+            for i in self._issuers.values()
+            if _http_url(i.jwks_url)
+        }
         self._local_jwks, self._trust_local = local_jwks, trust_local
         self._identity_claim, self._machine_claim = identity_claim, machine_claim
         for i in issuers:
             if i.audience is None and i.issuer != LOCAL_ISSUER:
                 log.warning("configured issuer has no audience: tokens for other services pass")
 
-    def check(self) -> Readiness:
-        trusted = sorted(self._issuers) + ([LOCAL_ISSUER] if self._local_jwks else [])
-        return Readiness(ready=bool(trusted), detail=", ".join(trusted) or "no trusted issuers")
+    def check(self, *, probe_remote: bool = True) -> Readiness:
+        """Probe each trusted issuer's verification keys without minting a token. With
+        `probe_remote` false, a remote issuer's settings are checked but its JWKS is not
+        fetched: a boot-time check that a transient IdP outage can't fail (a token is still
+        verified against the issuer's keys at request time, and refused when they can't be read)."""
+        gaps = []
+        for index, (name, _issuer) in enumerate(self._issuers.items()):
+            setting = f"identity.issuers[{index}]"
+            client = self._remote.get(name)
+            if not name.strip() or name == LOCAL_ISSUER:
+                gaps.append(f"{setting}: set a nonblank issuer distinct from {LOCAL_ISSUER!r}")
+                continue
+            if client is None:
+                gaps.append(f"{setting}: set jwks_url to an HTTP(S) URL")
+                continue
+            if not probe_remote:
+                continue
+            try:
+                keys = client.get_signing_keys(refresh=True)
+                usable = any(
+                    isinstance(k.key_id, str)
+                    and k.algorithm_name in _ALGORITHMS
+                    and isinstance(k.key, (rsa.RSAPublicKey, ec.EllipticCurvePublicKey))
+                    for k in keys
+                )
+            except jwt.PyJWKClientConnectionError:
+                gaps.append(f"{setting}: cannot reach configured JWKS -- check jwks_url")
+                continue
+            except _JWKS_ERRORS as error:
+                log.warning("identity issuer %r JWKS error: %s", name, error)
+                usable = False
+            if not usable:
+                gaps.append(f"{setting}: no supported signing key -- check jwks_url")
+        trusted = sorted(self._issuers)
+        if self._trust_local:
+            try:
+                usable = self._local_key_ready()
+            except (*_JWKS_ERRORS, ConfigError, UnsupportedAlgorithm):
+                usable = False
+            if not usable:
+                gaps.append(
+                    "no usable local JWKS -- initialize the local issuer with traust auth local"
+                )
+            else:
+                trusted.append(LOCAL_ISSUER)
+        if not trusted and not gaps:
+            gaps.append("no verified issuer -- set identity.issuers or enable identity.trust_local")
+        return Readiness(ready=not gaps, detail="; ".join(gaps) if gaps else ", ".join(trusted))
+
+    def _local_key_ready(self) -> bool:
+        if self._local_jwks is None:
+            return False
+        key = next((k for k in self._local_keys() if k.key_id == _LOCAL_KID), None)
+        if (
+            key is None
+            or key.public_key_use not in (None, "sig")
+            or key.algorithm_name != "ES256"
+            or not isinstance(key.key, ec.EllipticCurvePublicKey)
+            or not isinstance(key.key.curve, ec.SECP256R1)
+        ):
+            return False
+        try:
+            signing_key = _read_local_signing_key(self._local_jwks.with_name(_LOCAL_PEM))
+        except FileNotFoundError:
+            return True  # A verifier-only deployment needs no private key.
+        return signing_key.public_key().public_numbers() == key.key.public_numbers()
 
     def authenticate(self, credential: Credential) -> Principal:
         token = credential.token.get_secret_value()
@@ -106,12 +194,20 @@ class TokenIdentityProvider:
         return self._principal(claims, issuer)
 
     def _remote_key(self, issuer: str, token: str) -> object:
-        return self._remote[issuer].get_signing_key_from_jwt(token).key
+        client = self._remote.get(issuer)
+        if client is None:
+            raise self._refuse("invalid configured JWKS URL")
+        return client.get_signing_key_from_jwt(token).key
 
     def _local_key(self, token: str) -> object:
-        keys = jwt.PyJWKSet.from_json(Path(str(self._local_jwks)).read_text(encoding="utf-8"))
+        keys = self._local_keys()
         kid = jwt.get_unverified_header(token).get("kid")
-        return next((k for k in keys.keys if k.key_id == kid), keys.keys[0]).key
+        return next((k for k in keys if k.key_id == kid), keys[0]).key
+
+    def _local_keys(self) -> Sequence[jwt.PyJWK]:
+        if self._local_jwks is None:
+            raise jwt.PyJWKSetError("no local JWKS configured")
+        return jwt.PyJWKSet.from_json(self._local_jwks.read_text(encoding="utf-8")).keys
 
     def _principal(self, claims: Mapping[str, object], issuer: str) -> Principal:
         machine, person = claims.get(self._machine_claim), claims.get(self._identity_claim)
@@ -149,7 +245,9 @@ class CommandDirectory:
         self._command, self._runner = tuple(command), runner
 
     def check(self) -> Readiness:
-        return Readiness(ready=True, detail=" ".join(self._command))
+        if not self._command or not on_path(self._command[0]).ready:
+            return Readiness(ready=False, detail="identity.directory_command is not executable")
+        return Readiness(ready=True)
 
     def status(self, principal: Principal) -> DirectoryStatus:
         identity = principal.identity.strip()
@@ -173,6 +271,7 @@ class CommandDirectory:
 DEVICE_CODE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 LOCAL_TOKEN_LIFETIME = timedelta(days=7)
 _LOCAL_KID = "local-1"
+_LOCAL_PEM = "local-key.pem"
 
 
 class OidcLogin:
@@ -306,7 +405,7 @@ class LocalIssuer:
     """traust's own `local` issuer: this machine's key mints tokens for a solo deployment."""
 
     def __init__(self, home: Path, clock: Clock) -> None:
-        self._key, self.jwks = home / "local-key.pem", home / "local-jwks.json"
+        self._key, self.jwks = home / _LOCAL_PEM, home / "local-jwks.json"
         self._clock = clock
 
     def mint(self, identity: str, *, machine: bool = False) -> Credential:
@@ -326,9 +425,7 @@ class LocalIssuer:
 
     def _signing_key(self) -> ec.EllipticCurvePrivateKey:
         if self._key.is_file():
-            key = serialization.load_pem_private_key(self._key.read_bytes(), password=None)
-            if not isinstance(key, ec.EllipticCurvePrivateKey):
-                raise ConfigError(f"{self._key} is not an EC key")
+            key = _read_local_signing_key(self._key)
         else:
             key = ec.generate_private_key(ec.SECP256R1())
             pem = key.private_bytes(
@@ -342,6 +439,13 @@ class LocalIssuer:
             keys = {"keys": [{**jwk, "use": "sig", "kid": _LOCAL_KID}]}
             _write_private(self.jwks, json.dumps(keys).encode())
         return key
+
+
+def _read_local_signing_key(path: Path) -> ec.EllipticCurvePrivateKey:
+    key = serialization.load_pem_private_key(path.read_bytes(), password=None)
+    if not isinstance(key, ec.EllipticCurvePrivateKey):
+        raise ConfigError(f"{path} is not an EC key")
+    return key
 
 
 class CredentialStore:

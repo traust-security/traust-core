@@ -6,13 +6,15 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from traust_core.v1.errors import ServiceError, ValidationError
+from traust_core.v1.errors import ConfigError, ServiceError, ValidationError
 from traust_core.v1.models.common import RepoPath
 from traust_core.v1.models.dependencies import UnresolvedManifest
 from traust_core.v1.models.vocabulary import Ecosystem, ManifestCoverageReason
@@ -26,7 +28,10 @@ from traust_core.v1.providers.tree import MAX_FILE_BYTES, SKIP_DIRS
 # drops them from package-lock (not from yarn.lock), measured 2026-10-28 (dependencies log).
 _ENV = {"SYFT_JAVASCRIPT_INCLUDE_DEV_DEPENDENCIES": "true"}
 
-# The files syft's directory catalogers read (syft 1.51): an archive checkout keeps only these.
+_CONTAINERFILES = ("Dockerfile", "Dockerfile.*", "Containerfile", "Containerfile.*")
+
+
+# Keep Syft's inputs and containerfiles, which the coverage probe needs even when Syft skips them.
 # Measured 2026-10-28 on 60 repositories: 53,881 of 53,884 packages, the rest from checked-in
 # binaries (continuous-ops evidence 19). Re-measure after a syft upgrade.
 MANIFESTS: tuple[str, ...] = (
@@ -107,6 +112,7 @@ MANIFESTS: tuple[str, ...] = (
     ".terraform.lock.hcl",
     "Chart.yaml",
     "Chart.lock",
+    *_CONTAINERFILES,
 )
 
 
@@ -225,6 +231,155 @@ def _requirements(name: str) -> bool:
     return name.endswith(".txt") and "requirements" in name
 
 
+def _containerfile(name: str) -> bool:
+    return any(fnmatchcase(name, pattern) for pattern in _CONTAINERFILES)
+
+
+_DIRECTIVE = re.compile(r"#\s*(syntax|escape|check)\s*=\s*(.+)", re.I)
+_WORD = re.compile(r"""(?:[^\s'"\\]++|\\.|'[^']*'|"(?:[^"\\]++|\\.)*")++""")
+_HEREDOC = re.compile(r"[0-9]*<<(-?)([^<]+)")
+
+
+def _builder_flags(args: str, escape: str) -> tuple[list[str], str]:
+    flags = []
+    pos = 0
+    while args.startswith("--", pos):
+        word: list[str] = []
+        quote = ""
+        while pos < len(args):
+            char = args[pos]
+            if not quote and char.isspace():
+                break
+            pos += 1
+            if char == escape:
+                if pos == len(args):
+                    raise ValueError("incomplete Dockerfile flag escape")
+                word.append(args[pos])
+                pos += 1
+            elif char == quote:
+                quote = ""
+            elif not quote and char in "'\"":
+                quote = char
+            else:
+                word.append(char)
+        if quote:
+            raise ValueError("unterminated Dockerfile flag quote")
+        while pos < len(args) and args[pos].isspace():
+            pos += 1
+        flag = "".join(word)
+        if flag == "--":
+            break
+        flags.append(flag)
+    return flags, args[pos:]
+
+
+def _unquoted_heredoc(word: str) -> bool:
+    quote, pos = "", 0
+    while pos < len(word):
+        char = word[pos]
+        if quote == "'":
+            if char == quote:
+                quote = ""
+        elif char == "\\":
+            pos += 1
+        elif quote:
+            if char == quote:
+                quote = ""
+        elif char in "'\"":
+            quote = char
+        elif word.startswith("<<", pos):
+            return True
+        pos += 1
+    return False
+
+
+def _heredocs(args: str, *, shell: bool) -> Iterator[tuple[str, bool]]:
+    # BuildKit recognizes heredocs as complete whitespace-delimited words, not shell tokens:
+    # cat<<EOF is ambiguous and must not cause us to skip possible Docker instructions.
+    end = 0
+    for word in _WORD.finditer(args):
+        if args[end : word.start()].strip():
+            raise ValueError("invalid Dockerfile word")
+        end = word.end()
+        if match := _HEREDOC.fullmatch(word[0]):
+            [delimiter] = shlex.split(match[2])
+            yield delimiter, bool(match[1])
+        elif shell and _unquoted_heredoc(word[0]):
+            raise ValueError("ambiguous Dockerfile heredoc")
+    if args[end:].strip():
+        raise ValueError("invalid Dockerfile word")
+
+
+def _docker_instructions(text: str) -> Iterator[tuple[str, list[str], str]]:
+    lines = iter(text.removeprefix("\ufeff").split("\n"))
+    escape, directives = "\\", True
+    for line in lines:
+        line = line.strip()
+        if directives and (directive := _DIRECTIVE.fullmatch(line)):
+            if directive[1].lower() == "escape":
+                escape = directive[2]
+                if escape not in ("\\", "`"):
+                    raise ValueError("invalid Dockerfile escape directive")
+            continue
+        directives = False
+        if not line or line.startswith("#"):
+            continue
+        parts = []
+        while line.endswith(escape) and not line.endswith(escape * 2):
+            parts.append(line[:-1])
+            for line in lines:
+                if line.strip() and not line.lstrip().startswith("#"):
+                    line = line.rstrip(" \t\r")
+                    break
+            else:
+                raise ValueError("unterminated Dockerfile continuation")
+        command = "".join([*parts, line]).split(None, 1)
+        if command[0].lower() == "onbuild" and len(command) == 2:
+            command = command[1].split(None, 1)
+        op, args = command[0].lower(), command[1] if len(command) == 2 else ""
+        if op not in {"from", "add", "copy", "run"}:
+            continue
+        flags, args = _builder_flags(args, escape)
+        yield op, flags, args
+        if op == "from" or "<<" not in args:
+            continue
+        if args.startswith("["):
+            try:
+                if isinstance(json.loads(args), list):
+                    continue
+            except ValueError:
+                pass  # e.g. a shell test: RUN [ -f file ] && cat <<EOF
+        for delimiter, chomp in _heredocs(args, shell=op == "run"):
+            for body in lines:
+                if (body.lstrip("\t") if chomp else body) == delimiter:
+                    break
+            else:
+                raise ValueError("unterminated Dockerfile heredoc")
+
+
+def _external_base(text: str) -> bool:
+    stages: set[str] = set()
+    stage_count = 0
+    for op, flags, args in _docker_instructions(text):
+        if op == "from":
+            words = args.lower().split()
+            if not words or (words[0] != "scratch" and words[0] not in stages):
+                return True
+            if len(words) == 3 and words[1] == "as":
+                stages.add(words[2])
+            stage_count += 1
+        if op == "copy":
+            for flag in flags:
+                key, _, source = flag.lower().partition("=")
+                if (
+                    key == "--from"
+                    and source not in stages
+                    and not (source.isascii() and source.isdecimal() and int(source) < stage_count)
+                ):
+                    return True
+    return False
+
+
 @dataclass(frozen=True)
 class _Rule:
     """A manifest syft can't fully resolve (syft 1.51) unless `locks` pin it, beside it or, with
@@ -237,7 +392,18 @@ class _Rule:
     declares: Callable[[str], bool]
     locks: frozenset[str] = frozenset()
     above: bool = True
-    reason: ManifestCoverageReason = ManifestCoverageReason.NO_LOCKFILE
+    reason: str = ManifestCoverageReason.NO_LOCKFILE
+
+    def gap(self, path: PurePosixPath) -> UnresolvedManifest:
+        try:
+            reason = ManifestCoverageReason(self.reason)
+        except ValueError as e:
+            raise ConfigError(
+                f"installed manifest coverage contract lacks reason {self.reason!r}"
+            ) from e
+        return UnresolvedManifest(
+            ecosystem=self.ecosystem, path=RepoPath(path.as_posix()), reason=reason
+        )
 
 
 _RULES = (
@@ -256,6 +422,7 @@ _RULES = (
     _Rule(Ecosystem.NUGET, lambda n: n.endswith((".csproj", ".fsproj", ".vbproj")),
           lambda text: "<PackageReference" in text, frozenset({"packages.lock.json"}),
           above=False),
+    _Rule(Ecosystem.DOCKER, _containerfile, _external_base, reason="unsupported-manifest"),
 )  # fmt: skip
 
 # Ecosystems whose absence a manifest scan can prove: a rule knows the manifests that declare
@@ -286,15 +453,18 @@ def _filled(path: Path) -> bool:
 
 
 def unresolved_manifests(workspace: Path) -> tuple[UnresolvedManifest, ...]:
-    """The checkout's dependency manifests whose declarations syft can't all pin: a manifest
-    with no lockfile, or a requirements file with ranges. Their packages may be missing from
-    the SBOM. Vendored and generated trees are skipped, as the profilers skip them."""
+    """Find unresolved declarations; beneath build directories, inspecting only containerfiles."""
     if not workspace.is_dir():
         raise ValidationError(f"workspace is not a directory: {workspace}")
     held: dict[PurePosixPath, set[str]] = {}
     for top, dirs, names in os.walk(workspace, followlinks=False):
-        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
-        held[PurePosixPath(Path(top).relative_to(workspace).as_posix())] = set(names)
+        directory = PurePosixPath(Path(top).relative_to(workspace).as_posix())
+        dirs[:] = sorted(d for d in dirs if d == "build" or d not in SKIP_DIRS)
+        held[directory] = (
+            {name for name in names if _containerfile(name)}
+            if "build" in directory.parts
+            else set(names)
+        )
 
     def locked(rule: _Rule, directory: PurePosixPath) -> bool:
         scope = [directory, *directory.parents] if rule.above else [directory]
@@ -310,11 +480,5 @@ def unresolved_manifests(workspace: Path) -> tuple[UnresolvedManifest, ...]:
                 continue
             for rule in _RULES:
                 if rule.manifest(name) and not locked(rule, directory) and _declares(rule, path):
-                    found.append(
-                        UnresolvedManifest(
-                            ecosystem=rule.ecosystem,
-                            path=RepoPath((directory / name).as_posix()),
-                            reason=rule.reason,
-                        )
-                    )
+                    found.append(rule.gap(directory / name))
     return tuple(found)

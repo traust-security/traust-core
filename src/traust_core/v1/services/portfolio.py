@@ -68,6 +68,7 @@ from traust_core.v1.models.inventory import (
     RepositoryDisposition,
     RepositoryFilter,
     RepositoryRef,
+    RepositoryResolution,
     RepoState,
     RiskTier,
     SyncReport,
@@ -80,7 +81,13 @@ from traust_core.v1.models.observation import (
     ObservationTarget,
     SeenHead,
 )
-from traust_core.v1.models.operations import AssetName, OrderFilter, OrderManifest, OrderState
+from traust_core.v1.models.operations import (
+    AssetName,
+    OrderFilter,
+    OrderManifest,
+    OrderState,
+    WorkerId,
+)
 from traust_core.v1.models.product_definitions import (
     ProductDefinitions,
     ProductDefinitionsSnapshot,
@@ -120,6 +127,7 @@ from traust_core.v1.services.observation import (
     observe_forge_facts,
     parse_audit_date,
 )
+from traust_core.v1.services.order_binding import order_binding
 
 if TYPE_CHECKING:
     from traust_core.v1.services.assessment import AssessmentService
@@ -397,12 +405,30 @@ class PortfolioService:
         network: bool = True,
         breaker: BanBreaker | None = None,
         quota_deferred: bool | None = None,
+        run_order_id: UUID | None = None,
+        worker: WorkerId | None = None,
+        lease_generation: int | None = None,
     ) -> ForgeFacts:
         """Observe one repository at the forge and keep what it answered: public, archived and
         its fork's upstream (brought into the inventory) on the repository, and a repo-state
         assessment of the default-branch head when its status or measurements changed."""
         started = perf_counter()
         target = self._target(repository_id=repository_id, repo_url=repo_url)
+        guard = order_binding(
+            self._ops,
+            self._uow,
+            run_order_id,
+            target.repository_id,
+            worker,
+            lease_generation,
+            lock_at_commit=True,
+        )
+        if run_order_id is not None and (
+            self._assessment is None
+            or self._assessment._uow is not self._uow
+            or self._require_publisher()._uow is not self._uow
+        ):
+            raise ConfigError("order-bound observation needs a shared assessment transaction")
         facts = observe_forge_facts(
             target,
             self._sources,
@@ -414,10 +440,17 @@ class PortfolioService:
             seen=self._seen_head(target.repository_id),
             tools=self._tools,
         )
+        with guard:
+            self._keep_observation(target, facts, started, bound=run_order_id is not None)
+        return facts
+
+    def _keep_observation(
+        self, target: ObservationTarget, facts: ForgeFacts, started: float, *, bound: bool
+    ) -> None:
         self._count_toward_disposition(target.repository_id, facts, observed_url=target.repo_url)
         if facts.availability_queried:
             unknown = facts.liveness_status == LivenessStatus.UNKNOWN
-            self.record_liveness(
+            self._record_liveness(
                 Liveness(
                     repository_id=target.repository_id,
                     url=self.get_repository(target.repository_id).url,
@@ -432,11 +465,11 @@ class PortfolioService:
                     else facts.error
                     if facts.liveness_status == LivenessStatus.MISSING
                     else None,
-                )
+                ),
+                retry=not bound,
             )
         if facts.head is not None:
             self._keep(target, facts, started)
-        return facts
 
     def _keep(self, target: ObservationTarget, facts: ForgeFacts, started: float) -> None:
         assert facts.repo is not None and facts.head is not None and self._assessment is not None
@@ -818,6 +851,9 @@ class PortfolioService:
 
     def record_liveness(self, row: Liveness) -> PublishResult:
         """Record explicit availability evidence, carrying the start of an unchanged status."""
+        return self._record_liveness(row, retry=True)
+
+    def _record_liveness(self, row: Liveness, *, retry: bool) -> PublishResult:
         require_uuid(row.repository_id, "liveness.repository_id")
         repository = self.get_repository(row.repository_id)
         if row.url != repository.url:
@@ -873,7 +909,8 @@ class PortfolioService:
                     snapshot.to_artifact(), None if latest is None else latest.artifact_id
                 )
             except ConflictError:
-                continue
+                if not retry:  # A failed nested scope made the bound transaction rollback-only.
+                    raise
 
     def _completed_orders(self, repository_ids: Sequence[UUID], now: datetime) -> dict[UUID, list]:
         """The finished degraded/failed/refused repo_state orders of several repositories,
@@ -1717,6 +1754,56 @@ class PortfolioService:
     def find_repository(self, url: HttpsRepoUrl) -> Repository | None:
         return self.inventory.find_repository(url)
 
+    def resolve_repositories(self, urls: Sequence[str]) -> list[RepositoryResolution]:
+        """Every asked-for spelling's answer in one call: the repository core knows
+        under it, with the upstream edge as the hint when the matched row carries one,
+        and a URL correction's vacated spelling followed to the repository that moved.
+        The first tier folds whitespace, trailing slash and .git, git@ ssh spellings
+        and host case (scheme and www preserved); a case-folded spelling several rows
+        share answers as candidates; an unregistered or unparseable spelling answers
+        the honest absence."""
+        asked = list(dict.fromkeys(urls))
+        canonical = {url: _canonical_repo_url(url) for url in asked}
+        wanted = {folded for folded in canonical.values() if folded is not None}
+        answers: list[RepositoryResolution] = []
+        if not wanted:
+            return [RepositoryResolution(url=url) for url in asked]
+        github = {folded for folded in wanted if _forge_host(folded, self._hosts) == "github"}
+        with self._uow as uow:
+            exact = {row.url: row for row in uow.repositories.find_by_urls(wanted)}
+            folded_rows: dict[str, list[Repository]] = {}
+            for row in uow.repositories.find_by_urls_casefold(github):
+                folded_rows.setdefault(row.url.lower(), []).append(row)
+            for url in asked:
+                spelling = canonical[url]
+                if spelling is None:
+                    answers.append(RepositoryResolution(url=url))
+                    continue
+                row = exact.get(spelling)
+                if row is None and spelling in github:
+                    candidates = sorted(
+                        folded_rows.get(spelling.lower(), ()),
+                        key=lambda r: (r.created_at, r.id),
+                    )
+                    if len(candidates) > 1:
+                        # one folded spelling, several repositories: never this method's
+                        # pick (the oldest would be a guess)
+                        answers.append(RepositoryResolution(url=url, candidates=tuple(candidates)))
+                        continue
+                    row = candidates[0] if candidates else None
+                if row is not None and _is_vacated(row) and row.upstream_id is not None:
+                    # the correction's own record: the old spelling answers the
+                    # repository that moved, not the record of its leaving
+                    row = uow.repositories.get(row.upstream_id)
+                answers.append(
+                    RepositoryResolution(
+                        url=url,
+                        repository=row,
+                        alias_of=row.upstream_id if row is not None else None,
+                    )
+                )
+        return answers
+
     def list_repositories(self, filter: RepositoryFilter, page: PageRequest) -> Page[Repository]:
         if filter.url is not None:
             found = self.find_repository(filter.url)
@@ -1928,14 +2015,33 @@ def _registered_repository(
     return None
 
 
+def _canonical_repo_url(raw: str) -> str | None:
+    """The spelling core joins by: whitespace stripped, trailing slash and .git suffix
+    removed, git@ ssh spellings folded to https, the host lowercased; scheme and www
+    preserved. None when the spelling is no https repository URL."""
+    folded = raw.strip()
+    if folded.startswith("git@"):
+        host, _, path = folded.removeprefix("git@").partition(":")
+        if path:
+            folded = f"https://{host}/{path}"
+    try:
+        return str(HttpsRepoUrl._parse(folded))
+    except ValidationError:
+        return None
+
+
+def _forge_host(url: str, hosts: Mapping[str, str]) -> str | None:
+    """The forge kind a canonical URL's host maps to, None when it maps to none."""
+    try:
+        return hosts.get((urlsplit(url).hostname or "").lower())
+    except ValueError:
+        return None
+
+
 def _registered(doc: CorpusRegistryArtifact, product: Product) -> CorpusSubject:
     subject = CorpusRegistry.of(doc).subject(str(product.id))
     assert subject is not None
     return subject
-
-
-def _why(e: SourceError | ValidationError) -> object:
-    return e.observation_status if isinstance(e, SourceError) else e
 
 
 class PortfolioSync:
@@ -1969,49 +2075,53 @@ class PortfolioSync:
     def import_repository(self, url: HttpsRepoUrl) -> SyncReport:
         """Register one repository with the visibility its forge reports and its fork's
         upstream linked. A known repository with no upstream is asked again on import unless
-        its latest observation recorded the forge's answer that it isn't a fork."""
+        its latest observation recorded the forge's answer that it isn't a fork. A forge
+        that doesn't answer raises before anything is written: no half-registered row."""
         known = self._portfolio.find_repository(url)
         if known is not None and known.id is not None:
             if known.upstream_id is None and self._portfolio.fork_answer(known.id) is not False:
                 # lineage not known yet: the forge may name a parent, or correct a parent
-                # placeholder's visibility. A forge outage, or a host the forge provider
-                # can't ask, still returns the known id.
+                # placeholder's visibility. A forge that doesn't answer raises here; its own
+                # positive word that there is no such repository is the disposition's
+                # evidence, not onboarding's to weigh (Qodo #474: the vacated URL stays).
                 try:
                     info = self._sources.info(url).data
-                except (SourceError, ValidationError) as e:
-                    return SyncReport(
-                        unchanged=(known.id,),
-                        skipped=(f"{url}: forge facts not refreshed: {_why(e)}",),
-                    )
-                return SyncReport(unchanged=(known.id,), skipped=self._record_info(known.id, info))
+                except SourceError as e:
+                    if e.liveness_status is not LivenessStatus.MISSING:
+                        raise
+                    return SyncReport(unchanged=(known.id,))
+                self._record_info(known.id, info, self._head_of(info))
             return SyncReport(unchanged=(known.id,))
         info = self._sources.info(url).data
+        # the head is asked before the row is written: a forge that can't answer leaves no
+        # half-registered repository
+        head = self._head_of(info)
         report = self._register(url, info.visibility)
-        skipped = self._record_info((*report.added, *report.unchanged)[0], info)
-        return report + SyncReport(skipped=skipped)
+        self._record_info((*report.added, *report.unchanged)[0], info, head)
+        return report
 
-    def _record_info(self, repository_id: UUID, info: RepoInfo) -> tuple[str, ...]:
+    def _head_of(self, info: RepoInfo) -> GitSha | None:
+        """The default branch's head; None when the forge names no default branch or no
+        commit on it (an empty repository: the forge answered, so the import carries on
+        without a default line, as it does without a named branch)."""
+        if info.default_branch is None:
+            return None
+        try:
+            return self._sources.head(info.repo, info.default_branch).data
+        except SourceError as e:
+            if not e.empty_repository:
+                raise
+            return None
+
+    def _record_info(self, repository_id: UUID, info: RepoInfo, head: GitSha | None) -> None:
         """What an import learned from the forge: the visibility it reports (None: it didn't
         say), a fork's parent, and the default branch's line — the observation's default ref
-        without needing a run, so an imported repository is a subject from the start. A head
-        the forge couldn't give is skipped, and holds back the parent link that would settle
-        a fork's import, so the next import asks again."""
-        head, skipped = None, ()
-        if info.default_branch is not None:
-            try:
-                head = self._sources.head(info.repo, info.default_branch).data
-            except (SourceError, ValidationError) as e:
-                skipped = (f"{info.repo}: default line not imported: {_why(e)}",)
-        parent = (
-            None
-            if skipped
-            else _fork_parent_url(info.repo.host, info.fork, info.parent, self._hosts)
-        )
+        without needing a run, so an imported repository is a subject from the start."""
+        parent = _fork_parent_url(info.repo.host, info.fork, info.parent, self._hosts)
         self._portfolio.record_repo_info(repository_id, _is_public(info.visibility), parent)
         if head is not None:
             assert info.default_branch is not None
             self._portfolio.mark_default_branch(repository_id, head, RefName(info.default_branch))
-        return skipped
 
     def import_branch(
         self, repository_id: UUID, url: HttpsRepoUrl, branch: RefName

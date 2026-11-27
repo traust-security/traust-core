@@ -5,6 +5,7 @@ import logging
 import re
 from collections import Counter, defaultdict
 from collections.abc import Collection, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -64,7 +65,6 @@ from traust_core.v1.models.operations import (
     OrderFilter,
     OrderReason,
     OrderRequest,
-    OrderState,
     RecordKind,
     RunOrder,
     WorkerId,
@@ -141,6 +141,7 @@ from traust_core.v1.services.artifact_publishing import (
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings.service import FindingService
+from traust_core.v1.services.order_binding import order_binding
 from traust_core.v1.services.portfolio import Inventory, PortfolioService
 from traust_core.v1.services.validation import ValidationService
 
@@ -165,12 +166,15 @@ _SEVERITY_RANK = {s: i for i, s in enumerate(SEVERITY_ORDER)}
 
 class RemediationConfig(Model):
     """Where fixes are pushed: the deployment's mirror org, its patch-repository name prefix
-    and its own forge hosts."""
+    and its own forge hosts; and the machine identity fix commits are authored under."""
 
     fork_org: OrgName | None = None
     private_forge_hosts: tuple[str, ...] = ()
     patch_prefix: str = pydantic.Field(default="patch-", pattern=r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
     fix_branch_prefix: str = pydantic.Field(default="fix", pattern=r"^[A-Za-z0-9._-]+$")
+    committer: str = pydantic.Field(
+        default="traust-remediation", pattern=r"^[a-z0-9][a-z0-9-]*-remediation$"
+    )
 
     @pydantic.field_validator("private_forge_hosts")
     @classmethod
@@ -183,7 +187,7 @@ class RemediationConfig(Model):
 
 
 class ForkPolicy:
-    """Where fixes go: the inventory's private mirror, else the sci-patch-<name> convention in
+    """Where fixes go: the inventory's private mirror, else the fork-prefix convention in
     the fork org for GitHub, else the repository itself on the deployment's own forge; never
     a public repository."""
 
@@ -244,7 +248,7 @@ class ForkPolicy:
         )
 
     def before_convention(self, repository_url: str) -> Fork | None:
-        """The fork this policy answered before the sci-patch convention: the bare repository
+        """The fork this policy answered before the prefix convention: the bare repository
         name in the fork org, GitHub only — None where today's answer was already the old
         one's (a registered mirror, or the repository itself on a private forge)."""
         upstream = _url(repository_url)
@@ -254,6 +258,11 @@ class ForkPolicy:
         return self.of(
             HttpsRepoUrl("github.com", f"{self._config.fork_org}/{name}"), ForkVisibility.PRIVATE
         )
+
+    @property
+    def committer(self) -> str:
+        """The machine identity fix commits are authored under (`<name>@localhost`)."""
+        return self._config.committer
 
     def fix_branch(self, finding_id: UUID, title: str) -> str:
         slug = re.sub(r"[^A-Za-z0-9]+", "-", title).strip("-").lower()[:40]
@@ -294,6 +303,26 @@ class _RemediationRecording:
     report: StagedArtifact | ArtifactRef
     patch: StagedArtifact | None
     patch_refusal: str | None
+
+
+def _recording_ops(
+    ops: OpsService | None,
+    uow: TraustUnitOfWork,
+    findings: FindingService,
+    publisher: ArtifactPublisher,
+) -> OpsService:
+    if ops is None:
+        raise ConfigError("leased report recording requires operations authorization")
+    writers = (
+        ops._uow,
+        publisher._uow,
+        findings._uow,
+        findings.decisions._uow,
+        findings.intake._uow,
+    )
+    if any(writer is not uow for writer in writers):
+        raise ConfigError("recording, finding writers and operations must share a unit of work")
+    return ops
 
 
 class RemediationService:
@@ -376,7 +405,7 @@ class RemediationService:
 
     def prepare(self, work_item_id: UUID) -> RemediationInput:
         """What the skill patches: the findings as they stand with their latest validation and
-        audit suggestion, the commit, the fork and branch."""
+        audit suggestion, the commit, the fork and branch, and the commit's machine author."""
         item = self.get(work_item_id)
         subject = self._inventory.subject(item.repository_ref_id, work_item_id)
         views = self._findings.list_by_ids(item.finding_ids)
@@ -408,6 +437,7 @@ class RemediationService:
             fix_branch=order.fork_branch
             if order is not None and order.fork_branch is not None
             else self._forks.fix_branch(views[0].finding.id, views[0].finding.title),  # type: ignore[arg-type]
+            committer=self._forks.committer,
         )
 
     def _scheduled_fork(self, order: RunOrder, repository_url: str) -> Fork:
@@ -589,7 +619,7 @@ class RemediationService:
     def vouched(self, order: RunOrder, forks: dict[UUID, Fork | None] | None = None) -> bool:
         """Whether scheduling vouches for the order's fork facts: its scheduling stamp
         (contracts#130), or, for an order from before the stamp, today's fork policy — or
-        the bare name that policy answered before the sci-patch convention — read once per
+        the bare name that policy answered before the prefix convention — read once per
         repository into `forks` when given."""
         if (
             order.fork_scheduled_at is not None
@@ -608,7 +638,7 @@ class RemediationService:
 
     def _vouched_before_convention(self, order: RunOrder) -> bool:
         """Whether an unstamped order names the bare fork the policy answered before the
-        sci-patch convention: an era's door-set facts stay vouched across the change — the
+        prefix convention: an era's door-set facts stay vouched across the change — the
         bare name is computed from the repository, never read off the order, and a fork the
         inventory has since proven another upstream's never vouches."""
         if order.fork_url is None or order.fork_branch is None:
@@ -830,22 +860,23 @@ class RemediationService:
         run_order_id: UUID,
         principal: Principal,
         *,
+        lease_generation: int,
         diff: bytes | None = None,
     ) -> WorkItem:
         """Record a leased remediation run, bound to its repository and any named work item."""
 
-        if self._recording is None:
-            raise ConfigError("remediation recording requires operations authorization")
+        ops = _recording_ops(self._recording, self._uow, self._findings, self._publisher)
         doc = RemediationArtifact.parse(doc.payload)
         repository = self._inventory.find_repository(doc.metadata.repository)
         if repository is None or repository.id is None:
             raise NotFoundError(f"repository {doc.metadata.repository}")
-        with self._recording.recording(
+        with ops.recording(
             order_id=run_order_id,
             principal=principal,
             kind=RecordKind.REMEDIATION,
             repository_id=repository.id,
             provenance=provenance,
+            lease_generation=lease_generation,
         ) as order:
             # NEED(contracts: remediation recording section): the door shares the triage
             # allowlist until contracts lands a remediation section, so the allowlist alone
@@ -866,13 +897,16 @@ class RemediationService:
                     f"order {run_order_id}: remediation report covers findings of another"
                     " repository"
                 )
-        staged = self._stage_remediation(doc, provenance, order.work_item_id, diff)
-        with self._recording.recording(
+        staged = self._stage_remediation(
+            doc, provenance, order.work_item_id, diff, run_order_id=run_order_id
+        )
+        with ops.recording(
             order_id=run_order_id,
             principal=principal,
             kind=RecordKind.REMEDIATION,
             repository_id=repository.id,
             provenance=provenance,
+            lease_generation=lease_generation,
         ) as current:
             if (current.asset, current.work_item_id) != (order.asset, order.work_item_id):
                 raise ConflictError(
@@ -889,7 +923,6 @@ class RemediationService:
         provenance: Provenance,
         *,
         work_item_id: UUID | None = None,
-        run_order_id: UUID | None = None,
         diff: bytes | None = None,
     ) -> WorkItem: ...
     @overload
@@ -900,20 +933,15 @@ class RemediationService:
         provenance: Provenance,
         *,
         work_item_id: UUID | None = None,
-        run_order_id: UUID | None = None,
         diff: bytes | None = None,
     ) -> WorkItem | FleetFix:
-        """A report on the open work item for exactly its findings (`finding_ref` = finding id),
-        the one the run prepared when it names it (`work_item_id`; the report itself doesn't):
-        attached by the order whose run recorded it, its Jira keys linked, the item moved to its
-        status; re-recording is a no-op."""
+        """Record a local report on its work item, or publish a fleet-fix spec."""
         if isinstance(doc, FleetFixArtifact):
             if diff is not None:
                 raise ValidationError("fleet-fix specs do not take remediation patch bytes")
             return self._record_fleet_fix(doc, provenance)
-        return self._record_remediation(
-            self._stage_remediation(doc, provenance, work_item_id, diff), run_order_id
-        )
+        staged = self._stage_remediation(doc, provenance, work_item_id, diff, run_order_id=None)
+        return self._record_remediation(staged, None)
 
     def _stage_remediation(
         self,
@@ -921,6 +949,8 @@ class RemediationService:
         provenance: Provenance,
         work_item_id: UUID | None,
         diff: bytes | None,
+        *,
+        run_order_id: UUID | None,
     ) -> _RemediationRecording:
         doc = RemediationArtifact.parse(doc.payload)
         if doc.fork.visibility == ForkVisibility.PUBLIC:
@@ -931,6 +961,10 @@ class RemediationService:
         status = RemediationStatus(doc.summary.status)
         digest = sha256_hex(doc.payload)
         item = self._reported_item(wanted, digest, work_item_id)
+        if item.reported_by is not None and item.reported_by != run_order_id:
+            raise ConflictError(
+                f"work item {item.work_item_id}: report belongs to order {item.reported_by}"
+            )
         pushed_to = str(_url(doc.fork.url))
         self.refuse_public(pushed_to)
         # a scheduled fix is pushed where it was scheduled: its commit is what verification of
@@ -960,6 +994,8 @@ class RemediationService:
                 raise IntegrityError(
                     f"artifact {published.id}: doc digest {digest} != published {published.digest}"
                 )
+        if run_order_id is not None:
+            self._findings.decisions.require_order_ledger()
         patch, refusal = None, None
         if diff is not None:
             try:
@@ -990,6 +1026,12 @@ class RemediationService:
         with self._uow.write() as uow:
             self._findings.lock_findings(item.finding_ids)
             held = self._log.documents([self._log.get(item.work_item_id)], (doc.schema,))
+            if any(
+                row.run_order_id is not None and row.run_order_id != run_order_id for _, row in held
+            ):
+                raise ConflictError(
+                    f"work item {item.work_item_id}: report belongs to another order"
+                )
             if any(row.digest != digest for _, row in held):
                 raise ConflictError(f"work item {item.work_item_id} already holds another report")
             patch = self._record_patch(staged)
@@ -1089,17 +1131,21 @@ class RemediationService:
         )
 
     def apply_fleet_fix(
-        self, fleet_fix_id: UUID, target_id: UUID, approval_id: UUID
+        self,
+        fleet_fix_id: UUID,
+        target_id: UUID,
+        approval_id: UUID,
+        *,
+        worker: WorkerId,
+        lease_generation: int,
     ) -> PatchResult:
         """Apply a recorded spec to the target repository's default-branch head, under the
         approved run order the engine is executing, through the engine's applier (diffs only);
         recorded as a `fleet_fix` assessment of that commit holding the spec."""
+        guard = order_binding(
+            self._ops, self._uow, approval_id, target_id, worker, lease_generation
+        )
         fix = self.get_fleet_fix(fleet_fix_id)
-        order = self._ops.get(approval_id)
-        if order.repository_id != target_id or order.state != OrderState.LEASED:
-            raise ForbiddenError(
-                f"run order {approval_id} is not a leased order for repository {target_id}"
-            )
         manifest = self._ops.manifest(approval_id)
         if _fleet_fix_of(manifest.config) != fleet_fix_id:
             raise ForbiddenError(f"run order {approval_id} is not for fleet fix {fleet_fix_id}")
@@ -1124,24 +1170,25 @@ class RemediationService:
             raise ValidationError(
                 f"guard: {len(diff.files_changed)} files changed exceeds max_files_changed={limit}"
             )
-        recorded = self._log.find_recorded(
-            [ref.id], FLEET_FIX, FleetFixArtifact.schema, fix.artifact.digest
-        )
-        if recorded:
-            assessment = recorded[0][0]
-        else:
-            assessment, _ = self._log.add(
-                Assessment(
-                    repository_ref_id=ref.id,
-                    kind=FLEET_FIX,
-                    status=ASSESSMENT_COMPLETED,
-                    assessor=FLEET_FIX_ASSESSOR,
-                    assessor_version="",
-                    occurred_at=self._clock.now(),
-                ),
-                fleet_fix_id,
-                fix.artifact.digest,
+        with guard:
+            recorded = self._log.find_recorded(
+                [ref.id], FLEET_FIX, FleetFixArtifact.schema, fix.artifact.digest
             )
+            if recorded:
+                assessment = recorded[0][0]
+            else:
+                assessment, _ = self._log.add(
+                    Assessment(
+                        repository_ref_id=ref.id,
+                        kind=FLEET_FIX,
+                        status=ASSESSMENT_COMPLETED,
+                        assessor=FLEET_FIX_ASSESSOR,
+                        assessor_version="",
+                        occurred_at=self._clock.now(),
+                    ),
+                    fleet_fix_id,
+                    fix.artifact.digest,
+                )
         assert assessment.id is not None
         if not recorded:
             self._uow.after_commit(
@@ -1222,11 +1269,21 @@ class RemediationService:
             fix_id = _fleet_fix_of(self._ops.manifest(order.id).config)
             if fix_id is None:
                 raise IntegrityError(f"order {order.id}: its run manifest names no fleet fix")
-            patch = self.apply_fleet_fix(fix_id, order.repository_id, order.id)
+            patch = self.apply_fleet_fix(
+                fix_id,
+                order.repository_id,
+                order.id,
+                worker=worker,
+                lease_generation=order.lease_generation,
+            )
         except Exception as error:
-            self._ops.complete(order.id, worker, _refusal(error))
+            self._ops.complete(
+                order.id, worker, _refusal(error), lease_generation=order.lease_generation
+            )
             raise
-        done = self._ops.complete(order.id, worker, JobResult.succeeded())
+        done = self._ops.complete(
+            order.id, worker, JobResult.succeeded(), lease_generation=order.lease_generation
+        )
         return FleetFixRun(order=done, patch=patch)
 
     def get(self, work_item_id: UUID) -> WorkItem:
@@ -1681,33 +1738,43 @@ class VerificationService:
         provenance: Provenance,
         run_order_id: UUID,
         principal: Principal,
+        *,
+        lease_generation: int,
     ) -> Verification:
-        if self._recording is None:
-            raise ConfigError("verification recording requires operations authorization")
+        ops = _recording_ops(self._recording, self._uow, self._findings, self._publisher)
+        doc = VerificationArtifact.parse(doc.payload)
         repository = self._inventory.find_repository(doc.metadata.repository)
         if repository is None or repository.id is None:
             raise NotFoundError(f"repository {doc.metadata.repository}")
-        with self._recording.recording(
-            order_id=run_order_id,
-            principal=principal,
-            kind=RecordKind.VERIFICATION,
-            repository_id=repository.id,
-            provenance=provenance,
-        ):
-            return self.record(doc, provenance, run_order_id=run_order_id)
+        ops.check_recording(
+            run_order_id,
+            principal,
+            RecordKind.VERIFICATION,
+            repository.id,
+            provenance,
+            lease_generation=lease_generation,
+        )
+        guard = ops.recording(
+            run_order_id,
+            principal,
+            RecordKind.VERIFICATION,
+            repository.id,
+            provenance,
+            lease_generation=lease_generation,
+        )
+        return self._record(doc, provenance, run_order_id, guard)
 
-    def record(
+    def record(self, doc: VerificationArtifact, provenance: Provenance) -> Verification:
+        """Record a local verification report and its findings and verdicts atomically."""
+        return self._record(doc, provenance, None, nullcontext())
+
+    def _record(
         self,
         doc: VerificationArtifact,
         provenance: Provenance,
-        *,
-        run_order_id: UUID | None = None,
+        run_order_id: UUID | None,
+        guard: AbstractContextManager[object],
     ) -> Verification:
-        """A verification report (`original_id` = finding id from prepare) as a `verification`
-        assessment of the patched commit: its verdicts as decisions, its regressions as findings.
-        The assessment, its report, the regressions, the verdicts and the revalidation of the
-        remediations scheduled on them are one transaction; only the published bytes precede it.
-        Re-recording a finished run changes nothing."""
         if warnings := check_verification(doc):
             log.warning("verification report has %d warnings", len(warnings))
         meta = doc.metadata
@@ -1736,10 +1803,12 @@ class VerificationService:
                 digest,
             )
 
-        # the bytes go first, outside the transaction: content-addressed, a copy is harmless
-        published = None
+        staged = None
         if not recorded():
-            published = (provenance.artifact or self._publisher.publish_ref(doc)).id
+            if run_order_id is not None:
+                self._findings.decisions.require_order_ledger()
+            if provenance.artifact is None:
+                staged = self._publisher.stage(doc)
         said: defaultdict[tuple[Any, ...], list[UUID]] = defaultdict(list)
         for finding_id, f in verdicts.items():
             propagation = f.cross_repo.propagation if f.cross_repo else None
@@ -1747,17 +1816,25 @@ class VerificationService:
         rationales = {
             i: " ".join(f.evidence.explanation.split())[:RATIONALE_CAP] for i, f in verdicts.items()
         }
-        with self._uow.write() as uow:
+        with guard, self._uow.write() as uow:
             # under the write lock: a delivery of the same report may have landed meanwhile
             if found := recorded():
                 assessment, report = found[0]
-                if run_order_id is not None and assessment.run_order_id != run_order_id:
+                if assessment.run_order_id != run_order_id:
                     raise ConflictError(
                         f"verification assessment {assessment.id} belongs to order "
                         f"{assessment.run_order_id}, not {run_order_id}"
                     )
+                if assessment.run_order_id is not None:
+                    self._findings.decisions.require_order_ledger()
+                    assert assessment.id is not None
+                    return self._recorded_verification(repository_id, assessment.id)
             else:
-                assert published is not None  # a recorded assessment is never removed
+                if staged is not None:
+                    published = self._publisher.publish_staged(staged).artifact_id
+                else:
+                    assert provenance.artifact is not None  # recorded assessments are never removed
+                    published = provenance.artifact.id
                 assessment, report = self._log.add(
                     Assessment(
                         repository_ref_id=ref.id,  # type: ignore[arg-type]
@@ -1798,10 +1875,13 @@ class VerificationService:
                     "verification %s: %d verdicts on ref %s", assessment.id, len(verdicts), ref.id
                 )
             )
-        (verification,) = (
-            v for v in self._verifications(repository_id) if v.verification_id == assessment.id
-        )
-        return verification
+        return self._recorded_verification(repository_id, assessment.id)
+
+    def _recorded_verification(self, repository_id: UUID, assessment_id: UUID) -> Verification:
+        for verification in self._verifications(repository_id):
+            if verification.verification_id == assessment_id:
+                return verification
+        raise IntegrityError(f"verification assessment {assessment_id} lacks its recorded result")
 
     def _audit_of(
         self, finding_ids: Sequence[UUID], original_commit: str, patched: RepositoryRef
@@ -1890,6 +1970,109 @@ class VerificationService:
                     for _, ref in sorted(branches.items())
                 )
         return VerifySweep.of(entries)
+
+    def work_item_covered(
+        self,
+        repository_id: UUID,
+        order_id: UUID,
+        work_item_id: UUID,
+        verification_ids: Collection[UUID],
+    ) -> set[UUID]:
+        """Completed verifications from `order_id` covering every finding on a bound patched work
+        item at its fix commit."""
+        prepared = self.prepare(work_item_id)
+        item = prepared.work_item
+        if prepared.subject.repository_id != repository_id or not (item.fork and item.fix_commit):
+            raise ValidationError("verification order has no bound patched work item")
+        wanted = set(verification_ids)
+        runs = {
+            a.id
+            for a in self._assessment.list_for_order(order_id)
+            if a.id in wanted and a.run_order_id == order_id and a.status == ASSESSMENT_COMPLETED
+        }
+        return {
+            v.verification_id
+            for v in prepared.verifications
+            if v.verification_id in runs
+            and bool(item.finding_ids)
+            and set(item.finding_ids) <= {verdict.finding_id for verdict in v.verdicts}
+            and (
+                (ref := self._inventory.get_ref(v.repository_ref_id)).repository_id == repository_id
+                and ref.sha == item.fix_commit
+            )
+        }
+
+    def sweep_covered(
+        self,
+        repository_id: UUID,
+        verification_ids: Collection[UUID],
+        *,
+        order_id: UUID | None = None,
+    ) -> bool:
+        """Whether `verification_ids` cover every finding selected on the repository's default line.
+
+        Excludes newly discovered regressions whose occurrences originate exclusively from those
+        verification runs.
+        """
+        wanted = set(verification_ids)
+        if not wanted:
+            return False
+        with self._uow:
+            candidates = (
+                self._assessment.list_for_order(order_id)
+                if order_id is not None
+                else self._assessment.list_for_repository(
+                    repository_id, AssessmentKind.VERIFICATION
+                )
+            )
+            runs = [
+                a
+                for a in candidates
+                if a.id in wanted
+                and (order_id is None or a.run_order_id == order_id)
+                and a.status == ASSESSMENT_COMPLETED
+            ]
+            head = self._portfolio.default_ref(repository_id)
+            if not runs or {a.id for a in runs} != wanted or head is None or head.id is None:
+                return False
+            expected = {
+                view.finding.id
+                for view in self._findings.on_ref(head.id)
+                if view.finding.id is not None
+            }
+            recorded = {a.id for a in runs}
+            covered: set[UUID] = set()
+            regressions: set[UUID] = set()
+            current_runs: set[UUID] = set()
+            for v in self._verifications(repository_id):
+                if v.verification_id not in recorded:
+                    continue
+                ref = self._inventory.get_ref(v.repository_ref_id)
+                if (ref.repository_id, ref.name, ref.kind, ref.sha) == (
+                    repository_id,
+                    head.name,
+                    head.kind,
+                    head.sha,
+                ):
+                    current_runs.add(v.verification_id)
+                    covered.update(verdict.finding_id for verdict in v.verdicts)
+                    regressions.update(v.regression_ids)
+            if regressions:
+                origins: dict[UUID, set[UUID]] = {}
+                for occurrence in self._findings.occurrences(finding_ids=regressions):
+                    origins.setdefault(occurrence.finding_id, set()).add(occurrence.assessment_id)
+                expected -= {
+                    finding
+                    for finding in regressions
+                    if origins.get(finding) and origins[finding] <= current_runs
+                }
+            latest = self._portfolio.default_ref(repository_id)
+            return (
+                latest is not None
+                and (latest.id, latest.sha) == (head.id, head.sha)
+                and bool(expected)
+                and expected <= covered
+            )
 
     def sweep_markdown(self, sweep: VerifySweep) -> str:
         """Human-readable companion of the same classified sweep, not a second state store."""

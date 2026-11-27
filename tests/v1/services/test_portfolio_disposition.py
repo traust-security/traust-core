@@ -600,12 +600,15 @@ def test_the_worklist_leaves_out_the_corrections_records():
     assert harness.repository_id in {r.id for r in worklist.items}
 
 
-def test_onboarding_plans_nothing_for_a_dispositioned_repository(engine=None):
+def test_onboarding_plans_nothing_for_a_dispositioned_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The collector re-registering a vacated URL must not re-enter the repository
     through onboarding's baseline: the universe rule covers the onboarding door."""
     import pathlib
     import tempfile
 
+    from tests.v1.providers.test_forge_inventory import forge
     from tests.v1.repositories.tables.conftest import Seed
     from tests.v1.services.test_operations import OPERATOR
     from traust_core.v1.context import Config, Context
@@ -628,6 +631,10 @@ def test_onboarding_plans_nothing_for_a_dispositioned_repository(engine=None):
         )
         uow.commit()
     assert repo.id is not None
+    # the forge's positive word that the vacated URL has no repository: not a failed import
+    path = repo.url.removeprefix("https://github.com/")
+    gone, _, _ = forge({}, github={f"repos/{path}": (404, "gone")})
+    monkeypatch.setattr("traust_core.v1.context.context.command_source", lambda *a, **k: gone)
     onboarding = context.services().onboarding
     result = onboarding.onboard(
         OnboardingRequest(

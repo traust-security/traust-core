@@ -2,19 +2,24 @@
 
 from __future__ import annotations
 
+import json
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
-from typing import Literal, TypeVar
+from typing import Literal, Self, TypeVar
+from uuid import UUID
 
 import pydantic
+from cvss import CVSS3, CVSS4
+from cvss.exceptions import CVSSError
 from pydantic import Field, StrictBool, StrictFloat, StrictInt, StrictStr
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.base import Dto, Model
-from traust_core.v1.models.dependencies import cvss_base_score
+from traust_core.v1.models.values import canonical_decimal
+from traust_core.v1.models.vocabulary import Severity
 
 
 class CvssSource(StrEnum):
@@ -35,72 +40,12 @@ _VECTOR: dict[CvssVersion, re.Pattern[str]] = {
     "3.1": re.compile(r"CVSS:3\.1(/[A-Z]{1,3}:[A-Z])+"),
     "4.0": re.compile(r"CVSS:4\.0(/[A-Z]{1,3}:[A-Za-z]{1,5})+"),
 }
-_CIA, _MOD = ("H", "L", "N"), ("X", "H", "M", "L")
-# FIRST's metric values: 3.0 and 3.1 share one table, 4.0 has its own. Base metrics are required.
-_V3_BASE = {
-    "AV": ("N", "A", "L", "P"),
-    "AC": ("L", "H"),
-    "PR": ("N", "L", "H"),
-    "UI": ("N", "R"),
-    "S": ("U", "C"),
-    "C": _CIA,
-    "I": _CIA,
-    "A": _CIA,
-}
-_V3_METRICS = {
-    **_V3_BASE,
-    "E": ("X", "H", "F", "P", "U"),
-    "RL": ("X", "U", "W", "T", "O"),
-    "RC": ("X", "C", "R", "U"),
-    "CR": _MOD,
-    "IR": _MOD,
-    "AR": _MOD,
-    "MAV": ("X", "N", "A", "L", "P"),
-    "MAC": ("X", "L", "H"),
-    "MPR": ("X", "N", "L", "H"),
-    "MUI": ("X", "N", "R"),
-    "MS": ("X", "U", "C"),
-    "MC": ("X", *_CIA),
-    "MI": ("X", *_CIA),
-    "MA": ("X", *_CIA),
-}
-_V4_BASE = {
-    "AV": ("N", "A", "L", "P"),
-    "AC": ("L", "H"),
-    "AT": ("N", "P"),
-    "PR": ("N", "L", "H"),
-    "UI": ("N", "P", "A"),
-    "VC": _CIA,
-    "VI": _CIA,
-    "VA": _CIA,
-    "SC": _CIA,
-    "SI": _CIA,
-    "SA": _CIA,
-}
-_V4_METRICS = {
-    **_V4_BASE,
-    "E": ("X", "A", "P", "U"),
-    "CR": _MOD,
-    "IR": _MOD,
-    "AR": _MOD,
-    "MAV": ("X", "N", "A", "L", "P"),
-    "MAC": ("X", "L", "H"),
-    "MAT": ("X", "N", "P"),
-    "MPR": ("X", "N", "L", "H"),
-    "MUI": ("X", "N", "P", "A"),
-    "MVC": ("X", *_CIA),
-    "MVI": ("X", *_CIA),
-    "MVA": ("X", *_CIA),
-    "MSC": ("X", *_CIA),
-    "MSI": ("X", "S", *_CIA),
-    "MSA": ("X", "S", *_CIA),
-    "S": ("X", "N", "P"),
-    "AU": ("X", "N", "Y"),
-    "R": ("X", "A", "U", "I"),
-    "V": ("X", "D", "C"),
-    "RE": ("X", "L", "M", "H"),
-    "U": ("X", "Clear", "Green", "Amber", "Red"),
-}
+# The spec's 4.0 metric order, which the library doesn't check; it refuses every other malformation.
+_V4_ORDER = (
+    *("AV", "AC", "AT", "PR", "UI", "VC", "VI", "VA", "SC", "SI", "SA", "E", "CR", "IR", "AR"),
+    *("MAV", "MAC", "MAT", "MPR", "MUI", "MVC", "MVI", "MVA", "MSC", "MSI", "MSA"),
+    *("S", "AU", "R", "V", "RE", "U"),
+)
 _DECIMAL = re.compile(r"\d{1,2}(\.\d{1,3})?")
 _NIST = "nvd@nist.gov"
 _NVD_BLOCKS: tuple[tuple[str, CvssVersion], ...] = (("v31", "3.1"), ("v30", "3.0"), ("v40", "4.0"))
@@ -121,8 +66,64 @@ class CvssScore(Model):
     acquired_at: datetime | None = None
 
 
+class CvssStatement(Model):
+    """One source's statement as a view shows it: its score with FIRST's band beside it."""
+
+    source: CvssSource
+    version: CvssVersion
+    vector: str
+    score: Decimal | None
+    band: Severity | None
+    scored_by: str | None
+    document: str
+    acquired_at: datetime | None
+
+    @classmethod
+    def of(cls, stated: CvssScore) -> Self:
+        band = severity_of(stated.vector) if stated.score is not None else None
+        return cls(**stated.model_dump(), band=band)
+
+    def stated(self) -> CvssScore:
+        return CvssScore(**self.model_dump(exclude={"band"}))
+
+    @pydantic.field_serializer("score", when_used="json")
+    def _score(self, value: Decimal | None) -> str | None:
+        return canonical_decimal(value)
+
+
+class SelectedCvss(CvssStatement):
+    """The statement a finding's score follows, chosen by precedence: never an unscored one."""
+
+    score: Decimal
+    band: Severity
+    reason: Literal["precedence"] = "precedence"
+
+
+class AdvisoryCvss(Model):
+    """Every authority's scores for each linked advisory, ranked, from one day's kept documents,
+    by canonical id and every id a finding names; `unreadable`: what scored nothing, and why."""
+
+    scores: Mapping[UUID, tuple[CvssScore, ...]]
+    unreadable: tuple[str, ...] = ()
+
+    def to_bytes(self) -> bytes:
+        # canonical: the same scores are the same bytes, so an unchanged day is one artifact
+        body = self.model_dump(mode="json")
+        return json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+
+    @classmethod
+    def from_bytes(cls, raw: bytes) -> AdvisoryCvss:
+        try:
+            return cls.model_validate_json(raw)
+        except pydantic.ValidationError as e:
+            raise ValidationError(
+                f"not an advisory CVSS build ({e.error_count()} problem(s))"
+            ) from e
+
+
 class EffectiveCvss(Model):
-    """A finding's chosen 3.x score, the highest-ranked 4.0 beside it, and every source's."""
+    """A finding's chosen score (3.x; 4.0 only when no source has 3.x), the highest-ranked 4.0
+    beside it, and every source's."""
 
     chosen: CvssScore | None
     v4: CvssScore | None
@@ -137,6 +138,58 @@ class EffectiveCvss(Model):
         return self.chosen.source if self.chosen is not None else None
 
 
+def cvss_base_score(vector: str) -> float | None:
+    """A `CVSS:3.0/` or `CVSS:3.1/` vector's base score; None for any other, or one FIRST's
+    formula refuses (`AdvisoryRecord.cvss_score` ranks 3.x vectors only)."""
+    score = _v3_base_score(vector)
+    return None if score is None else float(score)
+
+
+def severity_of(vector: str | None) -> Severity | None:
+    """A vector's qualitative rating — FIRST's bands, Red Hat's `cvss` — or None when the
+    vector doesn't parse: never a guess at a malformed one. CVSS "None" reads informational."""
+    if not isinstance(vector, str) or (version := _version(vector)) is None:
+        return None
+    # the spec's 4.0 metric order, the same refusal `score_of` applies — a vector the
+    # scoring path rejects as malformed never supplies a computed label either
+    if version == "4.0" and not _in_spec_order(vector, version):
+        return None
+    try:
+        parsed = CVSS4(vector) if version == "4.0" else CVSS3(vector)
+        label = parsed.severities()[0]
+    except CVSSError:
+        return None
+    return Severity.INFORMATIONAL if label == "None" else Severity(label.lower())
+
+
+def cvss_computed_score(vector: str) -> Decimal | None:
+    """The base score FIRST's formula computes for a 3.x or 4.0 vector, or None when the
+    vector doesn't parse — the number a stated score must agree with."""
+    if (version := _version(vector)) is None:
+        return None
+    if version == "4.0":
+        return _v4_base_score(vector) if _in_spec_order(vector, version) else None
+    return _v3_base_score(vector)
+
+
+def _v3_base_score(vector: str) -> Decimal | None:
+    """FIRST's 3.0/3.1 formula, each version's own rounding (Red Hat's `cvss`)."""
+    if not vector.startswith(("CVSS:3.0/", "CVSS:3.1/")):
+        return None
+    try:
+        return CVSS3(vector).base_score
+    except CVSSError:
+        return None
+
+
+def _v4_base_score(vector: str) -> Decimal | None:
+    """FIRST's 4.0 formula over the whole vector, as sources state it (Red Hat's `cvss`)."""
+    try:
+        return Decimal(str(CVSS4(vector).base_score))
+    except CVSSError:
+        return None
+
+
 def score_of(
     source: CvssSource,
     vector: object,
@@ -147,23 +200,19 @@ def score_of(
     scored_by: str | None = None,
     acquired_at: datetime | None = None,
 ) -> CvssScore | None:
-    """A stated score, or None when it can't be trusted: never a guess at a malformed one.
-    A 3.x score is the one its vector computes, which a stated score must agree with."""
+    """A score, or None when it can't be trusted: never a guess at a malformed one. The score
+    is the one its vector computes (FIRST's formula), which a stated score must agree with."""
     if not isinstance(vector, str) or (detected := _version(vector)) is None:
         return None
     if version is not None and str(version) != detected:
         return None
     claimed = _bounded(stated)
-    if not _well_formed(vector, detected) or (stated is not None and claimed is None):
+    if not _in_spec_order(vector, detected) or (stated is not None and claimed is None):
         return None
-    if detected == "4.0":
-        score = claimed
-    else:
-        if (computed := cvss_base_score(vector)) is None:
-            return None
-        score = Decimal(str(computed))
-        if claimed is not None and claimed != score:
-            return None
+    computed = _v4_base_score(vector) if detected == "4.0" else _v3_base_score(vector)
+    if computed is None or (claimed is not None and claimed != computed):
+        return None
+    score = computed
     return CvssScore(
         source=source,
         version=detected,
@@ -449,20 +498,15 @@ def _version(vector: str) -> CvssVersion | None:
     return next((v for v, pattern in _VECTOR.items() if pattern.fullmatch(vector)), None)
 
 
-def _well_formed(vector: str, version: CvssVersion) -> bool:
-    metrics, base = (_V4_METRICS, _V4_BASE) if version == "4.0" else (_V3_METRICS, _V3_BASE)
-    pairs = [pair.split(":", 1) for pair in vector.split("/")[1:]]
-    keys = [key for key, _ in pairs]
-    if version == "4.0":  # 4.0 requires the spec's order; 3.x allows any
-        order = list(metrics)
-        positions = [order.index(key) if key in metrics else -1 for key in keys]
-        if positions != sorted(positions):
-            return False
-    return (
-        len(keys) == len(set(keys))
-        and set(base) <= set(keys)
-        and all(value in metrics.get(key, ()) for key, value in pairs)
-    )
+def _in_spec_order(vector: str, version: CvssVersion) -> bool:
+    """4.0 requires the spec's metric order; 3.x allows any."""
+    if version != "4.0":
+        return True
+    keys = [pair.split(":", 1)[0] for pair in vector.split("/")[1:]]
+    if not set(keys) <= set(_V4_ORDER):
+        return False
+    positions = [_V4_ORDER.index(key) for key in keys]
+    return positions == sorted(positions)
 
 
 def _bounded(value: object) -> Decimal | None:
@@ -488,3 +532,18 @@ def distinct(scores: Iterable[CvssScore | None]) -> tuple[CvssScore, ...]:
             key = (score.source, score.version, score.vector, score.document, score.scored_by)
             seen.setdefault((*key, score.score), score)
     return tuple(seen.values())
+
+
+def record_ids(kind: str, raw: bytes) -> tuple[str, ...]:
+    """The record ids a document names, `kind` being its scores' `document` prefix: each CVE an
+    NVD response holds, else the one record's; checked against the id asked for."""
+    if kind == "nvd":
+        record = _parsed(_NvdRecord, raw, "an NVD API 2.0 CVE record")
+        return tuple(v.cve.cve_id for v in record.vulnerabilities)
+    if kind == "cve-list":
+        return (_parsed(_CveListHeader, raw, "a CVE List record").metadata.cve_id,)
+    if kind == "osv":
+        return (_parsed(_OsvRecord, raw, "an OSV record").record_id,)
+    if kind == "rh-cve":
+        return (_parsed(_RhCveRecord, raw, "a Red Hat Security Data CVE record").cve_id,)
+    raise ValidationError(f"{kind}: not a document kind with record ids")

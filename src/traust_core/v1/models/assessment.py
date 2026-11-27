@@ -345,6 +345,7 @@ class Artifact(AppendOnly):
 
 class AssessmentRecordRequest(Model):
     run_order_id: UUID
+    lease_generation: int = Field(strict=True, gt=0)
     repository_ref_id: UUID
     payload: str
     provenance: Provenance

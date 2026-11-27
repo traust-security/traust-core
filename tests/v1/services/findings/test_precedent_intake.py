@@ -20,6 +20,7 @@ from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.identity import IdentityPolicy
 from traust_core.v1.services.findings.intake import FindingIntake
 from traust_core.v1.services.findings.precedents import FindingPrecedents
+from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
 from traust_core.v1.services.findings.review import ReviewPolicy
 from traust_core.v1.services.findings.taxonomy import TaxonomyPolicy
 from traust_core.v1.services.lint import Lint
@@ -83,6 +84,7 @@ def test_scanner_intake_produces_precedents_in_triage_preparation(
         clock=FixedClock(T0),
         objects=InMemoryObjectStore(),
         review=ReviewPolicy(),
+        rating=RatingPolicy(RatingConfig()),
     )
     [item] = triage.prepare(assessment.id).items
     assert item.locations[0].symbol == (None if unknown_function else symbol)

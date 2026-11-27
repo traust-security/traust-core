@@ -132,7 +132,7 @@ class FindingReview:
                         {finding.id for finding in findings if finding.id}
                     )
                 ]
-            facts = FindingFacts.load(uow, findings, until=None)
+            facts = FindingFacts.load(uow, findings, until=None, cvss=self._views.cvss)
             repository = {finding.id: finding.repository_id for finding in findings}
             cases = [
                 ReviewCase(

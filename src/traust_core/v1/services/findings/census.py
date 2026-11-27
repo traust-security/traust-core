@@ -17,10 +17,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from functools import cache
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 from uuid import UUID
 
 from traust_core.v1.models.assessment import CensusAssessment
+from traust_core.v1.models.cvss import CvssScore, CvssSource
 from traust_core.v1.models.findings import (
     CensusDecision,
     Disposition,
@@ -36,9 +37,13 @@ from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectStore
 from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.findings.claims import ApprovedClaim, approved_claims_for, claim_fold
+from traust_core.v1.services.findings.cvss import selection
 from traust_core.v1.services.findings.facts import decision_lines
 from traust_core.v1.services.findings.rating import RatingPolicy
 from traust_core.v1.services.portfolio import Inventory
+
+if TYPE_CHECKING:
+    from traust_core.v1.services.exposure import AdvisoryCvssReader
 
 # The census walks whole repositories at a time, a batch closed once it holds this many
 # findings: memory stays bounded by findings, never by repository count alone — a
@@ -67,13 +72,16 @@ class FindingCensusRow:
     title: str
     cvss_score: Decimal | None
     sla_due: datetime | None
+    cvss_source: CvssSource | None = None
 
 
 class CensusOccurrence(NamedTuple):
     """The latest report's census columns — what the rating and the top cut read — with
-    the first report's time (the clock an SLA reads)."""
+    the first report's time (the clock an SLA reads). The vector rides along so the
+    census bands the same severity the views compute from it."""
 
     severity: str | None
+    cvss_vector: str | None
     cvss_score: Decimal | None
     first: datetime
 
@@ -122,9 +130,15 @@ class FindingCensus:
     column set per table, the disposition folded over tuples (the policy's own owner),
     each bounded batch of whole repositories handed to the counter and released."""
 
-    def __init__(self, rating: RatingPolicy, objects: ObjectStore | None = None) -> None:
+    def __init__(
+        self,
+        rating: RatingPolicy,
+        objects: ObjectStore | None = None,
+        cvss: AdvisoryCvssReader | None = None,
+    ) -> None:
         self._rating = rating
         self._objects = objects
+        self._cvss = cvss
 
     def rows(
         self,
@@ -167,9 +181,9 @@ class FindingCensus:
         # the fold's (str(id)) one, so the exact key is applied here)
         findings.sort(key=lambda row: newest_first_key(row[4], row[0]))
         latest = {
-            finding_id: CensusOccurrence(severity, cvss, first)
-            for finding_id, severity, cvss, first in uow.census_reads.occurrences_for_repositories(
-                batch, as_of
+            finding_id: CensusOccurrence(severity, vector, cvss, first)
+            for finding_id, severity, vector, cvss, first in (
+                uow.census_reads.occurrences_for_repositories(batch, as_of)
             )
         }
         decisions: defaultdict[UUID, list[CensusDecision]] = defaultdict(list)
@@ -181,17 +195,23 @@ class FindingCensus:
                 categories[finding_id] = label
         claims = self._claims_of(uow, findings, with_claims)
         lines = self._lines_of(uow, decisions, batch)
+        named = {row[5] for row in findings if row[5] is not None}
+        authority = self._cvss.read(uow, named).scores if self._cvss is not None else {}
         return [
             row
             for finding in findings
-            if (row := self._row(finding, as_of, latest, decisions, categories, claims, lines))
+            if (
+                row := self._row(
+                    finding, as_of, latest, decisions, categories, claims, lines, authority
+                )
+            )
             is not None
         ]
 
     def _claims_of(
         self,
         uow: TraustUnitOfWork,
-        findings: Sequence[tuple[UUID, UUID, str | None, str, datetime]],
+        findings: Sequence[tuple[UUID, UUID, str | None, str, datetime, UUID | None]],
         with_claims: set[UUID],
     ) -> Mapping[UUID, Sequence[ApprovedClaim]]:
         if self._objects is None:
@@ -204,7 +224,7 @@ class FindingCensus:
                 fingerprint="",
                 title=title,
             )
-            for finding_id, repository_id, _, title, _ in findings
+            for finding_id, repository_id, _, title, _, _ in findings
             if finding_id in with_claims
         ]
         if not corrected:
@@ -243,15 +263,16 @@ class FindingCensus:
 
     def _row(
         self,
-        finding: tuple[UUID, UUID, str | None, str, datetime],
+        finding: tuple[UUID, UUID, str | None, str, datetime, UUID | None],
         as_of: datetime | None,
         latest: Mapping[UUID, CensusOccurrence],
         decisions: Mapping[UUID, Sequence[CensusDecision]],
         categories: Mapping[UUID, str | None],
         claims: Mapping[UUID, Sequence[ApprovedClaim]],
-        lines: Mapping[UUID, bool],
+        lines: Mapping[UUID | None, bool],
+        authority: Mapping[UUID, Sequence[CvssScore]],
     ) -> FindingCensusRow | None:
-        finding_id, repository_id, kind, title, _ = finding
+        finding_id, repository_id, kind, title, _, advisory_id = finding
         occurrence = latest.get(finding_id)
         if as_of is not None and occurrence is None:
             return None  # never reported by then: the view a tally would count is absent
@@ -267,14 +288,25 @@ class FindingCensus:
             Disposition.fold(finding_id, judged, lines, normalize=_normalized) if judged else None
         )
         state = finding_state(kind_of(kind, tuple(d.validity for d in raw)), disposition)
-        severity = self._rating.effective_severity(occurrence, disposition)
+        # the views' own selection (FindingViewQuery.view), so both count the same severity
+        chosen = selection(
+            authority.get(advisory_id, ()) if advisory_id is not None else (),
+            occurrence.cvss_vector if occurrence is not None else None,
+            occurrence.cvss_score if occurrence is not None else None,
+            reported=occurrence is not None,
+            document="occurrence",
+        ).chosen
+        severity = self._rating.effective_severity(occurrence, disposition, chosen)
+        score = chosen.score if chosen is not None else None
+        if chosen is None and occurrence is not None:
+            score = occurrence.cvss_score
         folded = claim_fold(claims.get(finding_id, ()), as_of)
         category = categories.get(finding_id)
         if folded is not None and folded.claim is not None:
             category = folded.category
         due = None
         if occurrence is not None and (disposition is None or disposition.is_open()):
-            due = self._rating.sla_due(severity, occurrence.first, occurrence.cvss_score)
+            due = self._rating.sla_due(severity, occurrence.first, score)
         return FindingCensusRow(
             finding_id=finding_id,
             repository_id=repository_id,
@@ -286,6 +318,13 @@ class FindingCensus:
             and disposition.assurance == DispositionAssurance.EXECUTION_PROVEN,
             unverified=disposition is None or disposition.assurance == DispositionAssurance.CLAIMED,
             title=folded.title if folded is not None else title,
-            cvss_score=occurrence.cvss_score if occurrence is not None else None,
+            cvss_score=score,
             sla_due=due,
+            cvss_source=(
+                chosen.source
+                if chosen is not None
+                else CvssSource.SCANNER
+                if score is not None
+                else None
+            ),
         )

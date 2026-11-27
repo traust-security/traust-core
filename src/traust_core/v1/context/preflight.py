@@ -8,14 +8,19 @@ from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING
 
 from traust_core.v1.context.home import config_completeness_audit
-from traust_core.v1.errors import ConfigError, PreflightError
+from traust_core.v1.errors import ConfigError, PreflightError, ServiceError
 from traust_core.v1.models.artifacts import RECORDED_FACTS
-from traust_core.v1.models.operations import MODEL_REGISTRY, Requirement
+from traust_core.v1.models.operations import MODEL_REGISTRY, REMEDIATE_FINDING, Requirement
 from traust_core.v1.providers.tools.toolchain import preflight_failures
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services.ledger import LedgerService
 
 if TYPE_CHECKING:
     from traust_core.v1.context.context import Context
+
+# The pack schema only permits top-level config keys. The bundle opts one asset into
+# decision-writing readiness without changing what a lone config key requires.
+_DECISION_WRITING_CONFIG = frozenset({"identity", "ledger", "review"})
 
 # The record door each required fact is recorded through; the fix preflight names.
 _FACT_RECORDINGS: dict[str, str] = {
@@ -41,11 +46,14 @@ def preflight(ctx: Context, requirements: Iterable[Requirement]) -> None:
 def preflight_findings(ctx: Context, requirements: Iterable[Requirement]) -> list[str]:
     """Every gap at once: the assets' requirements (tools, config, facts, feeds, secrets)
     and the config home's audit, each line naming its fix."""
-    merged = _merged(requirements)
+    listed = tuple(requirements)
+    merged = _merged(listed)
+    decision_writing = any(_DECISION_WRITING_CONFIG.issubset(r.config) for r in listed)
     errors, warnings = config_completeness_audit(config_home=ctx.config.config_home)
     return [
         *_tool_findings(ctx, merged.tools),
         *_config_findings(ctx, merged.config),
+        *(_decision_writing_findings(ctx) if decision_writing else []),
         *_fact_findings(ctx, merged.facts),
         *_feed_findings(ctx, merged.feeds),
         *_secret_findings(merged.secrets),
@@ -59,22 +67,24 @@ def _tool_findings(ctx: Context, tools: Sequence[str]) -> list[str]:
     # toolchain is a gap like any other, not an abort: preflight lists every gap at once.
     if not tools:
         return []
+    findings = []
+    if "syft" in tools and not ctx.process.allows("syft"):
+        findings.append("syft: not allowed -- add syft to process.allowed_binaries")
     try:
         chain = ctx.toolchain
     except ConfigError as exc:
-        return [f"tools: {exc}"]
-    return preflight_failures(chain.preflight(sorted(tools)))
+        return [*findings, f"tools: {exc}"]
+    return findings + preflight_failures(chain.preflight(sorted(tools)))
 
 
 def _secret_findings(secrets: Sequence[str]) -> list[str]:
     return [f"secrets: ${name} is not set" for name in sorted(secrets) if not os.environ.get(name)]
 
 
-def _merged(requirements: Iterable[Requirement]) -> Requirement:
-    listed = list(requirements)
+def _merged(requirements: Sequence[Requirement]) -> Requirement:
     return Requirement(
         **{
-            kind: sorted({entry for r in listed for entry in getattr(r, kind)})
+            kind: sorted({entry for r in requirements for entry in getattr(r, kind)})
             for kind in ("tools", "config", "facts", "feeds", "secrets")
         }
     )
@@ -95,6 +105,66 @@ def _config_findings(ctx: Context, keys: Sequence[str]) -> list[str]:
                 "(copy traust.example.yaml to start)"
             )
     return findings
+
+
+def _decision_writing_findings(ctx: Context) -> list[str]:
+    findings = []
+    if "identity" in ctx.config.provided:
+        findings.extend(_identity_findings(ctx))
+    if "ledger" in ctx.config.provided:
+        try:
+            LedgerService.check_signing(ctx.config.ledger)
+        except ServiceError as error:
+            findings.append(str(error))
+    if "review" in ctx.config.provided:
+        findings.extend(_salt_findings(ctx))
+    return findings
+
+
+def _identity_findings(ctx: Context, *, probe_remote: bool = True) -> list[str]:
+    try:
+        ready = ctx.identity.check(probe_remote=probe_remote) if ctx.identity is not None else None
+    except (ConfigError, ValueError, OSError):
+        return ["identity: cannot initialize verification -- check issuers and directory"]
+    if ready is None or not ready.ready:
+        detail = ready.detail if ready else "no verified identity configured"
+        return [f"identity: {detail}"]
+    return []
+
+
+def _salt_findings(ctx: Context) -> list[str]:
+    try:
+        salt = ctx.config.valve_salt()
+    except ConfigError as error:
+        return [str(error)]
+    if not salt or not salt.strip():
+        return [
+            "review: audit-valve salt is missing or blank -- set review.valve_salt_env "
+            "and export a nonblank secret"
+        ]
+    return []
+
+
+def check_recording_server(ctx: Context, *, probe_remote: bool = True) -> None:
+    """Check the writer's configured recording doors without opening its store. A server's
+    boot passes `probe_remote=False`: a remote issuer's JWKS is not fetched, so a transient IdP
+    outage doesn't stop the API (configuration and local keys are still checked)."""
+    recording = ctx.config.recording
+    decision_writer = recording.triage or recording.validation or recording.verification
+    if not (decision_writer or recording.assessment):
+        return
+    triage = any(asset != REMEDIATE_FINDING for asset in recording.triage)
+    gaps: list[str] = []
+    if decision_writer:
+        try:
+            LedgerService.require_order_config(ctx.config.ledger, signed=triage)
+        except ServiceError as error:
+            gaps.append(str(error))
+    gaps.extend(_identity_findings(ctx, probe_remote=probe_remote))
+    if triage:
+        gaps.extend(_salt_findings(ctx))
+    if gaps:
+        raise PreflightError("recording server: " + "; ".join(gaps))
 
 
 def _fact_findings(ctx: Context, facts: Sequence[str]) -> list[str]:

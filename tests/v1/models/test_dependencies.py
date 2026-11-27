@@ -10,6 +10,7 @@ from uuid import uuid4
 import pytest
 
 from traust_core.v1.errors import ValidationError
+from traust_core.v1.models.cvss import cvss_base_score
 from traust_core.v1.models.dependencies import (
     AdvisoryIdentifier,
     AdvisoryRecord,
@@ -20,7 +21,6 @@ from traust_core.v1.models.dependencies import (
     ImpactEvidence,
     ImpactInput,
     Version,
-    cvss_base_score,
     parse_advisory_identifier,
     repo_label,
     version_key,

@@ -29,7 +29,7 @@ class Provider:
     def __init__(self, principal: Principal) -> None:
         self.principal = principal
 
-    def check(self) -> Readiness:
+    def check(self, *, probe_remote: bool = True) -> Readiness:
         return Readiness(ready=True)
 
     def authenticate(self, credential: Credential) -> Principal:

@@ -29,10 +29,17 @@ from traust_core.v1.models.artifacts import FleetFixArtifact
 from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.inventory import Repository
-from traust_core.v1.models.operations import OrderReason, OrderRequest, OrderState, WorkerId
+from traust_core.v1.models.operations import (
+    OrderReason,
+    OrderRequest,
+    OrderState,
+    RunOrder,
+    WorkerId,
+)
 from traust_core.v1.models.remediation import (
     FleetFixDiff,
     FleetScope,
+    PatchResult,
     golden_failures,
     in_scope,
     rewrite_pinned_refs,
@@ -384,15 +391,26 @@ WORKER = WorkerId("worker-1")
 LEASE = timedelta(minutes=5)
 
 
-def leased(context: Context, fix_id: UUID, repository_id: UUID, state: str = "leased") -> UUID:
+def leased(context: Context, fix_id: UUID, repository_id: UUID, state: str = "leased") -> RunOrder:
     """A fleet-fix order through its real path: submitted, then approved and leased."""
     services = context.services()
     (order,) = services.remediation.submit_fleet_fix(fix_id, [repository_id], HUMAN)
     assert order.id is not None
     if state == "leased":
         services.remediation.approve_fleet_fix(order.id, HUMAN)
-        services.ops.claim(WORKER, LEASE, (FLEET_FIX_ORDER,))
-    return order.id
+        claimed = services.ops.claim(WORKER, LEASE, order_id=order.id)
+        assert claimed is not None
+        return claimed
+    return order
+
+
+def apply(
+    service: RemediationService, fix_id: UUID, repository_id: UUID, order: RunOrder
+) -> PatchResult:
+    assert order.id is not None
+    return service.apply_fleet_fix(
+        fix_id, repository_id, order.id, worker=WORKER, lease_generation=order.lease_generation
+    )
 
 
 def test_apply_records_one_fleet_fix_assessment_per_commit(
@@ -402,8 +420,8 @@ def test_apply_records_one_fleet_fix_assessment_per_commit(
     repo, ref = f["repos"][0], f["refs"][0]
     fix = service.record(spec(), provenance())
     order = leased(context, fix.fleet_fix_id, repo.id)
-    first = service.apply_fleet_fix(fix.fleet_fix_id, repo.id, order)
-    again = service.apply_fleet_fix(fix.fleet_fix_id, repo.id, order)
+    first = apply(service, fix.fleet_fix_id, repo.id, order)
+    again = apply(service, fix.fleet_fix_id, repo.id, order)
     assert first == again
     assert (first.applied, first.repository_ref_id, first.files_changed) == (
         True,
@@ -418,6 +436,42 @@ def test_apply_records_one_fleet_fix_assessment_per_commit(
     assert kinds == {"fleet_fix"}
 
 
+def test_same_worker_reclaim_during_application_fences_record_and_replay(
+    service: RemediationService,
+    context: Context,
+    engine: Engine,
+    applier: FakeApplier,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    f = fleet(engine)
+    repo, ref = f["repos"][0], f["refs"][0]
+    fix = service.record(spec(), provenance())
+    original = leased(context, fix.fleet_fix_id, repo.id)
+    assert original.id is not None and original.lease_expires_at is not None
+    expired = original.lease_expires_at + timedelta(seconds=1)
+    actual_apply = applier.apply
+    current: RunOrder | None = None
+
+    def reclaim_during_apply(spec: FleetFixArtifact, url: str, sha: str) -> FleetFixDiff:
+        nonlocal current
+        monkeypatch.setattr(context.clock, "now", lambda: expired)
+        current = context.services().ops.claim(WORKER, LEASE, order_id=original.id)
+        return actual_apply(spec, url, sha)
+
+    monkeypatch.setattr(applier, "apply", reclaim_during_apply)
+    with pytest.raises(ConflictError, match="stale lease generation"):
+        apply(service, fix.fleet_fix_id, repo.id, original)
+    assert current is not None and current.lease_generation > original.lease_generation
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert not uow.assessments.list_for_refs([ref.id], "fleet_fix")
+    monkeypatch.setattr(applier, "apply", actual_apply)
+    assert apply(service, fix.fleet_fix_id, repo.id, current).applied
+    before = list(applier.calls)
+    with pytest.raises(ConflictError, match="stale lease generation"):
+        apply(service, fix.fleet_fix_id, repo.id, original)
+    assert applier.calls == before
+
+
 def test_apply_uses_the_returning_observed_head(
     service: RemediationService, context: Context, engine: Engine, applier: FakeApplier
 ) -> None:
@@ -430,9 +484,7 @@ def test_apply_uses_the_returning_observed_head(
         seed.assessment(first, kind="repo-state", occurred_at=WHEN + timedelta(seconds=2))
         uow.commit()
     fix = service.record(spec(), provenance())
-    result = service.apply_fleet_fix(
-        fix.fleet_fix_id, repo.id, leased(context, fix.fleet_fix_id, repo.id)
-    )
+    result = apply(service, fix.fleet_fix_id, repo.id, leased(context, fix.fleet_fix_id, repo.id))
     assert result.repository_ref_id == first.id
     assert applier.calls[-1][2] == first.sha
 
@@ -447,9 +499,7 @@ def test_apply_refuses_a_repository_whose_head_was_never_observed(
         uow.commit()
     fix = service.record(spec(), provenance())
     with pytest.raises(NotFoundError, match="no observed default-branch head"):
-        service.apply_fleet_fix(
-            fix.fleet_fix_id, repo.id, leased(context, fix.fleet_fix_id, repo.id)
-        )
+        apply(service, fix.fleet_fix_id, repo.id, leased(context, fix.fleet_fix_id, repo.id))
 
 
 def test_applied_fleet_fix_logs_safe_id_only_for_a_new_assessment(
@@ -466,8 +516,8 @@ def test_applied_fleet_fix_logs_safe_id_only_for_a_new_assessment(
     with caplog.at_level(logging.INFO, logger=logger.name):
         logger.addHandler(caplog.handler)
         try:
-            first = service.apply_fleet_fix(fix.fleet_fix_id, repo.id, order)
-            assert service.apply_fleet_fix(fix.fleet_fix_id, repo.id, order) == first
+            first = apply(service, fix.fleet_fix_id, repo.id, order)
+            assert apply(service, fix.fleet_fix_id, repo.id, order) == first
         finally:
             logger.removeHandler(caplog.handler)
     events = {
@@ -486,11 +536,18 @@ def test_apply_refuses_without_the_target_s_leased_order(
     r0, r1, _ = ids(f["repos"])
     fix = service.record(spec(), provenance())
     other = leased(context, fix.fleet_fix_id, r1)
-    for order in (other, leased(context, fix.fleet_fix_id, r0, "awaiting_approval")):
-        with pytest.raises(ForbiddenError, match="not a leased order"):
-            service.apply_fleet_fix(fix.fleet_fix_id, r0, order)
+    with pytest.raises(ForbiddenError, match="repository is outside its scope"):
+        apply(service, fix.fleet_fix_id, r0, other)
+    waiting = leased(context, fix.fleet_fix_id, r0, "awaiting_approval")
+    assert waiting.id is not None
+    with pytest.raises(ConflictError, match="not leased"):
+        service.apply_fleet_fix(
+            fix.fleet_fix_id, r0, waiting.id, worker=WORKER, lease_generation=other.lease_generation
+        )
     with pytest.raises(NotFoundError):
-        service.apply_fleet_fix(fix.fleet_fix_id, r0, uuid4())
+        service.apply_fleet_fix(
+            fix.fleet_fix_id, r0, uuid4(), worker=WORKER, lease_generation=other.lease_generation
+        )
 
 
 @pytest.mark.parametrize(
@@ -523,9 +580,7 @@ def test_apply_enforces_the_spec_s_guards(
     fix = service.record(spec(), provenance())
     applier.diff = diff
     with pytest.raises(error, match=message):
-        service.apply_fleet_fix(
-            fix.fleet_fix_id, repo.id, leased(context, fix.fleet_fix_id, repo.id)
-        )
+        apply(service, fix.fleet_fix_id, repo.id, leased(context, fix.fleet_fix_id, repo.id))
     with SqlTraustUnitOfWork(engine) as uow:
         assert uow.assessments.list_for_refs([f["refs"][0].id], "fleet_fix") == []
 
@@ -538,9 +593,7 @@ def test_apply_without_an_engine_applier_is_a_config_error(
     repo = f["repos"][0]
     fix = service.record(spec(), provenance())
     with pytest.raises(ConfigError, match=r"NEED\(engine: fleet-fix applier\)"):
-        service.apply_fleet_fix(
-            fix.fleet_fix_id, repo.id, leased(context, fix.fleet_fix_id, repo.id)
-        )
+        apply(service, fix.fleet_fix_id, repo.id, leased(context, fix.fleet_fix_id, repo.id))
 
 
 # the human-gated order: submit, approve, claim
@@ -665,11 +718,12 @@ def test_a_refused_application_finishes_the_order_then_raises(
     repo = fleet(engine)["repos"][0]
     fix = service.record(spec(), provenance())
     order = leased(context, fix.fleet_fix_id, repo.id, "awaiting_approval")  # type: ignore[arg-type]
-    service.approve_fleet_fix(order, HUMAN)
+    assert order.id is not None
+    service.approve_fleet_fix(order.id, HUMAN)
     applier.diff = FleetFixDiff(files_changed=("config/deploy.yaml",))
     with pytest.raises(IntegrityError, match="outside its file_glob"):
         service.claim_fleet_fix(WORKER, LEASE)
-    done = context.services().ops.get(order)
+    done = context.services().ops.get(order.id)
     assert (done.state, done.reason) == (OrderState.REFUSED, OrderReason.BAD_REQUEST)
 
 
@@ -680,20 +734,22 @@ def test_apply_refuses_an_order_no_person_approved(
     fix = service.record(spec(), provenance())
     ops = context.services().ops
     request = OrderRequest(asset=FLEET_FIX_ORDER, priority=0, repository_id=r0)
-    ops.submit(request, HUMAN)
+    submitted = ops.submit(request, HUMAN)
+    ops.admit(submitted.id)  # the engine's admission tick queues the planned order
     queued = ops.claim(WORKER, LEASE, (FLEET_FIX_ORDER,))
     assert queued is not None and queued.id is not None
     with pytest.raises(ForbiddenError, match="is not for fleet fix"):
-        service.apply_fleet_fix(fix.fleet_fix_id, r0, queued.id)
+        apply(service, fix.fleet_fix_id, r0, queued)
     (planned,) = service.submit_fleet_fix(fix.fleet_fix_id, [r1], HUMAN)
     assert planned.id is not None
     with SqlTraustUnitOfWork(engine) as uow:  # admitted around the approval gate
         held = uow.run_orders.get_for_update(planned.id)
         uow.run_orders.update(held.model_copy(update={"state": OrderState.QUEUED}))
         uow.commit()
-    ops.claim(WORKER, LEASE, (FLEET_FIX_ORDER,))
+    claimed = ops.claim(WORKER, LEASE, order_id=planned.id)
+    assert claimed is not None
     with pytest.raises(ForbiddenError, match="no human approval"):
-        service.apply_fleet_fix(fix.fleet_fix_id, r1, planned.id)
+        apply(service, fix.fleet_fix_id, r1, claimed)
     assert applier.calls == []
 
 

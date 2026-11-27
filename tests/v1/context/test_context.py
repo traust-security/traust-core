@@ -5,6 +5,7 @@ import pytest
 import sqlalchemy as sa
 
 from tests.v1.example.repository import SqlTaskUnitOfWork, metadata
+from traust_core.v1 import contracts
 from traust_core.v1.context import Config, Context, StoreState
 from traust_core.v1.context.config import DatabaseConfig
 from traust_core.v1.errors import ConfigError
@@ -126,17 +127,23 @@ def test_recording_start_rejects_malformed_capabilities(scope: dict[str, object]
         Config.model_validate({"recording": {"start": [scope]}})
 
 
+CHANNEL = ["0001_repository_disposition", "0002_run_order_lease_generation"]
+
+
 def test_a_fresh_local_store_bootstraps_with_the_channel_stamped(tmp_path: Path) -> None:
     engine = Context(Config(home=tmp_path)).database
     inspector = sa.inspect(engine)
     assert inspector.has_table("db_upgrade")
     assert "disposition" in {c["name"] for c in inspector.get_columns("repository")}
     with engine.connect() as connection:
-        stamps = connection.exec_driver_sql("SELECT name FROM db_upgrade").fetchall()
-        assert [name for (name,) in stamps] == ["0001_repository_disposition"]
+        shipped = [upgrade.name for upgrade in contracts.shipped_db_upgrades("sqlite")]
+        stamps = connection.exec_driver_sql("SELECT name FROM db_upgrade ORDER BY name").fetchall()
+        assert [name for (name,) in stamps] == shipped
     again = Context(Config(home=tmp_path)).database  # re-open: nothing re-applied
     with again.connect() as connection:
-        assert connection.exec_driver_sql("SELECT count(*) FROM db_upgrade").fetchone()[0] == 1
+        assert connection.exec_driver_sql("SELECT count(*) FROM db_upgrade").scalar_one() == len(
+            shipped
+        )
 
 
 def test_a_fresh_store_logs_its_bootstrap_and_channel_trail(
@@ -213,13 +220,16 @@ def test_a_configured_postgres_with_foreign_public_tables_opens(
         _ = Context(configured).database  # opens: never bootstrapped, never refused
 
 
-def test_a_store_from_before_the_channel_is_refused_with_recreate(tmp_path: Path) -> None:
+def test_a_store_from_before_the_channel_is_brought_on_by_a_local_open(tmp_path: Path) -> None:
     engine = Context(Config(home=tmp_path)).database  # a store the channel stamped
     with engine.begin() as connection:
         connection.exec_driver_sql("DROP TABLE db_upgrade")  # the shape before the channel
     engine.dispose()
-    with pytest.raises(ConfigError, match="predates the upgrade channel"):
-        Context(Config(home=tmp_path)).services()
+    # A local store from before the channel is presumed current: the open brings it
+    # on at the head - stamped, nothing re-run - and the store serves.
+    _ = Context(Config(home=tmp_path)).services()
+    status = Context(Config(home=tmp_path)).store_status()
+    assert status.state is StoreState.CURRENT and status.pending == ()
 
 
 def test_a_local_store_applies_pending_upgrades_and_a_configured_one_refuses_them(
@@ -303,14 +313,35 @@ def test_the_control_surface_refuses_stores_it_cannot_plan(
         context.apply_db_upgrades()
 
 
-def test_the_control_surface_refuses_a_version_0_store(tmp_path: Path) -> None:
+def test_the_control_surface_brings_a_pre_channel_store_on_at_the_head(tmp_path: Path) -> None:
     engine = Context(Config(home=tmp_path)).database  # a store the channel stamped
     with engine.begin() as connection:
         connection.exec_driver_sql("DROP TABLE db_upgrade")  # the shape before the channel
     engine.dispose()
     context = Context(Config(home=tmp_path))
-    with pytest.raises(ConfigError, match="predates the upgrade channel"):
-        context.pending_db_upgrades()
+    assert context.pending_db_upgrades() == []  # nothing pending: nothing has run yet
+    stamped = context.apply_db_upgrades()  # the first apply brings it on, nothing runs
+    # everything shipped, whatever the channel holds today - the test follows
+    # the channel rather than naming its entries
+    shipped = [upgrade.name for upgrade in contracts.shipped_db_upgrades("sqlite")]
+    assert [upgrade.name for upgrade in stamped] == shipped
+    assert Context(Config(home=tmp_path)).store_status().state is StoreState.CURRENT
+
+
+def test_a_configured_store_from_before_the_channel_refuses_until_brought_on(
+    tmp_path: Path,
+) -> None:
+    engine = Context(Config(home=tmp_path)).database  # a store the channel stamped
+    with engine.begin() as connection:
+        connection.exec_driver_sql("DROP TABLE db_upgrade")  # the shape before the channel
+    engine.dispose()
+    store = tmp_path / "traust.db"
+    configured = Config(
+        home=tmp_path / "elsewhere",
+        database=DatabaseConfig(url=f"sqlite:///{store}"),
+    )
+    with pytest.raises(ConfigError, match="bring it on"):
+        _ = Context(configured).database  # its deployment brings it on, never an open
 
 
 def test_apply_db_upgrades_is_the_operators_call_not_an_open(
@@ -383,13 +414,6 @@ def test_store_status_reads_every_state_without_the_gate(
     status = Context(Config(home=tmp_path)).store_status()
     assert status.state is StoreState.BEHIND
     assert status.pending == tuple(pending)  # the plan travels with the state
-
-    engine = Context(Config(home=tmp_path)).database
-    monkeypatch.undo()
-    with engine.begin() as connection:
-        connection.exec_driver_sql("DROP TABLE db_upgrade")  # the shape before the channel
-    engine.dispose()
-    assert Context(Config(home=tmp_path)).store_status().state is StoreState.VERSION_0
 
 
 def test_a_channel_error_in_the_control_surface_is_a_config_error(

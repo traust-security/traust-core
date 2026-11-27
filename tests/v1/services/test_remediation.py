@@ -20,6 +20,7 @@ from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, commit_all, contract_db, git
 from tests.v1.repositories.tables.conftest import Seed
+from tests.v1.services.test_recording_authority import LEASE, OWNER
 from traust_core.v1.context import Config, Context
 from traust_core.v1.context.config import ProcessConfig, RecordingConfig
 from traust_core.v1.errors import (
@@ -29,6 +30,7 @@ from traust_core.v1.errors import (
     ForbiddenError,
     IntegrityError,
     NotFoundError,
+    ServiceError,
     ValidationError,
 )
 from traust_core.v1.models.artifacts import RemediationArtifact, ReportArtifact, ValidationArtifact
@@ -38,7 +40,7 @@ from traust_core.v1.models.findings import Finding, FindingCandidate, Label
 from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.insight import ViewFilter, ViewName
 from traust_core.v1.models.inventory import RepositoryRef
-from traust_core.v1.models.operations import RecordingStartScope
+from traust_core.v1.models.operations import OrderRequest, RecordingStartScope, WorkerId
 from traust_core.v1.models.remediation import (
     Check,
     CheckOutcome,
@@ -121,6 +123,16 @@ def test_a_patch_prefix_is_name_characters_only() -> None:
     for bad in ("patch prefix", "-patch"):  # a space; a leading hyphen names no repository
         with pytest.raises(pydantic.ValidationError):
             RemediationConfig(fork_org="o", patch_prefix=bad)
+
+
+def test_the_committer_is_a_machine_identity() -> None:
+    assert ForkPolicy(RemediationConfig(), FORGES).committer == "traust-remediation"
+    assert ForkPolicy(RemediationConfig(committer="sci-remediation"), FORGES).committer == (
+        "sci-remediation"
+    )
+    for bad in ("Shaun Smith", "shaun", "-remediation", "a.b-remediation"):
+        with pytest.raises(pydantic.ValidationError):
+            RemediationConfig(committer=bad)
 
 
 def test_a_github_repo_without_a_fork_org_is_a_config_error() -> None:
@@ -478,6 +490,7 @@ def test_prepare_hands_the_skill_the_findings_the_commit_and_where_to_push(
     assert only.strategy == "bound-resource"
     assert given.fork.owner == "mirror-org" and given.fork.visibility == "private"
     assert given.fix_branch == f"fix/{found.id}/unbounded-read-of-the-body"
+    assert given.committer == "traust-remediation"
 
 
 def test_record_attaches_the_report_links_its_tickets_and_moves_the_item(
@@ -597,6 +610,75 @@ def test_record_refuses_a_published_artifact_that_is_not_the_report(
         service.record(report([found.id]), claimed)  # type: ignore[list-item]
     with pytest.raises(ValidationError, match="several repositories"):
         service.record(report([found.id, elsewhere.id]), provenance())  # type: ignore[list-item]
+
+
+def test_direct_order_record_requires_a_ledger_before_staging_the_report_or_patch(
+    context: Context, engine: Engine
+) -> None:
+    context.config = context.config.model_copy(
+        update={"recording": RecordingConfig(triage=("remediate_finding",))}
+    )
+    services = context.services()
+    service = services.remediation
+    ref, found = seeded(engine)
+    assert ref.id is not None
+    item = service.open(ids(found), ref.id)
+    # a remediation order is queued only by its scheduling door, then claimed; the
+    # door's policy needs the repository's default line
+    with SqlTraustUnitOfWork(engine) as uow:
+        repo = uow.repositories.get(ref.repository_id)
+        Seed(uow).repository_ref(repo, is_default=True, sha="d" * 40)
+        uow.commit()
+    scheduled = services.ops.schedule_fix(
+        OrderRequest(
+            asset="remediate_finding",
+            priority=1,
+            repository_id=ref.repository_id,
+            work_item_id=item.work_item_id,
+        ),
+        PERSON,
+        "https://github.com/example-mirrors/example-service",
+        "fix/finding/unbounded-read",
+    )
+    assert scheduled.id is not None
+    order = services.ops.claim(WorkerId(OWNER.ref), LEASE, order_id=scheduled.id)
+    assert order is not None and order.id is not None
+    diff = b"+bounded\n"
+    doc = report(
+        ids(found),
+        metadata__repository=service._inventory.get_repository(ref.repository_id).url,
+        patch__diff_sha256=hashlib.sha256(diff).hexdigest(),
+    )
+    origin = provenance().model_copy(update={"run_id": order.id})
+    before = decisions(engine, found[0])
+    with pytest.raises(ServiceError, match="requires a ledger"):
+        service.record_order(
+            doc, origin, order.id, OWNER, lease_generation=order.lease_generation, diff=diff
+        )
+    assert not tuple(context.object_store.list())
+    assert service.get(item.work_item_id) == item
+    assert decisions(engine, found[0]) == before
+
+    context.config = context.config.model_copy(update={"ledger": LedgerConfig()})
+    writer = context.services().remediation
+    done = writer.record_order(
+        doc, origin, order.id, OWNER, lease_generation=order.lease_generation
+    )
+    assert done.reported_by == order.id and done.patch is None
+    before_upload = tuple(context.object_store.list())
+    with pytest.raises(ConflictError, match="report belongs to order"):
+        writer.record(doc, origin, diff=diff)
+    assert writer.get(item.work_item_id) == done
+    assert tuple(context.object_store.list()) == before_upload
+    patched = writer.record_order(
+        doc, origin, order.id, OWNER, lease_generation=order.lease_generation, diff=diff
+    )
+    assert patched.patch is not None
+    said = decisions(engine, found[0])[-1]
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.events.find_by_decision(said.id) is not None
+    with pytest.raises(ServiceError, match="requires a ledger"):
+        service.record_order(doc, origin, order.id, OWNER, lease_generation=order.lease_generation)
 
 
 def test_steps_go_on_the_ledger_when_it_is_on(engine: Engine, tmp_path: Path) -> None:

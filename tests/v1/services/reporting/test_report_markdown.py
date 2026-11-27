@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import re
 from pathlib import Path
 
 import pytest
@@ -155,3 +156,120 @@ def test_a_finding_shows_its_owasp_llm_categories(reporting: ReportingService) -
     report["findings"][0]["owasp_llm_references"] = ["LLM05", "LLM06"]
     assert "**OWASP LLM**" in _render(reporting, report)
     assert "LLM05, LLM06" in _render(reporting, report)
+
+
+NOT_AFFECTED = {
+    "dependency": {
+        "advisory": "CVE-2024-0001",
+        "module": "golang.org/x/net",
+        "ecosystem": "go",
+        "installed_version": "v0.33.0",
+        "classification": "version_not_in_range",
+        "evidence_level": "manifest",
+        "impact_artifact": "impact row: widget@abcdef0",
+    },
+    "rationale": "At or past the fix in every source's range.",
+}
+
+
+def test_not_affected_renders_each_eliminated_match_with_its_evidence() -> None:
+    report = copy.deepcopy(valid_report())
+    report["dependency_audit"] = {"prose": "Go modules reviewed."}
+    report["not_affected"] = [NOT_AFFECTED]
+    md = render_report(report)
+    assert md.index("## 6. Dependency Audit") < md.index(
+        "## 7. Not Affected (Eliminated with Evidence)"
+    )
+    assert (
+        "| CVE-2024-0001 | golang.org/x/net | v0.33.0 | version_not_in_range (manifest) | "
+        "At or past the fix in every source's range. | impact row: widget@abcdef0 |"
+    ) in md
+
+
+def test_not_affected_cites_a_vendor_reference_when_there_is_no_impact_row() -> None:
+    report = copy.deepcopy(valid_report())
+    entry = copy.deepcopy(NOT_AFFECTED)
+    del entry["dependency"]["impact_artifact"], entry["dependency"]["evidence_level"]
+    entry["dependency"]["classification"] = "not_imported"
+    entry["reference"] = "RHSA-2024:0001"
+    report["not_affected"] = [entry]
+    assert "| not_imported | At or past the fix in every source's range. | RHSA-2024:0001 |" in (
+        render_report(report)
+    )
+
+
+def test_not_affected_text_cannot_break_out_of_its_cell() -> None:
+    report = copy.deepcopy(valid_report())
+    entry = copy.deepcopy(NOT_AFFECTED)
+    entry["rationale"] = "a|b\n## Injected"
+    report["not_affected"] = [entry]
+    md = render_report(report)
+    assert "a\\|b ## Injected" in md
+    assert "\n## Injected" not in md
+
+
+def test_a_report_without_not_affected_renders_no_such_section() -> None:
+    assert "Not Affected" not in render_report(copy.deepcopy(valid_report()))
+
+
+def test_a_backslash_before_a_pipe_cannot_split_a_cell() -> None:
+    report = copy.deepcopy(valid_report())
+    entry = copy.deepcopy(NOT_AFFECTED)
+    entry["rationale"] = "a\\|b"
+    report["not_affected"] = [entry]
+    row = next(line for line in render_report(report).splitlines() if "CVE-2024-0001" in line)
+    unescaped = re.findall(r"(?<!\\)(?:\\\\)*\|", row)
+    assert len(unescaped) == 7, row
+
+
+def test_a_report_with_not_affected_passes_the_contract_and_renders() -> None:
+    """Core's pinned contracts accept the section, and render_report shows it."""
+    from traust_core.v1 import contracts
+
+    report = copy.deepcopy(valid_report())
+    report["not_affected"] = [NOT_AFFECTED]
+    assert contracts.schema_errors("report", report) == []
+    assert "Not Affected (Eliminated with Evidence)" in render_report(report)
+
+
+def test_a_location_path_keeps_its_backslashes_inside_its_code_span() -> None:
+    report = copy.deepcopy(valid_report())
+    report["findings"][0]["locations"] = [{"path": "src\\auth\\login.go", "lines": "3"}]
+    md = render_report(report)
+    assert "`src\\auth\\login.go" in md
+    assert "src\\\\auth" not in md
+
+
+def _not_affected_row(rationale: str) -> str:
+    report = copy.deepcopy(valid_report())
+    entry = copy.deepcopy(NOT_AFFECTED)
+    entry["rationale"] = rationale
+    report["not_affected"] = [entry]
+    return next(line for line in render_report(report).splitlines() if "CVE-2024-0001" in line)
+
+
+def _live_pipes(row: str) -> int:
+    """Pipes a GFM table splits on: those after an even run of backslashes."""
+    return len(re.findall(r"(?<!\\)(?:\\\\)*\|", row))
+
+
+def test_content_escapes_are_left_inert() -> None:
+    """A rationale's own Markdown escape (an escaped image marker) is not doubled into an
+    active image."""
+    row = _not_affected_row("see \\![alt](https://example.org/pixel)")
+    assert "see \\![alt](https://example.org/pixel)" in row
+    assert "\\\\![alt]" not in row
+
+
+def test_a_pipe_after_a_backslash_inside_a_code_span_stays_in_its_cell() -> None:
+    row = _not_affected_row("the ` x\\|y ` span")
+    assert _live_pipes(row) == 7, row
+
+
+def test_a_long_backtick_run_renders_in_linear_time() -> None:
+    import time
+
+    start = time.monotonic()
+    row = _not_affected_row("`" * 20000 + "|")
+    assert time.monotonic() - start < 1.0
+    assert _live_pipes(row) == 7

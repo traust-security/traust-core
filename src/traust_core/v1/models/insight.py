@@ -27,6 +27,7 @@ from traust_core.v1.models.base import Model
 from traust_core.v1.models.code_facts import LanguageCount
 from traust_core.v1.models.common import TimeBucket, TimeWindow
 from traust_core.v1.models.compliance import ComplianceRollup, DocVariance
+from traust_core.v1.models.cvss import CvssSource
 from traust_core.v1.models.dependencies import ExposureRollup
 from traust_core.v1.models.detection_quality import ComplianceCalibration, CriticalMiss, Scorecard
 from traust_core.v1.models.findings import (
@@ -51,6 +52,7 @@ from traust_core.v1.models.validation import ValidationRollup
 from traust_core.v1.models.values import canonical_decimal
 from traust_core.v1.models.vocabulary import (
     ComplianceFramework,
+    Ecosystem,
     IsolationDimension,
     OwnershipClass,
     RemediationStatus,
@@ -127,19 +129,26 @@ class CompliancePrecision(ViewModel):
 
 class ReportFormat(StrEnum):
     """A rendered report's format: markdown and html for every insight, csv for one with an
-    export table. Each format carries its media type and file suffix."""
+    export table, json for the view itself (the contract-checked model a page renders). Each
+    format carries its media type and file suffix."""
 
     MARKDOWN = "markdown"
     HTML = "html"
     CSV = "csv"
+    JSON = "json"
 
     @property
     def media_type(self) -> str:
-        return {"markdown": "text/markdown", "html": "text/html", "csv": "text/csv"}[self.value]
+        return {
+            "markdown": "text/markdown",
+            "html": "text/html",
+            "csv": "text/csv",
+            "json": "application/json",
+        }[self.value]
 
     @property
     def suffix(self) -> str:
-        return {"markdown": "md", "html": "html", "csv": "csv"}[self.value]
+        return {"markdown": "md", "html": "html", "csv": "csv", "json": "json"}[self.value]
 
 
 class ExecutivePanel(StrEnum):
@@ -224,7 +233,9 @@ class ProductRollup(Model):
     tally: FindingTally
 
 
-class TopFinding(Model):
+class FindingHeadline(Model):
+    """A finding as a list row names it: the executive summary's credential leaks."""
+
     finding_id: UUID
     repository_url: str
     title: str
@@ -236,6 +247,12 @@ class TopFinding(Model):
     @field_serializer("cvss_score", when_used="json")
     def _cvss(self, value: Decimal | None) -> str | None:
         return canonical_decimal(value)
+
+
+class TopFinding(FindingHeadline):
+    """The rollup's top cut, which also says who stated `cvss_score`."""
+
+    cvss_source: CvssSource | None = None
 
 
 class ContainerReport(Model):
@@ -349,6 +366,7 @@ class AcceptedRisk(Model):
     title: str
     severity: Severity | None  # None: unrated
     cvss_score: Decimal | None = None
+    cvss_source: CvssSource | None = None  # who stated `cvss_score`
     accepted_at: datetime | None = None
     accepted_by: str | None = None
     rationale: str | None = None
@@ -509,6 +527,18 @@ class PackageReach(Model):
     ecosystem: str
     name: str
     repositories: int
+
+
+class ManifestCoverageCounts(Model):
+    """The scope's coverage gaps in D11's names: `coverage_unknown` counts the units with no
+    scan-backed manifest coverage (a missing package proves nothing there, in any ecosystem);
+    `unresolved_manifest` counts, per ecosystem, the units with a manifest the SBOM tool
+    couldn't resolve; `ecosystem_coverage_unknown` counts, per ecosystem, the units whose scan
+    couldn't assess that one ecosystem (Docker on a legacy scan)."""
+
+    coverage_unknown: int
+    unresolved_manifest: Mapping[Ecosystem, int]
+    ecosystem_coverage_unknown: Mapping[Ecosystem, int] = {}
 
 
 class DependencyReach(ViewModel):
@@ -894,7 +924,7 @@ class ExecutiveSummary(ViewModel):
     """The leadership roll-up; `exposure` is fleet-wide, None for a product or team scope."""
 
     rollup: FindingsRollup
-    credential_leaks: tuple[TopFinding, ...] = ()
+    credential_leaks: tuple[FindingHeadline, ...] = ()
     themes: Mapping[str, int] = Field(default_factory=dict)
     hardening_themes: Mapping[str, int] = Field(default_factory=dict)
     languages: tuple[LanguageSeverity, ...] = ()

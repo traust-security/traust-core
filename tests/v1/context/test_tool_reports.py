@@ -11,6 +11,7 @@ import pytest
 
 from tests.v1.conftest import commit_all, git
 from tests.v1.models.test_elf_formats import elf
+from tests.v1.providers.tools.opengrep_fixtures import write_rule
 from traust_core.v1.context import Config, Context
 from traust_core.v1.context import tool_reports as reports
 from traust_core.v1.context.config import Locations
@@ -62,7 +63,13 @@ def git_repo(tmp_path: Path, files: dict[str, str]) -> tuple[Path, str]:
     return repo, commit_all(repo, "c")
 
 
-OPENGREP = """
+OPENGREP = (
+    f"sys.path.insert(0, {str(Path(__file__).parents[3])!r})\n"
+    "from tests.v1.providers.tools.opengrep_fixtures import native_output\n"
+    "quality = native_output(('opengrep', *args))\n"
+    "if quality is not None:\n"
+    "    print(quality.decode()); sys.exit(0)\n"
+    + """
 if args == ["--version"]:
     print("opengrep 1.25.0")
 else:
@@ -79,12 +86,20 @@ else:
         "skipped_rules": [],
     }))
 """
+)
 
 
 def pack(tmp_path: Path) -> Path:
     root = tmp_path / "pack"
     (root / "go").mkdir(parents=True)
-    (root / "go" / "weak-hash.yaml").write_text("rules:\n  - id: weak-hash\n")
+    (root / "go" / "weak-hash.yaml").write_text(
+        "rules:\n  - id: weak-hash\n    languages: [go]\n    severity: ERROR\n"
+        "    message: weak hash\n    pattern: md5.Sum(...)\n"
+    )
+    (root / "go" / "weak-hash.go").write_text(
+        "package fixture\nfunc sample(b []byte) {\n// ruleid: weak-hash\n"
+        "md5.Sum(b)\n// ok: weak-hash\nsha256.Sum256(b)\n}\n"
+    )
     return root
 
 
@@ -115,7 +130,50 @@ def test_opengrep_reports_the_facts_on_the_registered_pack_with_the_binary_given
         "suppressed_by_allowlist": 0,
     }
     assert report["rule_allowlist"] is None
-    assert report["supplemental_packs"] == {"applied": [], "skipped": []}
+    assert report["supplemental_packs"] == {"applied": []}
+
+
+def test_opengrep_default_facts_scan_applies_configured_and_requested_additions(
+    tmp_path: Path, bindir: Path
+) -> None:
+    fake(bindir, "opengrep", OPENGREP)
+    adopter, explicit = tmp_path / "unavailable-adopter", tmp_path / "unavailable-explicit"
+    ctx = context(tmp_path, opengrep_adopter_rules=str(adopter))
+    baseline = pack(tmp_path)
+    ctx.register_rule_pack(baseline)
+    repo = checkout(tmp_path, {"main.go": "package main\n"})
+
+    report = reports.opengrep_report(ctx, repo, [], add_rules=[str(explicit)])
+    assert report["outcome"] == "degraded"
+    assert report["facts"][0]["origin"] == "traust"
+    assert report["additive_rules"]["degraded"] == {str(adopter): 1, str(explicit): 1}
+
+    replacement = reports.opengrep_report(ctx, repo, [str(baseline)])
+    assert replacement["additive_rules"]["degraded"] == {}
+
+
+def test_intake_opengrep_rules_publishes_only_checked_inputs_without_activation(
+    tmp_path: Path, bindir: Path
+) -> None:
+    fake(bindir, "my-opengrep", OPENGREP)
+    ctx = context(tmp_path, opengrep_adopter_rules=str(tmp_path / "active"))
+    baseline = pack(tmp_path)
+    ctx.register_rule_pack(baseline)
+    source = write_rule(tmp_path / "proposed", "proposed-rule")
+    destination = tmp_path / "accepted"
+
+    report = reports.intake_opengrep_rules(
+        ctx, [str(source)], destination, binary="my-opengrep", timeout=60
+    )
+
+    assert report["admitted"] is True
+    assert report["destination"] == str(destination)
+    assert (destination / source.name).read_bytes() == source.read_bytes()
+    assert [check["name"] for check in report["quality_checks"]] == ["validate", "test"]
+    assert all(check["passed"] for check in report["quality_checks"])
+    assert ctx.config.locations.opengrep_adopter_rules == str(tmp_path / "active")
+    assert ctx.rule_pack == baseline
+    assert not (tmp_path / "active").exists()
 
 
 def test_opengrep_keeps_only_the_allowed_rules_and_takes_a_pack_override(

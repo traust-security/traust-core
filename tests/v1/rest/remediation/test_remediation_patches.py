@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.engine import Engine
 
 from tests.v1.rest.ops.conftest import runner
+from tests.v1.rest.remediation.conftest import reclaim
 from tests.v1.rest.remediation.test_remediation_records import (
     URL,
     World,
@@ -28,7 +29,7 @@ from traust_core.v1.models.artifacts import RemediationArtifact
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects.store import ObjectKey, ObjectRef
-from traust_core.v1.services.findings.decisions import FindingDecisions
+from traust_core.v1.services.ledger import LedgerService
 
 DIFF = b"--- a/pkg/api/handler.go\n+++ b/pkg/api/handler.go\n+// bounded request\n"
 
@@ -47,7 +48,8 @@ def test_runner_uploads_hold_neither_the_lease_lock_nor_findings_write_intent(
     doc = report(
         world, ("patch", {**json.loads(doc.payload)["patch"], "diff_sha256": sha256_hex(DIFF)})
     )
-    request = body(doc, leased(context, world, work_item_id=item.work_item_id))
+    order = leased(context, world, work_item_id=item.work_item_id)
+    request = body(doc, order)
     headers = runner(context)
     if replay:
         response = client.post(URL, json=request, headers=headers)
@@ -73,12 +75,20 @@ def test_runner_uploads_hold_neither_the_lease_lock_nor_findings_write_intent(
 
     monkeypatch.setattr(SqlTraustUnitOfWork, "write", tracked_write)
     monkeypatch.setattr(context.object_store, "put", upload)
+    if replay:
+        current = reclaim(context, order)
+        before = snapshot(context)
+        stale = client.post(URL, json={**request, "diff": DIFF.decode()}, headers=headers)
+        assert stale.status_code == 409 and "stale lease generation" in stale.json()["detail"]
+        assert not uploaded
+        assert snapshot(context) == before
+        request["lease_generation"] = current.lease_generation
     response = client.post(URL, json={**request, "diff": DIFF.decode()}, headers=headers)
     assert response.status_code == 200, response.text
     assert set(uploaded) == ({DIFF} if replay else {DIFF, doc.payload})
 
 
-def test_a_runner_resolution_failure_rolls_back_report_patch_and_ticket_links(
+def test_a_runner_ledger_failure_rolls_back_report_patch_ticket_links_and_decisions(
     context: Context, client: TestClient, engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     world = World(engine)
@@ -92,10 +102,10 @@ def test_a_runner_resolution_failure_rolls_back_report_patch_and_ticket_links(
     before = snapshot(context)
 
     def interrupted(*args: object, **kwargs: object) -> None:
-        raise RepositoryError("resolution interrupted")
+        raise RepositoryError("seal interrupted")
 
     with monkeypatch.context() as patch:
-        patch.setattr(FindingDecisions, "record_resolution", interrupted)
+        patch.setattr(LedgerService, "seal", interrupted)
         response = client.post(URL, json=request, headers=headers)
     assert response.status_code == 500, response.text
     after = snapshot(context)
@@ -107,8 +117,9 @@ def test_a_runner_resolution_failure_rolls_back_report_patch_and_ticket_links(
     assert retried.json()["report"] is not None and retried.json()["patch"] is not None
 
 
-def test_a_lease_expiring_during_upload_leaves_no_artifact_metadata(
-    context: Context, engine: Engine, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("reclaimed", [False, True], ids=["expired", "reclaimed-by-same-runner"])
+def test_a_lease_lost_during_upload_leaves_no_artifact_metadata(
+    context: Context, engine: Engine, monkeypatch: pytest.MonkeyPatch, reclaimed: bool
 ) -> None:
     world = World(engine)
     item = opened(context, world)
@@ -125,13 +136,21 @@ def test_a_lease_expiring_during_upload_leaves_no_artifact_metadata(
     expired = order.lease_expires_at + timedelta(seconds=1)
 
     def upload(key: ObjectKey, data: bytes) -> ObjectRef:
+        nonlocal before
+        if reclaimed and data == DIFF:
+            reclaim(context, order)
+            before = snapshot(context)
         stored = put(key, data)
-        monkeypatch.setattr(context.clock, "now", lambda: expired)
+        if not reclaimed:
+            monkeypatch.setattr(context.clock, "now", lambda: expired)
         return stored
 
     monkeypatch.setattr(context.object_store, "put", upload)
-    with pytest.raises(ConflictError, match="lease expired"):
-        context.services().remediation.record_order(doc, origin, order.id, principal, diff=DIFF)
+    detail = "stale lease generation" if reclaimed else "lease expired"
+    with pytest.raises(ConflictError, match=detail):
+        context.services().remediation.record_order(
+            doc, origin, order.id, principal, lease_generation=order.lease_generation, diff=DIFF
+        )
     after = snapshot(context)
     assert after.pop("objects") != before.pop("objects")
     assert after == before
@@ -236,5 +255,7 @@ def test_order_authorization_uses_retained_payload_not_a_mutated_report_mapping(
     before = snapshot(context)
     origin = provenance().model_copy(update={"run_id": order.id})
     with pytest.raises(ForbiddenError):
-        context.services().remediation.record_order(doc, origin, order.id, machine(context))
+        context.services().remediation.record_order(
+            doc, origin, order.id, machine(context), lease_generation=order.lease_generation
+        )
     assert snapshot(context) == before

@@ -5,12 +5,14 @@ import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 
 from traust_core.v1.context import Context
-from traust_core.v1.errors import TraustError
+from traust_core.v1.context.preflight import check_recording_server
+from traust_core.v1.errors import NotFoundError, TraustError
 from traust_core.v1.providers.correlation import (
     REQUEST_ID_HEADER,
     correlation_scope,
@@ -19,10 +21,12 @@ from traust_core.v1.providers.correlation import (
 from traust_core.v1.rest.common.problems import problem, safe_method, safe_order_id
 from traust_core.v1.rest.docs import DESCRIPTION, TAGS
 from traust_core.v1.rest.domains import DOMAINS
+from traust_core.v1.rest.roles import Role, serves, serving_role
 
 access = logging.getLogger("traust_core.rest.access")
 
 _TRACEPARENT = re.compile(r"^[0-9a-f]{2}-(?P<trace>[0-9a-f]{32})-[0-9a-f]{16}-[0-9a-f]{2}$")
+_OPERATION_KEYS = frozenset({"get", "put", "post", "delete", "options", "head", "patch", "trace"})
 
 
 def request_id(request: Request) -> str:
@@ -37,8 +41,12 @@ def request_id(request: Request) -> str:
     return uuid.uuid4().hex
 
 
-def create_app(context: Context) -> FastAPI:
-    """The REST API over `context`'s services; each package in `DOMAINS` brings its router."""
+def create_app(context: Context, role: Role = Role.ALL) -> FastAPI:
+    """The REST API over `context`'s services; each package in `DOMAINS` brings its router,
+    and `role` keeps the routes one serving role answers (`roles`)."""
+    if role in (Role.ALL, Role.COMMAND):
+        # only the roles that serve the recording doors need their ledger, identity and salt
+        check_recording_server(context, probe_remote=False)
     app = FastAPI(
         title="traust-core",
         version="v1",
@@ -51,6 +59,31 @@ def create_app(context: Context) -> FastAPI:
     app.state.context = context
     for domain in DOMAINS:
         app.include_router(domain.router)
+
+    # each operation carries the role that serves it, read from `roles` - not `openapi_extra`,
+    # which is per route and so cannot split a route whose methods straddle two roles
+    default_openapi = app.openapi
+
+    def openapi() -> dict[str, Any]:
+        spec = default_openapi()
+        for path, item in spec["paths"].items():
+            for method, operation in item.items():
+                if method in _OPERATION_KEYS:
+                    operation["x-traust-role"] = serving_role(path, method)
+        return spec
+
+    app.openapi = openapi
+
+    if role is not Role.ALL:
+
+        @app.middleware("http")
+        async def only_this_role(
+            request: Request, call_next: Callable[[Request], Awaitable[Response]]
+        ) -> Response:
+            # another role's route is not here: a 404, as if it were never mounted
+            if not serves(role, request.url.path, request.method):
+                return problem(request, NotFoundError(f"{request.url.path} is not served here"))
+            return await call_next(request)
 
     @app.middleware("http")
     async def correlate(

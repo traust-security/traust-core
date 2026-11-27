@@ -15,6 +15,7 @@ from traust_core.v1.models.detection_quality import RegressionPair
 from traust_core.v1.models.rule_mining import RuleFile, RuleProposal, SweepDraft
 from traust_core.v1.models.vocabulary import FindingKind
 from traust_core.v1.providers.config_matrix import YamlLoader
+from traust_core.v1.providers.tools.opengrep_quality import fixture_name
 
 SKELETON = "rule.skeleton.yaml"
 NOTES = "DRAFT.md"
@@ -80,7 +81,7 @@ class RuleDraftDirectory:
             raise ValidationError(f"draft {rule_id} already exists")
         target.mkdir(parents=True)
         (target / SKELETON).write_text(proposal.rule, encoding="utf-8")
-        example = Path(SKELETON).with_suffix(Path(proposal.example_name).suffix)
+        example = fixture_name(Path(SKELETON), proposal.example_name)
         (target / example).write_text(proposal.example, encoding="utf-8")
         notes = (
             f"# Proposed rule `{rule_id}`\n\n"

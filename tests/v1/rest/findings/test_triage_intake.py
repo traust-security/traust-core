@@ -16,6 +16,7 @@ from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectKey
 
 world = triage.world
+keys = triage.keys
 
 
 def record(world: triage.TriageWorld) -> TriageRecordResult:

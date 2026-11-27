@@ -376,3 +376,16 @@ def test_a_driver_error_from_ddl_is_a_repository_error(backend: str, tmp_path: P
         apply_schema(engine, ["CREATE TABLE ddl_twice (id INTEGER)"])
         with pytest.raises(RepositoryError, match="apply schema failed"):
             apply_schema(engine, ["ALTER TABLE ddl_twice ADD COLUMN id TEXT"])
+
+
+@pytest.mark.parametrize("backend", SQL_BACKENDS)
+def test_the_engine_puts_the_contract_schemas_on_the_search_path(
+    backend: str, tmp_path: Path
+) -> None:
+    """Raw-text SQL (the dashboard facts, the data channel) reaches traust.finding
+    whatever the database role's name: the schemas ride the connection's search path."""
+    with database(backend, tmp_path) as engine:
+        if engine.dialect.name != "postgresql":
+            pytest.skip("the search path is a PostgreSQL concern")
+        with engine.connect() as conn:
+            assert str(conn.execute(sa.text("SHOW search_path")).scalar_one()).startswith("traust")

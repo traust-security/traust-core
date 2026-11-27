@@ -7,6 +7,7 @@ from traust_core.v1.errors import AuthenticationError
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.identity import Credential, Principal, Role, TrustedIssuer
 from traust_core.v1.models.vocabulary import ActorKind
+from traust_core.v1.providers.base import Readiness
 from traust_core.v1.providers.identity import Directory, IdentityProvider
 
 log = logging.getLogger(__name__)
@@ -47,6 +48,13 @@ class IdentityService:
     ) -> None:
         self._provider, self._directory = provider, directory
         self._admins = frozenset(a.strip().lower() for a in admins if a.strip())
+
+    def check(self, *, probe_remote: bool = True) -> Readiness:
+        verification = self._provider.check(probe_remote=probe_remote)
+        if self._directory is not None and not (directory := self._directory.check()).ready:
+            failures = [r.detail for r in (verification, directory) if not r.ready]
+            return Readiness(ready=False, detail="; ".join(failures))
+        return verification
 
     def authenticate(self, credential: Credential) -> Principal:
         principal = self._provider.authenticate(credential)

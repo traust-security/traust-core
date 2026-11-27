@@ -194,6 +194,21 @@ class AssessmentLog:
         with self._uow as uow:
             return uow.artifacts.get(artifact_id)
 
+    def imported(self, digest: str) -> Artifact | None:
+        """An artifact no assessment produced, by digest: identical bytes are one row."""
+        with self._uow as uow:
+            return uow.artifacts.find(None, digest)
+
+    def keep_imported(self, artifact: Artifact) -> Artifact:
+        """Record an artifact no assessment produced; the same digest returns its row."""
+        with self._uow as uow:
+            return uow.artifacts.get_or_add(artifact)
+
+    def serialize_imported(self, stream: str) -> None:
+        """Serialize writers of one imported stream inside the caller's write transaction."""
+        with self._uow as uow:
+            uow.artifacts.lock_imported(stream)
+
     def list_artifacts(self, assessment_id: UUID, kind: str | None = None) -> list[Artifact]:
         """The assessment's documents, oldest first; an unknown assessment is a 404,
         never an empty listing (the door's semantics, not the query's)."""
@@ -306,6 +321,70 @@ class AssessmentLog:
                 for row in uow.artifacts.list_for_assessments(ids[i : i + _BATCH], kinds):  # type: ignore[arg-type]
                     held.setdefault(row.assessment_id, []).append(row)
         return [(a, row) for a in ordered for row in held.get(a.id, ())]
+
+    def recorded_order(
+        self,
+        order_id: UUID,
+        kind: str,
+        repository_ref_id: UUID,
+        doc: ArtifactDocument,
+        *,
+        baseline_id: UUID | None = None,
+    ) -> tuple[Assessment, Artifact] | None:
+        """The order's exact authored or triage result; the write decision requires its lock."""
+        with self._uow as uow:
+            rows = uow.assessments.list_for_run_order(order_id)
+            if not rows:
+                return None
+            if len(rows) != 1:
+                raise IntegrityError(f"order {order_id} already has multiple assessments")
+            (row,) = rows
+            if (row.kind, row.repository_ref_id, row.baseline_assessment_id) != (
+                kind,
+                repository_ref_id,
+                baseline_id,
+            ):
+                raise ConflictError(f"order {order_id} already recorded a different subject")
+            assert row.id is not None
+            reports = uow.artifacts.list_for_assessment(row.id, kind=doc.schema)
+            if len(reports) != 1:
+                raise IntegrityError(f"assessment {row.id} does not hold exactly one {doc.schema}")
+            (report,) = reports
+            if report.digest != sha256_hex(doc.payload):
+                raise ConflictError(f"order {order_id} already recorded different bytes")
+            return row, report
+
+    def recorded_order_subject(
+        self,
+        order_id: UUID,
+        kind: str,
+        repository_ref_id: UUID,
+        doc: ArtifactDocument,
+        *,
+        baseline_id: UUID,
+    ) -> tuple[Assessment, Artifact] | None:
+        """The order's exact result for one subject, for a door that records one assessment per
+        subject on one order (validation, per source): `recorded_order` narrowed to it."""
+        with self._uow as uow:
+            rows = [
+                row
+                for row in uow.assessments.list_for_run_order(order_id)
+                if (row.kind, row.repository_ref_id, row.baseline_assessment_id)
+                == (kind, repository_ref_id, baseline_id)
+            ]
+            if not rows:
+                return None
+            if len(rows) != 1:
+                raise IntegrityError(f"order {order_id} already has multiple {kind} assessments")
+            (row,) = rows
+            assert row.id is not None
+            reports = uow.artifacts.list_for_assessment(row.id, kind=doc.schema)
+            if len(reports) != 1:
+                raise IntegrityError(f"assessment {row.id} does not hold exactly one {doc.schema}")
+            (report,) = reports
+            if report.digest != sha256_hex(doc.payload):
+                raise ConflictError(f"order {order_id} already recorded different bytes")
+            return row, report
 
     def find_recorded(
         self,

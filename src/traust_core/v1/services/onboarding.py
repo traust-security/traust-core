@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import logging
 from collections.abc import Sequence
 from uuid import UUID
 
-from traust_core.v1.errors import ValidationError
+from traust_core.v1.errors import NotFoundError, TraustError, ValidationError
 from traust_core.v1.models.identity import Principal
+from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.onboarding import (
     Gap,
     OnboardingPlan,
@@ -15,11 +15,11 @@ from traust_core.v1.models.onboarding import (
     RepositorySpec,
 )
 from traust_core.v1.models.operations import OrderRequest
+from traust_core.v1.models.vocabulary import LivenessStatus
 from traust_core.v1.providers.clock import Clock, SystemClock
+from traust_core.v1.providers.sources import RepoInfo, SourceError
 from traust_core.v1.services.operations import OpsService
 from traust_core.v1.services.portfolio import PortfolioService, PortfolioSync
-
-log = logging.getLogger(__name__)
 
 
 class OnboardingService:
@@ -62,7 +62,7 @@ class OnboardingService:
             assert request.label is not None
             product = self._portfolio.register_product(request.product, request.label)
         onboarded = [self._onboard_repository(spec) for spec in self._specs(request)]
-        repository_ids = [repository_id for repository_id, _ in onboarded]
+        repository_ids = onboarded
         orders = [
             self._ops.plan(
                 OrderRequest(asset=asset, priority=0, repository_id=repository_id), principal
@@ -75,7 +75,6 @@ class OnboardingService:
             product_id=product.id,
             repository_ids=tuple(repository_ids),
             order_ids=tuple(o.id for o in orders if o.id),
-            skipped=tuple(why for _, skipped in onboarded for why in skipped),
         )
 
     def _active(self, repository_ids: Sequence[UUID]) -> list[UUID]:
@@ -90,29 +89,46 @@ class OnboardingService:
                 active.append(repository.id)
         return active
 
-    def _onboard_repository(self, spec: RepositorySpec) -> tuple[UUID, tuple[str, ...]]:
-        """The repository's id, and what its import couldn't refresh."""
-        report = self._sync.import_repository(spec.url)
-        repository_id = (*report.added, *report.unchanged)[0]
-        if report.skipped:
-            log.warning(
-                "onboarding repository %s: forge facts not refreshed (%d)",
-                repository_id,
-                len(report.skipped),
-            )
-        for ref in spec.refs:
-            self._sync.import_branch(repository_id, spec.url, ref)
+    def _onboard_repository(self, spec: RepositorySpec) -> UUID:
+        """The repository's id; a forge that doesn't answer fails the onboarding."""
+        try:
+            report = self._sync.import_repository(spec.url)
+            repository_id = (*report.added, *report.unchanged)[0]
+            for ref in spec.refs:
+                self._sync.import_branch(repository_id, spec.url, ref)
+        except SourceError as e:
+            raise self._forge_refused(str(spec.url), e) from e
         if spec.team is not None:
             self._portfolio.assign_owner(repository_id, spec.team, self._clock.now())
-        return repository_id, report.skipped
+        return repository_id
+
+    def _forge_refused(self, what: str, e: SourceError) -> TraustError:
+        # the forge's own no is the caller's 404; only a forge that didn't answer is a 502
+        if e.liveness_status is LivenessStatus.MISSING or e.empty_repository:
+            return NotFoundError(f"onboarding {what}: {e}")
+        return SourceError(
+            f"onboarding {what}: the forge didn't answer ({e.observation_status}): {e}",
+            e.observation_status,
+            endpoint_unreachable=e.endpoint_unreachable,
+        )
 
     def _specs(self, request: OnboardingRequest) -> list[RepositorySpec]:
         """The repositories named, then the organisation's others; one spec per URL."""
-        listed = [] if request.org is None else self._sync.list_org(request.org, request.host)
+        listed = (
+            []
+            if request.org is None
+            else [RepositorySpec(url=i.repo) for i in self._listed(request.org, request.host)]
+        )
         specs: dict[str, RepositorySpec] = {}
-        for spec in (*request.repositories, *(RepositorySpec(url=i.repo) for i in listed)):
+        for spec in (*request.repositories, *listed):
             specs.setdefault(str(spec.url), spec)
         return list(specs.values())
+
+    def _listed(self, org: OrgName, host: str) -> list[RepoInfo]:
+        try:
+            return self._sync.list_org(org, host)
+        except SourceError as e:
+            raise self._forge_refused(f"org {org} on {host}", e) from e
 
     def _gaps(self, request: OnboardingRequest) -> tuple[Gap, ...]:
         if request.label or self._portfolio.find_product(request.product) is not None:

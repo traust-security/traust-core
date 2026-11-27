@@ -9,9 +9,12 @@ license = "Apache-2.0"
 description = "traust platform API (v1): domain models, repositories, service interfaces, clients, config"
 requires-python = ">=3.11"
 dependencies = [
+    # FIRST's CVSS 3.0, 3.1 and 4.0 formulas (Red Hat Product Security; LGPLv3+, accepted:
+    # used unmodified as a library). Pinned exactly: a scoring change is a reviewed bump.
+    "cvss==3.6",
     "jsonschema[format-nongpl]>=4.0",
     "pydantic>=2.11",
-    "pyjwt[crypto]>=2.8",
+    "pyjwt[crypto]>=2.9",
     "pyyaml>=6.0",
     "referencing>=0.30",
     "sqlalchemy>=2.0",
@@ -24,7 +27,7 @@ dependencies = [
     "tree-sitter-java==0.23.5",
     "tree-sitter-rust==0.24.2",
     "tree-sitter-ruby==0.23.1",
-    "traust-contracts @ git+https://github.com/traust-security/traust-contracts.git@35c4443339c7afa9fc32fff1ec35b93e45618313",
+    "traust-contracts @ git+https://github.com/traust-security/traust-contracts.git@1d017b51a8da97a21068d4697ab40832043412fa",
     "traust-ledger @ git+https://github.com/traust-security/traust-ledger.git@95fd75ed9b7f548322f528f1fd99263ed6733960"
 ]
 
@@ -43,6 +46,7 @@ dev = [
     "boto3>=1.34",
     "fastapi>=0.115",
     "httpx2",
+    "hypothesis>=6.0",
     "moto[s3]>=5",
     "uvicorn>=0.30",
     "pytest>=8.0",

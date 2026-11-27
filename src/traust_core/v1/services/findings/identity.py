@@ -178,7 +178,7 @@ class IdentityPolicy:
         moves: list[IdentityMove] = []
 
         def claim(view: FindingView, label: Label, tier: str, **scores: float) -> None:
-            _, key = open_.pop(label)
+            candidate, key = open_.pop(label)
             moves.append(
                 IdentityMove(
                     finding_id=view.finding.id,  # type: ignore[arg-type]
@@ -186,6 +186,7 @@ class IdentityPolicy:
                     fingerprint_algo=key.algo,
                     fingerprint=key.value,
                     matched_by=AliasMatchedBy(tier),
+                    advisory_id=candidate.exposure.advisory_id if candidate.exposure else None,
                     **{k: round(v, 3) for k, v in scores.items()},
                 )
             )

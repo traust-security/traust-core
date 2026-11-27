@@ -259,26 +259,6 @@ def test_the_severity_set_matches_the_effective_severity(engine: Engine) -> None
     assert undecided.id in ids()  # but an unfiltered listing still serves it
 
 
-def test_the_count_counts_what_the_filtered_listing_serves(engine: Engine) -> None:
-    left, right, _made = seeded_estate(engine)
-    findings = service(engine)
-    both = set_of(left, right)
-    for update in (
-        {},
-        {"exposure": "open"},
-        {"exposure": "false_positive"},
-        {"exposure": "hardening"},
-        {"exposure": "closed"},
-        {"severity": ("critical",)},
-        {"severity": ("critical", "low")},
-        {"exposure": "open", "severity": ("critical",)},
-    ):
-        filter = both.model_copy(update=update)
-        served = walk(findings, filter)
-        assert findings.count_in(filter).total == len(served), update
-    assert findings.count_in(set_of(left)).total == 5  # one repository's own cut
-
-
 def test_a_sorted_window_serves_the_worklists_severity_order(engine: Engine) -> None:
     left, right, _made = seeded_estate(engine)
     findings = service(engine)

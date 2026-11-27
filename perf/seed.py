@@ -24,7 +24,7 @@ from traust_ledger.integrity import (
     stamp_merkle_metadata,
 )
 
-from traust_core.v1 import contracts
+from traust_core.v1 import contracts, data_migrations
 from traust_core.v1.repositories import apply_schema, create_database_engine, on_driver_connection
 from traust_core.v1.repositories.sql import Dialect, contract_dialect
 
@@ -51,6 +51,9 @@ REVISIONS_PER_REPOSITORY = 12
 RELEASES_PER_PRODUCT = 12
 OWNERSHIP_PERIODS = 10
 FINDINGS = 100_000
+# The long tail: one repository holds this many v3 findings (the rescan duress lands there).
+HOT_FINDINGS = 3_000
+CATEGORIES = 40
 # A year of scans (Appendix D: ~250k occurrences): every seeded finding reported once, ten per
 # assessment; half the locations name a line range (with its enclosing function), half a file.
 FINDINGS_PER_ASSESSMENT = 10
@@ -58,12 +61,13 @@ ARTIFACTS_PER_ASSESSMENT = 10
 PACKAGES = 100_000
 ADVISORIES = 50_000
 ADVISORY_BACKED_EVERY = 5
-# A year of daily snapshots per feed: the whole-file feeds and the per-source document manifests
-# (`<source>-documents`), each for a run order. Per-feed shape: it doesn't scale with the estate.
+# A year of daily snapshots per feed: the whole-file feeds, the per-source document manifests
+# (`<source>-documents`) and the ranked CVSS build they make (`advisory-cvss`), each for a run
+# order. Per-feed shape: it doesn't scale with the estate.
 # Like every seeded artifact, their artifacts are rows with no bytes behind them: perf measures
 # query plans, never payload reads (no case reads a feed's bytes).
 FEEDS = ("epss", "kev", "rh-cve", "vex", "cve-list-documents", "nvd-documents",
-         "ghsa-documents", "rh-cve-documents")  # fmt: skip
+         "ghsa-documents", "rh-cve-documents", "advisory-cvss")  # fmt: skip
 SNAPSHOT_DAYS = 365
 SBOMS = 20_000
 DEPENDENCIES_PER_SBOM = 150
@@ -110,7 +114,7 @@ SEED = (
     FROM generate_series(1, {RUN_BATCHES}) g""",
     f"""INSERT INTO traust_ops.run_order (run_batch_id, repository_id, asset, lane, state,
         priority, requested_by, lease_holder, lease_expires_at, started_at, finished_at, created_at,
-        updated_at)
+        updated_at, lease_generation, completed_by)
     SELECT b.id, CASE WHEN o.lane IS NULL AND o.asset <> 'repo_state' THEN NULL ELSE r.id END,
         o.asset, o.lane, o.state, mod(o.g, 100), 'machine:engine',
         CASE WHEN o.state = 'leased' THEN 'worker-' || mod(o.g, 50) END,
@@ -121,7 +125,11 @@ SEED = (
             THEN o.at + interval '10 minutes' END,
         o.at,
         CASE WHEN o.g > {OPEN_ORDERS} AND o.state <> 'withheld'
-            THEN o.at + interval '10 minutes' ELSE o.at END
+            THEN o.at + interval '10 minutes' ELSE o.at END,
+        CASE WHEN o.state IN ('leased', 'succeeded', 'degraded', 'refused', 'failed')
+            THEN 1 ELSE 0 END,
+        CASE WHEN o.state IN ('succeeded', 'degraded', 'refused', 'failed')
+            THEN 'worker-' || mod(o.g, 50) END
     FROM (
         SELECT g, now() - make_interval(secs => g * 15) AS at,
             CASE WHEN mod(g, 8) < 5 THEN replace(replace(w.lane, '-quarterly', ''), '-', '_')
@@ -252,15 +260,48 @@ SEED = (
     """INSERT INTO traust.location_hash (location_id, algorithm, digest)
     SELECT id, 'file-bytes-sha256/v1', encode(sha256(convert_to(path, 'UTF8')), 'hex')
     FROM traust.location WHERE symbol IS NOT NULL AND mod(abs(hashtext(id::text)), 5) < 3""",
+    # The v3 population is the estate's realistic shape: a long-tail repository holding
+    # HOT_FINDINGS (what a full rescan lands on), the rest spread; a weakness slice; every
+    # finding reported once at a mixed severity and labelled with one of CATEGORIES; and
+    # judged along the workflow in realistic proportions (m = the fingerprint number % 100):
+    # 0-39 identified (no decision), 40-54 confirmed, 55-69 false positive, 70-79
+    # remediated, 80-86 verified weakness (hardening), 87-94 risk accepted, 95-99 not
+    # affected. Severity by the number % 20: 5% critical, 20% high, 35% medium, 25% low,
+    # 10% informational, 5% unrated.
     f"""INSERT INTO traust.finding
         (repository_id, fingerprint_algo, fingerprint, kind, title)
-    SELECT r.id, 'v3', 'perf-' || g, 'vulnerability', 'Performance finding'
+    SELECT r.id, 'v3', 'perf-' || g,
+        CASE WHEN mod(g, 100) BETWEEN 80 AND 86 THEN 'weakness' ELSE 'vulnerability' END,
+        'Performance finding'
     FROM generate_series(1, {FINDINGS}) g
     JOIN traust.repository r
-        ON r.url = 'https://forge.example/org/r' || (1 + mod(g, {REPOSITORIES}))""",
+        ON r.url = 'https://forge.example/org/r'
+            || (CASE WHEN g <= {HOT_FINDINGS} THEN 1 ELSE 1 + mod(g, {REPOSITORIES}) END)""",
     """INSERT INTO traust.decision
-        (finding_id, statement_key, validity, evidence_grade, actor, occurred_at)
-    SELECT id, fingerprint, 'confirmed', 'E0', 'human:perf@example.com', now()
+        (finding_id, statement_key, validity, resolution, evidence_grade, actor, occurred_at)
+    SELECT id, fingerprint,
+        CASE WHEN m BETWEEN 55 AND 69 THEN 'false_positive'
+             WHEN m BETWEEN 80 AND 86 THEN 'true_positive'
+             WHEN m >= 95 THEN 'not_affected'
+             ELSE 'confirmed' END,
+        CASE WHEN m BETWEEN 70 AND 79 THEN 'resolved'
+             WHEN m BETWEEN 87 AND 94 THEN 'risk_accepted' END,
+        'E0', 'human:perf@example.com', now()
+    FROM (SELECT id, fingerprint, mod(split_part(fingerprint, '-', 2)::int, 100) AS m
+          FROM traust.finding WHERE fingerprint_algo = 'v3') v
+    WHERE m >= 40""",
+    f"""INSERT INTO traust.occurrence (finding_id, assessment_id, severity, rule)
+    SELECT f.id, a.id,
+        CASE WHEN s = 0 THEN 'critical' WHEN s <= 4 THEN 'high' WHEN s <= 11 THEN 'medium'
+             WHEN s <= 16 THEN 'low' WHEN s <= 18 THEN 'informational' ELSE 'unrated' END,
+        'rule-' || mod(f.n, 50)
+    FROM (SELECT id, row_number() OVER (ORDER BY id) n,
+                 mod(split_part(fingerprint, '-', 2)::int, 20) AS s
+          FROM traust.finding WHERE fingerprint_algo = 'v3') f
+    JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.assessment) a
+        ON a.n = 1 + mod(f.n - 1, {DECISIONS // FINDINGS_PER_ASSESSMENT})""",
+    f"""INSERT INTO traust.finding_label (finding_id, taxonomy, label)
+    SELECT id, 'category', 'cat-' || mod(split_part(fingerprint, '-', 2)::int, {CATEGORIES})
     FROM traust.finding WHERE fingerprint_algo = 'v3'""",
     """INSERT INTO traust.review_item (finding_id, decision_id, reason, status)
     SELECT d.finding_id, d.id, 'needs_manual_test',
@@ -336,11 +377,13 @@ SEED = (
     # _keep_advisory links them (a finding can name an alias). An assumption: the data model
     # sets no figure for this share.
     f"""UPDATE traust.finding f SET advisory_id = a.id, advisory_match = 'confirmed'
-    FROM (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.finding
-        WHERE fingerprint_algo = 'v3') pick
+    FROM (SELECT id, row_number() OVER (ORDER BY id) k
+        FROM (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.finding
+            WHERE fingerprint_algo = 'v3') v3
+        WHERE mod(n, {ADVISORY_BACKED_EVERY}) = 0) pick
     JOIN (SELECT id, row_number() OVER (ORDER BY md5(id::text)) n FROM traust.advisory) a
-        ON a.n = 1 + mod(pick.n * 3, {ADVISORIES})
-    WHERE f.id = pick.id AND mod(pick.n, {ADVISORY_BACKED_EVERY}) = 0""",
+        ON a.n = 1 + mod(pick.k - 1, {ADVISORIES})
+    WHERE f.id = pick.id""",
     """INSERT INTO traust.assessment (repository_ref_id, kind, status, assessor, assessor_version,
         occurred_at)
     SELECT id, 'repo-state', 'completed', 'forge', '1',
@@ -350,10 +393,13 @@ SEED = (
     SELECT o.id, art.id, f.feed, now() - make_interval(days => d)
     FROM unnest(ARRAY[{", ".join(f"'{feed}'" for feed in FEEDS)}]) WITH ORDINALITY f(feed, k)
     CROSS JOIN generate_series(1, {SNAPSHOT_DAYS}) d
+    CROSS JOIN (SELECT (SELECT count(*) FROM traust_ops.run_order) orders,
+        (SELECT count(*) FROM traust.artifact WHERE assessment_id IS NULL) artifacts) total
     JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust_ops.run_order) o
-        ON o.n = d * {len(FEEDS)} + k
+        ON o.n = 1 + mod(d * {len(FEEDS)} + k, total.orders)
     JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.artifact
-        WHERE assessment_id IS NULL) art ON art.n = d * {len(FEEDS)} + k""",
+        WHERE assessment_id IS NULL) art
+        ON art.n = 1 + mod(d * {len(FEEDS)} + k, total.artifacts)""",
 )
 
 
@@ -422,7 +468,10 @@ ANALYZED = (
 
 def _name() -> str:
     ddl = contracts.database_ddl(Dialect.POSTGRES)
-    steps = [*ddl, *SEED, *ANALYZED, inspect.getsource(_stamp_layers)]
+    # the upgrade channel's scripts too: a changed script must rebuild the rig, never be
+    # refused against one that applied its earlier text
+    channel = [u.sha256 for u in contracts.shipped_db_upgrades(Dialect.POSTGRES)]
+    steps = [*ddl, *channel, *SEED, *ANALYZED, inspect.getsource(_stamp_layers)]
     digest = hashlib.sha256("\n".join(steps).encode()).hexdigest()[:12]
     return f"traust_perf_{digest}"
 
@@ -449,6 +498,7 @@ def seeded_database(url: str) -> Engine:
             _upgrade(engine)  # the seed writes the shape the channel leaves, not the baseline
             apply_schema(engine, SEED)
             _stamp_layers(engine)
+            data_migrations.run(engine, cvss=None)  # the seeded decisions get their stamped state
             with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
                 for table in ANALYZED:
                     conn.exec_driver_sql(f"VACUUM (ANALYZE) {table}")
@@ -458,6 +508,7 @@ def seeded_database(url: str) -> Engine:
             raise
     else:
         _upgrade(engine)  # a reused database gains any script it lacks; a current one, none
+        data_migrations.run(engine, cvss=None)  # and any data entry it lacks, the same way
     return engine
 
 

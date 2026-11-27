@@ -84,6 +84,7 @@ class Repo:
             clock=FixedClock(NOW),
             objects=self.objects,
             review=ReviewPolicy(),
+            rating=RatingPolicy(RatingConfig()),
         )
         rating = RatingPolicy(RatingConfig())
         views = FindingViewQuery(rating)

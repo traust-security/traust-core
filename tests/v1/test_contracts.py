@@ -49,3 +49,61 @@ def test_database_ddl_applies_every_namespace_on_sqlite(tmp_path: Path) -> None:
     apply_contract_db(engine)
     names = set(sa.inspect(engine).get_table_names())
     assert {"repository", "ops_run_order", "ledger_events"} <= names
+
+
+def _scan(**advisory: object) -> dict[str, object]:
+    finding = {
+        "id": "REPO-abcdef0-001",
+        "file": "go.mod",
+        "line": 3,
+        "category": "supply-chain",
+        "severity": "critical",
+        "confidence": 0.9,
+        "title": "Vulnerable golang.org/x/net",
+        "description": "golang.org/x/net v0.20.0 is in the advisory's affected range.",
+        "recommendation": "Upgrade golang.org/x/net past the fixed version.",
+        **advisory,
+    }
+    return {
+        "target": "example/repo",
+        "scanned_at": "2026-01-01T00:00:00Z",
+        "focus_areas": ["dependencies"],
+        "metadata": {
+            "repo": "repo",
+            "repo_slug": "REPO",
+            "scanned_ref": "abcdef0",
+            "harness_version": "0.1.0",
+            "baseline": None,
+            "baseline_findings": 0,
+        },
+        "findings": [finding],
+        "summary": {
+            "total": 1,
+            "critical": 1,
+            "high": 0,
+            "medium": 0,
+            "low": 0,
+            "informational": 0,
+            "known": 0,
+            "low_confidence": 0,
+        },
+    }
+
+
+def test_a_vuln_scan_finding_carries_an_advisorys_cvss_and_dependency() -> None:
+    """traust-contracts#190: vuln-scan records an advisory's score and dependency evidence as
+    data, in the report finding's shapes, and the gate still refuses a malformed block."""
+    advisory = {
+        "cvss": {"vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", "score": 9.8},
+        "dependency": {
+            "advisory": "CVE-2024-0001",
+            "module": "golang.org/x/net",
+            "ecosystem": "go",
+            "installed_version": "v0.20.0",
+            "classification": "likely_affected",
+            "evidence_level": "manifest",
+            "impact_artifact": "impact row: repo@abcdef0",
+        },
+    }
+    assert contracts.schema_errors("vuln-findings", _scan(**advisory)) == []
+    assert contracts.schema_errors("vuln-findings", _scan(dependency={"advisory": "x"})) != []

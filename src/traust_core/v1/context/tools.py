@@ -11,6 +11,7 @@ import pydantic
 import yaml
 
 from traust_core.v1.context.config import Locations
+from traust_core.v1.context.documents import yaml_documents
 from traust_core.v1.context.redaction import load_yaml_config
 from traust_core.v1.errors import ConfigError, ValidationError
 from traust_core.v1.models.artifacts import AdapterResultArtifact
@@ -94,7 +95,13 @@ def scanner_tools(ctx: Context) -> tuple[AdapterTool[Any], ...]:
             runner=runner(("opengrep", "git"), opengrep.SCAN_TIMEOUT),
             clock=ctx.clock,
             checkouts=ctx.checkouts,
+            load=yaml_documents,
             supplements=ctx.rule_pack_supplements,
+            additive=(
+                (ctx.config.locations.opengrep_adopter_rules,)
+                if ctx.config.locations.opengrep_adopter_rules is not None
+                else ()
+            ),
         )
 
     java_opts = os.environ.get("JOERN_JAVA_OPTS", joern.DEFAULT_JAVA_OPTS)
@@ -228,7 +235,9 @@ def gitleaks_config(locations: Locations) -> Path:
 
 def load_rule_pack_supplements(path: Path) -> tuple[opengrep.SupplementalPack, ...]:
     """The supplemental packs `rule-pack-allowlist.yaml` enables."""
-    return tuple(opengrep.supplemental_packs(_config(path, "rule-pack-allowlist")["packs"]))
+    return tuple(
+        opengrep.supplemental_packs(_config(path, "rule-pack-allowlist")["packs"], base=path.parent)
+    )
 
 
 def osv_lookup(ctx: Context) -> OsvAdvisoryLookup:

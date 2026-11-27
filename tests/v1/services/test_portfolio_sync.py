@@ -28,7 +28,7 @@ from traust_core.v1.models.inventory import (
 )
 from traust_core.v1.models.observation import ComparisonStatus
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl, RepoPath
-from traust_core.v1.models.vocabulary import RefKind
+from traust_core.v1.models.vocabulary import LivenessStatus, RefKind
 from traust_core.v1.providers.base import Acquisition, Result
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.sources import OwnerHint, OwnerOrigin, RepoInfo, SourceError
@@ -256,11 +256,12 @@ def test_import_branch_registers_the_commit_the_branch_points_at(
     assert again == ref
 
 
-def test_a_forks_default_line_the_forge_couldnt_give_is_skipped_and_asked_again(
+def test_a_default_line_the_forge_couldnt_give_fails_the_import_and_a_retry_imports_it(
     portfolio: PortfolioService,
 ) -> None:
-    """A failed head lookup holds back the parent link, so the next import asks again
-    (Qodo 392: a linked fork was never asked for its default line)."""
+    """A forge that can't give the head raises before anything is written — no
+    half-registered repository — so the next import asks again (Qodo 392: a linked fork
+    was never asked for its default line)."""
     fork = url("example-org/fork")
     forge = Forge(
         described=RepoInfo(
@@ -273,19 +274,37 @@ def test_a_forks_default_line_the_forge_couldnt_give_is_skipped_and_asked_again(
         heads={"main": "c" * 40},
         head_error=SourceError("forge down", ComparisonStatus.UNREACHABLE),
     )
+    with pytest.raises(SourceError, match="forge down"):
+        sync(portfolio, forge).import_repository(fork)
+    assert portfolio.find_repository(fork) is None  # nothing was written
+    forge.head_error = None
     report = sync(portfolio, forge).import_repository(fork)
     (repository_id,) = report.added
-    assert portfolio.get_repository(repository_id).upstream_id is None
-    assert len(report.skipped) == 1 and "default line not imported" in report.skipped[0]
-    assert portfolio.inventory.default_line(repository_id) is None
-    forge.head_error = None
-    again = sync(portfolio, forge).import_repository(fork)
-    assert (again.unchanged, again.skipped) == ((repository_id,), ())
     line = portfolio.inventory.default_line(repository_id)
     assert line is not None and (line.name, line.sha) == ("main", "c" * 40)
     assert portfolio.get_repository(repository_id).upstream_id is not None
-    assert sync(portfolio, forge).import_repository(fork) == again
+    assert sync(portfolio, forge).import_repository(fork) == SyncReport(unchanged=(repository_id,))
     assert forge.calls.count(f"info {fork}") == 2  # a linked fork with its line isn't asked
+
+
+def test_an_empty_repository_imports_without_a_default_line(
+    portfolio: PortfolioService,
+) -> None:
+    """The forge answered that the default branch names no commit (an empty repository):
+    registered like any repository, just without a default line — the forge answered, so
+    it is not an outage to fail on."""
+    repo = url("example-org/empty")
+    forge = Forge(
+        described=RepoInfo(repo=repo, visibility="public", default_branch="main"),
+        head_error=SourceError(
+            f"{repo}: no commit on branch main",
+            ComparisonStatus.ERROR,
+            empty_repository=True,
+        ),
+    )
+    (repository_id,) = sync(portfolio, forge).import_repository(repo).added
+    assert portfolio.inventory.default_line(repository_id) is None
+    assert portfolio.get_repository(repository_id).url == str(repo)
 
 
 def test_import_branch_on_the_default_line_returns_its_latest_flagged_head(
@@ -461,13 +480,14 @@ def test_a_fork_links_a_parent_registered_in_another_case(portfolio: PortfolioSe
     assert repository_count(portfolio) == 2  # the fork and its one parent row
 
 
-def test_a_forge_outage_still_returns_a_known_repository(portfolio: PortfolioService) -> None:
+def test_a_forge_outage_on_a_known_repository_raises_and_writes_nothing(
+    portfolio: PortfolioService,
+) -> None:
     known = portfolio.register_repository(url("example-org/api"), public=True)
     assert known.id is not None
     forge = Forge(info_error=SourceError("forge down", ComparisonStatus.UNREACHABLE))
-    report = sync(portfolio, forge).import_repository(url("example-org/api"))
-    assert report.unchanged == (known.id,)
-    assert report.skipped == (f"{url('example-org/api')}: forge facts not refreshed: unreachable",)
+    with pytest.raises(SourceError):
+        sync(portfolio, forge).import_repository(url("example-org/api"))
     assert portfolio.get_repository(known.id) == known  # nothing changed without the forge
 
 
@@ -485,17 +505,33 @@ def test_a_parent_imported_in_another_case_is_the_forks_placeholder(
     assert portfolio.get_repository(placeholder_id).public is True
 
 
-def test_a_host_the_forge_cannot_ask_still_returns_a_known_repository(
+def test_a_known_repository_the_forge_reports_gone_stays_unchanged(
+    portfolio: PortfolioService,
+) -> None:
+    """The forge's positive no-such-repository is the disposition's evidence (Qodo #474),
+    not a failed import; a repository that isn't known yet raises instead."""
+    known = portfolio.register_repository(url("example-org/api"), public=True)
+    assert known.id is not None
+    gone = SourceError(
+        "the forge reports no such repository",
+        ComparisonStatus.ERROR,
+        liveness_status=LivenessStatus.MISSING,
+    )
+    report = sync(portfolio, Forge(info_error=gone)).import_repository(url("example-org/api"))
+    assert report == SyncReport(unchanged=(known.id,))
+    with pytest.raises(SourceError):
+        sync(portfolio, Forge(info_error=gone)).import_repository(url("example-org/other"))
+
+
+def test_a_host_the_forge_cannot_ask_raises_and_writes_nothing(
     portfolio: PortfolioService,
 ) -> None:
     known = portfolio.register_repository(url("example-org/api"), public=True)
     assert known.id is not None
     forge = Forge(info_error=ValidationError("unsupported forge kind: example"))
-    report = sync(portfolio, forge).import_repository(url("example-org/api"))
-    assert report.unchanged == (known.id,)
-    assert report.skipped == (
-        f"{url('example-org/api')}: forge facts not refreshed: unsupported forge kind: example",
-    )
+    with pytest.raises(ValidationError, match="unsupported forge kind"):
+        sync(portfolio, forge).import_repository(url("example-org/api"))
+    assert portfolio.get_repository(known.id) == known
 
 
 def test_every_lookup_and_registration_finds_a_github_repository_in_any_case(

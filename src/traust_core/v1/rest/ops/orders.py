@@ -43,10 +43,12 @@ class ClaimRequest(Model):
 
 class LeaseRequest(Model):
     lease_seconds: Annotated[int, Field(gt=0, le=MAX_LEASE_SECONDS)]
+    lease_generation: Annotated[int, Field(strict=True, gt=0)]
 
 
 class CompleteRequest(Model):
     result: JobResult
+    lease_generation: Annotated[int, Field(strict=True, gt=0)]
 
 
 class SubmitRequest(Model):
@@ -56,7 +58,8 @@ class SubmitRequest(Model):
 
 @router.post("/v1/orders", responses=PROBLEMS(401, 403, 422))
 def submit(body: SubmitRequest, ops: Ops, person: Person, request: Request) -> RunOrder:
-    """Queue the order a person asked for, under the config (pack version) it must run with."""
+    """Store the order a person asked for as planned, under the config (pack version) it must
+    run with; the engine's admission (pack menu, approval holds, budget) queues it."""
     order = ops.submit(body.order, person, body.config)
     request.state.order_id = order.id
     return order
@@ -92,7 +95,8 @@ def claim(body: ClaimRequest, ops: Ops, runner: Runner, request: Request) -> Run
     responses=PROBLEMS(401, 403, 404, 409, 422),
 )
 def start(body: StartRecordingRequest, ops: Ops, caller: Caller, request: Request) -> RunOrder:
-    """Start the caller's explicitly dispatched recording run within its server-owned scope."""
+    """Start the caller's explicitly dispatched recording run within its server-owned scope;
+    only a queued (admitted) order is taken over, never a planned or awaiting-approval one."""
     order = ops.start_recording(body.order, caller, timedelta(seconds=body.lease_seconds))
     assert order.id is not None
     request.state.order_id = order.id
@@ -148,13 +152,20 @@ def approve(order_id: UUID, ops: Ops, caller: Caller, request: Request) -> RunOr
     return order
 
 
-@router.post("/v1/orders/{order_id}/heartbeat", responses=PROBLEMS(401, 403, 404, 409))
+@router.post("/v1/orders/{order_id}/heartbeat", responses=PROBLEMS(401, 403, 404, 409, 422))
 def heartbeat(order_id: UUID, body: LeaseRequest, ops: Ops, runner: Runner) -> RunOrder:
-    """Extend the runner's lease; 409 if the order is not leased to it or the lease has expired."""
-    return ops.heartbeat(order_id, WorkerId(runner.ref), timedelta(seconds=body.lease_seconds))
+    """Extend the runner's live lease for the generation returned by claim or start."""
+    return ops.heartbeat(
+        order_id,
+        WorkerId(runner.ref),
+        timedelta(seconds=body.lease_seconds),
+        lease_generation=body.lease_generation,
+    )
 
 
 @router.post("/v1/orders/{order_id}/complete", responses=PROBLEMS(401, 403, 404, 409, 422))
 def complete(order_id: UUID, body: CompleteRequest, ops: Ops, runner: Runner) -> RunOrder:
-    """Finish the runner's order with its outcome; a repeated complete returns the same order."""
-    return ops.complete(order_id, WorkerId(runner.ref), body.result)
+    """Finish this lease attempt; replaying its completion returns the same order."""
+    return ops.complete(
+        order_id, WorkerId(runner.ref), body.result, lease_generation=body.lease_generation
+    )

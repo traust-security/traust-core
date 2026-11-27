@@ -47,6 +47,11 @@ class Principal(Model):
         return self.verified_by is not None and role in self.roles
 
 
+def ref_is_human(ref: str) -> bool:
+    """Whether an actor ref rows store (`requested_by`, `actor`) names a person."""
+    return ref.startswith(f"{ActorKind.HUMAN}:")
+
+
 LOCAL_ISSUER = "local"
 
 

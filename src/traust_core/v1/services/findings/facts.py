@@ -4,10 +4,12 @@ from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from traust_core.v1.models.assessment import Assessment
 from traust_core.v1.models.common import RecordBudget
+from traust_core.v1.models.cvss import CvssScore
 from traust_core.v1.models.findings import (
     Decision,
     Disposition,
@@ -22,6 +24,9 @@ from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.findings.claims import ApprovedClaim, approved_claims_for
 from traust_core.v1.services.portfolio import Inventory
 
+if TYPE_CHECKING:
+    from traust_core.v1.services.exposure import AdvisoryCvssReader
+
 
 @dataclass(frozen=True, slots=True)
 class FindingFacts:
@@ -34,8 +39,10 @@ class FindingFacts:
     cwes: Mapping[UUID, Sequence[str]]
     labels: Mapping[UUID, Sequence[FindingLabel]]
     assessments: Mapping[UUID, Assessment]
-    lines: Mapping[UUID, bool]
+    lines: Mapping[UUID | None, bool]
     claims: Mapping[UUID, Sequence[ApprovedClaim]] = field(default_factory=dict)
+    # every authority's scores by the advisory a finding names: today's, whatever `until` is
+    authority: Mapping[UUID, Sequence[CvssScore]] = field(default_factory=dict)
 
     @classmethod
     def load(
@@ -48,6 +55,7 @@ class FindingFacts:
         read_budget: RecordBudget | None = None,
         objects: ObjectStore | None = None,
         census: bool = False,
+        cvss: AdvisoryCvssReader | None = None,
     ) -> FindingFacts:
         """Decisions made after `until` are left out; every occurrence is kept. A census
         load leaves the cwes unread — counting views never read them."""
@@ -109,6 +117,11 @@ class FindingFacts:
                 if objects is not None and (claimed := [f for f in findings if f.id in corrected])
                 else {}
             ),
+            authority=(
+                cvss.read(uow, {f.advisory_id for f in findings if f.advisory_id}).scores
+                if cvss is not None
+                else {}
+            ),
         )
 
     def reported_by(self, finding_id: UUID, as_of: datetime | None) -> list[Occurrence]:
@@ -149,9 +162,10 @@ def decision_lines(
     baselines: Mapping[UUID, Assessment],
     refs: Sequence[RepositoryRef],
     repository_ref_id: UUID | None = None,
-) -> dict[UUID, bool]:
+) -> dict[UUID | None, bool]:
     """Assessments are ref-bound; unscoped human statements remain line-free.
-    Without an observed default branch, default-line reads cannot split a repository's refs."""
+    Without an observed default branch, default-line reads cannot split a repository's refs.
+    The one unsaved decision a stamp folds keys its line by None."""
     if repository_ref_id is None:
         observed = {r.repository_id for r in refs if r.is_default}
         refs = [r for r in refs if r.repository_id in observed]
@@ -167,10 +181,9 @@ def decision_lines(
         if judged is not None and judged.baseline_assessment_id is not None:
             judged = baselines[judged.baseline_assessment_id]
         ref = judged.repository_ref_id if judged is not None else d.repository_ref_id
-        if (
-            d.id is not None
-            and ref is not None
-            and (ref in on or ref in named or (judged is not None and ref in recorded))
-        ):
+        qualifies = ref is not None and (
+            ref in on or ref in named or (judged is not None and ref in recorded)
+        )
+        if qualifies:
             lines[d.id] = ref in on
     return lines

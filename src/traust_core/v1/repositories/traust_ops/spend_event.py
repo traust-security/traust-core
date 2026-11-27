@@ -8,7 +8,7 @@ from uuid import UUID
 import sqlalchemy as sa
 
 from traust_core.v1.models.operations import SpendDimension, SpendEvent, SpendFilter, SpendRollup
-from traust_core.v1.repositories.sql import UtcMonth
+from traust_core.v1.repositories.sql import UtcMonth, UtcTimestamp
 from traust_core.v1.repositories.tables import (
     TRAUST_OPS,
     RecordRepository,
@@ -46,6 +46,11 @@ SPEND_EVENT = TableSpec(
 
 class SpendEventRepository(RecordRepository[SpendEvent], Protocol):
     def list_for_order(self, run_order_id: UUID) -> list[SpendEvent]: ...
+    def stored_instant(self, stamp: datetime) -> datetime:
+        """`stamp` as this store keeps an occurred_at (SQLite's TEXT form keeps milliseconds;
+        PostgreSQL keeps microseconds), so a caller compares at the stored precision."""
+        ...
+
     def list_between(self, start: datetime, end: datetime) -> list[SpendEvent]: ...
     def order_costs(self, start: datetime, end: datetime) -> list[tuple[str, int, Decimal]]:
         """(lane, events, cost) per run order with a lane, over spend with start <= occurred_at <
@@ -65,6 +70,12 @@ class SqlSpendEventRepository(SqlAppendOnlyRepository[SpendEvent]):
 
     def list_for_order(self, run_order_id: UUID) -> list[SpendEvent]:
         return self._many(f"list for {run_order_id}", self.table.c.run_order_id == run_order_id)
+
+    def stored_instant(self, stamp: datetime) -> datetime:
+        dialect, column = self._connection.dialect, UtcTimestamp()
+        stored = column.process_result_value(column.process_bind_param(stamp, dialect), dialect)
+        assert stored is not None
+        return stored
 
     def list_between(self, start: datetime, end: datetime) -> list[SpendEvent]:
         """Spend with start <= occurred_at < end."""

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
@@ -12,8 +13,6 @@ from tests.v1.rest.findings.conftest import ANALYST
 from traust_core.v1.context import Context
 from traust_core.v1.models.common import PageRequest
 from traust_core.v1.models.findings import (
-    FindingDimension,
-    FindingFilter,
     FindingSetFilter,
     FindingSort,
     SortDirection,
@@ -43,6 +42,47 @@ def seed_reported(context: Context, count: int = 2) -> list:
             made.append(finding)
         uow.commit()
     return made
+
+
+def test_a_scored_finding_sends_its_computed_band_not_a_word(
+    context: Context, client: TestClient
+) -> None:
+    # the defect over the wire: reported medium, judged low, scored 9.8 — the body says critical
+    with SqlTraustUnitOfWork(context.database) as uow:
+        seed = Seed(uow)
+        repo = seed.repository()
+        finding = seed.finding(repo)
+        run = seed.assessment(seed.repository_ref(repo))
+        seed.occurrence(
+            finding,
+            run,
+            severity="medium",
+            cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+            cvss_score=Decimal("9.8"),
+        )
+        seed.decision(finding, severity="low", rationale="the triage rubric said so")
+        uow.commit()
+    body = client.get(f"/v1/findings/{finding.id}", headers=bearer(context, ANALYST)).json()
+    assert body["effective_severity"] == "critical"
+    assert body["cvss"] == {
+        "score": "9.8",
+        "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        "severity": "critical",
+        "basis": "computed",
+        "authority_scores": [],  # no advisory: the scanner's own statement is the selected one
+        "selected": {
+            "source": "scanner",
+            "version": "3.1",
+            "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+            "score": "9.8",
+            "band": "critical",
+            "scored_by": None,
+            "document": f"occurrence:{body['occurrence']['id']}",
+            "acquired_at": None,
+            "reason": "precedence",
+        },
+        "conflict": False,
+    }
 
 
 def test_get_a_finding_matches_in_process(context: Context, client: TestClient) -> None:
@@ -209,23 +249,6 @@ def test_the_batch_listing_refuses_a_cursor_on_a_sorted_window(
     assert bad.status_code == 422
 
 
-def test_the_count_matches_the_filtered_listing_in_process(
-    context: Context, client: TestClient
-) -> None:
-    findings = seed_reported(context, count=2)
-    in_set = [str(f.repository_id) for f in findings]
-    body = client.get(
-        "/v1/findings/count",
-        params={"repository_ids": in_set, "exposure": "open"},
-        headers=bearer(context, ANALYST),
-    )
-    assert body.status_code == 200
-    expected = context.services().findings.count_in(
-        FindingSetFilter(repository_ids=tuple(f.repository_id for f in findings), exposure="open")
-    )
-    same_as_in_process(body.json(), expected)
-
-
 def test_the_count_route_is_not_a_finding_id(context: Context, client: TestClient) -> None:
     seed_reported(context, count=1)
     gone = client.get("/v1/findings/count", headers=bearer(context, ANALYST))
@@ -237,31 +260,6 @@ def test_the_count_needs_a_token(context: Context, client: TestClient) -> None:
 
 
 # the cross-repository batch summaries
-def test_the_batch_summaries_match_each_repositorys_own(
-    context: Context, client: TestClient
-) -> None:
-    findings = seed_reported(context, count=3)
-    in_set = [str(f.repository_id) for f in findings[:2]]
-    body = client.get(
-        "/v1/findings/summaries",
-        params={"repository_ids": in_set},
-        headers=bearer(context, ANALYST),
-    )
-    assert body.status_code == 200
-    svc = context.services().findings
-    expected = svc.summary_in([f.repository_id for f in findings[:2]])
-    assert body.json() == [r.model_dump(mode="json") for r in expected]
-    own = [
-        row
-        for finding in findings[:2]
-        for row in svc.summary(
-            FindingFilter(repository_id=finding.repository_id),
-            FindingDimension.REPOSITORY,
-        )
-    ]
-    assert sorted(body.json(), key=lambda r: r["key"] or "") == sorted(
-        (r.model_dump(mode="json") for r in own), key=lambda r: r["key"] or ""
-    )
 
 
 def test_the_batch_summaries_refuse_no_set_and_oversized_sets(

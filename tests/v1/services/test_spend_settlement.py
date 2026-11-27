@@ -20,6 +20,7 @@ from tests.v1.services.test_operations import (
     W1,
     W2,
     manifest,
+    ops,
     publisher,
     seeded,
     stored,
@@ -68,7 +69,7 @@ def catalog(tmp_path_factory: pytest.TempPathFactory) -> ModelCatalog:
 def settling(engine: Engine, catalog: ModelCatalog | None) -> OpsService:
     uow, clock = SqlTraustUnitOfWork(engine), FixedClock(T0 + timedelta(minutes=3))
     spend = SpendService(uow, clock, (), catalog)
-    return OpsService(uow, clock, publisher(engine), spend=spend)
+    return OpsService(uow, clock, publisher(engine, uow), spend=spend)
 
 
 def usage(model: str, tokens_in: int = 10**6, tokens_out: int = 0, **kw: Any) -> ModelUsage:
@@ -87,9 +88,9 @@ def ran(*usages: ModelUsage) -> JobResult:
 
 
 def leased_in(engine: Engine, lane: str | None = AUDIT, worker: WorkerId = W1) -> RunOrder:
-    order = seeded(engine, lane=lane, state="leased", lease_holder=worker,
-                   lease_expires_at=T0 + LEASE, started_at=T0)  # fmt: skip
-    assert order.id is not None
+    queued = seeded(engine, lane=lane)
+    order = ops(engine).claim(worker, LEASE)
+    assert order is not None and order.id == queued.id
     return order
 
 
@@ -109,7 +110,9 @@ def test_complete_settles_one_event_per_model_in_the_orders_lane(
         usage("claude-opus-5-5", tokens_out=10**6, cache_read=10**6, cache_creation=10**6),
         usage("claude-haiku-5-5", tokens_in=1000, tokens_out=1000),
     )
-    done = settling(engine, catalog).complete(order.id, W1, result)
+    done = settling(engine, catalog).complete(
+        order.id, W1, result, lease_generation=order.lease_generation
+    )
     assert stored(engine, order) == done and done.state == OrderState.SUCCEEDED
     events = sorted(recorded(engine, order), key=lambda e: e.model)
     assert [(e.model, e.lane, e.skill, e.run_order_id) for e in events] == [
@@ -135,6 +138,7 @@ def test_usage_of_one_model_and_skill_settles_as_one_event(
             usage("claude-opus-5-5", occurred_at=later),
             usage("claude-opus-5-5", skill=SkillName("threat-model")),
         ),
+        lease_generation=order.lease_generation,
     )
     events = sorted(recorded(engine, order), key=lambda e: e.skill or "")
     assert [(e.skill, e.tokens_in, e.cost_usd, e.occurred_at) for e in events] == [
@@ -145,7 +149,9 @@ def test_usage_of_one_model_and_skill_settles_as_one_event(
 
 def test_an_order_without_a_lane_settles_without_one(engine: Engine, catalog: ModelCatalog) -> None:
     order = leased_in(engine, lane=None)
-    settling(engine, catalog).complete(order.id, W1, ran(usage("claude-opus-5-5")))
+    settling(engine, catalog).complete(
+        order.id, W1, ran(usage("claude-opus-5-5")), lease_generation=order.lease_generation
+    )
     assert [(e.lane, e.cost_usd) for e in recorded(engine, order)] == [(None, Decimal(4))]
 
 
@@ -159,7 +165,9 @@ def test_a_run_that_did_not_succeed_still_settles_what_it_spent(
 ) -> None:
     order = leased_in(engine)
     with_usage = result.model_copy(update={"usage": (usage("claude-opus-5-5"),)})
-    done = settling(engine, catalog).complete(order.id, W1, with_usage)
+    done = settling(engine, catalog).complete(
+        order.id, W1, with_usage, lease_generation=order.lease_generation
+    )
     assert done.state == OrderState(result.outcome)
     assert [e.cost_usd for e in recorded(engine, order)] == [Decimal(4)]
 
@@ -167,7 +175,10 @@ def test_a_run_that_did_not_succeed_still_settles_what_it_spent(
 def test_a_run_without_usage_settles_nothing(engine: Engine, catalog: ModelCatalog) -> None:
     order = leased_in(engine)
     assert (
-        settling(engine, catalog).complete(order.id, W1, JobResult.succeeded()).artifact_id is None
+        settling(engine, catalog)
+        .complete(order.id, W1, JobResult.succeeded(), lease_generation=order.lease_generation)
+        .artifact_id
+        is None
     )
     assert recorded(engine) == []
 
@@ -175,12 +186,22 @@ def test_a_run_without_usage_settles_nothing(engine: Engine, catalog: ModelCatal
 def test_completing_again_adds_no_spend(engine: Engine, catalog: ModelCatalog) -> None:
     order = leased_in(engine)
     result = ran(usage("claude-opus-5-5"))
-    done = settling(engine, catalog).complete(order.id, W1, result)
-    assert settling(engine, catalog).complete(order.id, W1, result) == done
+    done = settling(engine, catalog).complete(
+        order.id, W1, result, lease_generation=order.lease_generation
+    )
+    assert (
+        settling(engine, catalog).complete(
+            order.id, W1, result, lease_generation=order.lease_generation
+        )
+        == done
+    )
     with pytest.raises(ConflictError):
         late = JobResult.failed(OrderReason.RUNNER_CRASHED)
         settling(engine, catalog).complete(
-            order.id, W1, late.model_copy(update={"usage": result.usage})
+            order.id,
+            W1,
+            late.model_copy(update={"usage": result.usage}),
+            lease_generation=order.lease_generation,
         )
     assert len(recorded(engine, order)) == 1
 
@@ -188,7 +209,9 @@ def test_completing_again_adds_no_spend(engine: Engine, catalog: ModelCatalog) -
 def test_a_refused_completion_records_no_spend(engine: Engine, catalog: ModelCatalog) -> None:
     order = leased_in(engine)
     with pytest.raises(ConflictError):
-        settling(engine, catalog).complete(order.id, W2, ran(usage("claude-opus-5-5")))
+        settling(engine, catalog).complete(
+            order.id, W2, ran(usage("claude-opus-5-5")), lease_generation=order.lease_generation
+        )
     assert stored(engine, order).state == OrderState.LEASED
     assert recorded(engine) == []
 
@@ -203,7 +226,9 @@ class Negative:
 def test_spend_the_database_refuses_rolls_the_completion_back(engine: Engine) -> None:
     order = leased_in(engine)
     with pytest.raises(ConflictError):
-        settling(engine, Negative()).complete(order.id, W1, ran(usage("claude-opus-5-5")))  # type: ignore[arg-type]
+        settling(engine, Negative()).complete(  # type: ignore[arg-type]
+            order.id, W1, ran(usage("claude-opus-5-5")), lease_generation=order.lease_generation
+        )
     assert stored(engine, order).state == OrderState.LEASED
     assert recorded(engine) == []
 
@@ -213,7 +238,9 @@ def test_without_a_model_registry_the_order_completes_and_the_gap_is_recorded(
 ) -> None:
     order = leased_in(engine)
     result = ran(usage("claude-opus-5-5"), usage("claude-haiku-5-5"))
-    done = settling(engine, None).complete(order.id, W1, result)
+    done = settling(engine, None).complete(
+        order.id, W1, result, lease_generation=order.lease_generation
+    )
     assert done.state == OrderState.SUCCEEDED
     assert recorded(engine) == []
     assert manifest(engine, order)["degraded"] == {SPEND_UNPRICED: 2}
@@ -234,7 +261,9 @@ def test_a_model_the_registry_cannot_price_is_a_gap_and_the_rest_settles(
             )
         }
     )
-    done = settling(engine, catalog).complete(order.id, W1, result)
+    done = settling(engine, catalog).complete(
+        order.id, W1, result, lease_generation=order.lease_generation
+    )
     assert done.state == OrderState.DEGRADED
     assert [e.model for e in recorded(engine, order)] == ["claude-opus-5-5"]
     assert manifest(engine, order)["degraded"] == {"unreachable": 1, SPEND_UNPRICED: 2}
@@ -251,7 +280,9 @@ def test_the_context_wires_settlement_to_the_registered_registry(tmp_path: Path)
         uow.commit()
     order = services.ops.claim(W1, LEASE)
     assert order is not None and order.id is not None
-    services.ops.complete(order.id, W1, ran(usage("claude-opus-5-5")))
+    services.ops.complete(
+        order.id, W1, ran(usage("claude-opus-5-5")), lease_generation=order.lease_generation
+    )
     with SqlTraustUnitOfWork(ctx.database) as uow:
         (event,) = uow.spend_events.list_for_order(order.id)
     assert event.cost_usd == Decimal(4)
@@ -267,7 +298,9 @@ def test_two_orders_completed_at_once_each_settle_their_own_spend(
     def complete(order: RunOrder, worker: WorkerId, result: JobResult) -> None:
         start.wait()
         try:
-            settling(engine, catalog).complete(order.id, worker, result)
+            settling(engine, catalog).complete(
+                order.id, worker, result, lease_generation=order.lease_generation
+            )
         except Exception as e:
             failures.append(e)
 
