@@ -15,7 +15,8 @@ from tests.v1.repositories.tables.conftest import Seed, apart
 from tests.v1.services.findings.test_reads import service as finding_service
 from tests.v1.services.test_exposure_impact import AT, Lookup, engine
 from traust_core.v1.errors import ConfigError, NotFoundError
-from traust_core.v1.models.artifacts import RunManifestArtifact
+from traust_core.v1.models.artifacts import ManifestCoverageArtifact, RunManifestArtifact
+from traust_core.v1.models.assessment import AssessmentKind
 from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.dependencies import (
     AdvisoryIdentifier,
@@ -610,3 +611,168 @@ def test_an_unprotected_ecosystem_never_asserts_absence(engine: Engine, tmp_path
     assert row.state is ImpactState.UNDETERMINED  # syft's silence proves nothing for go
     assert "no manifest coverage rule" in row.reason
     assert any("absence is unproven" in c for c in answer.caveats)
+
+
+TWO = AdvisoryRecord(
+    identifier=CVE,
+    source="osv",
+    affected=(
+        LODASH.affected[0],
+        AffectedPackage(
+            ecosystem=Ecosystem.NPM,
+            name="minimist",
+            spans=(AffectedSpan(introduced=Version("0"), fixed=Version("1.2.6")),),
+        ),
+    ),
+)
+BOTH_IN_RANGE = json.dumps(
+    {
+        "bomFormat": "CycloneDX",
+        "components": [{"purl": "pkg:npm/lodash@4.17.20"}, {"purl": "pkg:npm/minimist@1.2.5"}],
+    }
+).encode()
+
+
+def _record(service: ExposureService, head: UUID, name: str, verdict: ImpactGovulncheck) -> None:
+    answer = service.impact(CVE)
+    for prepared in service.prepare(answer.advisory_id, head):  # type: ignore[arg-type]
+        if prepared.package.name != name:
+            continue
+        doc = prepared.model_copy(
+            update={"evidence": prepared.evidence.model_copy(update={"govulncheck": verdict})}
+        ).document("4.17.20")
+        service.record(head, doc, provenance())
+
+
+def test_one_packages_verdict_never_clears_another_held_on_the_ref(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # D7: lodash's recorded not_observed speaks for lodash@4.17.20 only; minimist@1.2.5 is
+    # held in range with no verdict, so the row stays at the manifest's likely_affected
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        head = default_ref(uow, Seed(uow))
+    ingest(engine, tool, objects, head, BOTH_IN_RANGE, tmp_path / "a", locked=True)
+    service = exposure(engine, tool, objects, TWO, findings=True)
+    _record(service, head, "lodash", ImpactGovulncheck.PACKAGE_IMPORTED_NOT_OBSERVED)
+    [row] = service.impact(CVE).rows
+    assert row.state is ImpactState.LIKELY_AFFECTED
+    assert {h.name for h in row.held} == {"lodash", "minimist"}
+
+
+def test_a_rescan_holding_another_in_range_version_drops_the_old_verdict(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # the not_observed verdict analysed 4.17.20; the ref now holds 4.17.15 (still in range)
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        head = default_ref(uow, Seed(uow))
+    ingest(engine, tool, objects, head, AFFECTED, tmp_path / "a", locked=True)
+    service = exposure(engine, tool, objects, findings=True)
+    _record(service, head, "lodash", ImpactGovulncheck.PACKAGE_IMPORTED_NOT_OBSERVED)
+    assert service.impact(CVE).rows[0].state is ImpactState.NOT_OBSERVED
+    rescanned = json.dumps(
+        {"bomFormat": "CycloneDX", "components": [{"purl": "pkg:npm/lodash@4.17.15"}]}
+    ).encode()
+    ingest(engine, tool, objects, head, rescanned, tmp_path / "b", locked=True)
+    [row] = service.impact(CVE).rows
+    assert row.state is ImpactState.LIKELY_AFFECTED  # never the stale verdict's not_observed
+
+
+def test_a_fixed_pin_in_one_ecosystem_never_proves_an_uncovered_other_absent(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # npm-and-Go advisory: the fixed npm pin is safe, but Go has no manifest coverage rule, so
+    # the ref's missing Go package proves nothing and the answer is incomplete
+    mixed = AdvisoryRecord(
+        identifier=CVE,
+        source="osv",
+        affected=(
+            LODASH.affected[0],
+            AffectedPackage(
+                ecosystem=Ecosystem.GO,
+                name="google.golang.org/grpc",
+                spans=(AffectedSpan(introduced=Version("0"), fixed=Version("1.58.3")),),
+            ),
+        ),
+    )
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        head = default_ref(uow, Seed(uow))
+    ingest(engine, tool, objects, head, FIXED, tmp_path / "a", locked=True)
+    answer = exposure(engine, tool, objects, mixed).impact(CVE)
+    [row] = answer.rows
+    assert row.state is ImpactState.UNDETERMINED and "go" in (row.reason or "")
+    assert [h.version for h in row.held] == [Version("4.17.21")]
+    assert answer.complete is False
+
+
+PYPI = AdvisoryRecord(
+    identifier=CVE,
+    source="osv",
+    affected=(
+        AffectedPackage(
+            ecosystem=Ecosystem.PYPI,
+            name="requests",
+            spans=(AffectedSpan(introduced=Version("0"), fixed=Version("2.32.0")),),
+        ),
+    ),
+)
+NO_REQUESTS = json.dumps(
+    {"bomFormat": "CycloneDX", "components": [{"purl": "pkg:pypi/idna@3.7"}]}
+).encode()
+
+
+def test_a_dependency_declared_only_in_setup_py_is_never_absent(
+    engine: Engine, tmp_path: Path
+) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        head = default_ref(uow, Seed(uow))
+    root = tmp_path / "a"
+    (root / "py").mkdir(parents=True)
+    (root / "py" / "setup.py").write_text(
+        "from setuptools import setup\nsetup(name='x', install_requires=['requests>=2'])\n"
+    )
+    tool.raw = NO_REQUESTS
+    exposure(engine, tool, objects).ingest_dependencies(head, root)
+    answer = exposure(engine, tool, objects, PYPI).impact(CVE)
+    assert ImpactState.NOT_IMPORTED not in answer.counts
+    assert ImpactState.NOT_IN_ECOSYSTEM not in answer.counts
+    [row] = answer.rows
+    assert (row.state, row.reason) == (ImpactState.UNRESOLVED_MANIFEST, "py/setup.py")
+
+
+def test_a_scan_from_a_probe_without_the_ecosystems_rules_is_coverage_unknown(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # a version-2 probe never checked setup.py / setup.cfg: PyPI is only partly covered there,
+    # so a missing package reads coverage_unknown until a current probe rescans
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        head = default_ref(uow, Seed(uow))
+    service = exposure(engine, tool, objects, PYPI)
+    sbom = service.ingest_sbom(NO_REQUESTS, head)
+    with SqlTraustUnitOfWork(engine) as uow:
+        ref = uow.repository_refs.get(head)
+        old = Seed(uow).assessment(
+            ref,
+            kind=AssessmentKind.MANIFEST_SBOM,
+            assessor="traust-manifest-coverage",
+            assessor_version="2",
+        )
+        document = ManifestCoverageArtifact.from_document(
+            {
+                "artifact": "manifest-coverage",
+                "tool": {"name": "syft", "version": "1.51.1"},
+                "assessment_id": str(old.id),
+                "sbom_id": str(sbom.id),
+                "unresolved": {},
+            }
+        )
+        service._attach_document(uow, old, document)
+        uow.repository_refs.update(ref.model_copy(update={"manifest_sbom_assessment_id": old.id}))
+        uow.commit()
+    answer = service.impact(CVE)
+    assert answer.counts == {ImpactState.COVERAGE_UNKNOWN: 1}
+    assert answer.complete is False

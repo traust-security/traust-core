@@ -370,7 +370,8 @@ def test_requeue_upgrades_a_legacy_scan_once_at_the_same_sha_and_sbom(
 
     assert service.unresolved_manifests(reference) is None
     assert uptake(Ecosystem.DOCKER) == FixUptakeState.NOT_OBSERVED
-    assert uptake(Ecosystem.PYPI) == FixUptakeState.MODULE_ABSENT
+    # the legacy scan never checked setup.py / setup.cfg: its PyPI silence proves nothing
+    assert uptake(Ecosystem.PYPI) == FixUptakeState.NOT_OBSERVED
     found = service.find_advisory(advisory.identifier)
     assert found and found.advisory_id
     prepared = {p.package.name: p for p in service.prepare(found.advisory_id, reference)}
