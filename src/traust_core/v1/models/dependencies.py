@@ -922,7 +922,7 @@ class RefImpact(Model):
 
 class ImpactAnswer(Model):
     """The whole-fleet answer for one advisory. Rows carry the refs whose SBOM uses the
-    advisory's ecosystems; the proven rest and every gap are counts by state."""
+    advisory's ecosystems; the judged rest and every gap are counts by state."""
 
     advisory_id: UUID | None
     identifier: AdvisoryIdentifier

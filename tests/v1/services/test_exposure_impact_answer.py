@@ -22,6 +22,7 @@ from traust_core.v1.models.dependencies import (
     AdvisoryRecord,
     AffectedPackage,
     AffectedSpan,
+    DependencyEvidenceLevel,
     ImpactState,
     Version,
 )
@@ -491,7 +492,15 @@ def test_an_advisory_stating_one_package_twice_keeps_every_span(
     assert row.state is ImpactState.LIKELY_AFFECTED
 
 
-def test_a_verdict_recorded_at_the_head_upgrades_the_row(engine: Engine, tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("stated", "graded"),
+    [(None, None), (DependencyEvidenceLevel.SYMBOL, "symbol")],
+    ids=["no stated level: ungraded", "stated symbol level"],
+)
+def test_a_verdict_recorded_at_the_head_upgrades_the_row(
+    engine: Engine, tmp_path: Path, stated: DependencyEvidenceLevel | None, graded: str | None
+) -> None:
+    # A reachability verdict's grade is the document's own; none is guessed (CVSS plan D8a).
     tool, objects = Tool(), InMemoryObjectStore()
     with SqlTraustUnitOfWork(engine) as uow:
         seed = Seed(uow)
@@ -507,16 +516,18 @@ def test_a_verdict_recorded_at_the_head_upgrades_the_row(engine: Engine, tmp_pat
     doc = prepared.model_copy(
         update={
             "evidence": prepared.evidence.model_copy(
-                update={"govulncheck": ImpactGovulncheck.SYMBOL_REACHABLE}
+                update={
+                    "govulncheck": ImpactGovulncheck.SYMBOL_REACHABLE,
+                    "evidence_level": stated,
+                }
             )
         }
     ).document("4.17.20")
     service.record(head, doc, provenance())
 
-    graded = service.impact(CVE)
-    [row] = graded.rows
+    [row] = service.impact(CVE).rows
     assert row.state is ImpactState.AFFECTED  # reachability recorded at this exact ref
-    assert row.evidence == "symbol"
+    assert row.evidence == graded
 
 
 def test_a_recorded_not_observed_demotes_and_another_refs_record_does_not(

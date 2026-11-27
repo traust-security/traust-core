@@ -240,7 +240,8 @@ _RECORDED_STATE = {
     ImpactClassification.NOT_OBSERVED: ImpactState.NOT_OBSERVED,
     ImpactClassification.VERSION_NOT_IN_RANGE: ImpactState.VERSION_NOT_IN_RANGE,
 }
-_PROVEN = frozenset(
+# The judged states: an answer about the advisory. Every other state is a counted gap.
+_JUDGED = frozenset(
     {
         ImpactState.AFFECTED,
         ImpactState.LIKELY_AFFECTED,
@@ -1654,7 +1655,7 @@ class ExposureService:
                 f"absence is unproven for {named_unprotected}: no manifest coverage rule "
                 "(a ref using the ecosystem shows undetermined, never not_imported)"
             )
-        gaps = [s for s in counted if s not in _PROVEN]
+        gaps = [s for s in counted if s not in _JUDGED]
         return ImpactAnswer(
             advisory_id=record.advisory_id,
             identifier=record.identifier,
@@ -2617,9 +2618,10 @@ def _joined(a: AffectedPackage, b: AffectedPackage) -> AffectedPackage:
 
 
 def _recorded_evidence(recorded: _Recorded, state: ImpactState) -> DependencyEvidenceLevel | None:
-    """The grade the recorded verdict rests on: the document's own level, else what its
-    classification implies (reachability tiers speak at symbol level; a range match at
-    manifest)."""
+    """The grade the recorded verdict rests on: the document's own level, else the manifest
+    level a range match implies. A reachability verdict whose document states no level stays
+    ungraded (None): a symbol grade is never guessed, and even a stated one is evidence for
+    triage, never an elimination on its own (CVSS plan D8a)."""
     try:
         level = recorded.doc.repos[0].evidence.evidence_level
     except (IndexError, AttributeError):
@@ -2627,7 +2629,7 @@ def _recorded_evidence(recorded: _Recorded, state: ImpactState) -> DependencyEvi
     if level is not None:
         return level
     if state in (ImpactState.AFFECTED, ImpactState.NOT_OBSERVED):
-        return DependencyEvidenceLevel.SYMBOL
+        return None
     return DependencyEvidenceLevel.MANIFEST
 
 
