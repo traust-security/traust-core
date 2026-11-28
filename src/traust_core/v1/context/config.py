@@ -22,6 +22,8 @@ from traust_core.v1.models.operations import (
     RecordingStartScope,
     RecordKind,
 )
+from traust_core.v1.models.vocabulary import DependencyEvidenceLevel, Ecosystem, ImpactTier
+from traust_core.v1.providers.analysis import IMPACT_ARSENAL
 from traust_core.v1.services.findings.rating import RatingConfig
 from traust_core.v1.services.findings.review import ReviewConfig
 from traust_core.v1.services.identity import IdentityConfig
@@ -316,6 +318,34 @@ class CampaignConfig(_Model):
     display_name: str | None = None
 
 
+class ImpactPluginConfig(_Model):
+    """A deployment-declared analysis plug-in: a command that prints one impact-evidence
+    document for one query (ecosystem, package, version, checkout path as its trailing
+    arguments), capped at its declared level."""
+
+    name: str
+    ecosystem: Ecosystem
+    level: DependencyEvidenceLevel
+    tier: ImpactTier  # the evidence kind it performs, from the contracts vocabulary
+    run: tuple[str, ...] = pydantic.Field(min_length=1)
+
+
+class ImpactConfig(_Model):
+    """Which analysis tools deepen impact reads. `analyzers` names tools from the registered
+    arsenal (an unknown name refuses startup); absent or empty means L1 only — the SBOM read
+    stays complete without analyzers by construction. `plugins` declare command plug-ins."""
+
+    analyzers: tuple[str, ...] = ()
+    plugins: tuple[ImpactPluginConfig, ...] = ()
+
+    @pydantic.field_validator("analyzers")
+    @classmethod
+    def _arsenal_names(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if unknown := sorted(set(value) - IMPACT_ARSENAL):
+            raise ValueError(f"impact.analyzers names no arsenal tool: {unknown}")
+        return value
+
+
 class OverridesConfig(_Model):
     """What an adopter may point at its own file for. Tool pins, safe-exec profiles and the
     feeds registry are the project's opinions: they ship with traust-core (`SHIPPED`)."""
@@ -417,6 +447,7 @@ class Config(_Model):
     execution: ExecutionConfig = ExecutionConfig()
     campaign: CampaignConfig = CampaignConfig()
     overrides: OverridesConfig = OverridesConfig()
+    impact: ImpactConfig = ImpactConfig()
     # The top-level keys the traust.yaml file set (the file's own keys, never defaults); the
     # zero-config defaults and hand-built configs set none. Private: the contracts schema owns
     # the public field set. Preflight checks requirements against it.

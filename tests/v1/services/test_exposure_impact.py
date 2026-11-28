@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -44,6 +44,7 @@ from traust_core.v1.models.inventory import RepositoryRef
 from traust_core.v1.models.observation import ComparisonStatus
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.models.vocabulary import (
+    DependencyEvidenceLevel,
     Ecosystem,
     ImpactBinaryStringScan,
     ImpactGovulncheck,
@@ -54,8 +55,9 @@ from traust_core.v1.models.vocabulary import (
 from traust_core.v1.providers.base import Acquisition, ProviderRegistry, Readiness, Result
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.feeds import FeedProvider
-from traust_core.v1.providers.impact import SourceScanAnalyzer
+from traust_core.v1.providers.impact import CommandAnalyzer, SourceScanAnalyzer
 from traust_core.v1.providers.osv import parse_osv
+from traust_core.v1.providers.process import ProcessOutputLimit, ProcessRunner
 from traust_core.v1.providers.sources import Commit, CommitFile, SourceError
 from traust_core.v1.providers.tools import ToolRequest
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -791,6 +793,7 @@ class Analyzer:
     name = "govulncheck"
     tier = ImpactTier.GOVULNCHECK
     ecosystems = frozenset({Ecosystem.GO})
+    level = DependencyEvidenceLevel.SYMBOL
 
     def __init__(self, found: ImpactEvidence, ready: bool = True) -> None:
         self.found, self.ready, self.seen = found, ready, []
@@ -884,9 +887,11 @@ def test_a_pinned_package_without_reachability_is_likely_affected(
     (tmp_path / "web").mkdir()
     (tmp_path / "web" / "a.js").write_text("const _ = require('lodash')\n")
     [scanned] = exposure.prepare(record.advisory_id, app.id, tmp_path)
+    # An import is a first-party code reference: the scan that found it observes at its
+    # declared level (symbol-usage), where the old field-chain graded it manifest.
     assert (scanned.evidence.source_import_scan, scanned.evidence.evidence_level) == (
         "imports_found",
-        "manifest",
+        "symbol-usage",
     )
     assert scanned.tiers == ("L1", "manifest_scan", "source_scan")
 
@@ -1180,6 +1185,212 @@ def test_a_scan_landing_while_a_commit_is_prepared_is_refused(engine: Engine) ->
     exposure._reach = overtaken  # type: ignore[method-assign]
     with pytest.raises(ConflictError, match="changed while it was prepared"):
         exposure.prepare(found, app.id)
+
+
+class StubProcess:
+    """A ProcessRunner double: one argv prefix, one stdout document."""
+
+    def __init__(self, stdout: bytes, returncode: int = 0) -> None:
+        self.stdout, self.returncode = stdout, returncode
+        self.argv: list[str] = []
+
+    def readiness(self, binary: str) -> Readiness:
+        return Readiness(ready=True, detail="")
+
+    def run(self, argv: Sequence[str], **kw: object) -> object:
+        self.argv = list(argv)
+        return type(
+            "R",
+            (),
+            {
+                "argv": tuple(argv),
+                "returncode": self.returncode,
+                "stdout": self.stdout,
+                "stderr": b"",
+                "seconds": 0.0,
+            },
+        )()
+
+
+def test_a_command_plugin_feeds_evidence_through_the_interface() -> None:
+    doc = json.dumps({"source_import_scan": "imports_found", "notes": "site scan"}).encode()
+    process = StubProcess(doc)
+    plugin = CommandAnalyzer(
+        name="site-scanner",
+        ecosystem=Ecosystem.NPM,
+        level=DependencyEvidenceLevel.SYMBOL_USAGE,
+        tier=ImpactTier.SOURCE_SCAN,
+        run=["site-scanner", "--json"],
+        process=process,  # type: ignore[arg-type]
+        clock=FixedClock(AT),
+    )
+    found = None
+    for version in ("4.17.20", "4.17.15"):  # one query per installed version
+        query = ImpactQuery(
+            advisory=LODASH,
+            package=AffectedPackage(ecosystem=Ecosystem.NPM, name="lodash"),
+            version=Version(version),
+        )
+        found = plugin.evidence(query, ToolRequest(workspace=Path("/tmp/checkout"))).data
+        # the query's operands follow `--`; the version sits in its documented place
+        assert process.argv == [
+            "site-scanner",
+            "--json",
+            "--",
+            "npm",
+            "lodash",
+            version,
+            "/tmp/checkout",
+        ]
+    assert found is not None and found.source_import_scan == "imports_found"
+
+
+def _plugin(doc: bytes, level: DependencyEvidenceLevel) -> CommandAnalyzer:
+    return CommandAnalyzer(
+        name="site-scanner",
+        ecosystem=Ecosystem.NPM,
+        level=level,
+        tier=ImpactTier.SOURCE_SCAN,
+        run=["site-scanner"],
+        process=StubProcess(doc),  # type: ignore[arg-type]
+        clock=FixedClock(AT),
+    )
+
+
+_NPM_QUERY = ImpactQuery(
+    advisory=LODASH, package=AffectedPackage(ecosystem=Ecosystem.NPM, name="lodash")
+)
+
+
+def test_invalid_plugin_output_never_echoes_what_it_printed() -> None:
+    secret = "sk-live-0123456789abcdef"
+    doc = json.dumps({"symbol_usage_scan": secret}).encode()
+    with pytest.raises(ValidationError) as error:
+        _plugin(doc, DependencyEvidenceLevel.SYMBOL).evidence(
+            _NPM_QUERY, ToolRequest(workspace=Path("/tmp/checkout"))
+        )
+    assert secret not in str(error.value)
+    assert error.value.__cause__ is not None  # kept for the logs, out of the answer
+
+
+@pytest.mark.parametrize(
+    ("level", "printed"),
+    [
+        (DependencyEvidenceLevel.MANIFEST, {"symbol_usage_scan": "symbols_used"}),
+        (DependencyEvidenceLevel.BINARY, {"feature_pattern_matches": 3}),
+        (DependencyEvidenceLevel.SYMBOL_USAGE, {"feature_pattern_matches": 1}),
+        (DependencyEvidenceLevel.SYMBOL, {"l1_version_in_range": False}),  # core's own field
+    ],
+    ids=["manifest emits symbol usage", "binary emits a feature match",
+         "symbol-usage emits a feature match", "any plug-in states the L1 range"],
+)  # fmt: skip
+def test_a_plugin_emitting_above_its_level_is_refused(
+    level: DependencyEvidenceLevel, printed: dict[str, object]
+) -> None:
+    with pytest.raises(ValidationError, match="can never claim more than its declared level"):
+        _plugin(json.dumps(printed).encode(), level).evidence(
+            _NPM_QUERY, ToolRequest(workspace=Path("/tmp/checkout"))
+        )
+
+
+def test_plugin_output_past_its_cap_fails_without_buffering_it(tmp_path: Path) -> None:
+    # `yes` repeats its operands forever: the bounded runner stops it at the cap
+    plugin = CommandAnalyzer(
+        name="flood",
+        ecosystem=Ecosystem.NPM,
+        level=DependencyEvidenceLevel.SYMBOL,
+        tier=ImpactTier.SOURCE_SCAN,
+        run=["yes"],
+        process=ProcessRunner(["yes"], timeout_seconds=20),
+        clock=FixedClock(AT),
+    )
+    with pytest.raises(ProcessOutputLimit):
+        plugin.evidence(_NPM_QUERY, ToolRequest(workspace=tmp_path))
+
+
+def test_a_sub_symbol_plugin_cannot_emit_reachability() -> None:
+    doc = json.dumps({"govulncheck": "symbol_reachable"}).encode()
+    plugin = CommandAnalyzer(
+        name="site-scanner",
+        ecosystem=Ecosystem.NPM,
+        level=DependencyEvidenceLevel.MANIFEST,
+        tier=ImpactTier.SOURCE_SCAN,
+        run=["site-scanner"],
+        process=StubProcess(doc),  # type: ignore[arg-type]
+        clock=FixedClock(AT),
+    )
+    query = ImpactQuery(
+        advisory=LODASH,
+        package=AffectedPackage(ecosystem=Ecosystem.NPM, name="lodash"),
+    )
+    with pytest.raises(ValidationError, match="can never claim"):
+        plugin.evidence(query, ToolRequest(workspace=Path("/tmp/checkout")))
+
+
+class _Unlevelled:
+    """An analyzer missing the protocol's evidence level."""
+
+    name = "legacy-tier"
+    tier = ImpactTier.SOURCE_SCAN
+    ecosystems = frozenset({Ecosystem.NPM})
+
+    def check(self) -> Readiness:
+        return Readiness(ready=True)
+
+    def evidence(self, query: ImpactQuery, request: ToolRequest) -> Result[ImpactEvidence]:
+        return Result(ImpactEvidence(), Acquisition(provider=self.name, acquired_at=AT))
+
+
+def test_an_analyzer_without_an_evidence_level_is_refused_when_wired(engine: Engine) -> None:
+    with pytest.raises(ConfigError, match="declares no evidence level"):
+        analyzing(engine, _Unlevelled())
+
+
+class _Empty(Analyzer):
+    """A tier that runs and observes nothing (no symbols to search, an empty document)."""
+
+    ecosystems = frozenset({Ecosystem.NPM})
+    level = DependencyEvidenceLevel.SYMBOL
+
+
+def test_an_analyzer_observing_nothing_grades_nothing(engine: Engine, tmp_path: Path) -> None:
+    [app] = refs(engine, 1)
+    assert app.id is not None
+    exposure = analyzing(engine, _Empty(ImpactEvidence(notes="ran")), records=(LODASH,))
+    exposure.ingest_sbom(SAMPLE, app.id)
+    record = exposure.find_advisory(LODASH.identifier)
+    assert record is not None and record.advisory_id is not None
+    [prepared] = exposure.prepare(record.advisory_id, app.id, tmp_path)
+    # the manifest pin floors it; the empty run claims no symbol depth
+    assert prepared.evidence.evidence_level == "manifest"
+
+
+def test_a_nuget_scan_with_no_symbols_to_search_grades_nothing(tmp_path: Path) -> None:
+    query = ImpactQuery(
+        advisory=LODASH, package=AffectedPackage(ecosystem=Ecosystem.NUGET, name="Newtonsoft.Json")
+    )
+    found = SourceScanAnalyzer(FixedClock(AT)).evidence(query, ToolRequest(workspace=tmp_path))
+    assert found.data.observed_level() is None
+
+
+def test_a_query_carries_the_installed_version_it_was_prepared_for(
+    engine: Engine, tmp_path: Path
+) -> None:
+    [app] = refs(engine, 1)
+    assert app.id is not None
+    seen: list[ImpactQuery] = []
+
+    class Recording(_Empty):
+        def evidence(self, query: ImpactQuery, request: ToolRequest) -> Result[ImpactEvidence]:
+            seen.append(query)
+            return super().evidence(query, request)
+
+    exposure = analyzing(engine, Recording(ImpactEvidence()), records=(LODASH,))
+    exposure.ingest_sbom(SAMPLE, app.id)
+    record = exposure.find_advisory(LODASH.identifier)
+    assert record is not None and record.advisory_id is not None
+    exposure.prepare(record.advisory_id, app.id, tmp_path)
+    assert [str(q.version) for q in seen] == ["4.17.20"]
 
 
 def test_shared_alias_preparation_keeps_ecosystem_version_fix_scope_and_record_identity(

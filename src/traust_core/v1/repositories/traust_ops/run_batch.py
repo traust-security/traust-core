@@ -23,5 +23,15 @@ class SqlRunBatchRepository(SqlMutableRepository[RunBatch]):
     record = RunBatch
 
     def find(self, kind: str, period: str) -> RunBatch | None:
+        """The batch for (kind, period), oldest first: (kind, period) carries no unique index,
+        so a concurrent create can leave a second, empty one — the oldest is the one holding
+        the orders."""
         c = self.table.c
-        return self._one(f"find {kind}/{period}", c.kind == kind, c.period == period)
+        stmt = (
+            self._select()
+            .where(c.kind == kind, c.period == period)
+            .order_by(c.created_at, c.id)
+            .limit(1)
+        )
+        row = self._execute(f"find {kind}/{period}", stmt).mappings().first()
+        return None if row is None else self._to_record(row)

@@ -1,0 +1,778 @@
+"""ExposureService.impact: every tracked ref's outcome for one advisory, its gaps counted,
+never silently missing (plan: impact analysis in SCI, layer 2)."""
+
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+from uuid import UUID, uuid4
+
+import pytest
+from sqlalchemy.engine import Engine
+
+from tests.v1.repositories.tables.conftest import Seed, apart
+from tests.v1.services.findings.test_reads import service as finding_service
+from tests.v1.services.test_exposure_impact import AT, Lookup, engine
+from traust_core.v1.errors import ConfigError, NotFoundError
+from traust_core.v1.models.artifacts import ManifestCoverageArtifact, RunManifestArtifact
+from traust_core.v1.models.assessment import AssessmentKind
+from traust_core.v1.models.common import Provenance
+from traust_core.v1.models.dependencies import (
+    AdvisoryIdentifier,
+    AdvisoryRecord,
+    AffectedPackage,
+    AffectedSpan,
+    DependencyEvidenceLevel,
+    ImpactState,
+    Version,
+)
+from traust_core.v1.models.identity import IdentitySource, Principal
+from traust_core.v1.models.operations import OrderState
+from traust_core.v1.models.vocabulary import ActorKind, Ecosystem, ImpactGovulncheck, SourceType
+from traust_core.v1.providers.base import Acquisition, ProviderRegistry, Readiness, Result
+from traust_core.v1.providers.clock import FixedClock
+from traust_core.v1.providers.feeds import FeedProvider
+from traust_core.v1.providers.tools import ToolRequest
+from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.repositories.objects import InMemoryObjectStore
+from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpec, PublishSpecs
+from traust_core.v1.services.exposure import ExposureService
+from traust_core.v1.services.findings import FindingIntake, IdentityPolicy, TaxonomyPolicy
+from traust_core.v1.services.operations import OpsService
+from traust_core.v1.services.portfolio import Inventory, PortfolioPolicy, PortfolioService
+
+__all__ = ["engine"]
+
+CVE = AdvisoryIdentifier("CVE-2026-0001")
+LODASH = AdvisoryRecord(
+    identifier=CVE,
+    source="osv",
+    affected=(
+        AffectedPackage(
+            ecosystem=Ecosystem.NPM,
+            name="lodash",
+            spans=(AffectedSpan(introduced=Version("0"), fixed=Version("4.17.21")),),
+        ),
+    ),
+)
+NOTHING = AdvisoryRecord(
+    identifier=AdvisoryIdentifier("CVE-2026-0002"),
+    source="osv",
+    unmodeled_ecosystems=("alpm",),
+)
+AFFECTED = json.dumps(
+    {"bomFormat": "CycloneDX", "components": [{"purl": "pkg:npm/lodash@4.17.20"}]}
+).encode()
+FIXED = json.dumps(
+    {"bomFormat": "CycloneDX", "components": [{"purl": "pkg:npm/lodash@4.17.21"}]}
+).encode()
+OTHER_NPM = json.dumps(
+    {"bomFormat": "CycloneDX", "components": [{"purl": "pkg:npm/left-pad@1.3.0"}]}
+).encode()
+GO = json.dumps(
+    {"bomFormat": "CycloneDX", "components": [{"purl": "pkg:golang/grpc@1.56.2"}]}
+).encode()
+
+
+def provenance() -> Provenance:
+    return Provenance(
+        run_id=uuid4(), source=SourceType("impact_report"), occurred_at=datetime.now(UTC)
+    )
+
+
+class Tool:
+    """The SBOM tool, saying whatever the test last loaded."""
+
+    name = "syft"
+
+    def __init__(self) -> None:
+        self.raw = AFFECTED
+
+    def check(self) -> Readiness:
+        return Readiness(ready=True, detail="")
+
+    def acquire(self, request: ToolRequest) -> Result[bytes]:
+        return Result(self.raw, Acquisition(provider="syft", acquired_at=AT, version="1.51.1"))
+
+
+OPERATOR = Principal(
+    identity="operator@example.com",
+    kind=ActorKind("human"),
+    display="operator",
+    verified_by=IdentitySource.OIDC,
+)
+
+
+def exposure(
+    engine: Engine,
+    tool: Tool,
+    objects: InMemoryObjectStore,
+    *records: AdvisoryRecord,
+    ops: OpsService | None = None,
+    findings: bool = False,
+) -> ExposureService:
+    uow = SqlTraustUnitOfWork(engine)
+    return ExposureService(
+        uow,
+        FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
+        feeds=ProviderRegistry[FeedProvider]("feed"),
+        objects=objects,
+        advisories=Lookup(*(records or (LODASH,))),  # type: ignore[arg-type]
+        portfolio=PortfolioService(uow, PortfolioPolicy()),
+        sbom_tool=tool,  # type: ignore[arg-type]
+        clock=None,
+        ops=ops,
+        findings=finding_service(engine) if findings else None,
+    )
+
+
+def filled(
+    engine: Engine, tool: Tool, objects: InMemoryObjectStore, *records: AdvisoryRecord
+) -> ExposureService:
+    uow = SqlTraustUnitOfWork(engine)
+    ops = OpsService(
+        uow,
+        FixedClock(AT),
+        # the run manifest publishes inside the order transaction: one unit of work
+        ArtifactPublisher(PublishSpecs(PublishSpec(RunManifestArtifact)), objects, uow),
+        inventory=Inventory(SqlTraustUnitOfWork(engine)),
+    )
+    return exposure(engine, tool, objects, *records, ops=ops)
+
+
+def checkout(root: Path, *, locked: bool) -> Path:
+    (root / "ui").mkdir(parents=True)
+    (root / "ui" / "package.json").write_text(json.dumps({"dependencies": {"lodash": "^4"}}))
+    if locked:
+        (root / "ui" / "package-lock.json").write_text('{"lockfileVersion": 3}')
+    return root
+
+
+def ingest(
+    engine: Engine,
+    tool: Tool,
+    objects: InMemoryObjectStore,
+    ref: UUID,
+    raw: bytes,
+    root: Path,
+    *,
+    locked: bool,
+) -> None:
+    tool.raw = raw
+    exposure(engine, tool, objects).ingest_dependencies(ref, checkout(root, locked=locked))
+
+
+def default_ref(uow: SqlTraustUnitOfWork, seed: Seed, **kw: object) -> UUID:
+    ref = seed.repository_ref(is_default=True, **kw)  # type: ignore[arg-type]
+    uow.commit()
+    assert ref.id is not None
+    return ref.id
+
+
+def test_every_state_over_the_tracked_fleet(engine: Engine, tmp_path: Path) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repo = seed.repository()
+        affected = default_ref(uow, seed, repository=repo)
+        seed.repository_ref(repo, name="dev", sha="b" * 40)  # an attached line, never scanned
+        fixed = default_ref(uow, seed)
+        not_imported = default_ref(uow, seed)
+        unresolved = default_ref(uow, seed)
+        outside = default_ref(uow, seed)
+        default_ref(uow, seed)  # never scanned: no SBOM, its line never scanned either
+        unknown = default_ref(uow, seed)
+        stale_repo = seed.repository()
+        scanned_head = default_ref(uow, seed, repository=stale_repo)
+        apart()
+        default_ref(uow, seed, repository=stale_repo, sha="b" * 40)  # the head moved past its scan
+        shipped = seed.repository_ref(name="release-4.16")
+        product = seed.product(slug="ocp")
+        seed.component(seed.release(product), shipped)
+        uow.commit()
+        assert shipped.id is not None
+
+    ingest(engine, tool, objects, affected, AFFECTED, tmp_path / "a", locked=True)
+    ingest(engine, tool, objects, fixed, FIXED, tmp_path / "b", locked=True)
+    ingest(engine, tool, objects, not_imported, OTHER_NPM, tmp_path / "c", locked=True)
+    ingest(engine, tool, objects, unresolved, OTHER_NPM, tmp_path / "d", locked=False)
+    ingest(engine, tool, objects, outside, GO, tmp_path / "e", locked=True)
+    ingest(engine, tool, objects, scanned_head, OTHER_NPM, tmp_path / "f", locked=True)
+    ingest(engine, tool, objects, shipped.id, GO, tmp_path / "g", locked=True)
+    exposure(engine, tool, objects).ingest_sbom(OTHER_NPM, unknown)
+
+    answer = exposure(engine, tool, objects).impact(CVE)
+    assert answer.ecosystems == (Ecosystem.NPM,)
+    assert answer.advisory_id is not None
+    by_state = {row.state: row for row in answer.rows}
+    assert set(by_state) == {
+        ImpactState.LIKELY_AFFECTED,
+        ImpactState.VERSION_NOT_IN_RANGE,
+        ImpactState.NOT_IMPORTED,
+        ImpactState.UNRESOLVED_MANIFEST,
+    }
+    assert by_state[ImpactState.LIKELY_AFFECTED].evidence == "manifest"  # no verdict recorded
+    [held] = by_state[ImpactState.LIKELY_AFFECTED].held
+    assert (held.name, held.version, held.in_range) == ("lodash", Version("4.17.20"), True)
+    assert by_state[ImpactState.UNRESOLVED_MANIFEST].reason == "ui/package.json"
+    assert by_state[ImpactState.NOT_IMPORTED].product_slugs == ()
+    assert by_state[ImpactState.LIKELY_AFFECTED].repository_ref_id == affected
+
+    assert answer.counts == {
+        ImpactState.LIKELY_AFFECTED: 1,
+        ImpactState.VERSION_NOT_IN_RANGE: 1,
+        ImpactState.NOT_IMPORTED: 1,
+        ImpactState.UNRESOLVED_MANIFEST: 1,
+        ImpactState.NOT_IN_ECOSYSTEM: 2,  # the go-scanned default head and the shipped commit
+        ImpactState.NO_SBOM: 2,  # the unscanned default head and the never-scanned dev line
+        ImpactState.STALE: 1,  # the moved default head: its line's SBOM is at the earlier commit
+        ImpactState.COVERAGE_UNKNOWN: 1,  # the SBOM given as a document, no scan
+    }
+    assert answer.complete is False
+    assert answer.fixable == 3  # every tracked head without an SBOM, its line notwithstanding
+    assert answer.as_of is not None
+
+
+def test_a_complete_answer_names_no_gaps(engine: Engine, tmp_path: Path) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        affected = default_ref(uow, seed)
+        outside = default_ref(uow, seed)
+        uow.commit()
+    ingest(engine, tool, objects, affected, AFFECTED, tmp_path / "a", locked=True)
+    ingest(engine, tool, objects, outside, GO, tmp_path / "b", locked=True)
+
+    answer = exposure(engine, tool, objects).impact(CVE)
+    assert answer.complete is True
+    assert answer.fixable == 0
+    assert answer.counts == {
+        ImpactState.LIKELY_AFFECTED: 1,
+        ImpactState.NOT_IN_ECOSYSTEM: 1,
+    }
+
+
+def test_products_shipping_each_row(engine: Engine, tmp_path: Path) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        head = seed.repository_ref(is_default=True)
+        uow.commit()
+        assert head.id is not None
+        seed.component(seed.release(seed.product(slug="ocp")), head)
+        uow.commit()
+    ingest(engine, tool, objects, head.id, AFFECTED, tmp_path / "a", locked=True)
+
+    answer = exposure(engine, tool, objects).impact(CVE)
+    [row] = answer.rows
+    assert row.state is ImpactState.LIKELY_AFFECTED
+    assert row.product_slugs == ("ocp",)
+
+
+def test_an_unknown_advisory_raises_and_a_uuid_answers(engine: Engine, tmp_path: Path) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    service = exposure(engine, tool, objects)
+    with pytest.raises(NotFoundError):
+        service.impact(AdvisoryIdentifier("CVE-0000-0000"))
+    answer = service.impact(CVE)
+    assert answer.advisory_id is not None
+    assert service.impact(answer.advisory_id).identifier == CVE
+
+
+def test_an_advisory_naming_nothing_modelled_answers_empty(engine: Engine) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    answer = exposure(engine, tool, objects, NOTHING).impact(NOTHING.identifier)
+    assert answer.ecosystems == ()
+    assert answer.unmodeled_ecosystems == ("alpm",)
+    assert answer.rows == ()
+    assert answer.counts == {}
+    assert answer.complete is True
+
+
+def test_no_tracked_refs_answer_empty(engine: Engine) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    answer = exposure(engine, tool, objects).impact(CVE)
+    assert answer.rows == ()
+    assert answer.counts == {}
+    assert answer.complete is True
+
+
+def batch_orders(engine: Engine, batch_id: UUID) -> list[tuple[str, UUID | None, str]]:
+    with SqlTraustUnitOfWork(engine) as uow:
+        orders = uow.run_orders.list_for_batch(batch_id)
+        return [(o.asset, o.repository_id, str(o.state)) for o in orders]
+
+
+def test_fill_queues_the_gap_orders_in_one_batch(engine: Engine, tmp_path: Path) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        scanned = default_ref(uow, seed)
+        gap_repo, other_gap = seed.repository(), seed.repository()
+        uow.commit()
+        default_ref(uow, seed, repository=gap_repo)
+        default_ref(uow, seed, repository=other_gap)
+    ingest(engine, tool, objects, scanned, OTHER_NPM, tmp_path / "a", locked=True)
+
+    service = filled(engine, tool, objects)
+    answer = service.impact(CVE)
+    assert answer.fixable == 2
+    batch = service.fill(CVE, OPERATOR)
+    assert batch is not None and batch.id is not None
+    # a submitted order is planned until the engine's admission queues it (c129551d)
+    expected = sorted(
+        (asset, repo.id, "planned")
+        for repo in (gap_repo, other_gap)
+        for asset in ("repo_state", "manifest_sbom")
+    )
+    assert sorted(batch_orders(engine, batch.id)) == expected
+
+
+def test_a_running_fill_returns_its_batch_without_more_orders(
+    engine: Engine, tmp_path: Path
+) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        gap_repo = seed.repository()
+        uow.commit()
+        default_ref(uow, seed, repository=gap_repo)
+
+    service = filled(engine, tool, objects)
+    first = service.fill(CVE, OPERATOR)
+    assert first is not None and first.id is not None
+    again = service.fill(CVE, OPERATOR)
+    assert again is not None and again.id == first.id
+    assert len(batch_orders(engine, first.id)) == 2  # one repo_state and one manifest_sbom
+
+
+def test_a_finished_fill_with_gaps_left_retries_into_its_batch(
+    engine: Engine, tmp_path: Path
+) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        gap_repo = seed.repository()
+        uow.commit()
+        default_ref(uow, seed, repository=gap_repo)
+
+    service = filled(engine, tool, objects)
+    first = service.fill(CVE, OPERATOR)
+    assert first is not None and first.id is not None
+    with SqlTraustUnitOfWork(engine) as uow:
+        for order in uow.run_orders.list_for_batch(first.id):
+            uow.run_orders.update(order.model_copy(update={"state": OrderState.FAILED}))
+        uow.commit()
+    again = service.fill(CVE, OPERATOR)
+    assert again is not None and again.id == first.id
+    assert len(batch_orders(engine, first.id)) == 4  # the failed pair retried, not replaced
+
+
+def test_fill_returns_none_when_the_answer_is_complete(engine: Engine, tmp_path: Path) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        scanned = default_ref(uow, seed)
+        uow.commit()
+    ingest(engine, tool, objects, scanned, AFFECTED, tmp_path / "a", locked=True)
+
+    service = filled(engine, tool, objects)
+    assert service.impact(CVE).complete is True
+    assert service.fill(CVE, OPERATOR) is None
+
+
+def test_fill_needs_the_ops_door(engine: Engine) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    service = exposure(engine, tool, objects)
+    with pytest.raises(ConfigError):
+        service.fill(CVE, OPERATOR)
+
+
+def test_a_fixed_version_behind_an_unresolved_manifest_is_not_proven(
+    engine: Engine, tmp_path: Path
+) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        fixed = default_ref(uow, seed)
+        uow.commit()
+    # The SBOM holds the fixed version, but the manifest that could hold another is unresolved
+    ingest(engine, tool, objects, fixed, FIXED, tmp_path / "a", locked=False)
+
+    answer = exposure(engine, tool, objects).impact(CVE)
+    by_state = {row.state: row for row in answer.rows}
+    row = by_state[ImpactState.UNRESOLVED_MANIFEST]
+    assert row.reason == "ui/package.json"
+    [held] = row.held  # what the SBOM does say is kept as evidence
+    assert (held.name, held.version, held.in_range) == ("lodash", Version("4.17.21"), False)
+    assert answer.complete is False
+
+
+def test_fill_refuses_an_advisory_naming_nothing_modelled(engine: Engine) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        default_ref(uow, seed)  # a gap exists, but nothing the advisory names can complete it
+        uow.commit()
+
+    service = filled(engine, tool, objects, NOTHING)
+    assert service.fill(NOTHING.identifier, OPERATOR) is None
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.run_batches.find("impact_fill", str(NOTHING.identifier)) is None  # type: ignore[arg-type]
+
+
+def test_a_repository_the_policy_wont_take_is_skipped_not_fatal(
+    engine: Engine, tmp_path: Path
+) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        good = seed.repository()
+        uow.commit()
+        default_ref(uow, seed, repository=good)
+        never_onboarded = seed.repository()  # a branch line, but no imported default line
+        uow.commit()
+        seed.repository_ref(repository=never_onboarded, name="release-4.16")
+
+    service = filled(engine, tool, objects)
+    batch = service.fill(CVE, OPERATOR)
+    assert batch is not None and batch.id is not None
+    assert sorted(batch_orders(engine, batch.id)) == [
+        ("manifest_sbom", good.id, "planned"),
+        ("repo_state", good.id, "planned"),
+    ]  # the never-onboarded repository's gap stays, never blocking the fill
+
+
+def test_a_fill_denied_everywhere_returns_no_batch(engine: Engine, tmp_path: Path) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        never_onboarded = seed.repository()  # a branch line, but no imported default line
+        uow.commit()
+        seed.repository_ref(repository=never_onboarded, name="release-4.16")
+
+    service = filled(engine, tool, objects)
+    assert service.fill(CVE, OPERATOR) is None
+    answer = service.impact(CVE)
+    assert answer.advisory_id is not None
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.run_batches.find("impact_fill", str(answer.advisory_id)) is None
+
+
+def test_an_advisory_stating_one_package_twice_keeps_every_span(
+    engine: Engine, tmp_path: Path
+) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    repeated = AdvisoryRecord(
+        identifier=CVE,
+        source="osv",
+        affected=(
+            AffectedPackage(
+                ecosystem=Ecosystem.NPM,
+                name="lodash",
+                spans=(AffectedSpan(introduced=Version("0"), fixed=Version("4.17.21")),),
+            ),
+            AffectedPackage(  # the same package again, a different span
+                ecosystem=Ecosystem.NPM,
+                name="lodash",
+                spans=(AffectedSpan(introduced=Version("4.18.0"), fixed=Version("4.19.0")),),
+            ),
+        ),
+    )
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        head = default_ref(uow, seed)
+    # 4.18.5 is inside the second statement's span: affected, not fixed
+    raw = json.dumps(
+        {"bomFormat": "CycloneDX", "components": [{"purl": "pkg:npm/lodash@4.18.5"}]}
+    ).encode()
+    ingest(engine, tool, objects, head, raw, tmp_path / "a", locked=True)
+    answer = exposure(engine, tool, objects, repeated).impact(CVE)
+    [row] = answer.rows
+    assert row.state is ImpactState.LIKELY_AFFECTED
+
+
+@pytest.mark.parametrize(
+    ("stated", "graded"),
+    [(None, None), (DependencyEvidenceLevel.SYMBOL, "symbol")],
+    ids=["no stated level: ungraded", "stated symbol level"],
+)
+def test_a_verdict_recorded_at_the_head_upgrades_the_row(
+    engine: Engine, tmp_path: Path, stated: DependencyEvidenceLevel | None, graded: str | None
+) -> None:
+    # A reachability verdict's grade is the document's own; none is guessed (CVSS plan D8a).
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        head = default_ref(uow, seed)
+        uow.commit()
+    ingest(engine, tool, objects, head, AFFECTED, tmp_path / "a", locked=True)
+
+    service = exposure(engine, tool, objects, findings=True)
+    answer = service.impact(CVE)
+    assert answer.rows[0].state is ImpactState.LIKELY_AFFECTED  # the range match alone
+
+    [prepared] = service.prepare(answer.advisory_id, head)  # type: ignore[arg-type]
+    doc = prepared.model_copy(
+        update={
+            "evidence": prepared.evidence.model_copy(
+                update={
+                    "govulncheck": ImpactGovulncheck.SYMBOL_REACHABLE,
+                    "evidence_level": stated,
+                }
+            )
+        }
+    ).document("4.17.20")
+    service.record(head, doc, provenance())
+
+    [row] = service.impact(CVE).rows
+    assert row.state is ImpactState.AFFECTED  # reachability recorded at this exact ref
+    assert row.evidence == graded
+
+
+def test_a_recorded_not_observed_demotes_and_another_refs_record_does_not(
+    engine: Engine, tmp_path: Path
+) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        head, other = default_ref(uow, seed), default_ref(uow, seed)
+        uow.commit()
+    ingest(engine, tool, objects, head, AFFECTED, tmp_path / "a", locked=True)
+    ingest(engine, tool, objects, other, AFFECTED, tmp_path / "b", locked=True)
+
+    service = exposure(engine, tool, objects, findings=True)
+    answer = service.impact(CVE)
+    [prepared] = service.prepare(answer.advisory_id, head)  # type: ignore[arg-type]
+    doc = prepared.model_copy(
+        update={
+            "evidence": prepared.evidence.model_copy(
+                update={"govulncheck": ImpactGovulncheck.PACKAGE_IMPORTED_NOT_OBSERVED}
+            )
+        }
+    ).document("4.17.20")
+    service.record(head, doc, provenance())
+
+    by_ref = {row.repository_ref_id: row for row in service.impact(CVE).rows}
+    assert by_ref[head].state is ImpactState.NOT_OBSERVED  # govulncheck demoted it
+    assert by_ref[other].state is ImpactState.LIKELY_AFFECTED  # no record at that ref
+
+
+def test_a_carrier_through_a_base_image_is_held_never_not_imported(
+    engine: Engine, tmp_path: Path
+) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        head = default_ref(uow, seed)
+        carrier_sbom = seed.sbom()
+        seed.dependency(
+            sbom=carrier_sbom,
+            package=seed.package(ecosystem="npm", name="lodash"),
+            version="4.17.20",
+        )
+        assert head is not None
+        seed.image(digest="sha256:image-1", sbom_id=carrier_sbom.id, repository_ref_id=head)
+        uow.commit()
+    ingest(engine, tool, objects, head, OTHER_NPM, tmp_path / "a", locked=True)
+
+    answer = exposure(engine, tool, objects).impact(CVE)
+    [row] = answer.rows
+    assert row.state is ImpactState.LIKELY_AFFECTED  # the image's hold, not a verdict
+    [held] = row.held
+    assert (held.version, held.carried) == (Version("4.17.20"), True)
+
+
+def test_an_unprotected_ecosystem_never_asserts_absence(engine: Engine, tmp_path: Path) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    go_advisory = AdvisoryRecord(
+        identifier=CVE,
+        source="osv",
+        affected=(
+            AffectedPackage(
+                ecosystem=Ecosystem.GO,
+                name="example.com/vulnerable",
+                spans=(AffectedSpan(introduced=Version("0"), fixed=Version("2.0")),),
+            ),
+        ),
+    )
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        head = default_ref(uow, seed)
+        uow.commit()
+    raw = json.dumps(
+        {"bomFormat": "CycloneDX", "components": [{"purl": "pkg:golang/example.com/other@1.0"}]}
+    ).encode()
+    ingest(engine, tool, objects, head, raw, tmp_path / "a", locked=True)
+
+    answer = exposure(engine, tool, objects, go_advisory).impact(CVE)
+    [row] = answer.rows
+    assert row.state is ImpactState.UNDETERMINED  # syft's silence proves nothing for go
+    assert "no manifest coverage rule" in row.reason
+    assert any("absence is unproven" in c for c in answer.caveats)
+
+
+TWO = AdvisoryRecord(
+    identifier=CVE,
+    source="osv",
+    affected=(
+        LODASH.affected[0],
+        AffectedPackage(
+            ecosystem=Ecosystem.NPM,
+            name="minimist",
+            spans=(AffectedSpan(introduced=Version("0"), fixed=Version("1.2.6")),),
+        ),
+    ),
+)
+BOTH_IN_RANGE = json.dumps(
+    {
+        "bomFormat": "CycloneDX",
+        "components": [{"purl": "pkg:npm/lodash@4.17.20"}, {"purl": "pkg:npm/minimist@1.2.5"}],
+    }
+).encode()
+
+
+def _record(service: ExposureService, head: UUID, name: str, verdict: ImpactGovulncheck) -> None:
+    answer = service.impact(CVE)
+    for prepared in service.prepare(answer.advisory_id, head):  # type: ignore[arg-type]
+        if prepared.package.name != name:
+            continue
+        doc = prepared.model_copy(
+            update={"evidence": prepared.evidence.model_copy(update={"govulncheck": verdict})}
+        ).document("4.17.20")
+        service.record(head, doc, provenance())
+
+
+def test_one_packages_verdict_never_clears_another_held_on_the_ref(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # D7: lodash's recorded not_observed speaks for lodash@4.17.20 only; minimist@1.2.5 is
+    # held in range with no verdict, so the row stays at the manifest's likely_affected
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        head = default_ref(uow, Seed(uow))
+    ingest(engine, tool, objects, head, BOTH_IN_RANGE, tmp_path / "a", locked=True)
+    service = exposure(engine, tool, objects, TWO, findings=True)
+    _record(service, head, "lodash", ImpactGovulncheck.PACKAGE_IMPORTED_NOT_OBSERVED)
+    [row] = service.impact(CVE).rows
+    assert row.state is ImpactState.LIKELY_AFFECTED
+    assert {h.name for h in row.held} == {"lodash", "minimist"}
+
+
+def test_a_rescan_holding_another_in_range_version_drops_the_old_verdict(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # the not_observed verdict analysed 4.17.20; the ref now holds 4.17.15 (still in range)
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        head = default_ref(uow, Seed(uow))
+    ingest(engine, tool, objects, head, AFFECTED, tmp_path / "a", locked=True)
+    service = exposure(engine, tool, objects, findings=True)
+    _record(service, head, "lodash", ImpactGovulncheck.PACKAGE_IMPORTED_NOT_OBSERVED)
+    assert service.impact(CVE).rows[0].state is ImpactState.NOT_OBSERVED
+    rescanned = json.dumps(
+        {"bomFormat": "CycloneDX", "components": [{"purl": "pkg:npm/lodash@4.17.15"}]}
+    ).encode()
+    ingest(engine, tool, objects, head, rescanned, tmp_path / "b", locked=True)
+    [row] = service.impact(CVE).rows
+    assert row.state is ImpactState.LIKELY_AFFECTED  # never the stale verdict's not_observed
+
+
+def test_a_fixed_pin_in_one_ecosystem_never_proves_an_uncovered_other_absent(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # npm-and-Go advisory: the fixed npm pin is safe, but Go has no manifest coverage rule, so
+    # the ref's missing Go package proves nothing and the answer is incomplete
+    mixed = AdvisoryRecord(
+        identifier=CVE,
+        source="osv",
+        affected=(
+            LODASH.affected[0],
+            AffectedPackage(
+                ecosystem=Ecosystem.GO,
+                name="google.golang.org/grpc",
+                spans=(AffectedSpan(introduced=Version("0"), fixed=Version("1.58.3")),),
+            ),
+        ),
+    )
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        head = default_ref(uow, Seed(uow))
+    ingest(engine, tool, objects, head, FIXED, tmp_path / "a", locked=True)
+    answer = exposure(engine, tool, objects, mixed).impact(CVE)
+    [row] = answer.rows
+    assert row.state is ImpactState.UNDETERMINED and "go" in (row.reason or "")
+    assert [h.version for h in row.held] == [Version("4.17.21")]
+    assert answer.complete is False
+
+
+PYPI = AdvisoryRecord(
+    identifier=CVE,
+    source="osv",
+    affected=(
+        AffectedPackage(
+            ecosystem=Ecosystem.PYPI,
+            name="requests",
+            spans=(AffectedSpan(introduced=Version("0"), fixed=Version("2.32.0")),),
+        ),
+    ),
+)
+NO_REQUESTS = json.dumps(
+    {"bomFormat": "CycloneDX", "components": [{"purl": "pkg:pypi/idna@3.7"}]}
+).encode()
+
+
+def test_a_dependency_declared_only_in_setup_py_is_never_absent(
+    engine: Engine, tmp_path: Path
+) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        head = default_ref(uow, Seed(uow))
+    root = tmp_path / "a"
+    (root / "py").mkdir(parents=True)
+    (root / "py" / "setup.py").write_text(
+        "from setuptools import setup\nsetup(name='x', install_requires=['requests>=2'])\n"
+    )
+    tool.raw = NO_REQUESTS
+    exposure(engine, tool, objects).ingest_dependencies(head, root)
+    answer = exposure(engine, tool, objects, PYPI).impact(CVE)
+    assert ImpactState.NOT_IMPORTED not in answer.counts
+    assert ImpactState.NOT_IN_ECOSYSTEM not in answer.counts
+    [row] = answer.rows
+    assert (row.state, row.reason) == (ImpactState.UNRESOLVED_MANIFEST, "py/setup.py")
+
+
+def test_a_scan_from_a_probe_without_the_ecosystems_rules_is_coverage_unknown(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # a version-2 probe never checked setup.py / setup.cfg: PyPI is only partly covered there,
+    # so a missing package reads coverage_unknown until a current probe rescans
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        head = default_ref(uow, Seed(uow))
+    service = exposure(engine, tool, objects, PYPI)
+    sbom = service.ingest_sbom(NO_REQUESTS, head)
+    with SqlTraustUnitOfWork(engine) as uow:
+        ref = uow.repository_refs.get(head)
+        old = Seed(uow).assessment(
+            ref,
+            kind=AssessmentKind.MANIFEST_SBOM,
+            assessor="traust-manifest-coverage",
+            assessor_version="2",
+        )
+        document = ManifestCoverageArtifact.from_document(
+            {
+                "artifact": "manifest-coverage",
+                "tool": {"name": "syft", "version": "1.51.1"},
+                "assessment_id": str(old.id),
+                "sbom_id": str(sbom.id),
+                "unresolved": {},
+            }
+        )
+        service._attach_document(uow, old, document)
+        uow.repository_refs.update(ref.model_copy(update={"manifest_sbom_assessment_id": old.id}))
+        uow.commit()
+    answer = service.impact(CVE)
+    assert answer.counts == {ImpactState.COVERAGE_UNKNOWN: 1}
+    assert answer.complete is False

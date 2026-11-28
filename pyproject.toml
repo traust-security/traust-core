@@ -27,7 +27,7 @@ dependencies = [
     "tree-sitter-java==0.23.5",
     "tree-sitter-rust==0.24.2",
     "tree-sitter-ruby==0.23.1",
-    "traust-contracts @ git+https://github.com/traust-security/traust-contracts.git@485578cbe584ad224d57b2c7c778174c0b66ba7c",
+    "traust-contracts @ git+https://github.com/traust-security/traust-contracts.git@6651aebad8bba6c8cee6fa16d77f0c8803d8d250",
     "traust-ledger @ git+https://github.com/traust-security/traust-ledger.git@95fd75ed9b7f548322f528f1fd99263ed6733960"
 ]
 

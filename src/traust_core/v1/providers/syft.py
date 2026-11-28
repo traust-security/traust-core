@@ -3,6 +3,8 @@ manifest parser."""
 
 from __future__ import annotations
 
+import ast
+import configparser
 import json
 import os
 import re
@@ -227,6 +229,101 @@ def _unpinned_requirements(text: str) -> bool:
     return False
 
 
+_SETUP_KEYS = ("install_requires", "extras_require", "setup_requires", "tests_require")
+# syft 1.48.0's setup.py reader (syft/pkg/cataloger/python/parse_setup.go `pinnedDependency`):
+# a quoted `name==version` whose name is one ASCII word run and whose version stops at the
+# first character outside [A-Za-z0-9_.]. Names with a hyphen, a dot or extras never match.
+_SYFT_PINNED = re.compile(r"""['"]\W?(\w+\W?==\W?[\w.]*)""", re.ASCII)
+
+
+def _syft_reads(requirement: str) -> bool:
+    """Whether syft catalogs this literal requirement as itself: the exact name and the whole
+    pinned version, as written. A pin syft skips or truncates is a dependency the SBOM lacks."""
+    name, sep, version = requirement.split(";", 1)[0].strip().partition("==")
+    if not sep or version.startswith("="):  # not an exact pin, or `===`
+        return False
+    name, version = name.strip(), version.strip()
+    for match in _SYFT_PINNED.finditer(f'"{requirement}"'):
+        parts = match.group(1).split("==")
+        if len(parts) == 2 and (parts[0].strip(), parts[1].strip()) == (name, version):
+            return True
+    return False
+
+
+def _is_setup_call(node: ast.Call) -> bool:
+    """`setup(...)` or `<module>.setup(...)` (setuptools, distutils.core): the call that
+    declares the project's requirements; any other call's keywords are not requirements."""
+    callee = node.func
+    return (isinstance(callee, ast.Name) and callee.id == "setup") or (
+        isinstance(callee, ast.Attribute) and callee.attr == "setup"
+    )
+
+
+def _requirements_unread(value: ast.expr) -> bool:
+    """One requirement argument's value: True when syft can't read every requirement in it."""
+    groups = value.values if isinstance(value, ast.Dict) else [value]
+    for group in groups:
+        if not isinstance(group, (ast.List, ast.Tuple)):
+            return True  # built at run time: syft can't see it
+        for item in group.elts:
+            if not (isinstance(item, ast.Constant) and isinstance(item.value, str)):
+                return True
+            if _unpinned_requirements(item.value) or not _syft_reads(item.value):
+                return True
+    return False
+
+
+def _setup_py_unpinned(text: str) -> bool:
+    """A setup.py whose requirements syft can't read whole: syft keeps only exact (`==`) pins
+    listed literally in the setup() call, with a plain one-word name (see `_SYFT_PINNED`); a
+    range, a name it skips, or any requirement built at run time (a variable, a call, `**`
+    expanded arguments it can't see through) is dropped. Only setup() calls declare
+    requirements. Parsed with `ast`, never executed; unparsable is unknown."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return True
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not _is_setup_call(node):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg is None:  # setup(**meta): a literal dict is read, anything else isn't
+                if not isinstance(keyword.value, ast.Dict):
+                    return True
+                for key, value in zip(keyword.value.keys, keyword.value.values, strict=True):
+                    if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+                        return True  # a nested `**` or a computed key
+                    if key.value in _SETUP_KEYS and _requirements_unread(value):
+                        return True
+            elif keyword.arg in _SETUP_KEYS and _requirements_unread(keyword.value):
+                return True
+    return False
+
+
+def _setup_cfg_deps(text: str) -> bool:
+    """A setup.cfg declaring requirements: syft catalogs none of them, pinned or not."""
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        parser.read_string(text)
+    except configparser.Error:
+        return True
+    return any(
+        value.strip()
+        for section, keys in (
+            ("options", ("install_requires", "setup_requires", "tests_require")),
+            (
+                "options.extras_require",
+                tuple(parser["options.extras_require"])
+                if parser.has_section("options.extras_require")
+                else (),
+            ),
+        )
+        if parser.has_section(section)
+        for key in keys
+        if (value := parser.get(section, key, fallback=""))
+    )
+
+
 def _requirements(name: str) -> bool:
     return name.endswith(".txt") and "requirements" in name
 
@@ -416,6 +513,11 @@ _RULES = (
           above=False),
     _Rule(Ecosystem.PYPI, _requirements, _unpinned_requirements,
           reason=ManifestCoverageReason.UNPINNED),
+    _Rule(Ecosystem.PYPI, lambda n: n == "setup.py", _setup_py_unpinned,
+          frozenset({"poetry.lock", "uv.lock", "pdm.lock"}),
+          reason=ManifestCoverageReason.UNPINNED),
+    _Rule(Ecosystem.PYPI, lambda n: n == "setup.cfg", _setup_cfg_deps,
+          frozenset({"poetry.lock", "uv.lock", "pdm.lock"}), reason="unsupported-manifest"),
     _Rule(Ecosystem.CARGO, lambda n: n == "Cargo.toml", _cargo_deps, frozenset({"Cargo.lock"})),
     _Rule(Ecosystem.RUBY, lambda n: n == "Gemfile", lambda text: bool(_GEM.search(text)),
           frozenset({"Gemfile.lock"}), above=False),
@@ -424,6 +526,11 @@ _RULES = (
           above=False),
     _Rule(Ecosystem.DOCKER, _containerfile, _external_base, reason="unsupported-manifest"),
 )  # fmt: skip
+
+# Ecosystems whose absence a manifest scan can prove: a rule knows the manifests that declare
+# membership and the lockfiles (or pins) that resolve it. Elsewhere syft's silence proves
+# nothing, and the impact read must not assert `not_imported` off it.
+PROTECTED_ECOSYSTEMS = frozenset({rule.ecosystem for rule in _RULES})
 
 
 def _declares(rule: _Rule, path: Path) -> bool:

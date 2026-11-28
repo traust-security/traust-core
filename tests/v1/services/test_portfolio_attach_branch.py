@@ -1,0 +1,249 @@
+"""PortfolioSync.attach_branch: the door that attaches a branch line to track, resolving its
+current head at the forge (the Snyk-style "scan this branch")."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+
+import pytest
+from sqlalchemy.engine import Engine
+
+from tests.v1.observation_support import HOSTS
+from tests.v1.providers.test_forge import github_source
+from tests.v1.repositories.tables import conftest as table_fixtures
+from tests.v1.repositories.tables.conftest import SHA, Seed
+from tests.v1.services.test_portfolio_sync import Forge
+from traust_core.v1.errors import ConflictError, NotFoundError, ServiceError
+from traust_core.v1.models.inventory import RefName
+from traust_core.v1.models.observation import ComparisonStatus
+from traust_core.v1.models.values import HttpsRepoUrl
+from traust_core.v1.providers.clock import FixedClock
+from traust_core.v1.providers.sources import SourceError
+from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService, PortfolioSync
+
+engine, uow, seed = table_fixtures.engine, table_fixtures.uow, table_fixtures.seed
+
+T0 = datetime(2026, 11, 9, tzinfo=UTC)
+MOVED = "b" * 40
+
+
+def attach(engine: Engine, heads: dict[str, str]) -> PortfolioSync:
+    uow = SqlTraustUnitOfWork(engine)
+    return PortfolioSync(
+        PortfolioService(uow, PortfolioPolicy()),
+        Forge(heads=heads),  # type: ignore[arg-type]
+        clock=FixedClock(T0),
+    )
+
+
+def test_attach_registers_the_lines_current_head(engine: Engine, seed: Seed) -> None:
+    repo = seed.repository(url="https://github.com/org/tooling")
+    seed.uow.commit()
+    ref = attach(engine, {"release-4.16": SHA}).attach_branch(
+        repo.id,
+        RefName("release-4.16"),  # type: ignore[arg-type]
+    )
+    assert (ref.name, ref.sha) == ("release-4.16", SHA)
+    with SqlTraustUnitOfWork(engine) as uow:
+        [line] = uow.repository_refs.list_lines(repo.id)  # type: ignore[arg-type]
+    assert line == ref
+
+
+def test_re_attach_moves_the_line_to_its_new_head(engine: Engine, seed: Seed) -> None:
+    repo = seed.repository(url="https://github.com/org/tooling")
+    seed.uow.commit()
+    service = attach(engine, {"release-4.16": SHA})
+    service.attach_branch(repo.id, RefName("release-4.16"))  # type: ignore[arg-type]
+    moved = attach(engine, {"release-4.16": MOVED}).attach_branch(
+        repo.id,
+        RefName("release-4.16"),  # type: ignore[arg-type]
+    )
+    assert moved.sha == MOVED
+    with SqlTraustUnitOfWork(engine) as uow:
+        [line] = uow.repository_refs.list_lines(repo.id)  # type: ignore[arg-type]
+    assert line == moved
+
+
+def test_attaching_the_default_branch_marks_the_default_line(engine: Engine, seed: Seed) -> None:
+    repo = seed.repository(url="https://github.com/org/tooling")
+    seed.repository_ref(repository=repo, name="main", sha=MOVED, is_default=True)
+    seed.uow.commit()
+    ref = attach(engine, {"main": SHA}).attach_branch(repo.id, RefName("main"))  # type: ignore[arg-type]
+    assert ref.is_default is True
+    assert ref.sha == SHA
+
+
+def url_of(repo_url: str) -> HttpsRepoUrl:
+    return HttpsRepoUrl.parse(repo_url, ("github.com",))
+
+
+def test_observe_lines_advances_each_attached_line(engine: Engine, seed: Seed) -> None:
+    repo = seed.repository(url="https://github.com/org/tooling")
+    seed.repository_ref(repository=repo, name="main", sha=SHA, is_default=True)
+    seed.repository_ref(repository=repo, name="dev", sha=MOVED)
+    seed.repository_ref(repository=repo, name="release-4.16", sha=MOVED)
+    seed.uow.commit()
+    report = attach(engine, {"dev": SHA, "release-4.16": MOVED}).observe_lines(
+        repo.id,
+        url_of("https://github.com/org/tooling"),  # type: ignore[arg-type]
+    )
+    assert report.observed == (RefName("dev"), RefName("release-4.16"))  # type: ignore[arg-type]
+    assert report.unobserved == ()
+    with SqlTraustUnitOfWork(engine) as uow:
+        lines = {r.name: r.sha for r in uow.repository_refs.list_lines(repo.id)}  # type: ignore[arg-type]
+    assert lines == {"main": SHA, "dev": SHA, "release-4.16": MOVED}  # default line untouched
+
+
+def test_observe_lines_names_a_line_the_forge_wont_answer(engine: Engine, seed: Seed) -> None:
+    repo = seed.repository(url="https://github.com/org/tooling")
+    seed.repository_ref(repository=repo, name="main", sha=SHA, is_default=True)
+    seed.repository_ref(repository=repo, name="release-4.16", sha=MOVED)
+    seed.uow.commit()
+    gone = SourceError("branch gone", observation_status=ComparisonStatus.UNREACHABLE)
+    service = PortfolioSync(
+        PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy()),
+        Forge(head_error=gone),  # type: ignore[arg-type]
+        clock=FixedClock(T0),
+    )
+    report = service.observe_lines(
+        repo.id,
+        url_of("https://github.com/org/tooling"),  # type: ignore[arg-type]
+    )
+    assert report.observed == ()
+    assert report.unobserved == (RefName("release-4.16"),)  # type: ignore[arg-type]
+
+
+def test_a_name_already_recorded_as_a_tag_refuses_the_branch(engine: Engine, seed: Seed) -> None:
+    repo = seed.repository(url="https://github.com/org/tooling")
+    seed.repository_ref(repository=repo, name="release-4.16", kind="tag", sha=SHA)
+    seed.uow.commit()
+    with pytest.raises(ConflictError):
+        attach(engine, {"release-4.16": SHA}).attach_branch(
+            repo.id,
+            RefName("release-4.16"),  # type: ignore[arg-type]
+        )
+
+
+def test_a_branch_the_forge_answers_404_for_is_not_found(engine: Engine, seed: Seed) -> None:
+    repo = seed.repository(url="https://github.com/org/tooling")
+    seed.uow.commit()
+    try:
+        raise ServiceError("HTTP 404", 404)
+    except ServiceError as exc:
+        gone = SourceError("HTTP 404", ComparisonStatus.ERROR)
+        gone.__cause__ = exc
+    with pytest.raises(NotFoundError):
+        PortfolioSync(
+            PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy()),
+            Forge(head_error=gone),  # type: ignore[arg-type]
+            clock=FixedClock(T0),
+        ).attach_branch(repo.id, RefName("release-4.16"))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(("status", "raised"), [(404, NotFoundError), (409, SourceError)])
+def test_the_real_forge_heads_404_is_not_found_through_its_wrappers(
+    engine: Engine, seed: Seed, status: int, raised: type[Exception]
+) -> None:
+    # head() wraps the forge's SourceError (itself from the HTTP 404) in a second one; the
+    # 404 is found down the chain, and no other status (409: an empty repository) becomes it
+    repo = seed.repository(url="https://github.com/org/tooling")
+    seed.uow.commit()
+    provider, _ = github_source("not found", status=status)
+    with pytest.raises(raised):
+        PortfolioSync(
+            PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy()),
+            provider,
+            clock=FixedClock(T0),
+            hosts=HOSTS,
+        ).attach_branch(repo.id, RefName("release-4.16"))  # type: ignore[arg-type]
+
+
+def test_an_unreachable_forge_attaching_stays_an_error(engine: Engine, seed: Seed) -> None:
+    repo = seed.repository(url="https://github.com/org/tooling")
+    seed.uow.commit()
+    unreachable = SourceError("no route", observation_status=ComparisonStatus.UNREACHABLE)
+    with pytest.raises(SourceError):
+        PortfolioSync(
+            PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy()),
+            Forge(head_error=unreachable),  # type: ignore[arg-type]
+            clock=FixedClock(T0),
+        ).attach_branch(repo.id, RefName("release-4.16"))  # type: ignore[arg-type]
+
+
+def test_a_quota_deferral_attaching_stays_an_error(engine: Engine, seed: Seed) -> None:
+    repo = seed.repository(url="https://github.com/org/tooling")
+    seed.uow.commit()
+    deferred = SourceError("quota", observation_status=ComparisonStatus.QUOTA_DEFERRED)
+    with pytest.raises(SourceError):
+        PortfolioSync(
+            PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy()),
+            Forge(head_error=deferred),  # type: ignore[arg-type]
+            clock=FixedClock(T0),
+        ).attach_branch(repo.id, RefName("release-4.16"))  # type: ignore[arg-type]
+
+
+def test_a_forge_error_attaching_stays_an_error(engine: Engine, seed: Seed) -> None:
+    repo = seed.repository(url="https://github.com/org/tooling")
+    seed.uow.commit()
+    malformed = SourceError("bad payload", observation_status=ComparisonStatus.ERROR)
+    with pytest.raises(SourceError):
+        PortfolioSync(
+            PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy()),
+            Forge(head_error=malformed),  # type: ignore[arg-type]
+            clock=FixedClock(T0),
+        ).attach_branch(repo.id, RefName("release-4.16"))  # type: ignore[arg-type]
+
+
+class _Ticking:
+    """A clock a minute further on at each read: every naming is strictly later."""
+
+    def __init__(self) -> None:
+        self.at = T0
+
+    def now(self) -> datetime:
+        self.at += timedelta(minutes=1)
+        return self.at
+
+
+def _sync(engine: Engine, forge: Forge, clock: _Ticking) -> PortfolioSync:
+    return PortfolioSync(
+        PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy(), clock=clock),  # type: ignore[arg-type]
+        forge,  # type: ignore[arg-type]
+        clock=clock,  # type: ignore[arg-type]
+    )
+
+
+def test_a_line_reset_to_an_earlier_commit_takes_that_commit_as_its_head(
+    engine: Engine, seed: Seed
+) -> None:
+    # A -> B -> A: the reused A row is named anew, so the line's head is A, not B
+    repo = seed.repository(url="https://github.com/org/tooling")
+    seed.uow.commit()
+    forge, clock = Forge(heads={"release-4.16": SHA}), _Ticking()
+    line = RefName("release-4.16")
+    _sync(engine, forge, clock).attach_branch(repo.id, line)  # type: ignore[arg-type]
+    forge.heads = {"release-4.16": MOVED}
+    _sync(engine, forge, clock).attach_branch(repo.id, line)  # type: ignore[arg-type]
+    forge.heads = {"release-4.16": SHA}
+    _sync(engine, forge, clock).attach_branch(repo.id, line)  # type: ignore[arg-type]
+    service = PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy())
+    [head] = service.tracked_refs_of(repo.id)  # type: ignore[arg-type]
+    assert head.sha == SHA
+
+
+def test_re_observing_an_unchanged_line_refreshes_when_its_head_was_confirmed(
+    engine: Engine, seed: Seed
+) -> None:
+    repo = seed.repository(url="https://github.com/org/tooling")
+    seed.uow.commit()
+    forge, clock = Forge(heads={"release-4.16": SHA}), _Ticking()
+    first = _sync(engine, forge, clock).attach_branch(repo.id, RefName("release-4.16"))  # type: ignore[arg-type]
+    sync = _sync(engine, forge, clock)
+    report = sync.observe_lines(repo.id, HttpsRepoUrl.parse(repo.url, HOSTS))  # type: ignore[arg-type]
+    assert report.observed == (RefName("release-4.16"),)
+    service = PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy())
+    [head] = service.tracked_refs_of(repo.id)  # type: ignore[arg-type]
+    assert head.id == first.id
+    assert first.default_named_at is not None and head.default_named_at is not None
+    assert head.default_named_at > first.default_named_at  # the impact answer's as_of moves

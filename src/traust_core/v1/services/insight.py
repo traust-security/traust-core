@@ -3269,12 +3269,17 @@ class DependencyReachView:
         counts = _manifest_gap_counts(
             [_measured_gaps(scan) for scan in scans.values()], model.repositories
         )
-        # a legacy scan's Docker coverage is unknown even though its other gaps count
-        legacy = sum(
-            1 for scan in scans.values() if scan.gaps is not None and not scan.current_probe
+        # an older scan's coverage is unknown for the rules it lacked (Docker for a pre-probe
+        # scan, PyPI for a v2 probe) even though its other gaps count
+        unknown = Counter(
+            ecosystem
+            for scan in scans.values()
+            if scan.gaps is not None
+            for ecosystem in scan.uncovered
         )
-        unknown = {Ecosystem.DOCKER: legacy} if legacy else {}
-        return model, counts.model_copy(update={"ecosystem_coverage_unknown": unknown})
+        return model, counts.model_copy(
+            update={"ecosystem_coverage_unknown": dict(sorted(unknown.items()))}
+        )
 
     def _snapshot(self, filter: ViewFilter) -> tuple[DependencyReach, Collection[RepositoryRef]]:
         if filter.as_of is not None:
@@ -3364,12 +3369,17 @@ class DependencyReachView:
 
 
 def _measured_gaps(scan: ManifestScanCoverage) -> tuple[UnresolvedManifest, ...] | None:
-    """The gaps a scan measured, for counting: a legacy scan keeps its non-Docker gaps (it never
-    measured Docker). Counts only: impact analysis still treats a legacy scan's coverage as
-    unknown, so an old scan never eliminates a match."""
+    """The gaps a scan measured, for counting. An older scan's gaps are real wherever it had a
+    rule, so they stand; its `uncovered` ecosystems are counted unknown beside them (a v2 probe
+    read PyPI requirement files but not setup.py). The one exception is Docker on a pre-probe
+    scan: it had no Docker rule at all, so it can't have measured a Docker gap. Counts only:
+    impact analysis reads uncovered ecosystems as unknown, so an old scan never eliminates a
+    match."""
     if scan.gaps is None:
         return None
-    return tuple(g for g in scan.gaps if scan.current_probe or g.ecosystem != Ecosystem.DOCKER)
+    if Ecosystem.DOCKER not in scan.uncovered:
+        return scan.gaps
+    return tuple(g for g in scan.gaps if g.ecosystem != Ecosystem.DOCKER)
 
 
 def _manifest_gap_counts(
@@ -3389,7 +3399,7 @@ def _manifest_gap_counts(
 @dataclass(frozen=True)
 class _ManifestReportCounts:
     counts: ManifestCoverageCounts
-    docker_unknown: int
+    ecosystem_unknown: Mapping[Ecosystem, int]  # older scans: the ecosystems they never checked
     unknown_probe: int
 
 
@@ -3397,7 +3407,8 @@ def _manifest_report_counts(
     refs: Collection[RepositoryRef], scans: Mapping[UUID, ManifestScanCoverage], total: int
 ) -> _ManifestReportCounts:
     unresolved: Counter[Ecosystem] = Counter()
-    without_scan, docker_unknown, unknown_probe = total, 0, 0
+    ecosystem_unknown: Counter[Ecosystem] = Counter()
+    without_scan, unknown_probe = total, 0
     for ref in refs:
         assert ref.id is not None
         if ref.manifest_sbom_assessment_id is None:
@@ -3407,14 +3418,13 @@ def _manifest_report_counts(
         if scan.gaps is None:
             unknown_probe += 1
             continue
-        unresolved.update({gap.ecosystem for gap in scan.gaps})
-        if not scan.current_probe:
-            docker_unknown += 1
+        unresolved.update({gap.ecosystem for gap in _measured_gaps(scan) or ()})
+        ecosystem_unknown.update(scan.uncovered)
     return _ManifestReportCounts(
         ManifestCoverageCounts(
             coverage_unknown=without_scan, unresolved_manifest=dict(sorted(unresolved.items()))
         ),
-        docker_unknown,
+        dict(sorted(ecosystem_unknown.items())),
         unknown_probe,
     )
 
@@ -3435,16 +3445,15 @@ def _manifest_gap_sections(
             f"{units.capitalize()} with an unrecognized manifest coverage probe: "
             f"{detailed.unknown_probe} (unknown across ecosystems)."
         )
-    docker_unknown = (
-        detailed.docker_unknown
-        if detailed is not None
-        else counts.ecosystem_coverage_unknown.get(Ecosystem.DOCKER, 0)
+    ecosystem_unknown = (
+        detailed.ecosystem_unknown if detailed is not None else counts.ecosystem_coverage_unknown
     )
-    if docker_unknown:
-        notes.append(
-            f"docker: coverage unknown in {docker_unknown} "
-            f"{unit if docker_unknown == 1 else units} with a legacy scan."
-        )
+    notes.extend(
+        f"{ecosystem}: coverage unknown in {count} {unit if count == 1 else units} "
+        "with a legacy scan."
+        for ecosystem, count in sorted(ecosystem_unknown.items())
+        if count
+    )
     notes.extend(
         f"{ecosystem}: unresolved manifests in {count} {unit if count == 1 else units}."
         for ecosystem, count in counts.unresolved_manifest.items()

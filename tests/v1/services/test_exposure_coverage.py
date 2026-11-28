@@ -107,11 +107,15 @@ def legacy_scan(
     unresolved: dict[str, dict[str, str]],
     *,
     assessor: str = "syft",
+    assessor_version: str = "1.51.1",
 ) -> None:
     with SqlTraustUnitOfWork(engine) as uow:
         ref = uow.repository_refs.get(reference)
         scan = Seed(uow).assessment(
-            ref, kind=AssessmentKind.MANIFEST_SBOM, assessor=assessor, assessor_version="1.51.1"
+            ref,
+            kind=AssessmentKind.MANIFEST_SBOM,
+            assessor=assessor,
+            assessor_version=assessor_version,
         )
         service._attach_document(
             uow,
@@ -128,6 +132,41 @@ def legacy_scan(
         )
         uow.repository_refs.update(ref.model_copy(update={"manifest_sbom_assessment_id": scan.id}))
         uow.commit()
+
+
+def test_a_v2_probe_scan_keeps_its_docker_gaps_and_reads_pypi_unknown(engine: Engine) -> None:
+    """Probe v3 added the setup.py rules: a v2 scan measured Docker (its gaps count) but never
+    setup.py, so PyPI is unknown beside them, not Docker (Qodo 411)."""
+    uow = SqlTraustUnitOfWork(engine)
+    with uow:
+        seed = Seed(uow)
+        ref = seed.repository_ref(seed.repository(url="https://github.com/org/v2"), is_default=True)
+        seed.assessment(ref, kind=AssessmentKind.REPO_STATE)
+        uow.commit()
+    assert ref.id is not None
+    service = exposure(engine)
+    service.ingest_sbom(NO_LODASH, ref.id)
+    legacy_scan(
+        engine,
+        service,
+        ref.id,
+        {"docker": {"Dockerfile": "unsupported-manifest"}},
+        assessor="traust-manifest-coverage",
+        assessor_version="2",
+    )
+    portfolio = PortfolioService(uow, PortfolioPolicy(), assessment=AssessmentService(uow))
+    reader = DependencyReachView(service, portfolio)
+    _, report = reader.build_report(ViewFilter(), T0)
+    text = "\n".join(section.body for section in report.sections)
+    assert "docker: unresolved manifests in 1 repository." in text
+    assert "pypi: coverage unknown in 1 repository with a legacy scan." in text
+    assert "docker: coverage unknown" not in text
+    _, sidecar = reader.with_coverage(ViewFilter())
+    assert sidecar.model_dump(mode="json") == {
+        "coverage_unknown": 0,
+        "unresolved_manifest": {"docker": 1},
+        "ecosystem_coverage_unknown": {"pypi": 1},
+    }
 
 
 @pytest.mark.skipif(shutil.which("syft") is None, reason="syft not on PATH")
@@ -370,7 +409,8 @@ def test_requeue_upgrades_a_legacy_scan_once_at_the_same_sha_and_sbom(
 
     assert service.unresolved_manifests(reference) is None
     assert uptake(Ecosystem.DOCKER) == FixUptakeState.NOT_OBSERVED
-    assert uptake(Ecosystem.PYPI) == FixUptakeState.MODULE_ABSENT
+    # the legacy scan never checked setup.py / setup.cfg: its PyPI silence proves nothing
+    assert uptake(Ecosystem.PYPI) == FixUptakeState.NOT_OBSERVED
     found = service.find_advisory(advisory.identifier)
     assert found and found.advisory_id
     prepared = {p.package.name: p for p in service.prepare(found.advisory_id, reference)}
@@ -771,6 +811,7 @@ def test_reach_report_distinguishes_legacy_unrecognized_and_missing_scans(
     assert "Repositories without scan-backed manifest coverage (coverage_unknown): 1" in text
     assert "Repositories with an unrecognized manifest coverage probe: 1" in text
     assert "docker: coverage unknown in 1 repository with a legacy scan." in text
+    assert "pypi: coverage unknown in 1 repository with a legacy scan." in text  # pre-setup.py
     assert "npm: unresolved manifests in 2 repositories." in text
     # The sidecar keeps a legacy scan's measured gaps, as the report does: npm is unresolved
     # in the legacy and the current repository; only the document SBOM and the unrecognized
@@ -779,7 +820,7 @@ def test_reach_report_distinguishes_legacy_unrecognized_and_missing_scans(
     assert sidecar.model_dump(mode="json") == {
         "coverage_unknown": 2,
         "unresolved_manifest": {"npm": 2},
-        "ecosystem_coverage_unknown": {"docker": 1},
+        "ecosystem_coverage_unknown": {"docker": 1, "pypi": 1},
     }
     # a report built from the sidecar keeps the legacy scan's unknown Docker coverage
     from_sidecar = reader.report(model, T0, sidecar)

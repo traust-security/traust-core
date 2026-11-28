@@ -255,7 +255,8 @@ def test_crypto_package_report_uses_legacy_gaps_but_keeps_docker_unknown(
     assert "Commits without scan-backed manifest coverage (coverage_unknown): 1" in text
     assert "Commits with an unrecognized manifest coverage probe: 1" in text
     assert "docker: coverage unknown in 1 commit with a legacy scan." in text
-    assert "pypi: unresolved manifests in 1 commit." in text
+    assert "pypi: coverage unknown in 1 commit with a legacy scan." in text  # pre-setup.py rules
+    assert "pypi: unresolved manifests in 1 commit." in text  # its measured gap still counts
 
 
 @pytest.mark.parametrize(

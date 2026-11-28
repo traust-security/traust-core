@@ -223,6 +223,38 @@ def test_a_default_line_imported_after_the_last_observation_is_current(
     assert portfolio(uow).current_default_ref(seed.repository().id) is None  # never imported
 
 
+def test_a_former_default_line_re_named_as_a_head_does_not_become_the_default_again(
+    uow: SqlTraustUnitOfWork, seed: Seed
+) -> None:
+    """main was the default, then the forge named develop; re-attaching main's head must keep
+    develop the default line and still rank main's head first on its own line (Qodo 411)."""
+    repo = audited(seed, "renamed-default")
+    main_head = portfolio(uow).mark_default_branch(repo.id, GitSha("a" * 40), RefName("main"))
+    apart()
+    develop = portfolio(uow, at=NOW + timedelta(minutes=1)).mark_default_branch(
+        repo.id, GitSha("b" * 40), RefName("develop")
+    )
+    apart()
+    later = portfolio(uow, at=NOW + timedelta(minutes=2))
+    again = later.name_line_head(repo.id, GitSha("a" * 40), RefName("main"))
+    assert again.id == main_head.id and not again.is_default
+    assert later.inventory.default_line(repo.id).id == develop.id
+    heads = {r.name: r.sha for r in later.tracked_refs_of(repo.id)}
+    assert heads == {"main": "a" * 40, "develop": "b" * 40}
+
+
+def test_re_naming_the_default_lines_own_head_keeps_its_flag(
+    uow: SqlTraustUnitOfWork, seed: Seed
+) -> None:
+    repo = audited(seed, "kept-default")
+    head = portfolio(uow).mark_default_branch(repo.id, GitSha("c" * 40), RefName("main"))
+    apart()
+    later = portfolio(uow, at=NOW + timedelta(minutes=1))
+    again = later.name_line_head(repo.id, GitSha("c" * 40), RefName("main"))
+    assert again.id == head.id and again.is_default
+    assert later.inventory.default_line(repo.id).id == head.id
+
+
 def test_an_empty_inventory_lists_nothing(uow: SqlTraustUnitOfWork) -> None:
     page = portfolio(uow).liveness(RepositoryFilter(), PageRequest(limit=10))
     assert page.items == () and page.next is None

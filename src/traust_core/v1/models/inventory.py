@@ -229,6 +229,14 @@ class SyncReport(Model):
         )
 
 
+class LinesReport(Model):
+    """What observing a repository's tracked branch lines produced: the lines advanced to their
+    forge head, and the lines the forge would not answer (named, never fatal to the rest)."""
+
+    observed: tuple[RefName, ...] = ()
+    unobserved: tuple[RefName, ...] = ()
+
+
 class RepositoryResolution(Model):
     """One asked-for URL spelling's answer: the repository core knows under it, plus
     the upstream edge as the hint when the matched row carries one (a fork or mirror:

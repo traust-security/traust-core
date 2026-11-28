@@ -271,3 +271,46 @@ def test_an_oversized_manifest_is_unresolved_without_reading_it(tmp_path: Path) 
 def test_a_missing_workspace_is_refused(tmp_path: Path) -> None:
     with pytest.raises(ValidationError):
         unresolved_manifests(tmp_path / "missing")
+
+
+@pytest.mark.parametrize(
+    ("name", "text", "locked", "reason"),
+    [
+        ("setup.py", "setup(install_requires=['requests>=2'])\n", False, "unpinned"),
+        ("setup.py", "setup(install_requires=REQS)\n", False, "unpinned"),  # built at run time
+        ("setup.py", "setup(extras_require={'x': ['idna']})\n", False, "unpinned"),
+        ("setup.py", "setup(install_requires=['requests==2.32.3'])\n", False, None),  # read
+        ("setup.py", "setup(install_requires=['requests>=2'])\n", True, None),  # lock pins it
+        ("setup.py", "setup(name='x')\n", False, None),  # declares nothing
+        # syft's reader takes a one-word name only (syft 1.48.0 parse_setup.go pinnedDependency)
+        ("setup.py", "setup(install_requires=['python-dateutil==2.8.2'])\n", False, "unpinned"),
+        ("setup.py", "setup(install_requires=['zope.interface==5.0'])\n", False, "unpinned"),
+        ("setup.py", "setup(install_requires=['requests[security]==2.31.0'])\n", False,
+         "unpinned"),
+        ("setup.py", "setup(install_requires=['pkg==1.0+local'])\n", False, "unpinned"),
+        # only setup() declares requirements
+        ("setup.py", "validate(install_requires=['foo>=1'])\nsetup(name='x')\n", False, None),
+        ("setup.py", "import setuptools\nsetuptools.setup(install_requires=['a>=1'])\n", False,
+         "unpinned"),
+        # `**` expansion: a literal dict is read through, anything else is unknown
+        ("setup.py", "setup(**{'install_requires': ['requests>=2']})\n", False, "unpinned"),
+        ("setup.py", "setup(**{'install_requires': ['requests==2.32.3']})\n", False, None),
+        ("setup.py", "setup(**meta)\n", False, "unpinned"),
+        ("setup.cfg", "[options]\ninstall_requires =\n    requests==2.32.3\n", False,
+         "unsupported-manifest"),  # syft catalogs setup.cfg not at all
+        ("setup.cfg", "[metadata]\nname = x\n", False, None),
+    ],
+    ids=["range", "dynamic", "extras", "exact pins", "locked", "no requirements",
+         "hyphenated name", "dotted name", "extras name", "local version",
+         "unrelated call", "module setup", "literal dict expansion", "pinned dict expansion",
+         "opaque expansion",
+         "setup.cfg requirements", "setup.cfg metadata only"],
+)  # fmt: skip
+def test_setup_py_and_setup_cfg_requirements_syft_cant_read_are_unresolved(
+    tmp_path: Path, name: str, text: str, locked: bool, reason: str | None
+) -> None:
+    (tmp_path / name).write_text(text)
+    if locked:
+        (tmp_path / "uv.lock").write_text("version = 1\n")
+    found = unresolved_manifests(tmp_path)
+    assert [(m.path, m.reason) for m in found] == ([(name, reason)] if reason else [])
