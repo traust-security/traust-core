@@ -201,7 +201,9 @@ class Inventory:
         """The latest ref named the repository's default line (import or observation) —
         the onboarding step that gives a run something to work on; None for a registered row
         alone. Earlier flags stay: each was the forge's answer when it was recorded; the
-        naming time (default_named_at), not the row's age, orders them."""
+        naming time (default_named_at), not the row's age, orders them. The one exception:
+        a flagged head re-named as its line's head after the forge named another line
+        default loses its flag (`name_line_head`), so the old line can't win the default again."""
         with self._uow as uow:
             return uow.repository_refs.default(repository_id)
 
@@ -1183,8 +1185,17 @@ class PortfolioService:
                     f"ref {branch}@{sha.value} of repository {repository_id} is already "
                     f"recorded as a {ref.kind or 'bare commit'}; a line has one kind"
                 )
+            update: dict[str, object] = {}
             if ref.default_named_at != named:
-                ref = uow.repository_refs.update(ref.model_copy(update={"default_named_at": named}))
+                update["default_named_at"] = named
+            if ref.is_default:
+                # a flag from when this line was the default: once the forge names another
+                # line default, re-naming this head must not make it the default again
+                current = uow.repository_refs.default(repository_id)
+                if current is not None and current.name != branch:
+                    update["is_default"] = False
+            if update:
+                ref = uow.repository_refs.update(ref.model_copy(update=update))
             uow.commit()
             return ref
 
