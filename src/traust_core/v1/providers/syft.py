@@ -230,32 +230,73 @@ def _unpinned_requirements(text: str) -> bool:
 
 
 _SETUP_KEYS = ("install_requires", "extras_require", "setup_requires", "tests_require")
+# syft 1.48.0's setup.py reader (syft/pkg/cataloger/python/parse_setup.go `pinnedDependency`):
+# a quoted `name==version` whose name is one ASCII word run and whose version stops at the
+# first character outside [A-Za-z0-9_.]. Names with a hyphen, a dot or extras never match.
+_SYFT_PINNED = re.compile(r"""['"]\W?(\w+\W?==\W?[\w.]*)""", re.ASCII)
+
+
+def _syft_reads(requirement: str) -> bool:
+    """Whether syft catalogs this literal requirement as itself: the exact name and the whole
+    pinned version, as written. A pin syft skips or truncates is a dependency the SBOM lacks."""
+    name, sep, version = requirement.split(";", 1)[0].strip().partition("==")
+    if not sep or version.startswith("="):  # not an exact pin, or `===`
+        return False
+    name, version = name.strip(), version.strip()
+    for match in _SYFT_PINNED.finditer(f'"{requirement}"'):
+        parts = match.group(1).split("==")
+        if len(parts) == 2 and (parts[0].strip(), parts[1].strip()) == (name, version):
+            return True
+    return False
+
+
+def _is_setup_call(node: ast.Call) -> bool:
+    """`setup(...)` or `<module>.setup(...)` (setuptools, distutils.core): the call that
+    declares the project's requirements; any other call's keywords are not requirements."""
+    callee = node.func
+    return (isinstance(callee, ast.Name) and callee.id == "setup") or (
+        isinstance(callee, ast.Attribute) and callee.attr == "setup"
+    )
+
+
+def _requirements_unread(value: ast.expr) -> bool:
+    """One requirement argument's value: True when syft can't read every requirement in it."""
+    groups = value.values if isinstance(value, ast.Dict) else [value]
+    for group in groups:
+        if not isinstance(group, (ast.List, ast.Tuple)):
+            return True  # built at run time: syft can't see it
+        for item in group.elts:
+            if not (isinstance(item, ast.Constant) and isinstance(item.value, str)):
+                return True
+            if _unpinned_requirements(item.value) or not _syft_reads(item.value):
+                return True
+    return False
 
 
 def _setup_py_unpinned(text: str) -> bool:
     """A setup.py whose requirements syft can't read whole: syft keeps only exact (`==`) pins
-    listed literally in the setup() call; a range, or any requirement built at run time (a
-    variable, a call), is dropped. Parsed with `ast`, never executed; unparsable is unknown."""
+    listed literally in the setup() call, with a plain one-word name (see `_SYFT_PINNED`); a
+    range, a name it skips, or any requirement built at run time (a variable, a call, `**`
+    expanded arguments it can't see through) is dropped. Only setup() calls declare
+    requirements. Parsed with `ast`, never executed; unparsable is unknown."""
     try:
         tree = ast.parse(text)
     except (SyntaxError, ValueError):
         return True
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
+        if not isinstance(node, ast.Call) or not _is_setup_call(node):
             continue
         for keyword in node.keywords:
-            if keyword.arg not in _SETUP_KEYS:
-                continue
-            value = keyword.value
-            groups = value.values if isinstance(value, ast.Dict) else [value]
-            for group in groups:
-                if not isinstance(group, (ast.List, ast.Tuple)):
-                    return True  # built at run time: syft can't see it
-                for item in group.elts:
-                    if not (isinstance(item, ast.Constant) and isinstance(item.value, str)):
+            if keyword.arg is None:  # setup(**meta): a literal dict is read, anything else isn't
+                if not isinstance(keyword.value, ast.Dict):
+                    return True
+                for key, value in zip(keyword.value.keys, keyword.value.values, strict=True):
+                    if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+                        return True  # a nested `**` or a computed key
+                    if key.value in _SETUP_KEYS and _requirements_unread(value):
                         return True
-                    if _unpinned_requirements(item.value):
-                        return True
+            elif keyword.arg in _SETUP_KEYS and _requirements_unread(keyword.value):
+                return True
     return False
 
 
