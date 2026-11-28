@@ -1374,6 +1374,14 @@ class FindingCvss(Model):
         return canonical_decimal(value)
 
 
+class FindingEvidence(Model):
+    """A code block the report quotes for a finding (`findings[].evidence[]`)."""
+
+    code: str
+    language: str | None = None
+    caption: str | None = None
+
+
 class FindingView(Model):
     finding: Finding
     occurrence: Occurrence | None = None
@@ -1386,13 +1394,16 @@ class FindingView(Model):
     # no assessment has reported yet.
     first_reported_at: datetime | None = None
     last_reported_at: datetime | None = None
-    # The accepted claim's description — the drawer's substance on core rows; None when
-    # no claim was accepted (the report artifact keeps the reported text, the finding
-    # row never carried it).
+    # The drawer's substance: the accepted claim's description, else the report's prose for
+    # the finding — None when neither states one (the finding row never carried it).
     description: str | None = None
     locations: tuple[Location | ClaimLocation, ...] = ()
     cwes: tuple[str, ...] = ()
     labels: tuple[FindingLabel, ...] = ()
+    # The report row the finding's occurrence was recorded from: its quoted evidence and
+    # remediation text; empty when no report states the finding (an imported one, say).
+    evidence: tuple[FindingEvidence, ...] = ()
+    remediation: str | None = None
 
     @property
     def cvss_score(self) -> Decimal | None:

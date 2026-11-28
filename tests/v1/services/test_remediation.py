@@ -1096,11 +1096,13 @@ def test_prepare_carries_the_latest_validation_and_the_audits_remediation_hint(
         "confirmed",
         rows[0]["remediation"],
     )
-    assert (given[stamped.id].validation, given[stamped.id].remediation_hint) == (
-        None,
-        rows[2]["remediation"],
-    )
+    # The hint is the row the finding's page shows, chosen by the same intake binding
+    # (Qodo #554): the legacy row's raw `fingerprint` names `stamped`, but the binding
+    # recomputes the row's identity, so neither read takes that row's text.
+    assert (given[stamped.id].validation, given[stamped.id].remediation_hint) == (None, None)
     assert (given[scanned.id].validation, given[scanned.id].remediation_hint) == (None, None)
+    for finding_id, prepared in given.items():
+        assert prepared.remediation_hint == services.findings.get(finding_id).remediation
     draft = service.assemble(item.work_item_id, path, NARRATIVE, [check("pass")])
     verdicts = {
         s["finding_ref"]: s["validation_verdict"]

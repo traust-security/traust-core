@@ -107,6 +107,7 @@ from traust_core.v1.services.artifact_publishing import (
     A,
     ArtifactPublisher,
     AssessmentLog,
+    AssessmentReports,
     StagedArtifact,
 )
 from traust_core.v1.services.cloud_config import CloudConfigCitations
@@ -196,6 +197,7 @@ class AssessmentService:
         self._tools = tools
         self._decisions = decisions
         self._publisher = publisher
+        self._reports = AssessmentReports(self._log, publisher) if publisher is not None else None
         self._findings = findings
         self._git = git
         self._symbols = symbols
@@ -1268,13 +1270,9 @@ class AssessmentService:
 
     def report(self, assessment_id: UUID) -> ReportArtifact | None:
         """The report document the assessment holds; None when it holds none."""
-        if self._publisher is None:
+        if self._reports is None:
             raise ConfigError("reading an audit's report needs the publisher")
-        audit = self._log.get(assessment_id)
-        for _, row in self._log.documents([audit], [ReportArtifact.schema]):
-            assert row.id is not None
-            return self._publisher.read(row.id, ReportArtifact)
-        return None
+        return self._reports.report(assessment_id)
 
     def intake_bindings(self, assessment_id: UUID) -> AssessmentIntakeBindings:
         """Original report or triage row labels bound by their own native intake owner."""
@@ -1295,23 +1293,7 @@ class AssessmentService:
             doc = self.report(assessment_id)
             if doc is None:
                 raise NotFoundError(f"assessment {assessment_id} has no report artifact")
-            repository_id = self._inventory.get_ref(assessment.repository_ref_id).repository_id
-            admitted = {
-                occurrence.finding_id
-                for occurrence in self._findings.occurrences(assessment_id=assessment_id)
-            }
-            bindings: dict[Label, UUID] = {}
-            identified: set[UUID] = set()
-            for candidate in FindingCandidate.of_report(doc.findings, repository_id):
-                finding_id = self._intake.match(repository_id, candidate)
-                if finding_id is not None and finding_id in admitted:
-                    identified.add(finding_id)
-                    bindings[candidate.label] = finding_id
-            if identified != admitted:
-                raise IntegrityError(
-                    f"assessment {assessment_id}: report labels do not cover its admitted findings"
-                )
-            return AssessmentIntakeBindings(findings=bindings)
+            return self._intake.bindings(assessment, doc, strict=True)
 
     def observation_target(
         self, *, repository_id: UUID | None = None, repo_url: str | None = None

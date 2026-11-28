@@ -166,6 +166,11 @@ def test_container_population_is_cumulative_image_scoped_and_decision_driven(
     assert all(not row.history for row in before_decision.findings)
     payload = json.loads(model.model_dump_json())
     assert {row["view"]["finding"]["id"] for row in payload["findings"]} == set(map(str, by_id))
+    # the container fold carries no report prose: the contract's finding_view states none
+    assert all(
+        "evidence" not in row["view"] and "remediation" not in row["view"]
+        for row in payload["findings"]
+    )
     report = context.services().insight.report(ViewName.CONTAINER_FINDINGS, scope)
     table = next(section.table for section in report.sections if section.heading == "Findings")
     assert {row[0]: row[3] for row in table.rows} == {

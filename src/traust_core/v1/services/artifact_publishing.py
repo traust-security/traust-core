@@ -4,7 +4,7 @@ import logging
 import re
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from time import perf_counter
 from typing import Any, Generic, Protocol, TypeVar
 from uuid import UUID
@@ -24,6 +24,7 @@ from traust_core.v1.models.artifacts import (
     ARTIFACT_FOR_SCHEMA,
     ArtifactDocument,
     RemediationArtifact,
+    ReportArtifact,
 )
 from traust_core.v1.models.assessment import Artifact, Assessment, CensusAssessment
 from traust_core.v1.models.base import Dto
@@ -461,6 +462,39 @@ class AssessmentLog:
 class Imported(Generic[A]):
     artifact_id: UUID
     document: A
+
+
+_EPOCH = datetime.min.replace(tzinfo=UTC)
+
+
+class AssessmentReports:
+    """The report document an assessment holds: the one reader the report doors share."""
+
+    def __init__(self, log: AssessmentLog, publisher: ArtifactPublisher) -> None:
+        self._log = log
+        self._publisher = publisher
+
+    def report(self, assessment_id: UUID) -> ReportArtifact | None:
+        audit = self._log.get(assessment_id)
+        for _, row in self._log.documents([audit], [ReportArtifact.schema]):
+            assert row.id is not None
+            return self._publisher.read(row.id, ReportArtifact)
+        return None
+
+    def held(self, assessments: Iterable[Assessment]) -> list[tuple[Assessment, Artifact]]:
+        """Every report artifact the assessments hold, listed by one batched query and read
+        by nothing until `read`: newest assessment first and, within one assessment, its
+        newest artifact first. An assessment holding no report contributes no entry."""
+        rows = self._log.documents(assessments, [ReportArtifact.schema])
+        rank: dict[UUID | None, int] = {}
+        for assessment, _ in rows:
+            rank.setdefault(assessment.id, len(rank))
+        newest_first = sorted(rows, key=lambda pair: pair[1].created_at or _EPOCH, reverse=True)
+        return sorted(newest_first, key=lambda pair: rank[pair[0].id])
+
+    def read(self, artifact: Artifact) -> ReportArtifact:
+        assert artifact.id is not None
+        return self._publisher.read(artifact.id, ReportArtifact)
 
 
 class PublishResult(Dto):

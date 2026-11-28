@@ -196,7 +196,10 @@ def test_retained_claim_changes_current_projection_not_reported_evidence(claims:
     assert corrected.disposition == before.disposition
     assert claims.findings.occurrences(finding_ids=[claims.finding_id]) == occurrences
     assert claims.findings.locations([occurrences[0].id]) == locations
-    assert claims.findings.list_by_cwe("CWE-120") == [corrected]
+    # the listing stays lean: it carries the fold, not the single get's report prose
+    assert claims.findings.list_by_cwe("CWE-120") == [
+        corrected.model_copy(update={"evidence": (), "remediation": None})
+    ]
     assert claims.findings.list_by_cwe("CWE-89") == []
     assert claims.findings.claim(claims.finding_id, NOW - timedelta(seconds=1)) is None
     [historical] = claims.findings.all(
@@ -224,11 +227,12 @@ def test_retained_claim_changes_current_projection_not_reported_evidence(claims:
 
 
 def test_the_view_carries_the_claims_description(claims: Claims) -> None:
-    """The drawer's substance on core rows: the description the accepted claim states,
-    folded onto every FindingView route from the claim the fold already holds — None
-    before any claim was accepted, and for an `as_of` that predates it."""
+    """The drawer's substance on core rows: the report's prose until a claim is accepted,
+    then the description the accepted claim states — and None on a listing fold, which
+    never reads the report, for an `as_of` that predates the claim."""
+    report = json.loads(claims.original.payload)["findings"][0]
     before = claims.findings.get(claims.finding_id)
-    assert before.description is None
+    assert before.description == report["description"]
     pending = claims.request()
     corrected = claims.accept(pending.id)
     assert corrected.description == (

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import re
 from collections import Counter, defaultdict
@@ -54,7 +53,7 @@ from traust_core.v1.models.findings import (
     FindingView,
 )
 from traust_core.v1.models.identity import Principal
-from traust_core.v1.models.integrity import FingerprintInput, sha256_hex
+from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import OrgName, RepositoryRef, default_line, ref_line
 from traust_core.v1.models.operations import (
     OPEN_ORDER_STATES,
@@ -429,7 +428,7 @@ class RemediationService:
                     decisions=tuple(self._findings.history(v.finding.id)),  # type: ignore[arg-type]
                     strategy=preferred_strategy(v),
                     validation=next(iter(self._validation.attempts(v.finding.id)), None),  # type: ignore[arg-type]
-                    remediation_hint=self._hint(v, subject.repository_url),
+                    remediation_hint=self._hint(v),
                 )
                 for v in views
             ),
@@ -448,27 +447,13 @@ class RemediationService:
         internal = str(url) == str(_url(repository_url))
         return self._forks.of(url, ForkVisibility.INTERNAL if internal else ForkVisibility.PRIVATE)
 
-    def _hint(self, view: FindingView, repository_url: str) -> str | None:
-        """The `remediation` text of the finding's entry in the report its occurrence came from;
-        None when that assessment holds no report or the report doesn't state the finding."""
-        finding, occurrence = view.finding, view.occurrence
-        if occurrence is None or occurrence.assessment_id is None:
-            return None
-        report = self._assessment.report(occurrence.assessment_id)
-        if report is None:
-            return None
-        for row in json.loads(report.payload)["findings"]:
-            if row.get("fingerprint") is not None:
-                same = row["fingerprint"] == finding.fingerprint and row.get(
-                    "fingerprint_algo"
-                ) in (None, finding.fingerprint_algo)
-            else:
-                same = bool(row.get("locations")) and finding.id == self._findings.intake.match(
-                    finding.repository_id, FingerprintInput.from_report(row, repository_url)
-                )
-            if same:
-                return str(row["remediation"])
-        return None
+    def _hint(self, view: FindingView) -> str | None:
+        """The `remediation` text of the finding's report row: the same row, chosen through
+        the same intake binding, as the finding's page shows (`FindingService.report_row`);
+        None when no readable report states the finding."""
+        assert view.finding.id is not None
+        row = self._findings.report_row(view.finding.id)
+        return None if row is None or row.remediation is None else str(row.remediation)
 
     def assemble(
         self,

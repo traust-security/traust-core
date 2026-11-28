@@ -12,7 +12,13 @@ from functools import cmp_to_key
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
+from traust_core.v1.errors import (
+    ConflictError,
+    IntegrityError,
+    NotFoundError,
+    TraustError,
+    ValidationError,
+)
 from traust_core.v1.models.artifacts import (
     ANALYSIS_ARTIFACTS,
     CodeFactsArtifact,
@@ -21,6 +27,7 @@ from traust_core.v1.models.artifacts import (
     ImpactAnalysisArtifact,
     IsolationReviewArtifact,
     ReportArtifact,
+    SchemaView,
     VulnFindingsArtifact,
 )
 from traust_core.v1.models.assessment import (
@@ -43,6 +50,7 @@ from traust_core.v1.models.findings import (
     FindingCandidate,
     FindingClock,
     FindingDimension,
+    FindingEvidence,
     FindingFilter,
     FindingFix,
     FindingRollup,
@@ -83,6 +91,7 @@ from traust_core.v1.repositories.objects import ObjectStore
 from traust_core.v1.services.artifact_publishing import (
     ArtifactPublisher,
     AssessmentLog,
+    AssessmentReports,
     PublishSpec,
     PublishSpecs,
     stored_bytes,
@@ -294,6 +303,7 @@ class FindingService:
         self.review = review
         self.precedents = precedents
         self._claims = FindingClaims(uow, objects, self.artifacts, intake, decisions)
+        self._reports = AssessmentReports(self._log, self.artifacts)
         self._occurrence_claims = OccurrenceClaims(uow, decisions)
 
     def record_occurrence_claims(
@@ -358,7 +368,76 @@ class FindingService:
     def get(self, finding_id: UUID) -> FindingView:
         with self._uow as uow:
             (view,) = self._views.views(uow, [uow.findings.get(finding_id)])
-        return view
+        return self._prose(view)
+
+    def _prose(self, view: FindingView) -> FindingView:
+        """The report row the finding was recorded from, as the view's prose
+        (description, evidence, remediation): only this single-get read pays the report
+        read. Prose is optional enrichment, so a report that can't be read or bound never
+        fails the finding's page: `report_row` logs it with its context and traceback (the
+        view carries no marker for it: its contract has no such field)."""
+        assert view.finding.id is not None
+        row = self.report_row(view.finding.id)
+        if row is None:
+            return view
+        return view.model_copy(
+            update={
+                "description": view.description
+                if view.description is not None
+                else row.description,
+                "evidence": tuple(
+                    FindingEvidence(code=block.code, language=block.language, caption=block.caption)
+                    for block in row.evidence
+                ),
+                "remediation": row.remediation,
+            }
+        )
+
+    def report_row(self, finding_id: UUID) -> SchemaView | None:
+        """The row of the newest report that states the finding, chosen through the intake's
+        per-row binding (two rows may share a label): the one selector the finding's page
+        and the remediation hint share. Every report artifact of every assessment reporting
+        the finding is a candidate, newest first; one batched query lists them, so
+        report-less assessments (a later impact analysis's, say) cost no read and never
+        hide an earlier report. A candidate that can't be read or bound is logged with its
+        context and traceback and skipped, so an older report still supplies the row. None
+        when no readable report states the finding."""
+        occurrences = self.occurrences(finding_ids=[finding_id])
+        assessments = self._log.list_by_ids({o.assessment_id for o in occurrences})
+        for assessment, artifact in self._reports.held(assessments):
+            try:
+                report = self._reports.read(artifact)
+                rows = self.intake.row_findings(assessment, report)
+            except (ConflictError, IntegrityError):
+                # the stored report contradicts what intake admitted: someone must act
+                log.error(
+                    "finding %s: report artifact %s of assessment %s cannot be bound",
+                    finding_id,
+                    artifact.id,
+                    assessment.id,
+                    exc_info=True,
+                )
+                continue
+            except TraustError:
+                log.warning(
+                    "finding %s: report artifact %s of assessment %s cannot be read or bound",
+                    finding_id,
+                    artifact.id,
+                    assessment.id,
+                    exc_info=True,
+                )
+                continue
+            row = next(
+                (
+                    row
+                    for row, bound in zip(report.findings, rows, strict=True)
+                    if bound == finding_id
+                ),
+                None,
+            )
+            if row is not None:
+                return row
+        return None
 
     def get_by_fingerprint(
         self, repository_id: UUID, fingerprint: str, fingerprint_algo: str | None = None

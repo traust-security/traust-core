@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -11,14 +13,24 @@ from tests.v1.repositories.tables.conftest import Seed
 from tests.v1.rest.conftest import bearer, same_as_in_process
 from tests.v1.rest.findings.conftest import ANALYST
 from traust_core.v1.context import Context
-from traust_core.v1.models.common import PageRequest
+from traust_core.v1.models.artifacts import ReportArtifact
+from traust_core.v1.models.assessment import AssessmentKind
+from traust_core.v1.models.common import PageRequest, Provenance
 from traust_core.v1.models.findings import (
+    FindingCandidate,
     FindingSetFilter,
     FindingSort,
+    Label,
     SortDirection,
 )
+from traust_core.v1.models.vocabulary import SourceType
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.findings.service import FindingWindow
+
+AUDIT = json.loads(
+    (Path(__file__).parents[3] / "fixtures" / "reporting" / "widget-report.json").read_text()
+)
+WHEN = datetime(2026, 10, 23, 9, tzinfo=UTC)
 
 
 def seed_finding(context: Context):
@@ -276,3 +288,47 @@ def test_the_batch_summaries_refuse_no_set_and_oversized_sets(
 
 def test_the_batch_summaries_needs_a_token(context: Context, client: TestClient) -> None:
     assert client.get("/v1/findings/summaries").status_code == 401
+
+
+def test_a_finding_recorded_from_a_report_carries_its_prose(
+    context: Context, client: TestClient
+) -> None:
+    services = context.services()
+    with SqlTraustUnitOfWork(context.database) as uow:
+        seed = Seed(uow)
+        repo = seed.repository(url=f"https://github.com/example-org/svc-{uuid4().hex[:8]}")
+        ref = seed.repository_ref(repo)
+        uow.commit()
+    raw = json.loads(json.dumps(AUDIT))
+    del raw["metadata"]["additional"]  # a legacy, unstamped report: identity is recomputed
+    raw["remediation_roadmap"] = [  # recorded canonically, so priorities are the canonical enum
+        {**item, "priority": item["priority"].lower()} for item in raw["remediation_roadmap"]
+    ]
+    rows = [{k: v for k, v in f.items() if k != "fingerprint"} for f in raw["findings"]]
+    rows[0]["evidence"] = [{"code": 'q := "SELECT * FROM t WHERE id = " + id', "language": "go"}]
+    doc = ReportArtifact.parse(json.dumps({**raw, "findings": rows}).encode())
+    audit = services.assessment.record(
+        doc,
+        ref.id,
+        AssessmentKind.SECURE_CODE_CANONICAL,
+        "skill:audit",
+        "1",
+        Provenance(run_id=uuid4(), source=SourceType.TRIAGE_REPORT, occurred_at=WHEN),
+    )
+    taken = services.findings.intake.accept(
+        audit.id, FindingCandidate.of_report(doc.findings[:1], repo.id)
+    )
+    matched = taken.findings[Label(rows[0]["id"])]
+    body = client.get(f"/v1/findings/{matched}", headers=bearer(context, ANALYST)).json()
+    assert body["description"] == rows[0]["description"]
+    assert body["remediation"] == rows[0]["remediation"]
+    assert body["evidence"] == [
+        {"code": 'q := "SELECT * FROM t WHERE id = " + id', "language": "go", "caption": None}
+    ]
+    assert sorted(loc["path"] for loc in body["locations"]) == [
+        "pkg/db/other.go",
+        "pkg/db/query.go",
+    ]
+    bare = seed_finding(context)
+    empty = client.get(f"/v1/findings/{bare.id}", headers=bearer(context, ANALYST)).json()
+    assert (empty["description"], empty["evidence"], empty["remediation"]) == (None, [], None)

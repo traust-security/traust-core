@@ -9,7 +9,15 @@ from uuid import UUID
 from pydantic import ValidationError as ModelValidationError
 
 from traust_core.v1 import contracts
-from traust_core.v1.errors import ConfigError, ConflictError, ForbiddenError, ValidationError
+from traust_core.v1.errors import (
+    ConfigError,
+    ConflictError,
+    ForbiddenError,
+    IntegrityError,
+    ValidationError,
+)
+from traust_core.v1.models.artifacts import ReportArtifact
+from traust_core.v1.models.assessment import Assessment, AssessmentIntakeBindings
 from traust_core.v1.models.common import CodeHash, CodeSpan
 from traust_core.v1.models.cvss import cvss_computed_score
 from traust_core.v1.models.dependencies import AdvisoryMatch
@@ -23,6 +31,7 @@ from traust_core.v1.models.findings import (
     FindingView,
     IdentityMove,
     IntakeResult,
+    Label,
     Location,
     LocationHash,
     Occurrence,
@@ -233,6 +242,52 @@ class FindingIntake:
             identities, _ = self._claimed_identities(uow, repository_id)
             found = self._match(uow, repository_id, (fp.algo, fp.value), identities)
         return None if found is None else found.id
+
+    def bindings(
+        self, assessment: Assessment, doc: ReportArtifact, *, strict: bool = False
+    ) -> AssessmentIntakeBindings:
+        """The report's row labels bound to the findings its assessment admitted — the rule
+        the `intake_bindings` doors serve. A row that identifies no admitted finding is left
+        out; a view read just carries no prose for it. `strict` (the doors) refuses an
+        admitted finding no row covers. Coverage counts every row, not the label map: a
+        report may repeat a label across rows naming different findings."""
+        rows = self.row_findings(assessment, doc, strict=strict)
+        bound = {
+            Label(row.id): finding_id
+            for row, finding_id in zip(doc.findings, rows, strict=True)
+            if finding_id is not None
+        }
+        return AssessmentIntakeBindings(findings=bound)
+
+    def row_findings(
+        self, assessment: Assessment, doc: ReportArtifact, *, strict: bool = False
+    ) -> list[UUID | None]:
+        """Each report row's admitted finding, in row order (None for a row that identifies
+        none): the per-row binding a reader uses to pick a finding's own row even when two
+        rows share a label. `strict` refuses an admitted finding no row covers. The
+        repository and its retained claim identities are read once for the whole report,
+        not once per row."""
+        assert assessment.id is not None
+        with self._uow as uow:
+            _, repository = self._inventory.resolve(assessment.repository_ref_id)
+            assert repository.id is not None
+            repository_id = repository.id
+            admitted = {o.finding_id for o in uow.occurrences.list_for_assessment(assessment.id)}
+            identities, _ = self._claimed_identities(uow, repository_id)
+            rows: list[UUID | None] = []
+            for candidate in FindingCandidate.of_report(doc.findings, repository_id):
+                fingerprint = self._fingerprint(
+                    repository, self._validate(candidate), "intake binding"
+                )
+                found = self._match(
+                    uow, repository_id, (fingerprint.algo, fingerprint.value), identities
+                )
+                rows.append(found.id if found is not None and found.id in admitted else None)
+        if strict and {f for f in rows if f is not None} != admitted:
+            raise IntegrityError(
+                f"assessment {assessment.id}: report labels do not cover its admitted findings"
+            )
+        return rows
 
     def _claimed_identities(
         self, uow: TraustUnitOfWork, repository_id: UUID
