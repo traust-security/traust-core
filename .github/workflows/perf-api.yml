@@ -31,7 +31,7 @@ jobs:
       pull-requests: write
     services:
       postgres:
-        image: postgres:16@sha256:63e83b5a3dc36a917dccb76fe1bd2ac51f1ec9c1deb47ff20d4f04233bf6eae9
+        image: postgres:16@sha256:ce81150802644ddfac1db4da9e63be6f2a3818aa6ee98a7a28838aeea65dc37a
         env:
           POSTGRES_USER: traust
           POSTGRES_PASSWORD: traust-test-only
