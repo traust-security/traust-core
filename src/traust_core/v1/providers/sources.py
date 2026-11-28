@@ -23,7 +23,10 @@ class CheckoutRequest(Dto):
     # history must reach. The mirror serves every shape; the archive serves none.
     history: int | GitSha | None = None
     writable: bool = False
+    # Reuse a ref-counted read-only worktree per (repo, sha); never combined with writable=True.
+    shared: bool = False
     # Glob patterns of the files to keep (a basename, or a path when it holds "/"); None keeps all.
+    refresh_tags: bool = False
     keep: tuple[str, ...] | None = None
 
 
@@ -41,6 +44,7 @@ class Workspace(Dto):
     path: Path
     # The checkout provider that made it, so release reaches the right one.
     provider: CheckoutProviderName
+    shared: bool = False
 
 
 class Checkouts(Protocol):

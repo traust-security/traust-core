@@ -7,7 +7,7 @@ from uuid import UUID
 
 import sqlalchemy as sa
 
-from traust_core.v1.errors import NotFoundError
+from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.operations import OPEN_ORDER_STATES, OrderState, RunOrder
 from traust_core.v1.repositories.tables import (
     TRAUST_OPS,
@@ -45,6 +45,9 @@ RUN_ORDER = TableSpec(
         text_column("fork_branch", nullable=True),
         timestamp_column("fork_scheduled_at", nullable=True),
         uuid_column("input_artifact_id", nullable=True),
+        text_column("target_purl", nullable=True),
+        text_column("target_sha", nullable=True),
+        text_column("target_module_path", nullable=True),
     ),
 )
 
@@ -113,10 +116,13 @@ class RunOrderRepository(MutableRecordRepository[RunOrder], Protocol):
         work_item_id: UUID | None = None,
         *,
         for_update: bool = False,
+        target_purl: str | None = None,
+        target_sha: str | None = None,
     ) -> RunOrder | None:
         """An open order (planned through leased) for an asset and repository, if any; given a
         work item, only an open order naming that work item (another effort's order on the
-        same repository is not this one's attempt)."""
+        same repository is not this one's attempt); given a component target, only that
+        (PURL, SHA) target's order, else only an order with no component target."""
         ...
 
     def find_by_work_item(self, work_item_id: UUID) -> RunOrder | None:
@@ -340,12 +346,25 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
         work_item_id: UUID | None = None,
         *,
         for_update: bool = False,
+        target_purl: str | None = None,
+        target_sha: str | None = None,
     ) -> RunOrder | None:
         c = self.table.c
         subject = (
             c.repository_id.is_(None) if repository_id is None else c.repository_id == repository_id
         )
-        where = [c.asset == asset, c.state.in_(OPEN_ORDER_STATES), subject]
+        if target_purl is None:
+            if target_sha is not None:
+                raise ValidationError("target_sha requires target_purl")
+            target_conds = (c.target_purl.is_(None), c.target_sha.is_(None))
+        else:
+            if target_sha is None or not target_sha.strip():
+                raise ValidationError("target_sha is required when target_purl is set")
+            target_conds = (
+                c.target_purl == target_purl,
+                c.target_sha == target_sha.strip().lower(),
+            )
+        where = [c.asset == asset, c.state.in_(OPEN_ORDER_STATES), subject, *target_conds]
         if work_item_id is not None:
             where.append(c.work_item_id == work_item_id)
         stmt = self._select().where(*where).limit(1)

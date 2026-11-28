@@ -39,6 +39,7 @@ def list_assessments(
     repository_ids: Annotated[list[UUID] | None, Query()] = None,
     kind: AssessmentKind | None = None,
     status: Status = None,
+    target_purl: Annotated[str | None, Query(max_length=512)] = None,
     limit: Annotated[int, Query(ge=1, le=1000)] = 100,
     cursor: Cursor | None = None,
 ) -> Page[Assessment]:
@@ -60,9 +61,11 @@ def list_assessments(
                 f"list assessments for at most {MAX_REPOSITORY_IDS} repositories per request"
             )
         return assessments.list_for_repositories(
-            repository_ids, kind, PageRequest(limit=limit, cursor=cursor)
+            repository_ids, kind, PageRequest(limit=limit, cursor=cursor), target_purl=target_purl
         )
-    filter = AssessmentFilter(repository_ref_id=repository_ref_id, kind=kind, status=status)
+    filter = AssessmentFilter(
+        repository_ref_id=repository_ref_id, kind=kind, status=status, target_purl=target_purl
+    )
     return assessments.list(filter, PageRequest(limit=limit, cursor=cursor))
 
 
@@ -113,9 +116,13 @@ def list_repository_assessments(
     "/v1/repositories/{repository_id}/assessments/latest", responses=PROBLEMS(401, 404, 422)
 )
 def get_latest_recorded_assessment(
-    repository_id: UUID, kind: AssessmentKind, assessments: Assessments, _: Caller
+    repository_id: UUID,
+    kind: AssessmentKind,
+    assessments: Assessments,
+    _: Caller,
+    target_purl: Annotated[str | None, Query(max_length=512)] = None,
 ) -> Assessment:
-    return assessments.latest_recorded(repository_id, kind)
+    return assessments.latest_recorded(repository_id, kind, target_purl=target_purl)
 
 
 @router.get("/v1/orders/{order_id}/assessments", responses=PROBLEMS(401))

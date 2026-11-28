@@ -273,3 +273,15 @@ def test_a_long_backtick_run_renders_in_linear_time() -> None:
     row = _not_affected_row("`" * 20000 + "|")
     assert time.monotonic() - start < 1.0
     assert _live_pipes(row) == 7
+
+
+def test_a_target_value_cannot_close_its_code_span() -> None:
+    report = valid_report()
+    report["metadata"]["target"] = {
+        "purl": "pkg:maven/org.example/beans@7.1.0",
+        "module_path": "beans`**forged**`",
+        "verification": {"strategy": "shared_release", "manifest_paths": ["beans/pom.xml"]},
+    }
+    md = render_report(report)
+    assert "`beans`**forged**``" not in md  # the old single-backtick span, closed early
+    assert "`` beans`**forged**` ``" in md

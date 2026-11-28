@@ -49,6 +49,8 @@ LANGUAGE_BY_SUFFIX = {
     ".js": "JavaScript",
     ".jsx": "JavaScript",
     ".mjs": "JavaScript",
+    ".java": "Java",
+    ".kt": "Kotlin",
     ".sh": "Sh",
     ".bash": "Sh",
 }
@@ -113,6 +115,9 @@ def source_files(root: Path) -> Iterator[tuple[str, Path, str]]:
 
 def _builtin(root: Path) -> Iterator[SymbolFact]:
     for rel, path, language in source_files(root):
+        patterns = _PATTERNS.get(language, ())
+        if not patterns:
+            continue
         in_group = False
         for n, line in enumerate(path.read_text(errors="replace").splitlines(), start=1):
             if language == "Go" and (in_group or _GO_GROUP.match(line.strip())):
@@ -123,7 +128,7 @@ def _builtin(root: Path) -> Iterator[SymbolFact]:
                 elif m := _GO_GROUP_MEMBER.match(line):
                     yield _fact(m.group(1), rel, n, "variable", language)
                 continue
-            for pattern, kind in _PATTERNS[language]:
+            for pattern, kind in patterns:
                 if m := pattern.match(line):
                     if kind == "method":
                         yield _fact(m.group(1), rel, n, "type-receiver", language)

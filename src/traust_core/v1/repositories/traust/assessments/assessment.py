@@ -33,6 +33,7 @@ ASSESSMENT = TableSpec(
         text_column("assessor"),
         text_column("assessor_version"),
         timestamp_column("occurred_at"),
+        text_column("target_purl", nullable=True),
     ),
     append_only=True,
 )
@@ -52,12 +53,15 @@ class AssessmentRepository(RecordRepository[Assessment], Protocol):
         status: str | None = None,
         *,
         as_of: datetime | None = None,
+        target_purl: str | None = None,
     ) -> Assessment | None: ...
     def latest_for_refs(
         self,
         repository_ref_ids: Collection[UUID],
         kind: str | Collection[str],
         status: str | Collection[str],
+        *,
+        target_purl: str | None = None,
     ) -> Assessment | None: ...
     def latest_per_ref(
         self,
@@ -105,6 +109,7 @@ class AssessmentRepository(RecordRepository[Assessment], Protocol):
         repository_ref_ids: Collection[UUID] | None = None,
         kind: str | None = None,
         status: str | None = None,
+        target_purl: str | None = None,
         assessor_version: str | None = None,
         since: datetime | None = None,
         until: datetime | None = None,
@@ -167,9 +172,11 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
         status: str | None = None,
         *,
         as_of: datetime | None = None,
+        target_purl: str | None = None,
     ) -> Assessment | None:
         c = self.table.c
-        conditions = [c.repository_ref_id == repository_ref_id, c.kind == kind]
+        scope = c.target_purl.is_(None) if target_purl is None else c.target_purl == target_purl
+        conditions = [c.repository_ref_id == repository_ref_id, c.kind == kind, scope]
         if status is not None:
             conditions.append(c.status == status)
         if as_of is not None:
@@ -188,16 +195,20 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
         repository_ref_ids: Collection[UUID],
         kind: str | Collection[str],
         status: str | Collection[str],
+        *,
+        target_purl: str | None = None,
     ) -> Assessment | None:
         if not repository_ref_ids:
             return None
         c = self.table.c
+        scope = c.target_purl.is_(None) if target_purl is None else c.target_purl == target_purl
         stmt = (
             self._select()
             .where(
                 c.repository_ref_id.in_(list(repository_ref_ids)),
                 c.kind.in_([kind] if isinstance(kind, str) else kind),
                 c.status.in_([status] if isinstance(status, str) else status),
+                scope,
             )
             .order_by(c.occurred_at.desc(), c.created_at.desc(), c.id.desc())
             .limit(1)
@@ -227,6 +238,7 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
                     c.repository_ref_id.in_(batch),
                     c.kind.in_(list(kinds)),
                     c.status == status,
+                    c.target_purl.is_(None),
                     *([] if as_of is None else [c.occurred_at <= as_of]),
                 )
                 .subquery()
@@ -292,7 +304,10 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
         until: datetime | None,
     ) -> list[sa.ColumnElement[bool]]:
         c = self.table.c
-        conditions: list[sa.ColumnElement[bool]] = [c.repository_ref_id.in_(list(batch))]
+        conditions: list[sa.ColumnElement[bool]] = [
+            c.repository_ref_id.in_(list(batch)),
+            c.target_purl.is_(None),
+        ]
         if kinds is not None:
             conditions.append(c.kind.in_(list(kinds)))
         if status is not None:
@@ -340,6 +355,7 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
         repository_ref_ids: Collection[UUID] | None = None,
         kind: str | None = None,
         status: str | None = None,
+        target_purl: str | None = None,
         assessor_version: str | None = None,
         since: datetime | None = None,
         until: datetime | None = None,
@@ -363,6 +379,8 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
             conditions.append(c.kind == kind)
         if status is not None:
             conditions.append(c.status == status)
+        if target_purl is not None:
+            conditions.append(c.target_purl == target_purl)
         if assessor_version is not None:
             conditions.append(c.assessor_version == assessor_version)
         return self._page("search", *conditions, limit=limit, after=after, at="occurred_at")

@@ -145,10 +145,16 @@ class AssessmentReads(SqlRepository):
         self._refs = tables.table(REPOSITORY_REF)
 
     def latest_for_repository(
-        self, repository_id: UUID, kinds: Collection[str], statuses: Collection[str]
+        self,
+        repository_id: UUID,
+        kinds: Collection[str],
+        statuses: Collection[str],
+        *,
+        target_purl: str | None = None,
     ) -> Assessment | None:
         assessments, refs = self._assessments, self._refs
         c = assessments.c
+        scope = c.target_purl.is_(None) if target_purl is None else c.target_purl == target_purl
         stmt = (
             sa.select(assessments)
             .select_from(assessments.join(refs, refs.c.id == c.repository_ref_id))
@@ -156,6 +162,7 @@ class AssessmentReads(SqlRepository):
                 refs.c.repository_id == repository_id,
                 c.kind.in_(kinds),
                 c.status.in_(statuses),
+                scope,
             )
             .order_by(c.occurred_at.desc(), c.created_at.desc(), c.id.desc())
             .limit(1)

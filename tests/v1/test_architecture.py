@@ -207,14 +207,14 @@ def test_only_the_ledger_service_imports_traust_ledger() -> None:
     assert importers == ["services/ledger.py"]
 
 
-def test_only_the_identity_provider_imports_jwt_or_cryptography() -> None:
-    """Tokens and their keys have one home: the identity provider."""
+def test_only_the_identity_and_provenance_providers_import_jwt_or_cryptography() -> None:
+    """Tokens, attestations, and their keys live only in identity and provenance providers."""
     importers = sorted(
         str(path.relative_to(SRC))
         for path in SRC.rglob("*.py")
         if any(name.split(".")[0] in {"jwt", "cryptography"} for name in _imported_modules(path))
     )
-    assert importers == ["providers/identity.py"]
+    assert importers == ["providers/identity.py", "providers/provenance.py"]
 
 
 def test_only_the_s3_store_imports_boto() -> None:
@@ -235,6 +235,16 @@ def test_only_the_cvss_model_imports_the_cvss_library() -> None:
         if any(name.split(".")[0] == "cvss" for name in _imported_modules(path))
     )
     assert importers == ["models/cvss.py"]
+
+
+def test_only_the_purl_model_imports_packageurl() -> None:
+    """PURL parsing is a pure value operation: the PURL model holds `packageurl`."""
+    importers = sorted(
+        str(path.relative_to(SRC))
+        for path in SRC.rglob("*.py")
+        if any(name.split(".")[0] == "packageurl" for name in _imported_modules(path))
+    )
+    assert importers == ["models/purl.py"]
 
 
 def test_only_the_syntax_module_imports_tree_sitter() -> None:

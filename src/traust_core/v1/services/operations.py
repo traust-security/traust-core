@@ -17,11 +17,21 @@ from traust_core.v1.errors import (
     ConflictError,
     ForbiddenError,
     NotFoundError,
+    UnresolvedTargetError,
     ValidationError,
 )
 from traust_core.v1.models.artifacts import RunManifestArtifact
 from traust_core.v1.models.common import Page, PageRequest, Provenance, TimeBucket, TimeWindow
+from traust_core.v1.models.component_target import (
+    ComponentTarget,
+    ComponentTargetRequest,
+    UnresolvedTargetReason,
+    canonical_component_purl,
+    normalize_component_commit,
+    normalize_module_path,
+)
 from traust_core.v1.models.identity import Principal, ref_is_human
+from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
 from traust_core.v1.models.operations import (
     DOOR_ONLY_ASSETS,
     FEED_ORDER_STATES,
@@ -80,6 +90,7 @@ from traust_core.v1.models.operations import (
     WorkerId,
     WorkLane,
 )
+from traust_core.v1.models.values import GitSha, HttpsRepoUrl, LocalRepoUrl
 from traust_core.v1.models.vocabulary import (
     ActorKind,
     AssessmentKind,
@@ -88,6 +99,7 @@ from traust_core.v1.models.vocabulary import (
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.feeds import FeedStatus
 from traust_core.v1.providers.model_catalog import ModelCatalog, ModelSpec
+from traust_core.v1.providers.sources import CheckoutRequest, Checkouts
 from traust_core.v1.providers.tools import DatabaseStatus
 from traust_core.v1.repositories.traust_ops import OpsUnitOfWork
 from traust_core.v1.services.artifact_publishing import (
@@ -96,6 +108,7 @@ from traust_core.v1.services.artifact_publishing import (
     StagedArtifact,
 )
 from traust_core.v1.services.assessment import AssessmentService
+from traust_core.v1.services.component_target import ComponentTargetResolver
 from traust_core.v1.services.portfolio import Inventory, PortfolioService
 from traust_core.v1.services.provider_catalog import ProviderBinding, ProviderCatalog
 
@@ -134,6 +147,9 @@ _PRIOR_RECORD_KIND: Final[Mapping[RecordKind, RecordKind]] = {
 _COMPLETED_ORDER_STATES: Final[tuple[OrderState, ...]] = (
     OrderState.SUCCEEDED,
     OrderState.DEGRADED,
+)
+_TRANSIENT_ORDER_REQUEST_FIELDS: Final[frozenset[str]] = frozenset(
+    {"target_release_ref", "target_provenance"}
 )
 
 S = TypeVar("S", contravariant=True)
@@ -213,6 +229,11 @@ class PolicyDenied(ForbiddenError):
         return self.deny_issues[0].code
 
 
+def _binding_form(target: ComponentTarget) -> ComponentTarget:
+    """A verified target as recording binds it: every verified field, the PURL canonical."""
+    return target.model_copy(update={"purl": canonical_component_purl(target.purl)})
+
+
 def _refuse_door_only(asset: AssetName) -> None:
     if asset in DOOR_ONLY_ASSETS:
         raise ForbiddenError(
@@ -241,6 +262,9 @@ class OpsService:
         recording_starts: Sequence[RecordingStartScope] = (),
         inventory: Inventory | None = None,
         assessments: AssessmentLog | None = None,
+        checkouts: Checkouts | None = None,
+        component_targets: ComponentTargetResolver | None = None,
+        hosts: Mapping[str, str] | None = None,
     ) -> None:
         if getattr(manifests, "_uow", uow) is not uow:
             # completion and moves publish the run manifest inside the order transaction, so a
@@ -260,6 +284,9 @@ class OpsService:
         self._recording_starts = tuple(recording_starts)
         self._inventory = inventory
         self._assessments = assessments
+        self._checkouts = checkouts
+        self._component_targets = component_targets
+        self._hosts = dict(hosts or DEFAULT_FORGE_HOSTS)
 
     def submit(
         self, request: OrderRequest, principal: Principal, config: Sequence[ConfigDigest] = ()
@@ -308,9 +335,10 @@ class OpsService:
         state: OrderState,
         **fork: object,
     ) -> RunOrder:
+        request, resolved_target = self._resolve_component_target(request)
         order = RunOrder(
-            **request.model_dump(),
-            **self._config_manifest(tuple(config)),
+            **request.model_dump(exclude=_TRANSIENT_ORDER_REQUEST_FIELDS),
+            **self._initial_manifest(tuple(config), resolved_target),
             **fork,
             state=state,
             requested_by=principal.ref,
@@ -351,6 +379,79 @@ class OpsService:
                 f"work item {request.work_item_id} is not a remediation work item of "
                 f"repository {request.repository_id}"
             )
+
+    def _resolve_component_target(
+        self, request: OrderRequest
+    ) -> tuple[OrderRequest, ComponentTarget | None]:
+        """Resolve and verify a component PURL target against the registered repository at its
+        pinned SHA before queueing or leasing, replacing caller fields with the server-verified
+        tuple. Fails closed when checkout/resolver wiring is absent or verification fails."""
+        if request.target_purl is None:
+            return request, None
+        if self._inventory is None or self._checkouts is None or self._component_targets is None:
+            raise ConfigError(
+                "component target orders require inventory, checkouts, and component_targets "
+                "(Context wires them)"
+            )
+        assert request.repository_id is not None and request.target_sha is not None
+        repo = self._inventory.get_repository(request.repository_id)
+        try:
+            sha = GitSha.parse(normalize_component_commit(request.target_sha))
+        except ValidationError as e:
+            raise UnresolvedTargetError(
+                UnresolvedTargetReason.MISSING_PIN,
+                f"invalid target_sha {request.target_sha!r}: {e}",
+            ) from e
+        origin = (
+            LocalRepoUrl.parse(repo.url)
+            if repo.url.startswith(("file:", "/"))
+            else HttpsRepoUrl.parse(repo.url, self._hosts)
+        )
+        target_request = ComponentTargetRequest(
+            purl=request.target_purl,
+            repository=repo.url,
+            commit=str(sha),
+            release_ref=request.target_release_ref,
+            module_path=request.target_module_path,
+            provenance_record=request.target_provenance,
+        )
+        refreshed = False
+        while True:
+            try:
+                workspace = self._checkouts.checkout(
+                    CheckoutRequest(repo=origin, ref=sha, shared=True, refresh_tags=refreshed)
+                ).data
+            except NotFoundError as e:
+                raise UnresolvedTargetError(
+                    UnresolvedTargetReason.TAG_COMMIT_MISMATCH,
+                    f"pinned commit {sha} could not be checked out from {repo.url}: {e}",
+                ) from e
+            try:
+                resolved = self._component_targets.resolve(target_request, workspace.path)
+                break
+            except UnresolvedTargetError as e:
+                if (
+                    not refreshed
+                    and isinstance(origin, HttpsRepoUrl)
+                    and e.reason
+                    in (
+                        UnresolvedTargetReason.TAG_COMMIT_MISMATCH,
+                        UnresolvedTargetReason.NO_MANIFEST_MATCH,
+                    )
+                ):
+                    refreshed = True
+                    continue
+                raise
+            finally:
+                self._checkouts.release(workspace)
+        updated = request.model_copy(
+            update={
+                "target_purl": resolved.purl,
+                "target_sha": resolved.commit,
+                "target_module_path": resolved.module_path,
+            }
+        )
+        return updated, resolved
 
     def preflight(self, request: PreflightRequest, principal: Principal) -> PreflightResult:
         """May this stage run on this subject now: fail-fast courtesy; submit re-verifies."""
@@ -556,7 +657,8 @@ class OpsService:
     ) -> RunOrder:
         _classifiers(lane=request.lane, event_source=request.event_source)
         self._check_work_item(request)
-        manifest = self._config_manifest(tuple(config))
+        request, resolved_target = self._resolve_component_target(request)
+        manifest = self._initial_manifest(tuple(config), resolved_target)
         with self._uow.write() as uow:
             # A fix attempt is its own work item's: another effort's open order on the same
             # repository is not this attempt, so the lookup names the work item.
@@ -565,11 +667,13 @@ class OpsService:
                 request.repository_id,
                 None if fork is None else request.work_item_id,
                 for_update=True,
+                target_purl=request.target_purl,
+                target_sha=request.target_sha,
             )
             if current is None:
                 saved = uow.run_orders.add(
                     RunOrder(
-                        **request.model_dump(),
+                        **request.model_dump(exclude=_TRANSIENT_ORDER_REQUEST_FIELDS),
                         **manifest,
                         fork_url=None if fork is None else fork.url,
                         fork_branch=None if fork is None else fork.branch,
@@ -579,6 +683,20 @@ class OpsService:
                     )
                 )
             elif current.state == OrderState.PLANNED:
+                current_target = (
+                    current.target_purl,
+                    current.target_sha,
+                    current.target_module_path,
+                )
+                requested_target = (
+                    request.target_purl,
+                    request.target_sha,
+                    request.target_module_path,
+                )
+                if current_target != requested_target:
+                    raise ConflictError(
+                        f"order {current.id} targets {current_target!r}, not {requested_target!r}"
+                    )
                 if ref_is_human(current.requested_by):
                     # A person asked for this order through the submit door, with the route they
                     # chose; the engine re-ranks only what it planned itself (a machine's ref).
@@ -680,6 +798,116 @@ class OpsService:
             )
         return order
 
+    def _verified_manifest_target(self, order: RunOrder) -> ComponentTarget | None:
+        """Return the Core-verified ComponentTarget stored in an existing order's run manifest."""
+        if order.artifact_id is None:
+            return None
+        doc = json.loads(self._manifests.get(order.artifact_id).payload)
+        raw_target = doc.get("component_target")
+        if raw_target is None:
+            return None
+        return ComponentTarget.model_validate(raw_target)
+
+    def _try_takeover_verified_component_order(
+        self,
+        request: OrderRequest,
+        principal: Principal,
+        worker: WorkerId,
+        lease_for: timedelta,
+    ) -> RunOrder | None:
+        """Take over an existing planned/queued component order reusing its Core-verified
+        manifest when the caller supplies no fresh provenance envelope or release_ref."""
+        if (
+            request.target_purl is None
+            or request.target_provenance is not None
+            or request.target_release_ref is not None
+        ):
+            return None
+        assert request.target_sha is not None
+        canon_purl = canonical_component_purl(request.target_purl)
+        try:
+            canon_sha = str(GitSha.parse(normalize_component_commit(request.target_sha)))
+        except ValidationError as e:
+            raise UnresolvedTargetError(
+                UnresolvedTargetReason.MISSING_PIN,
+                f"invalid target_sha {request.target_sha!r}: {e}",
+            ) from e
+        req_module = (
+            normalize_module_path(request.target_module_path)
+            if request.target_module_path is not None
+            else None
+        )
+        now = self._clock.now()
+        with self._uow.write() as uow:
+            current = uow.run_orders.find_open(
+                request.asset,
+                request.repository_id,
+                for_update=True,
+                target_purl=canon_purl,
+                target_sha=canon_sha,
+            )
+            if current is None:
+                return None
+            assert current.id is not None
+            current = uow.run_orders.get_for_update(current.id)
+            # The start door's own rules (traust-core#551 and c129551d) hold for a component
+            # takeover too: only an admitted (queued) order is taken over, never one awaiting
+            # admission or approval.
+            if current.state is OrderState.AWAITING_APPROVAL:
+                raise ConflictError(
+                    f"order {current.id}: {current.asset} is awaiting approval — approve it "
+                    f"(POST /v1/orders/{current.id}/approve) rather than take it over"
+                )
+            if current.state is OrderState.PLANNED:
+                raise ConflictError(
+                    f"order {current.id}: {current.asset} is awaiting admission — take it "
+                    "over once the engine has queued it"
+                )
+            if current.state is not OrderState.QUEUED:
+                raise ConflictError(
+                    f"order {current.id}: {current.asset} is already {current.state}"
+                )
+            if request.work_item_id not in (None, current.work_item_id):
+                raise ConflictError(
+                    f"order {current.id} runs work item {current.work_item_id}, not "
+                    f"{request.work_item_id}"
+                )
+            if req_module is not None and req_module != current.target_module_path:
+                raise ConflictError(
+                    f"order {current.id} targets "
+                    f"{(current.target_purl, current.target_sha, current.target_module_path)!r}, "
+                    f"not {(canon_purl, canon_sha, req_module)!r}"
+                )
+            verified = self._verified_manifest_target(current)
+            if (
+                verified is None
+                or canonical_component_purl(verified.purl) != canon_purl
+                or verified.commit.lower() != canon_sha.lower()
+                or verified.module_path != current.target_module_path
+            ):
+                return None
+            # A takeover is a new claim: its generation moves past the order's last one, so a
+            # stale holder's heartbeat, completion and recordings are refused (#551).
+            lease = {
+                "state": OrderState.LEASED,
+                "lease_holder": worker,
+                "lease_generation": current.lease_generation + 1,
+                "lease_expires_at": now + lease_for,
+                "started_at": now,
+            }
+            saved = uow.run_orders.update(current.model_copy(update=lease))
+            saved = uow.run_orders.get(saved.id)
+            uow.commit()
+        self._uow.after_commit(
+            lambda: log.info(
+                "order %s started actor_kind=%s",
+                saved.id,
+                principal.kind,
+                extra={"order_id": str(saved.id), "actor_kind": str(principal.kind)},
+            )
+        )
+        return saved
+
     def start(
         self, request: OrderRequest, principal: Principal, worker: WorkerId, lease_for: timedelta
     ) -> RunOrder:
@@ -688,9 +916,17 @@ class OpsService:
         approval one never is, else a new one is stored."""
         _classifiers(lane=request.lane, event_source=request.event_source)
         self._check_work_item(request)
+        taken = self._try_takeover_verified_component_order(request, principal, worker, lease_for)
+        if taken is not None:
+            return taken
+        request, resolved_target = self._resolve_component_target(request)
         with self._uow.write() as uow:
             current = uow.run_orders.find_open(
-                request.asset, request.repository_id, for_update=True
+                request.asset,
+                request.repository_id,
+                for_update=True,
+                target_purl=request.target_purl,
+                target_sha=request.target_sha,
             )
             now = self._clock.now()
             lease = {
@@ -704,7 +940,12 @@ class OpsService:
                 # Taking over the scheduling door's queued order below is a runner's move; only
                 # a door that stores a new order refuses a door-only asset.
                 _refuse_door_only(request.asset)
-                order = RunOrder(**request.model_dump(), **lease, requested_by=principal.ref)
+                order = RunOrder(
+                    **request.model_dump(exclude=_TRANSIENT_ORDER_REQUEST_FIELDS),
+                    **self._initial_manifest((), resolved_target),
+                    **lease,
+                    requested_by=principal.ref,
+                )
                 saved = uow.run_orders.add(order)
             else:
                 assert current.id is not None
@@ -730,8 +971,40 @@ class OpsService:
                         f"order {current.id} runs work item {current.work_item_id}, not "
                         f"{request.work_item_id}"
                     )
-                saved = uow.run_orders.update(current.model_copy(update=lease))
-            assert saved.id is not None
+                current_target = (
+                    current.target_purl,
+                    current.target_sha,
+                    current.target_module_path,
+                )
+                requested_target = (
+                    request.target_purl,
+                    request.target_sha,
+                    request.target_module_path,
+                )
+                if current_target != requested_target:
+                    raise ConflictError(
+                        f"order {current.id} targets {current_target!r}, not {requested_target!r}"
+                    )
+                stored_target = self._verified_manifest_target(current)
+                if (
+                    resolved_target is not None
+                    and stored_target is not None
+                    and _binding_form(stored_target) != _binding_form(resolved_target)
+                ):
+                    # recording binds the whole verified target (release_ref, verification): a
+                    # lease on a different one could never record, only hold the order
+                    raise ConflictError(
+                        f"order {current.id} was verified for release "
+                        f"{stored_target.release_ref!r} ({stored_target.verification.strategy}), "
+                        f"not {resolved_target.release_ref!r} "
+                        f"({resolved_target.verification.strategy})"
+                    )
+                extra = (
+                    self._initial_manifest((), resolved_target)
+                    if current.artifact_id is None and resolved_target is not None
+                    else {}
+                )
+                saved = uow.run_orders.update(current.model_copy(update={**lease, **extra}))
             saved = uow.run_orders.get(saved.id)
             uow.commit()
         self._uow.after_commit(
@@ -848,13 +1121,14 @@ class OpsService:
         provenance: Provenance,
         *,
         lease_generation: int,
+        target: ComponentTarget | None = None,
     ) -> RunOrder:
         """Authorize before staging bytes; recording repeats the checks under its lease lock."""
         principal = _recording_principal(principal)
         with self._uow.write() as uow:
             order = uow.run_orders.get_for_update(order_id)
             self._check_recording(
-                order, principal, kind, repository_id, provenance, lease_generation
+                order, principal, kind, repository_id, provenance, lease_generation, target=target
             )
         return order
 
@@ -868,13 +1142,14 @@ class OpsService:
         provenance: Provenance,
         *,
         lease_generation: int,
+        target: ComponentTarget | None = None,
     ) -> Iterator[RunOrder]:
         """Authorize and serialize one leased runner's report with its domain writes."""
         principal = _recording_principal(principal)
         with self._uow.write() as uow:
             order = uow.run_orders.get_for_update(order_id)
             self._check_recording(
-                order, principal, kind, repository_id, provenance, lease_generation
+                order, principal, kind, repository_id, provenance, lease_generation, target=target
             )
             yield order
             assert order.lease_expires_at is not None
@@ -883,25 +1158,42 @@ class OpsService:
             uow.commit()
 
     def check_bound(
-        self, order_id: UUID, repository_id: UUID, *, worker: WorkerId, lease_generation: int
+        self,
+        order_id: UUID,
+        repository_id: UUID,
+        *,
+        worker: WorkerId,
+        lease_generation: int,
+        target: ComponentTarget | None = None,
     ) -> RunOrder:
         """Check before staging; bound repeats the check around the writes."""
         with self._uow.write() as uow:
             order = uow.run_orders.get_for_update(order_id)
             _Lease(worker, lease_generation).require(order, self._clock.now())
             self._require_repository(order, repository_id)
+            if order.target_purl is not None or target is not None:
+                self._check_target_binding(order, target)
             return order
 
     @contextmanager
     def bound(
-        self, order_id: UUID, repository_id: UUID, *, worker: WorkerId, lease_generation: int
+        self,
+        order_id: UUID,
+        repository_id: UUID,
+        *,
+        worker: WorkerId,
+        lease_generation: int,
+        target: ComponentTarget | None = None,
     ) -> Iterator[RunOrder]:
-        """Commit repository-scoped writes under the worker's original lease."""
+        """Commit repository-scoped writes under the worker's original lease (and its
+        server-resolved component target, when present)."""
         lease = _Lease(worker, lease_generation)
         with self._uow.write() as uow:
             order = uow.run_orders.get_for_update(order_id)
             lease.require(order, self._clock.now())
             self._require_repository(order, repository_id)
+            if order.target_purl is not None or target is not None:
+                self._check_target_binding(order, target)
             yield order
             assert order.lease_expires_at is not None
             if order.lease_expires_at <= self._clock.now():
@@ -916,6 +1208,8 @@ class OpsService:
         repository_id: UUID,
         provenance: Provenance,
         lease_generation: int,
+        *,
+        target: ComponentTarget | None = None,
     ) -> None:
         _require(order, OrderState.LEASED)
         if order.lease_holder != principal.ref:
@@ -928,6 +1222,49 @@ class OpsService:
             raise ValidationError("recording provenance.run_id must equal run_order_id")
         if provenance.source != _RECORDING_SOURCES.get(kind):
             raise ValidationError("recording provenance source does not match the report kind")
+        if kind == RecordKind.ASSESSMENT:
+            self._check_target_binding(order, target)
+
+    def _check_target_binding(self, order: RunOrder, target: ComponentTarget | None) -> None:
+        """Bind an assessment recording to the order's server-resolved target (including manifest
+        verification metadata when recorded), never only repository identity."""
+        if order.target_purl is None:
+            if target is not None:
+                raise ForbiddenError(
+                    f"order {order.id}: whole-repository order refuses component report "
+                    f"for {target.purl}"
+                )
+            return
+        if target is None:
+            raise ForbiddenError(
+                f"order {order.id}: component target {order.target_purl} required; "
+                "report has no metadata.target"
+            )
+        expected_purl = canonical_component_purl(order.target_purl)
+        actual_purl = canonical_component_purl(target.purl)
+        expected_sha = (order.target_sha or "").lower()
+        expected_path = normalize_module_path(order.target_module_path or "")
+        actual_path = normalize_module_path(target.module_path)
+        if (
+            actual_purl != expected_purl
+            or target.commit.lower() != expected_sha
+            or actual_path != expected_path
+        ):
+            raise ForbiddenError(
+                f"order {order.id}: report target ({actual_purl}, {target.commit}, {actual_path}) "
+                f"does not match leased order target ({expected_purl}, {expected_sha}, "
+                f"{expected_path})"
+            )
+        if order.artifact_id is not None:
+            doc = json.loads(self._manifests.get(order.artifact_id).payload)
+            raw_expected = doc.get("component_target")
+            if raw_expected is not None:
+                expected = ComponentTarget.model_validate(raw_expected)
+                if _binding_form(target) != _binding_form(expected):
+                    raise ForbiddenError(
+                        f"order {order.id}: report metadata.target does not match server-resolved "
+                        "manifest target verification"
+                    )
 
     @staticmethod
     def _require_repository(order: RunOrder, repository_id: UUID) -> None:
@@ -1302,6 +1639,22 @@ class OpsService:
             self._config_manifests[config] = self._publish(None, lambda m: {**m, "config": entries})
         return {"artifact_id": self._config_manifests[config]}
 
+    def _initial_manifest(
+        self, config: tuple[ConfigDigest, ...], component_target: ComponentTarget | None
+    ) -> dict[str, UUID]:
+        if component_target is None:
+            return self._config_manifest(config)
+        target_doc = component_target.model_dump(mode="json", exclude_none=True)
+        entries = [c.model_dump(mode="json", exclude_none=True) for c in config]
+
+        def build(m: dict[str, Any]) -> dict[str, Any]:
+            out = {**m, "component_target": target_doc}
+            if entries:
+                out["config"] = entries
+            return out
+
+        return {"artifact_id": self._publish(None, build)}
+
     def requeue_expired(self) -> int:
         with self._uow as uow:
             count = uow.run_orders.requeue_expired(self._clock.now())
@@ -1427,7 +1780,14 @@ class OpsService:
             manifests[order.id] = OrderManifest.model_validate(
                 {
                     k: doc[k]
-                    for k in ("config", "approval", "sessions", "degraded", "outputs")
+                    for k in (
+                        "config",
+                        "approval",
+                        "sessions",
+                        "degraded",
+                        "outputs",
+                        "component_target",
+                    )
                     if k in doc
                 }
             )

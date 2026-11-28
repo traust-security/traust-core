@@ -206,3 +206,23 @@ def test_ctags_outside_the_allowlist_never_runs(
     monkeypatch.setattr(shutil, "which", lambda name: f"/opt/{name}")
     result = SymbolIndex(ProcessRunner(()), CLOCK).enumerate(ToolRequest(workspace=clone))
     assert result.acquisition.source == "builtin"
+
+
+def test_java_and_kotlin_references_are_scanned_without_builtin_regexes(
+    index: SymbolIndex, tmp_path: Path
+) -> None:
+    repo = tmp_path / "jvm"
+    (repo / "spring-context").mkdir(parents=True)
+    (repo / "spring-context" / "AppContext.java").write_text(
+        "public class AppContext { BeanCache cache() { return new BeanCache(); } }\n"
+    )
+    (repo / "spring-context" / "Adapter.kt").write_text(
+        "fun makeCache(): BeanCache = BeanCache()\n"
+    )
+
+    refs = index.references(repo, ["BeanCache"])
+    assert {(r.path, r.line) for r in refs} == {
+        ("spring-context/AppContext.java", 1),
+        ("spring-context/Adapter.kt", 1),
+    }
+    assert index.enumerate(ToolRequest(workspace=repo)).data == []

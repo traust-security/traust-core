@@ -118,3 +118,12 @@ class ViewContractError(DocumentError):
 
 class RemovedSecretError(DocumentError):
     """A patch carries high-confidence secrets only outside its added lines."""
+
+
+class UnresolvedTargetError(ValidationError):
+    """A component PURL target could not be deterministically verified against the pinned tree."""
+
+    def __init__(self, reason: str, detail: str) -> None:
+        super().__init__(f"unresolved target ({reason}): {detail}")
+        self.reason = reason
+        self.detail = detail

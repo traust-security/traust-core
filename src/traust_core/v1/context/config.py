@@ -190,6 +190,8 @@ class Locations(_Model):
     inputs: str | None = None
     mirror_cache: str | None = None
 
+    provenance_trust: str | None = None
+
     @pydantic.field_validator("opengrep_adopter_rules")
     @classmethod
     def _local_adopter_rules(cls, value: str | None) -> str | None:
@@ -265,6 +267,9 @@ class Locations(_Model):
         if (local := _local_path(self.mirror_cache)) is None:
             raise ConfigError("locations.mirror_cache must be a local path")
         return local if local.is_absolute() else home / local
+
+    def provenance_trust_path(self) -> Path | None:
+        return _local_path(self.provenance_trust)
 
 
 class FeedsConfig(_Model):
@@ -386,6 +391,7 @@ _PATH_FIELDS = (
     "opengrep_rules",
     "opengrep_adopter_rules",
     "mirror_cache",
+    "provenance_trust",
 )
 
 

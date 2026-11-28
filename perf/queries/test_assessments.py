@@ -256,3 +256,88 @@ def test_the_census_counts_group_by_index(engine: sa.Engine, explained: Profile)
     # one statement per 500-ref batch, each the same grouped count
     for statement in explained(read):
         fast(statement, "idx_assessment_ref_kind_occurred", 50)
+
+
+def _seed_component_assessments(engine: sa.Engine) -> tuple[UUID, UUID, str, str]:
+    """Populate representative non-null target_purl rows so partial-index plans measure hits."""
+    target_purl = "pkg:maven/org.springframework/spring-beans@7.1.0"
+    sibling_purl = "pkg:maven/org.springframework/spring-context@7.1.0"
+    with engine.begin() as conn:
+        existing = conn.exec_driver_sql(
+            "SELECT a.repository_ref_id, r.repository_id, a.kind "
+            "FROM traust.assessment a JOIN traust.repository_ref r ON r.id = a.repository_ref_id "
+            "WHERE a.target_purl = %s LIMIT 1",
+            (target_purl,),
+        ).first()
+        if existing is not None:
+            return existing[0], existing[1], existing[2], target_purl
+        refs = conn.exec_driver_sql(
+            "SELECT id, repository_id FROM traust.repository_ref LIMIT 100"
+        ).all()
+        rows = []
+        base = datetime(2026, 11, 20, tzinfo=UTC)
+        for i, (ref_id, _) in enumerate(refs):
+            for j, purl in enumerate((target_purl, sibling_purl)):
+                rows.append(
+                    (
+                        ref_id,
+                        "secure_code",
+                        "completed",
+                        "skill:secure-code-audit",
+                        "1.0.0",
+                        base + timedelta(minutes=i * 2 + j),
+                        purl,
+                    )
+                )
+        conn.exec_driver_sql(
+            "INSERT INTO traust.assessment "
+            "(repository_ref_id, kind, status, assessor, assessor_version, "
+            "occurred_at, target_purl) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            rows,
+        )
+        conn.exec_driver_sql("ANALYZE traust.assessment")
+        return refs[0][0], refs[0][1], "secure_code", target_purl
+
+
+def test_component_target_purl_latest_uses_partial_index(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    """Component-scoped latest lookup finds the intended PURL via the partial index (real hit)."""
+    ref_id, repo_id, kind, target_purl = _seed_component_assessments(engine)
+
+    def read_ref(uow: SqlTraustUnitOfWork) -> None:
+        found = uow.assessments.latest(ref_id, kind, ASSESSMENT_COMPLETED, target_purl=target_purl)
+        assert found is not None and found.target_purl == target_purl
+
+    def read_repo(uow: SqlTraustUnitOfWork) -> None:
+        found = uow.assessment_reads.latest_for_repository(
+            repo_id, (kind,), (ASSESSMENT_COMPLETED, ASSESSMENT_DEGRADED), target_purl=target_purl
+        )
+        assert found is not None and found.target_purl == target_purl
+
+    (by_ref,) = explained(read_ref)
+    fast(by_ref, "idx_assessment_ref_target_kind_occurred", 5)
+    (by_repo,) = explained(read_repo)
+    fast(by_repo, "idx_assessment_ref_target_kind_occurred", 10)
+
+
+def test_whole_repo_latest_is_null_stays_indexed_with_component_rows_present(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    """Whole-repo latest (target_purl IS NULL) stays indexed and excludes component PURL rows."""
+    _seed_component_assessments(engine)
+    with SqlTraustUnitOfWork(engine) as unit:
+        table = unit.assessments.table
+        row = unit.connection.execute(
+            sa.select(table.c.repository_ref_id, table.c.kind, table.c.status)
+            .where(table.c.target_purl.is_(None))
+            .limit(1)
+        ).one()
+
+    def read_whole(uow: SqlTraustUnitOfWork) -> None:
+        found = uow.assessments.latest(row.repository_ref_id, row.kind, row.status)
+        assert found is not None and found.target_purl is None
+
+    (stmt,) = explained(read_whole)
+    fast(stmt, "idx_assessment_ref_kind_occurred", 5)

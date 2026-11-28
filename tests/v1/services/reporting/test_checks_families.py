@@ -870,3 +870,29 @@ def test_a_threat_rating_must_follow_from_its_factors(
     assert result.errors == [
         "threats[0] (T1) risk_rating: risk_rating.severity is 'note'; its levels give 'high'"
     ]
+
+
+@pytest.mark.parametrize(
+    ("manifest_paths", "error"),
+    [
+        (5, "must be an array"),
+        ("pom.xml", "must be an array"),  # never read one character at a time
+        ([7], "must be a string"),
+    ],
+    ids=["number", "string", "item"],
+)
+def test_a_malformed_target_manifest_list_is_an_error_not_a_crash(
+    manifest_paths: Any, error: str
+) -> None:
+    from traust_core.v1.services.reporting.checks import check_metadata_target
+
+    report = {
+        "metadata": {
+            "target": {
+                "purl": "pkg:maven/org.example/beans@7.1.0",
+                "verification": {"strategy": "shared_release", "manifest_paths": manifest_paths},
+            }
+        }
+    }
+    result = _run(check_metadata_target, report)
+    assert any("manifest_paths" in e and error in e for e in result.errors)

@@ -16,6 +16,7 @@ from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.artifacts import ReportArtifact
 from traust_core.v1.models.base import AppendOnly, Dto, Model
 from traust_core.v1.models.common import Provenance
+from traust_core.v1.models.component_target import ComponentTarget
 from traust_core.v1.models.findings import (
     FindingCandidate,
     FindingView,
@@ -277,6 +278,7 @@ class AssessmentFilter(Model):
     repository_ref_id: UUID | None = None
     kind: AssessmentKind | None = None
     status: str | None = None
+    target_purl: str | None = None
 
 
 class ThreatFilter(Model):
@@ -322,6 +324,7 @@ class Assessment(AppendOnly):
     assessor: str
     assessor_version: str
     occurred_at: datetime
+    target_purl: str | None = None
 
 
 class CensusAssessment(NamedTuple):
@@ -728,3 +731,4 @@ class AssessmentSkillInput(SkillInput):
     # the diff's named audit, else the default line's newest completed code audit
     baseline_assessment_id: UUID | None = None
     diff: DiffScope | None = None
+    component_target: ComponentTarget | None = None

@@ -316,3 +316,32 @@ def test_engine_registered_sources_reach_their_doors(tmp_path: Path) -> None:
     assert (services.compliance._adr_source, services.compliance._docs) == (adr, docs)
     quality = services.detection_quality
     assert (quality._rule_packs, quality._canaries) == (packs, canaries)
+
+
+def test_a_broken_provenance_trust_policy_fails_no_request_that_does_not_use_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traust_core.v1.providers.provenance import DsseProvenanceVerifier
+
+    reads: list[Path] = []
+    real = DsseProvenanceVerifier.from_file.__func__  # type: ignore[attr-defined]
+
+    def counted(cls: type, path: Path) -> DsseProvenanceVerifier:
+        reads.append(path)
+        return real(cls, path)
+
+    monkeypatch.setattr(DsseProvenanceVerifier, "from_file", classmethod(counted))
+    broken = tmp_path / "trust.json"
+    broken.write_text("{not json", encoding="utf-8")
+    with contract_db("sqlite", tmp_path) as engine:
+        url = engine.url.render_as_string(hide_password=False)
+        ctx = Context.from_file(
+            _write(
+                tmp_path,
+                f"home: {tmp_path / 'home'}\ndatabase:\n  url: {url}\nrating: {{}}\n"
+                f"locations:\n  provenance_trust: {broken}\n",
+            )
+        )
+        for _ in range(3):  # one unit of work per request
+            assert ctx.services().ops is not None
+    assert reads == []  # read on the first order that carries provenance, not on wiring

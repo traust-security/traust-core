@@ -37,13 +37,14 @@ URL = HttpsRepoUrl.parse(REPO, ("github.com",))
 class Forge:
     """A local bare repository standing in for the forge at REPO, with a working clone."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, object_format: str | None = None) -> None:
+        fmt = [f"--object-format={object_format}"] if object_format else []
         self.bare = root / "forge" / "o" / "r.git"
         self.bare.mkdir(parents=True)
-        git(self.bare, "init", "--bare", "-q")
+        git(self.bare, "init", "--bare", "-q", *fmt)
         self.work = root / "work"
         self.work.mkdir()
-        git(self.work, "init", "-q")
+        git(self.work, "init", "-q", *fmt)
 
     def commit(self, name: str, content: bytes) -> GitSha:
         (self.work / name).write_bytes(content)

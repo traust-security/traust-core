@@ -25,7 +25,8 @@ THIRD_PARTY = {
         "pydantic",
         "pydantic_core",
         "cvss",
-    },  # pydantic_core: custom-type core schema (HttpsRepoUrl); cvss: one module, test_architecture
+        "packageurl",
+    },  # pydantic_core: HttpsRepoUrl; cvss & packageurl: one module each (test_architecture)
     # each pair has one module (test_architecture); tree_sitter* are the grammars
     "providers": {
         "pydantic",

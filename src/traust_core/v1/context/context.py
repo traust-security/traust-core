@@ -133,14 +133,20 @@ from traust_core.v1.providers.identity import (
 from traust_core.v1.providers.impact import GovulncheckAnalyzer, SourceScanAnalyzer
 from traust_core.v1.providers.llm_app import LlmAppDetector
 from traust_core.v1.providers.local import LocalCheckout
-from traust_core.v1.providers.mirror import FETCH_TIMEOUT_SECONDS, MirrorCheckout
+from traust_core.v1.providers.mirror import (
+    FETCH_TIMEOUT_SECONDS,
+    LOCAL_SHARED_DIR,
+    MirrorCheckout,
+)
 from traust_core.v1.providers.model_catalog import ModelCatalog, RegistryModelCatalog
 from traust_core.v1.providers.osv import ExportedAdvisoryLookup
+from traust_core.v1.providers.package_manifests import PackageManifestScanner
 from traust_core.v1.providers.package_source import PackageSources
 from traust_core.v1.providers.pqc import PqcScanner, PqcScanTool
 from traust_core.v1.providers.priv_profile import PrivProfiler
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.product_definitions import ProductDefinitionsCache
+from traust_core.v1.providers.provenance import DsseProvenanceVerifier
 from traust_core.v1.providers.report_files import ReportFiles
 from traust_core.v1.providers.route_guards import RouteGuardMatrix
 from traust_core.v1.providers.rule_drafts import RuleDraftDirectory
@@ -177,6 +183,7 @@ from traust_core.v1.services.attestation import AttestationService, StatementPol
 from traust_core.v1.services.below_range import BelowRangeService
 from traust_core.v1.services.code_facts import CodeFactsService
 from traust_core.v1.services.compliance import GATE, ComplianceService
+from traust_core.v1.services.component_target import ComponentTargetResolver
 from traust_core.v1.services.dashboards import DashboardService
 from traust_core.v1.services.detection_quality import DetectionQualityService
 from traust_core.v1.services.exposure import (
@@ -335,6 +342,7 @@ class Services:
     redaction: RedactionPolicy
     reporting: ReportingService
     checkouts: RepoCheckoutService
+    component_targets: ComponentTargetResolver
 
 
 @dataclass(frozen=True)
@@ -353,11 +361,13 @@ class Context:
         clock: Clock | None = None,
         object_store: ObjectStore | None = None,
         process: ProcessRunner | None = None,
+        provenance_verifier: DsseProvenanceVerifier | None = None,
     ) -> None:
         self.config = config
         self.clock: Clock = clock or SystemClock()
         self._object_store = object_store
         self._process = process
+        self._provenance_verifier = provenance_verifier
         self.tools: ProviderRegistry[ToolProvider[Any]] = ProviderRegistry("tool")
         self.sources: ProviderRegistry[SourceProvider] = ProviderRegistry("source")
         self.feeds: ProviderRegistry[FeedProvider] = ProviderRegistry("feed")
@@ -458,7 +468,22 @@ class Context:
                 self.config.locations.mirror_cache_dir(self.config.home),
                 self.forge_api,
             ),
-            LocalCheckout(self.process, self.clock),
+            LocalCheckout(
+                self.process,
+                self.clock,
+                self.config.locations.mirror_cache_dir(self.config.home) / LOCAL_SHARED_DIR,
+            ),
+        )
+
+    @cached_property
+    def component_targets(self) -> ComponentTargetResolver:
+        """One resolver per Context: the trust policy is read once, on the first order that
+        carries provenance, not on every request's wiring."""
+        return ComponentTargetResolver(
+            self.git,
+            PackageManifestScanner(yaml_documents),
+            provenance_verifier=self._provenance_verifier,
+            trust_policy=self.config.locations.provenance_trust_path(),
         )
 
     @cached_property
@@ -998,6 +1023,7 @@ class Context:
             self.model_catalog,
             inventory=Inventory(uow, hosts),
         )
+        component_targets = self.component_targets
         ops = OpsService(
             uow,
             self.clock,
@@ -1020,6 +1046,9 @@ class Context:
             recording_starts=self.config.recording.start,
             inventory=Inventory(uow, hosts),
             assessments=AssessmentLog(uow),
+            checkouts=self.checkouts,
+            component_targets=component_targets,
+            hosts=hosts,
         )
         validation_records = ValidationRecords(uow, self.object_store, findings=FindingRecords(uow))
         precedents = FindingPrecedents(uow, validation=validation_records)
@@ -1368,6 +1397,7 @@ class Context:
             ),
             exposure=exposure,
             checkouts=self.checkouts,
+            component_targets=component_targets,
             below_range=BelowRangeService(
                 exposure,
                 advisories=self.advisories,

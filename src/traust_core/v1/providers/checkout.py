@@ -132,3 +132,20 @@ class GitCheckout:
         if since.startswith("-"):
             raise ValidationError(f"not a ref: {since!r}")
         return self._git(checkout, "diff", "--name-only", f"{since}..HEAD", "--").splitlines()
+
+    def tags_at(self, checkout: Path, sha: str) -> tuple[str, ...]:
+        """Tag names pointing directly at `sha`."""
+        if not _SHA.fullmatch(sha):
+            raise ValidationError(f"not a commit sha: {sha!r}")
+        out = self._git(checkout, "tag", "--points-at", sha, check=False)
+        return tuple(sorted(t.strip() for t in out.splitlines() if t.strip()))
+
+    def resolve_tag(self, checkout: Path, tag: str) -> str | None:
+        """Commit SHA that `refs/tags/<tag>` peels to, or None when absent."""
+        if not tag or tag.startswith("-"):
+            raise ValidationError(f"not a tag name: {tag!r}")
+        out = self._git(
+            checkout, "rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}", check=False
+        )
+        sha = out.strip()
+        return sha if _SHA.fullmatch(sha) else None

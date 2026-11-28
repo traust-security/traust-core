@@ -333,3 +333,85 @@ def test_a_documents_feeds_latest_snapshot_is_found_by_the_feed_index(
     fast(latest, "idx_ops_feed_snapshot_feed_retrieved", 5)
     with SqlTraustUnitOfWork(engine) as uow:
         assert uow.feed_snapshots.latest("nvd-documents") is not None
+
+
+def _seed_component_orders(engine: sa.Engine) -> tuple[UUID, str]:
+    """Populate representative non-null target_purl orders so partial-index plans measure hits."""
+    target_purl = "pkg:maven/org.springframework/spring-beans@7.1.0"
+    sibling_purl = "pkg:maven/org.springframework/spring-context@7.1.0"
+    with engine.begin() as conn:
+        existing = conn.exec_driver_sql(
+            "SELECT repository_id FROM traust_ops.run_order "
+            "WHERE asset = 'sci_scan' AND target_purl = %s LIMIT 1",
+            (target_purl,),
+        ).first()
+        if existing is not None:
+            repo_id = existing[0]
+            whole = conn.exec_driver_sql(
+                "SELECT 1 FROM traust_ops.run_order "
+                "WHERE repository_id = %s AND asset = 'sci_scan' AND target_purl IS NULL LIMIT 1",
+                (repo_id,),
+            ).first()
+            if whole is None:
+                conn.exec_driver_sql(
+                    "INSERT INTO traust_ops.run_order "
+                    "(repository_id, asset, state, priority, requested_by) "
+                    "VALUES (%s, 'sci_scan', 'queued', 1, 'human:perf')",
+                    (repo_id,),
+                )
+                conn.exec_driver_sql("ANALYZE traust_ops.run_order")
+            return repo_id, target_purl
+        repos = conn.exec_driver_sql("SELECT id FROM traust.repository LIMIT 100").scalars().all()
+        rows = []
+        sha_a = "f" * 40
+        sha_b = "e" * 40
+        for rid in repos:
+            rows.append((rid, "sci_scan", "queued", 1, "human:perf", None, None, None))
+            rows.append(
+                (rid, "sci_scan", "queued", 1, "human:perf", target_purl, sha_a, "spring-beans")
+            )
+            rows.append(
+                (rid, "sci_scan", "queued", 1, "human:perf", target_purl, sha_b, "spring-beans")
+            )
+            rows.append(
+                (rid, "sci_scan", "queued", 1, "human:perf", sibling_purl, sha_a, "spring-context")
+            )
+        conn.exec_driver_sql(
+            "INSERT INTO traust_ops.run_order "
+            "(repository_id, asset, state, priority, requested_by, "
+            "target_purl, target_sha, target_module_path) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            rows,
+        )
+        conn.exec_driver_sql("ANALYZE traust_ops.run_order")
+        return repos[0], target_purl
+
+
+def test_find_open_component_target_purl_uses_partial_index(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    """Component-scoped open-order lookup finds the intended PURL via partial index (real hit)."""
+    repo_id, target_purl = _seed_component_orders(engine)
+
+    def lookup(uow: SqlTraustUnitOfWork) -> None:
+        found = uow.run_orders.find_open(
+            "sci_scan", repo_id, target_purl=target_purl, target_sha="f" * 40
+        )
+        assert (
+            found is not None and found.target_purl == target_purl and found.target_sha == "f" * 40
+        )
+
+    (stmt,) = explained(lookup)
+    fast(stmt, "idx_ops_run_order_target_purl", 5)
+
+
+def test_find_open_whole_repo_is_null_stays_indexed(engine: sa.Engine, explained: Profile) -> None:
+    """Whole-repo open-order lookup (target_purl IS NULL) finds the null row via asset+state idx."""
+    repo_id, _ = _seed_component_orders(engine)
+
+    def lookup(uow: SqlTraustUnitOfWork) -> None:
+        found = uow.run_orders.find_open("sci_scan", repo_id)
+        assert found is not None and found.target_purl is None
+
+    (stmt,) = explained(lookup)
+    fast(stmt, "idx_ops_run_order_asset_state", 5)

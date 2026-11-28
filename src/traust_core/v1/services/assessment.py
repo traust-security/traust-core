@@ -74,6 +74,11 @@ from traust_core.v1.models.assessment import (
 from traust_core.v1.models.cloud_config import audit_candidates, audit_judgments
 from traust_core.v1.models.code_facts import SymbolFact
 from traust_core.v1.models.common import ArtifactRef, Page, PageRequest, Provenance
+from traust_core.v1.models.component_target import (
+    ComponentTarget,
+    canonical_component_purl,
+    normalize_module_path,
+)
 from traust_core.v1.models.findings import (
     CandidateFormat,
     Decision,
@@ -160,6 +165,23 @@ def clusters(paths: Sequence[str]) -> list[tuple[str, list[str]]]:
     return [(name, sorted(ps)) for name, ps in ranked]
 
 
+def _extract_component_target(doc: AssessmentArtifact) -> ComponentTarget | None:
+    """Parse and normalize optional `metadata.target` from a report artifact."""
+    if not isinstance(doc, ReportArtifact):
+        return None
+    raw = json.loads(doc.payload)
+    target = (raw.get("metadata") or {}).get("target")
+    if target is None:
+        return None
+    try:
+        parsed = ComponentTarget.model_validate(target)
+    except pydantic.ValidationError as e:
+        raise ValidationError(f"invalid metadata.target: {e}") from e
+    normalized_path = normalize_module_path(parsed.module_path)
+    normalized_purl = canonical_component_purl(parsed.purl)
+    return parsed.model_copy(update={"purl": normalized_purl, "module_path": normalized_path})
+
+
 def touches(location: str, paths: Collection[str]) -> bool:
     """A reported location names one of `paths`, allowing for a component- or repo-root prefix."""
     a = location.removeprefix("./").lstrip("/")
@@ -227,18 +249,35 @@ class AssessmentService:
         return ToolRun(results)
 
     def prepare(
-        self, repository_ref_id: UUID, kind: AssessmentKind, diff: DiffRequest | None = None
+        self,
+        repository_ref_id: UUID,
+        kind: AssessmentKind,
+        diff: DiffRequest | None = None,
+        *,
+        component_target: ComponentTarget | None = None,
     ) -> AssessmentSkillInput:
         """What an assessment of one commit starts from: the repository's findings, its latest
         threat model, its baseline audit and, in diff mode, the changes since that audit.
         `DiffRefused` when the diff can't stand in for that audit."""
         if self._findings is None:
             raise ConfigError("prepare needs the finding reads (Context wires them)")
+        if component_target is not None and diff is not None:
+            raise ValidationError("component PURL audits are initial source audits, not diff scans")
         if diff is not None and not self._require_git().is_checkout(diff.checkout):
             raise DiffRefused(
                 "target is not a git checkout — no diff is computable against any baseline"
             )
         subject = self._inventory.subject(repository_ref_id)
+        if component_target is not None:
+            if component_target.commit.lower() != subject.sha.lower():
+                raise ValidationError(
+                    f"component target commit {component_target.commit} != ref sha {subject.sha}"
+                )
+            if component_target.repository.rstrip("/") != subject.repository_url.rstrip("/"):
+                raise ValidationError(
+                    f"component target repository {component_target.repository} != "
+                    f"{subject.repository_url}"
+                )
         line = sorted(default_line(self._inventory.list_refs(subject.repository_id)))
         with self._uow as uow:
             modelled = self._latest_for_refs(
@@ -247,7 +286,7 @@ class AssessmentService:
             threat_model = (
                 uow.artifacts.list_for_assessment(modelled.id) if modelled and modelled.id else []
             )
-            baseline = self._baseline(uow, diff, line)
+            baseline = None if component_target is not None else self._baseline(uow, diff, line)
         document = self._threat_model_document(modelled)
         anchor = None
         if diff is not None:
@@ -274,6 +313,7 @@ class AssessmentService:
             threat_model_document=document,
             baseline_assessment_id=baseline.id if baseline else None,
             diff=self._scope(diff, baseline, anchor, known) if diff and anchor else None,
+            component_target=component_target,
         )
 
     def threat_model_entry_points(
@@ -308,7 +348,13 @@ class AssessmentService:
         self, uow: AssessmentsUnitOfWork, diff: DiffRequest | None, line: list[UUID]
     ) -> Assessment | None:
         if diff is not None and diff.baseline_assessment_id is not None:
-            return self._read(uow.assessments.get(diff.baseline_assessment_id))
+            found = self._read(uow.assessments.get(diff.baseline_assessment_id))
+            if found.target_purl is not None:
+                raise ValidationError(
+                    f"assessment {diff.baseline_assessment_id} is scoped to component "
+                    f"{found.target_purl} and cannot anchor a whole-repository diff"
+                )
+            return found
         return self._latest_for_refs(uow, line, AssessmentKind.SECURE_CODE, ASSESSMENT_COMPLETED)
 
     def _latest_for_refs(
@@ -564,7 +610,17 @@ class AssessmentService:
             raise ConfigError("secure-code recording requires operations authorization")
         if self._recording._uow is not self._uow:
             raise ConfigError("secure-code recording and operations must share a unit of work")
-        ref = self._inventory.get_ref(repository_ref_id)
+        ref, repo = self._inventory.resolve(repository_ref_id)
+        target = _extract_component_target(doc)
+        if target is not None:
+            if target.commit.lower() != ref.sha.lower():
+                raise ValidationError(
+                    f"report target commit {target.commit} does not match ref commit {ref.sha}"
+                )
+            if target.repository.rstrip("/") != repo.url.rstrip("/"):
+                raise ValidationError(
+                    f"report target repository {target.repository} does not match {repo.url}"
+                )
         self._recording.check_recording(
             run_order_id,
             principal,
@@ -572,6 +628,7 @@ class AssessmentService:
             ref.repository_id,
             provenance,
             lease_generation=lease_generation,
+            target=target,
         )
         document = contracts.validate_json("report#/$defs/canonical_write", doc.payload)
         doc = type(doc)(doc.payload, document)
@@ -586,6 +643,7 @@ class AssessmentService:
             assessor="skill:secure-code-audit",
             assessor_version=assessor_version,
             occurred_at=provenance.occurred_at,
+            target_purl=target.purl if target is not None else None,
         )
         prepared, artifact = self._prepare_record(
             doc, assessment, provenance.artifact, authored_order_id=run_order_id
@@ -597,6 +655,7 @@ class AssessmentService:
             kind=RecordKind.ASSESSMENT,
             repository_id=ref.repository_id,
             provenance=provenance,
+            target=target,
         ):
             replay = self._log.recorded_order(run_order_id, assessment.kind, repository_ref_id, doc)
             if replay is not None:
@@ -656,9 +715,25 @@ class AssessmentService:
         if provenance.artifact is None and self._publisher is None:
             raise ValidationError("record requires a published artifact reference")
         self._gate(doc)
-        ref = self._inventory.get_ref(repository_ref_id)
+        ref, repo = self._inventory.resolve(repository_ref_id)
+        target = _extract_component_target(doc)
+        if target is not None:
+            if target.commit.lower() != ref.sha.lower():
+                raise ValidationError(
+                    f"report target commit {target.commit} does not match ref commit {ref.sha}"
+                )
+            if target.repository.rstrip("/") != repo.url.rstrip("/"):
+                raise ValidationError(
+                    f"report target repository {target.repository} does not match {repo.url}"
+                )
         guard = order_binding(
-            self._recording, self._uow, run_order_id, ref.repository_id, worker, lease_generation
+            self._recording,
+            self._uow,
+            run_order_id,
+            ref.repository_id,
+            worker,
+            lease_generation,
+            target=target,
         )
         assessment = Assessment(
             repository_ref_id=repository_ref_id,
@@ -668,6 +743,7 @@ class AssessmentService:
             assessor=assessor,
             assessor_version=assessor_version,
             occurred_at=provenance.occurred_at,
+            target_purl=target.purl if target is not None else None,
         )
         doc, artifact = self._prepare_record(doc, assessment, provenance.artifact)
         with guard:
@@ -825,7 +901,7 @@ class AssessmentService:
                 ):
                     assert held[0].id is not None
                     same_run = self._log.find_at(held[0].id, assessment.occurred_at)
-                    if same_run is None:
+                    if same_run is None or same_run.target_purl != assessment.target_purl:
                         continue
                     if same_run.run_order_id != assessment.run_order_id:
                         raise ConflictError(
@@ -982,13 +1058,17 @@ class AssessmentService:
         *,
         status: str | None = None,
         as_of: datetime | None = None,
+        target_purl: str | None = None,
     ) -> Assessment | None:
         if as_of is not None and as_of.utcoffset() is None:
             raise ValidationError("as_of must be timezone-aware")
+        normalized_purl = canonical_component_purl(target_purl) if target_purl is not None else None
         spellings = self._kind_spellings(kind)
         with self._uow as uow:
             rows = [
-                uow.assessments.latest(repository_ref_id, value, status, as_of=as_of)
+                uow.assessments.latest(
+                    repository_ref_id, value, status, as_of=as_of, target_purl=normalized_purl
+                )
                 for value in spellings
             ]
             found = max(
@@ -1047,6 +1127,11 @@ class AssessmentService:
                     repository_ref_id=filter.repository_ref_id,
                     kind=kind,
                     status=filter.status,
+                    target_purl=(
+                        canonical_component_purl(filter.target_purl)
+                        if filter.target_purl is not None
+                        else None
+                    ),
                     limit=page.limit + 1,
                     after=after,
                 )
@@ -1065,14 +1150,19 @@ class AssessmentService:
             rows = uow.assessments.list_for_run_order(run_order_id)
         return sorted((self._read(row) for row in rows), key=lambda a: (a.occurred_at, a.id))
 
-    def latest_recorded(self, repository_id: UUID, kind: AssessmentKind) -> Assessment:
-        """The repository's newest completed or degraded assessment across all its refs."""
+    def latest_recorded(
+        self, repository_id: UUID, kind: AssessmentKind, *, target_purl: str | None = None
+    ) -> Assessment:
+        """The repository's newest completed or degraded assessment across all its refs
+        (whole-repository only when `target_purl` is None, else scoped to that PURL)."""
         self._inventory.get_repository(repository_id)
+        normalized_purl = canonical_component_purl(target_purl) if target_purl is not None else None
         with self._uow as uow:
             found = uow.assessment_reads.latest_for_repository(
                 repository_id,
                 self._kind_spellings(kind),
                 (ASSESSMENT_COMPLETED, ASSESSMENT_DEGRADED),
+                target_purl=normalized_purl,
             )
         if found is None:
             raise NotFoundError(f"no recorded {kind} assessment for repository {repository_id}")
@@ -1092,6 +1182,8 @@ class AssessmentService:
         repository_ids: Collection[UUID],
         kind: AssessmentKind | None,
         page: PageRequest,
+        *,
+        target_purl: str | None = None,
     ) -> Page[Assessment]:
         """The assessments across every ref of these repositories, newest first and
         cursor-paged under the collection listing's own discipline: the batched
@@ -1099,6 +1191,7 @@ class AssessmentService:
         consumer that wants the whole history follows the cursor (the SDK's
         paged iterators do)."""
         after = page.position()
+        normalized_purl = canonical_component_purl(target_purl) if target_purl is not None else None
         refs = [r.id for r in self._inventory.list_refs_of(repository_ids) if r.id]
         kinds = self._kind_spellings(kind) if kind is not None else [None]
         with self._uow as uow:
@@ -1106,7 +1199,11 @@ class AssessmentService:
                 self._read(row)
                 for spelling in kinds
                 for row in uow.assessments.search(
-                    repository_ref_ids=refs, kind=spelling, limit=page.limit + 1, after=after
+                    repository_ref_ids=refs,
+                    kind=spelling,
+                    target_purl=normalized_purl,
+                    limit=page.limit + 1,
+                    after=after,
                 )
             ]
         rows.sort(key=lambda a: (a.occurred_at, a.id), reverse=True)

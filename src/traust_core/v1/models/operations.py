@@ -22,6 +22,7 @@ from traust_core.v1.models.artifacts import SessionTask as SessionTask
 from traust_core.v1.models.assessment import Assessment
 from traust_core.v1.models.base import AppendOnly, Dto, Entity, Model
 from traust_core.v1.models.common import Cursor, Sha256, TimeWindow, encode_cursor
+from traust_core.v1.models.component_target import ComponentTarget, DsseEnvelope
 from traust_core.v1.models.inventory import Release
 from traust_core.v1.models.vocabulary import BudgetEnforcement
 
@@ -200,6 +201,8 @@ OPEN_ORDER_STATES = (
     OrderState.LEASED,
 )
 
+MAX_TARGET_PROVENANCE_BYTES = 65_536
+
 
 class OrderRequest(Model):
     """What admission puts on the queue: one asset for one partition, routed or not."""
@@ -214,6 +217,41 @@ class OrderRequest(Model):
     # Fork facts are no part of a request: only scheduling (OpsService.schedule_fix) sets them,
     # after its ForkPolicy and branch checks, so the generic orders door can't steer a fix.
     work_item_id: UUID | None = None  # the remediation work item the order runs, if any
+    target_purl: str | None = None
+    target_sha: str | None = None
+    target_module_path: str | None = None
+    target_release_ref: str | None = None
+    target_provenance: DsseEnvelope | None = None  # DSSE-signed in-toto provenance
+
+    @pydantic.model_validator(mode="after")
+    def _component_target_fields(self) -> OrderRequest:
+        if self.target_module_path is not None and not self.target_module_path.strip():
+            raise ValueError("target_module_path must be non-empty when supplied")
+        if self.target_release_ref is not None and not self.target_release_ref.strip():
+            raise ValueError("target_release_ref must be non-empty when supplied")
+        if (
+            self.target_provenance is not None
+            and len(self.target_provenance.model_dump_json()) > MAX_TARGET_PROVENANCE_BYTES
+        ):
+            raise ValueError(f"target_provenance exceeds {MAX_TARGET_PROVENANCE_BYTES} bytes")
+        fields = (
+            self.target_purl,
+            self.target_sha,
+            self.target_module_path,
+            self.target_release_ref,
+            self.target_provenance,
+        )
+        if any(f is not None for f in fields):
+            if not (
+                self.target_purl is not None
+                and self.target_purl.strip()
+                and self.target_sha is not None
+                and self.target_sha.strip()
+            ):
+                raise ValueError("component target orders require both target_purl and target_sha")
+            if self.repository_id is None:
+                raise ValueError("component target orders require repository_id")
+        return self
 
 
 class DenyIssue(Model):
@@ -318,13 +356,15 @@ class OrderApproval(Model):
 
 
 class OrderManifest(Model):
-    """What an order's run manifest says about the config it was planned with and its approval."""
+    """What an order's run manifest says about the config it was planned with, its approval, and
+    any server-resolved component PURL target."""
 
     config: tuple[ConfigDigest, ...] = ()
     approval: OrderApproval | None = None
     sessions: tuple[SessionRecord, ...] = ()
     degraded: Mapping[str, int] = Field(default_factory=dict)
     outputs: tuple[UUID, ...] = ()
+    component_target: ComponentTarget | None = None
 
     @model_serializer(mode="wrap")
     def serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
@@ -335,6 +375,8 @@ class OrderManifest(Model):
             document.pop("degraded", None)
         if not self.outputs:
             document.pop("outputs", None)
+        if self.component_target is None:
+            document.pop("component_target", None)
         return document
 
 
@@ -707,6 +749,9 @@ class RunOrder(Entity):
     fork_branch: str | None = None  # its fix branch
     fork_scheduled_at: datetime | None = None  # when scheduling set them, checked
     input_artifact_id: UUID | None = None  # the asset's input document, if it takes one
+    target_purl: str | None = None
+    target_sha: str | None = None
+    target_module_path: str | None = None
 
 
 FEED_ORDER_STATES = (*FINISHED_ORDER_STATES, OrderState.AWAITING_APPROVAL)

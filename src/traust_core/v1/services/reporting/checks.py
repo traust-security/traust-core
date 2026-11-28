@@ -13,6 +13,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 from traust_core.v1 import contracts
+from traust_core.v1.errors import UnresolvedTargetError
+from traust_core.v1.models.component_target import normalize_module_path, parse_component_purl
 from traust_core.v1.models.ledger import DocumentVerification
 from traust_core.v1.providers.report_files import ReportFiles
 from traust_core.v1.services.artifact_publishing import RedactionPolicy
@@ -376,6 +378,106 @@ def check_metadata_repository(report: Report, result: ReportValidation) -> None:
 
 def _is_local_fixture_url(value: str) -> bool:
     return _LOCAL_FIXTURE_RE.fullmatch(value) is not None
+
+
+def check_metadata_target(report: Report, result: ReportValidation) -> None:
+    """When a report declares `metadata.target`, verify PURL syntax, commit/repo consistency,
+    and normalized repo-relative paths."""
+    meta = report.get("metadata") or {}
+    target = meta.get("target")
+    if target is None:
+        return
+    if not isinstance(target, dict):
+        result.error("metadata.target must be an object")
+        return
+    purl = target.get("purl")
+    if isinstance(purl, str):
+        try:
+            parse_component_purl(purl)
+        except UnresolvedTargetError as e:
+            result.error(f"metadata.target.purl: {e}")
+    commit = target.get("commit")
+    meta_commit = meta.get("commit")
+    if (
+        isinstance(commit, str)
+        and isinstance(meta_commit, str)
+        and meta_commit.strip()
+        and commit.lower() != meta_commit.strip().lower()
+    ):
+        result.error(
+            f"metadata.target.commit ({commit}) does not match metadata.commit ({meta_commit})"
+        )
+    target_repo = target.get("repository")
+    meta_repo = meta.get("repository")
+    if (
+        isinstance(target_repo, str)
+        and isinstance(meta_repo, str)
+        and meta_repo.strip()
+        and target_repo.strip().rstrip("/") != meta_repo.strip().rstrip("/")
+    ):
+        result.error(
+            f"metadata.target.repository ({target_repo}) does not match "
+            f"metadata.repository ({meta_repo})"
+        )
+    mod_path = target.get("module_path")
+    if isinstance(mod_path, str):
+        try:
+            normalized = normalize_module_path(mod_path)
+        except UnresolvedTargetError as e:
+            result.error(f"metadata.target.module_path: {e}")
+        else:
+            if normalized != mod_path:
+                result.error(
+                    f"metadata.target.module_path {mod_path!r} must be normalized ({normalized!r})"
+                )
+    verification = target.get("verification")
+    if isinstance(verification, dict):
+        manifest_paths = verification.get("manifest_paths")
+        if manifest_paths is not None and not isinstance(manifest_paths, list):
+            # runs after schema errors too: a malformed shape is a finding, never a crash
+            result.error("metadata.target.verification.manifest_paths must be an array of paths")
+            manifest_paths = None
+        for mp in manifest_paths or ():
+            if not isinstance(mp, str):
+                result.error(
+                    f"metadata.target.verification.manifest_paths entry {mp!r} must be a string"
+                )
+            else:
+                try:
+                    norm_mp = normalize_module_path(mp)
+                except UnresolvedTargetError as e:
+                    result.error(f"metadata.target.verification.manifest_paths: {e}")
+                else:
+                    if norm_mp == "." or norm_mp != mp:
+                        result.error(
+                            f"metadata.target.verification.manifest_paths entry {mp!r} must be a "
+                            "normalized repo-relative file path"
+                        )
+        strategy = verification.get("strategy")
+        has_prov = "provenance" in verification
+        prov = verification.get("provenance")
+        if strategy == "external_provenance":
+            if not isinstance(prov, dict) or not all(
+                isinstance(prov.get(k), str) and prov.get(k).strip()
+                for k in ("source", "ref", "digest")
+            ):
+                result.error(
+                    "metadata.target.verification.provenance requires non-empty source, ref, and "
+                    "digest when strategy is 'external_provenance'"
+                )
+            elif "manifest_version" in prov and (
+                not isinstance(prov["manifest_version"], str)
+                or not prov["manifest_version"].strip()
+            ):
+                result.error(
+                    "metadata.target.verification.provenance.manifest_version must be a "
+                    "non-empty string when present"
+                )
+        elif has_prov:
+            result.error(
+                "metadata.target.verification.provenance must be omitted when strategy is "
+                f"{strategy!r}"
+            )
 
 
 def _cross_validate_review_surfaces(report: Report, result: ReportValidation) -> None:
@@ -1351,6 +1453,7 @@ def validate_report(
     # these read findings and metadata directly; a malformed shape already has schema errors
     if not any(k in sid for k in _NON_AUDIT) and _report_shaped(report):
         check_metadata_repository(report, result)
+        check_metadata_target(report, result)
         if strict:
             strict_checks(report, result, context)
     return result

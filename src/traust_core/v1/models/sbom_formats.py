@@ -9,31 +9,11 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable, Iterator, Mapping
 from typing import Any
-from urllib.parse import unquote
 
 from traust_core.v1.errors import ValidationError
-from traust_core.v1.models.dependencies import SbomContents, SbomEntry, Version, package_name
+from traust_core.v1.models.dependencies import SbomContents, SbomEntry, Version
+from traust_core.v1.models.purl import Purl
 from traust_core.v1.models.vocabulary import Ecosystem
-
-_PURL_TYPES = {
-    "golang": Ecosystem.GO,
-    "npm": Ecosystem.NPM,
-    "pypi": Ecosystem.PYPI,
-    "maven": Ecosystem.MAVEN,
-    "cargo": Ecosystem.CARGO,
-    "gem": Ecosystem.RUBY,
-    "nuget": Ecosystem.NUGET,
-    "github": Ecosystem.ACTIONS,
-    "githubactions": Ecosystem.ACTIONS,
-    "docker": Ecosystem.DOCKER,
-    "oci": Ecosystem.DOCKER,
-    "helm": Ecosystem.HELM,
-    "rpm": Ecosystem.RPM,
-    "deb": Ecosystem.DEB,
-    "apk": Ecosystem.APK,
-}
-# Distro purls carry the vendor as namespace (pkg:deb/debian/openssl); the package is the name.
-_VENDOR_NAMESPACE = {Ecosystem.RPM, Ecosystem.DEB, Ecosystem.APK}
 
 Component = tuple[str, str | None, str | None]  # (ref, purl, version)
 
@@ -146,20 +126,7 @@ def _direct(roots: set[str], edges: Mapping[str, set[str]], parts: list[Componen
 
 def _purl(raw: str) -> tuple[Ecosystem, str, str | None] | None:
     """pkg:type/namespace/name@version?qualifiers#subpath -> (ecosystem, name, version)."""
-    if not raw.startswith("pkg:"):
+    parsed = Purl.try_parse(raw)
+    if parsed is None or parsed.ecosystem is None:
         return None
-    body = raw[4:].split("#", 1)[0].split("?", 1)[0]
-    head, at, version = body.rpartition("@")
-    if not at or "/" in version:
-        head, version = body, ""
-    kind, _, path = head.partition("/")
-    ecosystem = _PURL_TYPES.get(kind.lower())
-    segments = [unquote(s) for s in path.split("/") if s]
-    if ecosystem is None or not segments:
-        return None
-    *namespace, name = segments
-    if ecosystem == Ecosystem.MAVEN and namespace:
-        name = f"{'.'.join(namespace)}:{name}"
-    elif ecosystem not in _VENDOR_NAMESPACE:
-        name = "/".join([*namespace, name])
-    return ecosystem, package_name(ecosystem, name), unquote(version) or None
+    return parsed.ecosystem, parsed.package_id, parsed.version

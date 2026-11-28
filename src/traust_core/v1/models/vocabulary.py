@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     ComplianceTargetResolvesVia = StrEnum
     ComplianceVerdict = StrEnum
     ComplianceVerdictSource = StrEnum
+    ComponentTargetStrategy = StrEnum
     CrossRepoPropagation = StrEnum
     DependencyEvidenceLevel = StrEnum
     DecisionReason = StrEnum
@@ -121,6 +122,7 @@ else:
     ComplianceTargetResolvesVia = contracts.enum("compliance-target-resolves-via")
     ComplianceVerdict = contracts.enum("compliance-verdict")
     ComplianceVerdictSource = contracts.enum("compliance-verdict-source")
+    ComponentTargetStrategy = contracts.enum("component-target-strategy")
     CrossRepoPropagation = contracts.enum("cross-repo-propagation")
     DecisionReason = contracts.enum("decision-reason")
     DependencyEvidenceLevel = contracts.enum("dependency-evidence-level")

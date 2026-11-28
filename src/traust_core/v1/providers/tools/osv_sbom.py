@@ -9,9 +9,9 @@ import tempfile
 from collections import Counter
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote
 
 from traust_core.v1.errors import ValidationError
+from traust_core.v1.models.purl import Purl
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.osv import OsvAdvisoryLookup
 from traust_core.v1.providers.process import ProcessResult, ProcessRunner
@@ -40,26 +40,14 @@ class SbomFormatError(ValidationError):
 
 def parse_purl(purl: str) -> Key | None:
     """(OSV ecosystem, package, version) for a supported language purl."""
-    if not purl or not purl.startswith("pkg:"):
+    parsed = Purl.try_parse(purl)
+    if parsed is None:
         return None
-    body = purl[4:].split("?", 1)[0].split("#", 1)[0]
-    ptype, _, rest = body.partition("/")
-    eco = PURL_ECOSYSTEM.get(ptype.lower())
-    if not eco:
+    eco = PURL_ECOSYSTEM.get(parsed.type)
+    if not eco or (eco == "Maven" and not parsed.namespace):
         return None
-    path, _, version = rest.rpartition("@") if "@" in rest else (rest, "", "")
-    parts = [unquote(p) for p in path.split("/") if p]
-    if not parts:
-        return None
-    version = unquote(version)
-    if eco == "Maven":
-        if len(parts) < 2:
-            return None
-        name = f"{parts[-2]}:{parts[-1]}"
-    elif eco == "PyPI":
-        name = re.sub(r"[-_.]+", "-", parts[-1]).lower()
-    else:
-        name = "/".join(parts)
+    name = parsed.package_id
+    version = parsed.version or ""
     if eco == "Go":
         version = version.removeprefix("v")
         if name == "stdlib":

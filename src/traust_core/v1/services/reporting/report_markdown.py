@@ -54,6 +54,16 @@ def _fence_for(code: str) -> str:
     return "`" * max(3, longest + 1)
 
 
+def _code_span(value: Any) -> str:
+    """An inline code span the value can't close: the delimiter outruns its longest backtick
+    run, padded when the value starts or ends with a backtick (CommonMark)."""
+    text = _clean_inline(value)
+    longest = max((len(m) for m in _BACKTICK_RUN_RX.findall(text)), default=0)
+    fence = "`" * (longest + 1)
+    pad = " " if text.startswith("`") or text.endswith("`") else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
+
+
 def _table(headers: list[str], rows: list[list[Any]]) -> str:
     lines = [
         "| " + " | ".join(_cell(h) for h in headers) + " |",
@@ -81,6 +91,30 @@ def _metadata(meta: Report) -> str:
         ("methodology", "Methodology"),
     ]
     present = [(label, meta[key]) for key, label in field_map if key in meta]
+
+    target = meta.get("target")
+    if isinstance(target, dict):
+        if target.get("purl"):
+            present.append(("Target PURL", _code_span(target["purl"])))
+        if target.get("module_path"):
+            present.append(("Target Module", _code_span(target["module_path"])))
+        if target.get("release_ref"):
+            present.append(("Release Ref", _code_span(target["release_ref"])))
+        ver = target.get("verification")
+        if isinstance(ver, dict) and ver.get("strategy"):
+            manifests = ver.get("manifest_paths")
+            count = len(manifests) if isinstance(manifests, list) else 0
+            ver_str = f"{_code_span(ver['strategy'])} ({count} manifest(s))"
+            present.append(("Target Verification", ver_str))
+            prov = ver.get("provenance")
+            if isinstance(prov, dict) and prov.get("source") and prov.get("digest"):
+                prov_str = (
+                    f"{_code_span(prov['source'])} ({_code_span(prov.get('ref', ''))}, "
+                    f"{_code_span(prov['digest'])})"
+                )
+                if prov.get("manifest_version"):
+                    prov_str += f" [manifest_version={_code_span(prov['manifest_version'])}]"
+                present.append(("Target Provenance", prov_str))
 
     lb = meta.get("loc_breakdown")
     if lb:
