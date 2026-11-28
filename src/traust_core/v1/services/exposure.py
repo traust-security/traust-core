@@ -689,7 +689,10 @@ class ExposureService:
     def manifest_coverage(
         self, refs: Collection[RepositoryRef]
     ) -> dict[UUID, tuple[UnresolvedManifest, ...] | None]:
-        """Scan-bound coverage for the same ref snapshots used to read package rows."""
+        """Scan-bound coverage for the same ref snapshots used to read package rows: the
+        gaps of a current scan, else None. An older scan's gaps stay unknown here on purpose:
+        a flat gap list can't say which ecosystems its rules never checked, and listing the
+        rest would read those as clean. Per-ecosystem readers use `manifest_scan_coverage`."""
         return {
             ref_id: scan.gaps if scan.current_probe else None
             for ref_id, scan in self._probe_coverages(refs).items()
